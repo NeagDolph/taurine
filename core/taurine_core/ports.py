@@ -44,6 +44,13 @@ class IndexPort(Protocol):
         ...
 
 
+class SpanExtractorPort(Protocol):
+    def extract(self, text: str) -> list[tuple[str, float]]:
+        """Salient spans in the text -> [(span, score)] desc, deduped, capped.
+        Must never raise; returns [] on any failure."""
+        ...
+
+
 class RerankerPort(Protocol):
     async def rerank(self, query: str, docs: list[tuple[str, str]]) -> list[tuple[str, float]]:
         """docs=[(note_id, doc_text)] -> [(note_id, relevance)] desc.

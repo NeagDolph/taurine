@@ -74,6 +74,7 @@ class RetrievalResult(BaseModel):
     heard: str                     # the window text
     hits: list[Hit]
     expansions: list[Expansion]
+    extracted: list[str] = []      # GLiNER spans that served as query heads
 
 
 # ── slate / cards ──────────────────────────────────────────────────────
@@ -147,6 +148,7 @@ class RetrievalEvent(BaseModel):
     expansions: list[Expansion]
     retrieval_id: str = ""         # equals the search TriggerEvent's trigger_id
     seqs: list[int] = []           # transcript chunks forming the window
+    extracted: list[str] = []      # GLiNER spans that served as query heads
 
 
 # ── trigger provenance (debug UI: spans → notes they brought about) ────

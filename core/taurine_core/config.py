@@ -62,6 +62,21 @@ ALIAS_STOPWORDS = frozenset(
 SALIENT_TERMS = 6                        # top rare window terms forming the salient query
 SALIENT_MIN_TERM_LEN = 3
 
+# ── C2 GLiNER span extraction ──────────────────────────────────────────
+GLINER_MODEL = "urchade/gliner_medium-v2.1"
+GLINER_LABELS = [
+    "person",
+    "company",
+    "project",
+    "product",
+    "document topic",
+    "task",
+    "event",
+    "place",
+]
+GLINER_THRESHOLD = 0.38
+GLINER_MAX_SPANS = 4
+
 # ── slate ──────────────────────────────────────────────────────────────
 QUOTA_EXACT = 3
 QUOTA_SEARCH = 8
