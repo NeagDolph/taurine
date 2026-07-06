@@ -103,6 +103,12 @@ export function MapView({
 
   useEffect(() => {
     let cancelled = false
+    const loadingTimer = window.setTimeout(() => {
+      if (!cancelled) {
+        setIsLoading(true)
+        setError('')
+      }
+    }, 120)
 
     fetchGraph()
       .then((response) => {
@@ -117,6 +123,7 @@ export function MapView({
         }
       })
       .finally(() => {
+        window.clearTimeout(loadingTimer)
         if (!cancelled) {
           setIsLoading(false)
         }
@@ -124,6 +131,7 @@ export function MapView({
 
     return () => {
       cancelled = true
+      window.clearTimeout(loadingTimer)
     }
   }, [lastSync])
 
@@ -300,7 +308,7 @@ export function MapView({
     >
       <ForceGraph2D<MapNode, MapLink>
         ref={graphRef}
-        autoPauseRedraw={false}
+        autoPauseRedraw={!visible}
         backgroundColor="#0b0f14"
         cooldownTicks={80}
         d3AlphaDecay={0.025}
