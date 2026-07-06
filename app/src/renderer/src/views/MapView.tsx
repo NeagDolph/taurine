@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import ForceGraph2D, { type ForceGraphMethods, type LinkObject, type NodeObject } from 'react-force-graph-2d'
+import ForceGraph2D, {
+  type ForceGraphMethods,
+  type LinkObject,
+  type NodeObject
+} from 'react-force-graph-2d'
 import {
   LIVE_EDGE_FADE_MS,
   NOW_NODE_ID,
@@ -62,7 +66,9 @@ export function MapView({
     }
     pruneTimerRef.current = window.setTimeout(() => {
       pruneTimerRef.current = null
-      setLiveLinks((current) => current.filter((link) => link.fadeStartedAt === undefined || liveLinkOpacity(link) > 0))
+      setLiveLinks((current) =>
+        current.filter((link) => link.fadeStartedAt === undefined || liveLinkOpacity(link) > 0)
+      )
     }, LIVE_EDGE_FADE_MS + 120)
   }, [])
 
@@ -86,7 +92,9 @@ export function MapView({
     const observer = new ResizeObserver(([entry]) => {
       const width = Math.max(320, Math.floor(entry.contentRect.width))
       const height = Math.max(300, Math.floor(entry.contentRect.height))
-      setSize((current) => (current.width === width && current.height === height ? current : { width, height }))
+      setSize((current) =>
+        current.width === width && current.height === height ? current : { width, height }
+      )
     })
 
     observer.observe(element)
@@ -95,12 +103,11 @@ export function MapView({
 
   useEffect(() => {
     let cancelled = false
-    setIsLoading(true)
-    setError('')
 
     fetchGraph()
       .then((response) => {
         if (!cancelled) {
+          setError('')
           setBaseGraph(graphResponseToMapData(response, 'Now'))
         }
       })
@@ -134,7 +141,9 @@ export function MapView({
         current.filter((link) => link.fadeStartedAt === undefined),
         now
       ),
-      ...current.filter((link) => link.fadeStartedAt !== undefined && liveLinkOpacity(link, now) > 0),
+      ...current.filter(
+        (link) => link.fadeStartedAt !== undefined && liveLinkOpacity(link, now) > 0
+      ),
       ...update.links
     ])
 
@@ -179,7 +188,9 @@ export function MapView({
     () => ({
       nodes: baseGraph.nodes,
       links: [
-        ...baseGraph.links.map((link) => (link.kind === 'static' ? { ...link, shared: [...link.shared] } : { ...link })),
+        ...baseGraph.links.map((link) =>
+          link.kind === 'static' ? { ...link, shared: [...link.shared] } : { ...link }
+        ),
         ...liveLinks.map((link) => ({ ...link }))
       ]
     }),
@@ -228,35 +239,40 @@ export function MapView({
     [flashUntilByNode, nowLabel, pinnedSet]
   )
 
-  const drawLink = useCallback((link: GraphLinkObject, ctx: CanvasRenderingContext2D, globalScale: number) => {
-    const source = endpoint(link.source)
-    const target = endpoint(link.target)
-    if (!source || !target) {
-      return
-    }
+  const drawLink = useCallback(
+    (link: GraphLinkObject, ctx: CanvasRenderingContext2D, globalScale: number) => {
+      const source = endpoint(link.source)
+      const target = endpoint(link.target)
+      if (!source || !target) {
+        return
+      }
 
-    const isStatic = link.kind === 'static'
-    const opacity = isStatic ? staticLinkOpacity(link.weight) : liveLinkOpacity(link)
-    if (opacity <= 0) {
-      return
-    }
+      const isStatic = link.kind === 'static'
+      const opacity = isStatic ? staticLinkOpacity(link.weight) : liveLinkOpacity(link)
+      if (opacity <= 0) {
+        return
+      }
 
-    ctx.save()
-    ctx.beginPath()
-    ctx.moveTo(source.x, source.y)
-    ctx.lineTo(target.x, target.y)
-    ctx.strokeStyle = isStatic ? `rgba(138, 160, 171, ${opacity})` : rgba(link.color, opacity)
-    ctx.lineWidth = isStatic ? Math.max(0.75 / globalScale, 0.35) : Math.max((link.kind === 'rank' ? 2.6 : 1.8) / globalScale, 0.8)
-    if (link.kind === 'hop') {
-      ctx.setLineDash([4 / globalScale, 5 / globalScale])
-    }
-    ctx.stroke()
-    ctx.restore()
+      ctx.save()
+      ctx.beginPath()
+      ctx.moveTo(source.x, source.y)
+      ctx.lineTo(target.x, target.y)
+      ctx.strokeStyle = isStatic ? `rgba(138, 160, 171, ${opacity})` : rgba(link.color, opacity)
+      ctx.lineWidth = isStatic
+        ? Math.max(0.75 / globalScale, 0.35)
+        : Math.max((link.kind === 'rank' ? 2.6 : 1.8) / globalScale, 0.8)
+      if (link.kind === 'hop') {
+        ctx.setLineDash([4 / globalScale, 5 / globalScale])
+      }
+      ctx.stroke()
+      ctx.restore()
 
-    if (link.kind === 'hop') {
-      drawHopLabel(ctx, source, target, link.hop, globalScale, opacity)
-    }
-  }, [])
+      if (link.kind === 'hop') {
+        drawHopLabel(ctx, source, target, link.hop, globalScale, opacity)
+      }
+    },
+    []
+  )
 
   const overlayText = error
     ? error
@@ -343,7 +359,9 @@ function endpoint(value: GraphLinkObject['source']): { x: number; y: number } | 
   }
 
   const maybeNode = value as GraphNodeObject
-  return typeof maybeNode.x === 'number' && typeof maybeNode.y === 'number' ? { x: maybeNode.x, y: maybeNode.y } : null
+  return typeof maybeNode.x === 'number' && typeof maybeNode.y === 'number'
+    ? { x: maybeNode.x, y: maybeNode.y }
+    : null
 }
 
 function drawNodeLabel(
@@ -395,7 +413,14 @@ function drawHopLabel(
   const height = fontSize + paddingY * 2
 
   ctx.fillStyle = `rgba(10, 13, 18, ${Math.min(0.84, opacity + 0.18)})`
-  roundedRect(ctx, x - width / 2 - paddingX, y - height / 2, width + paddingX * 2, height, 4 / globalScale)
+  roundedRect(
+    ctx,
+    x - width / 2 - paddingX,
+    y - height / 2,
+    width + paddingX * 2,
+    height,
+    4 / globalScale
+  )
   ctx.fill()
 
   ctx.fillStyle = rgba('#f0c888', Math.min(0.95, opacity + 0.28))

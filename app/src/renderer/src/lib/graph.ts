@@ -160,7 +160,10 @@ export function nowLabelFromText(text: string, wordCount = 6): string {
   return words.length === 0 ? 'Now' : words.slice(-wordCount).join(' ')
 }
 
-export function liveGraphFromRetrieval(event: RetrievalEvent, createdAt = Date.now()): LiveGraphUpdate {
+export function liveGraphFromRetrieval(
+  event: RetrievalEvent,
+  createdAt = Date.now()
+): LiveGraphUpdate {
   const touchedNodeIds = new Set<string>()
   const totalRanks = Math.max(1, event.hits.length)
   const links: LiveGraphLink[] = []
@@ -198,7 +201,10 @@ export function liveGraphFromRetrieval(event: RetrievalEvent, createdAt = Date.n
   return { links, touchedNodeIds }
 }
 
-export function fadingLiveLinks(links: LiveGraphLink[], fadeStartedAt = Date.now()): LiveGraphLink[] {
+export function fadingLiveLinks(
+  links: LiveGraphLink[],
+  fadeStartedAt = Date.now()
+): LiveGraphLink[] {
   return links.map((link) => ({
     ...link,
     fadeStartedAt: link.fadeStartedAt ?? fadeStartedAt

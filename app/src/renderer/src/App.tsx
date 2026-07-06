@@ -77,7 +77,9 @@ function App(): React.JSX.Element {
         setAmbientItems(event.items)
       }),
       client.onPin((event) => {
-        setPinnedNoteIds((current) => (current.includes(event.card.note_id) ? current : [...current, event.card.note_id]))
+        setPinnedNoteIds((current) =>
+          current.includes(event.card.note_id) ? current : [...current, event.card.note_id]
+        )
         setPinnedCards((current) => {
           const withoutDuplicate = current.filter(
             (card) => card.card_id !== event.card.card_id && card.note_id !== event.card.note_id
@@ -183,7 +185,12 @@ function App(): React.JSX.Element {
           <h1>Taurine</h1>
           <span>Live meeting copilot</span>
         </div>
-        <SessionControls state={listeningState} error={micError} onStart={startListening} onStop={stopListening} />
+        <SessionControls
+          state={listeningState}
+          error={micError}
+          onStart={startListening}
+          onStop={stopListening}
+        />
       </header>
 
       {showDisconnectedBanner ? (
