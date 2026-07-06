@@ -230,12 +230,14 @@ export function nodeRadius(degree: number): number {
 }
 
 export function rankColor(rank: number, totalRanks: number): string {
+  // rank-hot = yellow accent, rank-cold = cool gray-blue
   const t = totalRanks <= 1 ? 0 : clamp((rank - 1) / (totalRanks - 1), 0, 1)
-  return mixHex('#ff5c5c', '#4c7dff', t)
+  return mixHex('#ffd75e', '#5f7690', t)
 }
 
 export function hopColor(hop: number): string {
-  return mixHex('#d7aa62', '#6176bc', clamp((hop - 1) / 3, 0, 1))
+  // dashed expansion edges: warm amber fading to muted slate as hops grow
+  return mixHex('#e5b23c', '#5b6577', clamp((hop - 1) / 3, 0, 1))
 }
 
 export function linkTooltip(link: MapLink): string {
