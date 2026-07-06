@@ -12,6 +12,7 @@ from typing import Any, Protocol
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
 from taurine_core import config
@@ -94,6 +95,14 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 await asyncio.gather(periodic_task, return_exceptions=True)
 
     app = FastAPI(lifespan=lifespan)
+    # localhost-bound service consumed by the Electron renderer (vite origin
+    # in dev, file:// in prod) — REST needs CORS; the ws is exempt anyway
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
 
     @app.get("/graph")
     async def graph() -> GraphResponse:
@@ -122,6 +131,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             lambda: _index_status(active_runtime),
         )
         sender = asyncio.create_task(_send_events(websocket, events))
+        await emit(
+            StatusEvent(asr="disconnected", index=_index_status(active_runtime))
+        )
         try:
             while True:
                 message = await websocket.receive()

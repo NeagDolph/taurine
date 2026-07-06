@@ -16,11 +16,22 @@ body {
 
 .app-shell {
   color: #f1f5f0;
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 12px;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   height: 100vh;
   padding: 16px;
+}
+
+.app-shell > * {
+  flex: 0 0 auto;
+}
+
+/* the workspace always owns the remaining height, regardless of which
+   conditional siblings (banner, pinned stack) are mounted */
+.app-shell > .workspace {
+  flex: 1 1 0;
+  min-height: 0;
 }
 
 .app-header,
@@ -543,6 +554,10 @@ button:disabled {
   .app-shell {
     height: auto;
     min-height: 100vh;
+  }
+
+  .app-shell > .workspace {
+    min-height: 60vh;
   }
 
   .workspace,

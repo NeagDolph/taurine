@@ -56,6 +56,7 @@ export function MapView({
   const [size, setSize] = useState({ width: 720, height: 480 })
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState('')
+  const [retryNonce, setRetryNonce] = useState(0)
 
   const nowLabel = useMemo(() => nowLabelFromText(latestFinalText), [latestFinalText])
   const pinnedSet = useMemo(() => new Set(pinnedNoteIds), [pinnedNoteIds])
@@ -133,7 +134,15 @@ export function MapView({
       cancelled = true
       window.clearTimeout(loadingTimer)
     }
-  }, [lastSync])
+  }, [lastSync, retryNonce])
+
+  useEffect(() => {
+    if (!error) {
+      return
+    }
+    const timeout = window.setTimeout(() => setRetryNonce((nonce) => nonce + 1), 4000)
+    return () => window.clearTimeout(timeout)
+  }, [error, retryNonce])
 
   useEffect(() => {
     if (!retrieval || processedRetrievalRef.current === retrieval) {

@@ -147,6 +147,9 @@ def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
             ws.send_json({"type": "start", "channels": [{"id": 2, "label": "system"}]})
             ws.send_bytes(bytes([2]) + b"\x01\x00\x02\x00")
 
+            greeting = ws.receive_json()
+            assert greeting["type"] == "status"  # initial status on connect
+
             assert ws.receive_json() == {
                 "type": "transcript",
                 "channel": 2,
