@@ -28,6 +28,8 @@ LLM_TIMEOUT_S = 15.0
 
 # ── notes sync ─────────────────────────────────────────────────────────
 SYNC_INTERVAL_S = 300.0
+GIST_MAX_CHARS = 220                     # was 120: mid-word truncation degraded rerank docs
+                                         # and card copy (audit finding #5)
 
 # ── note graph ─────────────────────────────────────────────────────────
 GRAPH_KNN = 6
@@ -50,6 +52,12 @@ C2_TOP_K = 8                             # match the search-lane quota (was 5: e
 FUSED_PROTECT = 3                        # top-N fused candidates enter the slate even if the
                                          # reranker demotes them (rerank can't see entity links
                                          # through ASR spelling drift)
+DENSE_PROTECT = 2                        # top-N dense-window hits likewise protected (RRF
+                                         # buries single-list hits — audit finding #1)
+SALIENT_MIN_DF = 1                       # drop df=0 window terms: they are ASR misspellings,
+                                         # not rare gold (audit finding #2)
+GRAPH_VOTE_TOP = 10                      # fused candidates whose neighbors get vote credit
+GRAPH_VOTE_WEIGHT = 0.5                  # vote strength multiplier (5th RRF list)
 MIN_COSINE = 0.35                        # floor only when no BM25 hit AND no graph path
 
 # ── fuzzy entity snapping (ASR spelling drift: "Armand" → "Armaan") ────
