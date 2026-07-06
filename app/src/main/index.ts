@@ -3,11 +3,18 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 
+if (is.dev) {
+  // dev-only: lets tooling attach to the real renderer for debugging
+  app.commandLine.appendSwitch('remote-debugging-port', '9223')
+}
+
 function createWindow(): void {
   // Create the browser window.
   const mainWindow = new BrowserWindow({
-    width: 900,
-    height: 670,
+    width: 1360,
+    height: 860,
+    minWidth: 980,
+    minHeight: 640,
     show: false,
     autoHideMenuBar: true,
     ...(process.platform === 'linux' ? { icon } : {}),

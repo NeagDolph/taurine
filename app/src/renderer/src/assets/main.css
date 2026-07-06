@@ -808,6 +808,12 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
+  /* single-column workspace rows are auto-sized, so the main pane must
+     bring its own height or the view stack (100%-of-auto) collapses to 0 */
+  .main-pane {
+    min-height: 56vh;
+  }
+
   .ambient-sidebar {
     min-height: 320px;
   }
