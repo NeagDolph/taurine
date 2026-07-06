@@ -4,7 +4,11 @@
 HOST = "127.0.0.1"
 PORT = 8930
 
-# ── ASR (wire protocol: see docs/reference/mic_test.py) ────────────────
+# ── ASR ────────────────────────────────────────────────────────────────
+# "deepgram" (general speech, prod-proven) | "taurine" (customer-service-tuned)
+ASR_PROVIDER = "deepgram"
+DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen"
+DEEPGRAM_MODEL = "nova-3"
 ASR_URL = "wss://transcription.trywink.io/taurine"  # + ?token=<TAURINE_ASR_TOKEN>
 ASR_RECONNECT_MIN_S = 1.0
 ASR_RECONNECT_MAX_S = 30.0
@@ -41,8 +45,17 @@ HOP_DECAY = 0.5
 RERANK_MODEL = "rerank-v3.5"
 RERANK_TIMEOUT_S = 2.0
 RERANK_MAX_CANDIDATES = 20
-C2_TOP_K = 5
+C2_TOP_K = 8                             # match the search-lane quota (was 5: entity notes
+                                         # repeatedly died at ordered[6] — see 2026-07-06 triage)
+FUSED_PROTECT = 3                        # top-N fused candidates enter the slate even if the
+                                         # reranker demotes them (rerank can't see entity links
+                                         # through ASR spelling drift)
 MIN_COSINE = 0.35                        # floor only when no BM25 hit AND no graph path
+
+# ── fuzzy entity snapping (ASR spelling drift: "Armand" → "Armaan") ────
+FUZZY_SNAP_MIN_LEN = 4                   # only snap spans at least this long
+FUZZY_SNAP_MAX_DIST = 2                  # max Levenshtein distance to an alias/title term
+FUZZY_SNAP_LABELS = ("person", "organization", "project")  # spans eligible for snapping
 
 # ── C1 exact collector ─────────────────────────────────────────────────
 ALIAS_WORD_BOUNDARY_UNDER = 4            # aliases shorter than this need word-boundary match
@@ -93,5 +106,7 @@ REOFFER_S = 60.0
 # ── presenter / cards ──────────────────────────────────────────────────
 PRESENTER_TRANSCRIPT_CHUNKS = 15
 PRESENTER_MAX_PICKS = 2
+PRESENTER_MAX_TOOL_CALLS = 3             # read_note tool-loop budget per pass
+PRESENTER_NEIGHBORS_SHOWN = 3            # neighbor ids listed per slate line
 WHY_MAX_CHARS = 140
 MAX_PINNED = 3
