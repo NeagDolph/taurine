@@ -1,34 +1,251 @@
-import Versions from './components/Versions'
-import electronLogo from './assets/electron.svg'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { AmbientList } from './components/AmbientList'
+import { PinnedStack } from './components/PinnedStack'
+import { SessionControls, type ListeningState } from './components/SessionControls'
+import { StatusBar } from './components/StatusBar'
+import { PcmAudioCapture } from './lib/audio'
+import {
+  SidecarClient,
+  type AmbientItem,
+  type AsrState,
+  type Card,
+  type IndexStatus,
+  type RetrievalEvent,
+  type SidecarConnectionState,
+  type TranscriptEvent
+} from './lib/sidecar'
+import { FeedView, type FeedTranscript } from './views/FeedView'
 
 function App(): React.JSX.Element {
-  const ipcHandle = (): void => window.electron.ipcRenderer.send('ping')
+  const clientRef = useRef<SidecarClient | null>(null)
+  const audioRef = useRef<PcmAudioCapture | null>(null)
+  const transcriptIdRef = useRef(0)
+
+  const [activeView, setActiveView] = useState<'feed' | 'map'>('feed')
+  const [connection, setConnection] = useState<SidecarConnectionState>('disconnected')
+  const [retryInMs, setRetryInMs] = useState<number | undefined>()
+  const [asr, setAsr] = useState<AsrState>('disconnected')
+  const [index, setIndex] = useState<IndexStatus>({ notes: 0, last_sync: null })
+  const [statusDetail, setStatusDetail] = useState('')
+  const [listeningState, setListeningState] = useState<ListeningState>('idle')
+  const [micError, setMicError] = useState('')
+  const [syncing, setSyncing] = useState(false)
+  const [syncError, setSyncError] = useState('')
+  const [chunks, setChunks] = useState<FeedTranscript[]>([])
+  const [interimsByChannel, setInterimsByChannel] = useState<Record<number, TranscriptEvent>>({})
+  const [ambientItems, setAmbientItems] = useState<AmbientItem[]>([])
+  const [pinnedCards, setPinnedCards] = useState<Card[]>([])
+  const [lastRetrieval, setLastRetrieval] = useState<RetrievalEvent | null>(null)
+
+  useEffect(() => {
+    const client = new SidecarClient()
+    clientRef.current = client
+
+    const unsubscribe = [
+      client.onConnection((event) => {
+        setConnection(event.state)
+        setRetryInMs(event.retryInMs)
+      }),
+      client.onTranscript((event) => {
+        if (event.final) {
+          transcriptIdRef.current += 1
+          setChunks((current) =>
+            [
+              ...current,
+              {
+                ...event,
+                id: `${event.ts}-${transcriptIdRef.current}`
+              }
+            ].slice(-200)
+          )
+          setInterimsByChannel((current) => {
+            const next = { ...current }
+            delete next[event.channel]
+            return next
+          })
+          return
+        }
+
+        setInterimsByChannel((current) => ({
+          ...current,
+          [event.channel]: event
+        }))
+      }),
+      client.onAmbient((event) => {
+        setAmbientItems(event.items)
+      }),
+      client.onPin((event) => {
+        setPinnedCards((current) => {
+          const withoutDuplicate = current.filter(
+            (card) => card.card_id !== event.card.card_id && card.note_id !== event.card.note_id
+          )
+          return [event.card, ...withoutDuplicate].slice(0, 3)
+        })
+      }),
+      client.onUnpin((event) => {
+        setPinnedCards((current) => current.filter((card) => card.card_id !== event.card_id))
+      }),
+      client.onRetrieval((event) => {
+        setLastRetrieval(event)
+      }),
+      client.onStatus((event) => {
+        setAsr(event.asr)
+        setIndex(event.index)
+        setStatusDetail(event.detail)
+      })
+    ]
+
+    client.connect()
+
+    return () => {
+      audioRef.current?.stop()
+      audioRef.current = null
+      client.stop()
+      unsubscribe.forEach((remove) => remove())
+      client.disconnect()
+      clientRef.current = null
+    }
+  }, [])
+
+  const interims = useMemo(() => Object.values(interimsByChannel), [interimsByChannel])
+
+  const startListening = useCallback(async () => {
+    const client = clientRef.current
+    if (!client || listeningState === 'starting' || listeningState === 'listening') {
+      return
+    }
+
+    setMicError('')
+    setListeningState('starting')
+    client.start([{ id: 0, label: 'mic' }])
+
+    const capture = new PcmAudioCapture((frame) => {
+      clientRef.current?.sendAudioFrame(frame)
+    })
+    audioRef.current = capture
+
+    try {
+      await capture.start()
+      setListeningState('listening')
+    } catch (error) {
+      capture.stop()
+      audioRef.current = null
+      client.stop()
+      setMicError(error instanceof Error ? error.message : 'Microphone capture failed')
+      setListeningState('error')
+    }
+  }, [listeningState])
+
+  const stopListening = useCallback(() => {
+    setListeningState('stopping')
+    audioRef.current?.stop()
+    audioRef.current = null
+    clientRef.current?.stop()
+    setListeningState('idle')
+  }, [])
+
+  const dismissCard = useCallback((cardId: string) => {
+    clientRef.current?.dismiss(cardId)
+    setPinnedCards((current) => current.filter((card) => card.card_id !== cardId))
+  }, [])
+
+  const openNote = useCallback((noteId: string) => {
+    clientRef.current?.openNote(noteId)
+  }, [])
+
+  const syncIndex = useCallback(async () => {
+    const client = clientRef.current
+    if (!client || syncing) {
+      return
+    }
+
+    setSyncing(true)
+    setSyncError('')
+    try {
+      await client.syncIndex()
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Index sync failed')
+    } finally {
+      setSyncing(false)
+    }
+  }, [syncing])
+
+  const showDisconnectedBanner = connection !== 'connected'
 
   return (
-    <>
-      <img alt="logo" className="logo" src={electronLogo} />
-      <div className="creator">Powered by electron-vite</div>
-      <div className="text">
-        Build an Electron app with <span className="react">React</span>
-        &nbsp;and <span className="ts">TypeScript</span>
-      </div>
-      <p className="tip">
-        Please try pressing <code>F12</code> to open the devTool
-      </p>
-      <div className="actions">
-        <div className="action">
-          <a href="https://electron-vite.org/" target="_blank" rel="noreferrer">
-            Documentation
-          </a>
+    <div className="app-shell">
+      <header className="app-header">
+        <div className="brand-block">
+          <h1>Taurine</h1>
+          <span>Live meeting copilot</span>
         </div>
-        <div className="action">
-          <a target="_blank" rel="noreferrer" onClick={ipcHandle}>
-            Send IPC
-          </a>
+        <SessionControls state={listeningState} error={micError} onStart={startListening} onStop={stopListening} />
+      </header>
+
+      {showDisconnectedBanner ? (
+        <div className="disconnect-banner" role="status">
+          Sidecar {connection}
+          {retryInMs ? `, retrying in ${Math.ceil(retryInMs / 1000)}s` : ''}
         </div>
+      ) : null}
+
+      <PinnedStack cards={pinnedCards} onOpenNote={openNote} onDismiss={dismissCard} />
+
+      <div className="workspace">
+        <main className="main-pane">
+          <div className="view-switch" role="tablist" aria-label="Main view">
+            <button
+              className={activeView === 'feed' ? 'active' : ''}
+              type="button"
+              role="tab"
+              aria-selected={activeView === 'feed'}
+              onClick={() => setActiveView('feed')}
+            >
+              Feed
+            </button>
+            <button
+              className={activeView === 'map' ? 'active' : ''}
+              type="button"
+              role="tab"
+              aria-selected={activeView === 'map'}
+              onClick={() => setActiveView('map')}
+            >
+              Map
+            </button>
+          </div>
+
+          {activeView === 'feed' ? (
+            <FeedView chunks={chunks} interims={interims} />
+          ) : (
+            <section className="map-placeholder" aria-label="Map view">
+              <div>
+                <span className="section-label">Map</span>
+                <h2>Placeholder</h2>
+                <p>{lastRetrieval ? lastRetrieval.heard : 'No retrieval pass yet'}</p>
+              </div>
+              {lastRetrieval ? (
+                <div className="retrieval-summary">
+                  <span>{lastRetrieval.hits.length} hits</span>
+                  <span>{lastRetrieval.expansions.length} linked</span>
+                </div>
+              ) : null}
+            </section>
+          )}
+        </main>
+
+        <AmbientList items={ambientItems} />
       </div>
-      <Versions></Versions>
-    </>
+
+      <StatusBar
+        asr={asr}
+        connection={connection}
+        detail={statusDetail}
+        index={index}
+        isSyncing={syncing}
+        syncError={syncError}
+        onSync={syncIndex}
+      />
+    </div>
   )
 }
 
