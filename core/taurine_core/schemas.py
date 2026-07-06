@@ -12,6 +12,7 @@ class Chunk(BaseModel):
     text: str
     ts: float                      # sidecar wall-clock at finalization
     final: bool = True
+    seq: int = 0                   # monotonic per session, assigned at ingest
 
 
 # ── index shapes ───────────────────────────────────────────────────────
@@ -114,6 +115,7 @@ class TranscriptEvent(BaseModel):
     text: str
     final: bool
     ts: float
+    seq: int = 0                   # 0 for interims (only finals get seqs)
 
 
 class AmbientItem(BaseModel):
@@ -143,6 +145,28 @@ class RetrievalEvent(BaseModel):
     heard: str
     hits: list[Hit]
     expansions: list[Expansion]
+    retrieval_id: str = ""         # equals the search TriggerEvent's trigger_id
+    seqs: list[int] = []           # transcript chunks forming the window
+
+
+# ── trigger provenance (debug UI: spans → notes they brought about) ────
+class TriggerMatch(BaseModel):
+    note_id: str
+    title: str
+    rank: Optional[int] = None     # post-rerank rank for search triggers
+    score: float = 0.0
+    via_note_id: Optional[str] = None
+    hop: Optional[int] = None
+
+
+class TriggerEvent(BaseModel):
+    type: Literal["trigger"] = "trigger"
+    trigger_id: str
+    kind: Literal["exact", "search"]
+    seqs: list[int]                # transcript chunks involved
+    span: str                      # matched alias (exact) / window text (search)
+    matches: list[TriggerMatch]    # notes this trigger brought about
+    action: Literal["pinned", "slated", "none"]
 
 
 class IndexStatus(BaseModel):
