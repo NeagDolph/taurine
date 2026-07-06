@@ -21,6 +21,8 @@ def extract_notes(app: object | None = None) -> list[NoteRecord]:
 
             app = NotesApp()
         account = _value(getattr(app, "default_account"))
+        if isinstance(account, str):
+            account = app.account(account)  # macnotesapp: default_account is a name
         raw_notes = _value(getattr(account, "notes"))
         return [_record_from_raw(raw_note) for raw_note in raw_notes]
     except Exception as exc:
