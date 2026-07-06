@@ -59,4 +59,5 @@ async def test_devfeed_turns_stdin_lines_into_final_chunks_and_json_events() -> 
         "text": "hello world",
         "final": True,
         "ts": 99.0,
+        "seq": 0,
     }

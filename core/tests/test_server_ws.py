@@ -156,6 +156,7 @@ def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
                 "text": "heard words",
                 "final": True,
                 "ts": 55.0,
+                "seq": 0,
             }
 
             ws.send_json({"type": "dismiss", "card_id": "card-1"})
