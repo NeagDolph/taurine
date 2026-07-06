@@ -250,10 +250,15 @@ async def test_c2_trigger_event_correlates_with_retrieval_event_and_logger() -> 
                 score=0.31,
             )
         ],
+        extracted=["shopify checkout", "Ashish"],
     )
     debug = {
         "window": "window text",
+        "salient": "window text",
         "dense": [["direct", 0.9]],
+        "dense_salient": [["direct", 0.8]],
+        "gliner_spans": [["shopify checkout", 0.95], ["Ashish", 0.9]],
+        "dense_gliner": [["direct", 0.87]],
         "bm25": [],
         "fused": [["direct", 0.016]],
         "expansions": [{"from": "direct", "to": "expanded", "score": 0.31}],
@@ -304,11 +309,14 @@ async def test_c2_trigger_event_correlates_with_retrieval_event_and_logger() -> 
     ]
     assert retrieval.retrieval_id == trigger.trigger_id
     assert retrieval.seqs == [1]
+    assert retrieval.extracted == ["shopify checkout", "Ashish"]
     assert [kind for kind, _payload in logger.records].count("c2_pass") == 1
     c2_payload = [payload for kind, payload in logger.records if kind == "c2_pass"][0]
     assert c2_payload["trigger_id"] == trigger.trigger_id
     assert c2_payload["seqs"] == [1]
     assert c2_payload["slate_adds"] == ["direct"]
+    assert c2_payload["gliner_spans"] == [["shopify checkout", 0.95], ["Ashish", 0.9]]
+    assert c2_payload["dense_gliner"] == [["direct", 0.87]]
 
 
 @pytest.mark.asyncio

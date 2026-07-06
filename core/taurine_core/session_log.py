@@ -41,6 +41,18 @@ def _seq_range(seqs: list[Any]) -> str:
     return f"#{seqs[0]}–{seqs[-1]}"
 
 
+def _span_summary(rows: Any) -> str:
+    if not isinstance(rows, list) or not rows:
+        return ""
+    spans: list[str] = []
+    for row in rows[:2]:
+        if isinstance(row, (list, tuple)) and row:
+            spans.append(str(row[0]))
+    if not spans:
+        return ""
+    return f" spans=[{_short('; '.join(spans), 40)}]"
+
+
 def console_line(kind: str, payload: dict[str, Any]) -> str | None:
     """Lean one-line console rendering of a session-log record.
 
@@ -78,10 +90,11 @@ def console_line(kind: str, payload: dict[str, Any]) -> str | None:
             else "rerank off"
         )
         top = f" top={_note_ref(ordered[0][0])}" if ordered else ""
+        spans = _span_summary(payload.get("gliner_spans"))
         return (
             f"c2 {_seq_range(payload.get('seqs') or [])} “{_short(payload.get('window'), 40)}” → "
             f"{len(ordered)} ranked, {len(expansions)} via graph, {rerank}, "
-            f"+{len(adds)} slated{top}"
+            f"+{len(adds)} slated{top}{spans}"
         )
     if kind == "slate":
         op = payload.get("op")

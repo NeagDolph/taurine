@@ -28,6 +28,7 @@ from taurine_core.live.ingest import Event, EventSink, LiveSession
 from taurine_core.live.presenter import Presenter
 from taurine_core.live.rerank import CohereReranker
 from taurine_core.live.slate import Slate
+from taurine_core.live.spans import GlinerSpanExtractor
 from taurine_core.llm import OpenRouterClient
 from taurine_core.session_log import NullSessionLogger, SessionLogger
 from taurine_core.schemas import (
@@ -194,6 +195,7 @@ def build_runtime() -> Runtime:
     index = Index(Path("taurine.db"))
     llm = OpenRouterClient(secrets["OPEN_ROUTER_API_KEY"])
     reranker = CohereReranker(secrets["COHERE_API_KEY"])
+    span_extractor = GlinerSpanExtractor()
 
     def make_live_session(emit: EventSink, logger: SessionLogger) -> LiveSession:
         clock = _MonotonicClock()
@@ -205,7 +207,12 @@ def build_runtime() -> Runtime:
             ),
             cadence=Cadence(clock),
             exact=ExactCollector(index),
-            ambient=AmbientRetriever(index, reranker, clock),
+            ambient=AmbientRetriever(
+                index,
+                reranker,
+                clock,
+                span_extractor=span_extractor,
+            ),
             presenter=Presenter(llm, on_log=lambda payload: logger.log("presenter", **payload)),
             emit=emit,
             clock=clock,

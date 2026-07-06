@@ -273,6 +273,7 @@ class LiveSession:
                 expansions=result.expansions,
                 retrieval_id=trigger_id,
                 seqs=seqs,
+                extracted=result.extracted,
             )
         )
         await self._emit_ambient_if_changed(before_revision)
@@ -450,8 +451,10 @@ class LiveSession:
             debug = {
                 "window": result.heard,
                 "salient": None,
+                "gliner_spans": [],
                 "dense": [],
                 "dense_salient": [],
+                "dense_gliner": [],
                 "bm25": [],
                 "fused": [],
                 "expansions": [
@@ -468,6 +471,8 @@ class LiveSession:
                 "floor_dropped": [],
                 "slate_adds": [],
             }
+        debug.setdefault("gliner_spans", [])
+        debug.setdefault("dense_gliner", [])
         debug["slate_adds"] = survived_adds
         self._logger.log("c2_pass", trigger_id=trigger_id, seqs=seqs, **debug)
 

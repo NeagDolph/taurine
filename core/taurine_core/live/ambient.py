@@ -7,7 +7,7 @@ from typing import Any
 from typing import Protocol
 
 from taurine_core import config
-from taurine_core.ports import IndexPort, RerankerPort, RerankError
+from taurine_core.ports import IndexPort, RerankerPort, RerankError, SpanExtractorPort
 from taurine_core.schemas import Expansion, Hit, RetrievalResult, SlateItem
 
 
@@ -37,6 +37,7 @@ class AmbientRetriever:
         reranker: RerankerPort,
         clock: Clock,
         on_debug: Callable[[dict[str, Any]], None] | None = None,
+        span_extractor: SpanExtractorPort | None = None,
     ) -> None:
         self.last_slate_adds: list[SlateItem] = []
         self.last_debug: dict[str, Any] | None = None
@@ -44,6 +45,7 @@ class AmbientRetriever:
         self._reranker = reranker
         self._clock = clock
         self._on_debug = on_debug
+        self._span_extractor = span_extractor
         self._last_run_at: float | None = None
 
     async def on_window(self, window_text: str) -> RetrievalResult | None:
@@ -58,17 +60,20 @@ class AmbientRetriever:
         self._last_run_at = now
 
         salient = self._salient_query(window_text)
+        gliner_spans = self._extract_spans(window_text)
+        extracted = [span for span, _score in gliner_spans]
         dense = self._index.dense_search(window_text, config.RERANK_MAX_CANDIDATES)
         dense_salient = (
             self._index.dense_search(salient, config.RERANK_MAX_CANDIDATES)
             if salient
             else []
         )
+        dense_gliner = self._dense_gliner(gliner_spans)
         bm25 = self._index.bm25_search(window_text, config.RERANK_MAX_CANDIDATES)
-        dense_scores = self._dense_scores(dense, dense_salient)
+        dense_scores = self._dense_scores(dense, dense_salient, dense_gliner)
         bm25_note_ids = {note_id for note_id, _score in bm25}
 
-        direct_scores = self._rrf_scores(dense, dense_salient, bm25)
+        direct_scores = self._rrf_scores(dense, dense_salient, dense_gliner, bm25)
         candidate_scores = dict(direct_scores)
         expansion_arrivals = self._expand(candidate_scores, direct_scores)
 
@@ -78,8 +83,10 @@ class AmbientRetriever:
             self._record_debug(
                 window=window_text,
                 salient=salient,
+                gliner_spans=gliner_spans,
                 dense=dense,
                 dense_salient=dense_salient,
+                dense_gliner=dense_gliner,
                 bm25=bm25,
                 direct_scores=direct_scores,
                 expansion_arrivals=expansion_arrivals,
@@ -89,7 +96,7 @@ class AmbientRetriever:
                 floor_dropped=[],
                 slate_adds=[],
             )
-            return RetrievalResult(heard=window_text, hits=[], expansions=[])
+            return RetrievalResult(heard=window_text, hits=[], expansions=[], extracted=extracted)
 
         ordered, rerank_used, rerank_error = await self._reranked_or_fallback(
             window_text,
@@ -132,8 +139,10 @@ class AmbientRetriever:
         self._record_debug(
             window=window_text,
             salient=salient,
+            gliner_spans=gliner_spans,
             dense=dense,
             dense_salient=dense_salient,
+            dense_gliner=dense_gliner,
             bm25=bm25,
             direct_scores=direct_scores,
             expansion_arrivals=expansion_arrivals,
@@ -143,7 +152,12 @@ class AmbientRetriever:
             floor_dropped=floor_dropped,
             slate_adds=[note_id for note_id, _score in top],
         )
-        return RetrievalResult(heard=window_text, hits=hits, expansions=expansions)
+        return RetrievalResult(
+            heard=window_text,
+            hits=hits,
+            expansions=expansions,
+            extracted=extracted,
+        )
 
     def _rrf_scores(
         self,
@@ -187,14 +201,37 @@ class AmbientRetriever:
         query = " ".join(term for _index, term in terms if term in selected)
         return query or None
 
+    def _extract_spans(self, window_text: str) -> list[tuple[str, float]]:
+        if self._span_extractor is None:
+            return []
+        try:
+            return self._span_extractor.extract(window_text)
+        except Exception:
+            return []
+
+    def _dense_gliner(
+        self,
+        gliner_spans: list[tuple[str, float]],
+    ) -> list[tuple[str, float]]:
+        scores: dict[str, float] = {}
+        for span, _span_score in gliner_spans:
+            for note_id, score in self._index.dense_search(
+                span,
+                config.RERANK_MAX_CANDIDATES,
+            ):
+                scores[note_id] = max(scores.get(note_id, float("-inf")), score)
+        return sorted(scores.items(), key=lambda item: item[1], reverse=True)[
+            : config.RERANK_MAX_CANDIDATES
+        ]
+
     @staticmethod
     def _dense_scores(
-        dense: list[tuple[str, float]],
-        dense_salient: list[tuple[str, float]],
+        *ranked_lists: list[tuple[str, float]],
     ) -> dict[str, float]:
         scores: dict[str, float] = {}
-        for note_id, score in [*dense, *dense_salient]:
-            scores[note_id] = max(scores.get(note_id, float("-inf")), score)
+        for rows in ranked_lists:
+            for note_id, score in rows:
+                scores[note_id] = max(scores.get(note_id, float("-inf")), score)
         return scores
 
     def _expand(
@@ -327,8 +364,10 @@ class AmbientRetriever:
         *,
         window: str,
         salient: str | None,
+        gliner_spans: list[tuple[str, float]],
         dense: list[tuple[str, float]],
         dense_salient: list[tuple[str, float]],
+        dense_gliner: list[tuple[str, float]],
         bm25: list[tuple[str, float]],
         direct_scores: dict[str, float],
         expansion_arrivals: dict[str, _ExpansionArrival],
@@ -341,8 +380,10 @@ class AmbientRetriever:
         debug = {
             "window": window,
             "salient": salient,
+            "gliner_spans": _rows(gliner_spans),
             "dense": _rows(dense),
             "dense_salient": _rows(dense_salient),
+            "dense_gliner": _rows(dense_gliner),
             "bm25": _rows(bm25),
             "fused": _rows(
                 [

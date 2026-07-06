@@ -66,6 +66,16 @@ class QueryAwareIndex(FakeIndex):
         return self.dense_by_query.get(text, [])[:k]
 
 
+class FakeSpanExtractor:
+    def __init__(self, spans: list[tuple[str, float]]) -> None:
+        self.spans = spans
+        self.calls: list[str] = []
+
+    def extract(self, text: str) -> list[tuple[str, float]]:
+        self.calls.append(text)
+        return self.spans
+
+
 @pytest.fixture
 def ok_reranker() -> OkReranker:
     return OkReranker()
@@ -313,6 +323,104 @@ async def test_salient_query_uses_rare_terms_and_dense_salient_joins_rrf() -> No
     assert debug["salient"] == salient
     assert debug["dense"] == [["window", 0.9]]
     assert debug["dense_salient"] == [["salient", 0.88], ["window", 0.5]]
+    assert debug["fused"] == [
+        ["window", pytest.approx((1 / (config.RRF_K + 1)) + (1 / (config.RRF_K + 2)))],
+        ["salient", pytest.approx(1 / (config.RRF_K + 1))],
+        ["bm", pytest.approx(1 / (config.RRF_K + 1))],
+    ]
+
+
+async def test_span_queries_form_dense_gliner_list_and_survive_floor() -> None:
+    window = "alpha checkout"
+    span_extractor = FakeSpanExtractor(
+        [("shopify checkout", 0.95), ("Ashish", 0.9)]
+    )
+    index = QueryAwareIndex(
+        notes={
+            "window": note("window", "Window Note"),
+            "span-only": note("span-only", "Span Note"),
+        },
+        dense_by_query={
+            window: [("window", 0.9)],
+            "shopify checkout": [("span-only", 0.94), ("window", 0.4)],
+            "Ashish": [("span-only", 0.7)],
+        },
+        chunks={
+            "window": "window chunk",
+            "span-only": "span chunk",
+        },
+    )
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker({"span-only": 0.99, "window": 0.8}),
+        FakeClock(),
+        on_debug=debug_records.append,
+        span_extractor=span_extractor,
+    ).on_window(window)
+
+    assert res is not None
+    assert span_extractor.calls == [window]
+    assert index.dense_queries == [window, window, "shopify checkout", "Ashish"]
+    assert res.extracted == ["shopify checkout", "Ashish"]
+    assert [hit.note_id for hit in res.hits] == ["span-only", "window"]
+    debug = debug_records[0]
+    assert debug["gliner_spans"] == [["shopify checkout", 0.95], ["Ashish", 0.9]]
+    assert debug["dense_gliner"] == [["span-only", 0.94], ["window", 0.4]]
+    assert debug["fused"] == [
+        ["window", pytest.approx((1 / (config.RRF_K + 1)) * 2 + (1 / (config.RRF_K + 2)))],
+        ["span-only", pytest.approx(1 / (config.RRF_K + 1))],
+    ]
+
+
+async def test_empty_span_extractor_degrades_to_three_list_rrf() -> None:
+    window = "alpha beta gamma delta epsilon zeta theta"
+    salient = "beta gamma delta epsilon zeta theta"
+    span_extractor = FakeSpanExtractor([])
+    index = QueryAwareIndex(
+        notes={
+            "window": note("window", "Window Note"),
+            "salient": note("salient", "Salient Note"),
+            "bm": note("bm", "BM Note"),
+        },
+        dense_by_query={
+            window: [("window", 0.9)],
+            salient: [("salient", 0.88), ("window", 0.5)],
+        },
+        bm25=[("bm", 5.0)],
+        chunks={
+            "window": "window chunk",
+            "salient": "salient chunk",
+            "bm": "bm chunk",
+        },
+        doc_frequencies={
+            "alpha": 10,
+            "beta": 0,
+            "gamma": 1,
+            "delta": 0,
+            "epsilon": 2,
+            "zeta": 3,
+            "theta": 0,
+        },
+    )
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker({"salient": 0.99, "window": 0.8, "bm": 0.7}),
+        FakeClock(),
+        on_debug=debug_records.append,
+        span_extractor=span_extractor,
+    ).on_window(window)
+
+    assert res is not None
+    assert span_extractor.calls == [window]
+    assert index.dense_queries == [window, salient]
+    assert res.extracted == []
+    debug = debug_records[0]
+    assert debug["gliner_spans"] == []
+    assert debug["dense_gliner"] == []
     assert debug["fused"] == [
         ["window", pytest.approx((1 / (config.RRF_K + 1)) + (1 / (config.RRF_K + 2)))],
         ["salient", pytest.approx(1 / (config.RRF_K + 1))],

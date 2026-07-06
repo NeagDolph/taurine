@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from taurine_core.session_log import SessionLogger
+from taurine_core.session_log import SessionLogger, console_line
 
 
 def test_session_logger_writes_jsonl_records_and_session_end(tmp_path) -> None:
@@ -17,6 +17,8 @@ def test_session_logger_writes_jsonl_records_and_session_end(tmp_path) -> None:
         salient="hello",
         dense=[["n1", 0.9]],
         dense_salient=[["n1", 0.8]],
+        gliner_spans=[["shopify checkout", 0.95]],
+        dense_gliner=[["n2", 0.87]],
         bm25=[],
         fused=[["n1", 0.016]],
         expansions=[{"from": "n1", "to": "n2", "score": 0.4}],
@@ -63,6 +65,8 @@ def test_session_logger_writes_jsonl_records_and_session_end(tmp_path) -> None:
     assert records[1]["trigger_id"] == "abc123"
     assert records[1]["salient"] == "hello"
     assert records[1]["dense_salient"] == [["n1", 0.8]]
+    assert records[1]["gliner_spans"] == [["shopify checkout", 0.95]]
+    assert records[1]["dense_gliner"] == [["n2", 0.87]]
     assert records[2]["op"] == "add"
     assert records[3]["reason"] == "debounce"
     assert records[4]["picks"] == []
@@ -76,3 +80,25 @@ def test_session_logger_create_log_and_close_do_not_raise_on_bad_path(tmp_path) 
     logger = SessionLogger.create(not_a_directory)
     logger.log("chunk", unserializable=object())
     logger.close()
+
+
+def test_c2_console_line_appends_compact_gliner_spans() -> None:
+    line = console_line(
+        "c2_pass",
+        {
+            "seqs": [1, 2],
+            "window": "we should ask ashish about checkout",
+            "ordered": [["n1", 0.9]],
+            "expansions": [],
+            "slate_adds": ["n1"],
+            "rerank_used": True,
+            "gliner_spans": [
+                ["shopify checkout", 0.95],
+                ["Ashish", 0.9],
+                ["extra", 0.8],
+            ],
+        },
+    )
+
+    assert line is not None
+    assert line.endswith(" spans=[shopify checkout; Ashish]")
