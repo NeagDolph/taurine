@@ -184,18 +184,21 @@ export function MapView({
     }
   }, [])
 
-  const graphData = useMemo(
-    () => ({
+  const graphData = useMemo(() => {
+    const nodeIds = new Set(baseGraph.nodes.map((node) => node.id))
+
+    return {
       nodes: baseGraph.nodes,
       links: [
         ...baseGraph.links.map((link) =>
           link.kind === 'static' ? { ...link, shared: [...link.shared] } : { ...link }
         ),
-        ...liveLinks.map((link) => ({ ...link }))
+        ...liveLinks
+          .filter((link) => nodeIds.has(link.source) && nodeIds.has(link.target))
+          .map((link) => ({ ...link }))
       ]
-    }),
-    [baseGraph, liveLinks]
-  )
+    }
+  }, [baseGraph, liveLinks])
 
   const drawNode = useCallback(
     (node: GraphNodeObject, ctx: CanvasRenderingContext2D, globalScale: number) => {
