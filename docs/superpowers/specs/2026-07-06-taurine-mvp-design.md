@@ -11,6 +11,14 @@ descendant of the wink voice_agent_v4 slate paradigm (managers decide *what's
 a candidate*; presenter + cadence decide *what's worth showing right now*),
 re-targeted from a product catalog to a personal document corpus.
 
+On top of retrieval, Taurine maintains a **note graph** (Reflect-style):
+edges between notes that share topics, entities, or semantic similarity,
+built at index time. The graph is (a) rendered as a live visual map — the
+current transcription as a node whose edges to retrieved notes appear in
+real time, colored by retrieval rank and by hop distance — and (b) used in
+retrieval itself: neighbors of retrieved notes are pulled into the candidate
+pool before reranking.
+
 ## Goals
 
 - Talk about a topic covered in your Notes → the right note appears in the
@@ -18,15 +26,20 @@ re-targeted from a product catalog to a personal document corpus.
   one-liner within ~10s.
 - No garbage promotions during unrelated chatter — empty selection is the
   default, silence is a feature.
-- Everything off-the-shelf: local embedding model, cloud flash-tier LLMs,
-  no custom-trained models anywhere.
+- Everything off-the-shelf: local embedding model, cloud flash-tier LLMs
+  (all via OpenRouter), Cohere Rerank for the retrieval path — no
+  custom-trained models anywhere (we're data-poor until real usage exists;
+  a custom reranker can replace Cohere later behind the same interface).
+- The note graph makes cross-note structure visible (map view) and useful
+  (graph-expanded retrieval).
 
 ## Non-goals (explicitly out of MVP scope)
 
 - **No logging / data capture of any kind.** No decision logs, no feedback
   capture for future training. Dismiss buttons exist purely as UX.
 - No replay harness.
-- No custom-trained models (no gate, no reranker, no fine-tuned embeddings).
+- No custom-trained models (no gate, no custom reranker, no fine-tuned
+  embeddings). Cohere Rerank (hosted, off-the-shelf) is in scope.
 - No system audio capture (but the ingest is N-channel-shaped so it can be
   added without refactoring).
 - No external connectors (Google Docs, Linear, email) and no agent actions.
@@ -60,7 +73,10 @@ sidecar owns one ASR websocket per audio channel.
         │
         ├──► C2 AMBIENT RETRIEVER (throttle 8s)
         │      rolling window → local embed → hybrid search (dense + BM25, RRF)
+        │      → 1-hop graph expansion (note-graph neighbors join the pool)
+        │      → Cohere Rerank over the pooled candidates
         │      top rows ──► slate add (source=search, decay 2)
+        │      + retrieval event → live map (rank-colored edges)
         │
         ▼
    ┌─────────────────────────────┐         ┌──────────────────┐
@@ -71,9 +87,10 @@ sidecar owns one ASR websocket per audio channel.
    └──────┬──────────────────────┘         └────────┬─────────┘
           │ every revision                          │ presenter pass
           ▼                                         ▼
-   ambient feed → UI                    PRESENTER (DeepSeek Flash,
-   (top-k, no LLM)                      Gemini fallback) picks 0–2,
-                                        writes one-liners → pinned cards
+   ambient feed → UI                    PRESENTER (flash LLM via
+   (top-k, no LLM)                      OpenRouter, model fallback)
+                                        picks 0–2, writes one-liners
+                                        → pinned cards
 ```
 
 ## Components
@@ -86,14 +103,35 @@ Stack: electron-vite + React + TypeScript.
   downsample to 16 kHz mono s16le → binary frames to the sidecar ws every
   ~250 ms. Each binary frame is prefixed with a 1-byte channel id (`0` =
   mic). Adding system audio later = a second channel id on the same socket.
-- **UI** — single window, three regions:
-  - **Live transcript** (main column): finalized chunks, channel-labeled.
-  - **Ambient list** (sidebar): the current slate (≤11 notes), sorted by
-    relevance — title, gist, score bar. Updates on every slate revision. Low-visual-weight;
-    no LLM involvement.
-  - **Pinned "now" slot** (top): promoted cards — note title, presenter's
-    one-liner, and an "Open in Notes" button. Max 3 stacked, newest first.
-    Each card has a dismiss (×) button.
+- **UI** — single window: two switchable main views (Feed / Map) plus
+  persistent chrome:
+  - **Live transcript** (Feed view, main column): finalized chunks,
+    channel-labeled.
+  - **Ambient list** (sidebar, always visible): the current slate (≤11
+    notes), sorted by relevance — title, gist, score bar. Updates on every
+    slate revision. Low-visual-weight; no LLM involvement.
+  - **Pinned "now" slot** (top, always visible): promoted cards — note
+    title, presenter's one-liner, and an "Open in Notes" button. Max 3
+    stacked, newest first. Each card has a dismiss (×) button.
+  - **Map view**: the live note graph, detailed below.
+- **Map view** — force-directed canvas graph (`react-force-graph-2d`):
+  - **Nodes** = notes (label = title, size ∝ degree). Loaded once from
+    `GET /graph`, patched after index re-syncs.
+  - **Static edges** = note-graph connections (semantic / shared-topic /
+    shared-entity), drawn faint, opacity ∝ weight; hover shows edge type
+    and the shared topics/entities behind it.
+  - **The "now" node**: one distinguished node for the current
+    transcription window (label = last few words heard). On every C2 pass
+    the sidecar emits a `retrieval` event and the map draws live edges:
+    - now-node → directly retrieved note, colored on a **rank gradient**
+      (rank 1 hottest → rank K coolest);
+    - retrieved note → graph-expanded neighbor, colored on a separate
+      **hop scale** with the hop count on the edge — so it's visible which
+      candidates arrived through connections rather than direct retrieval,
+      and how many steps from a retrieved note they sit.
+  - Live edges from the previous pass fade when the next `retrieval` event
+    replaces them; touched nodes flash-highlight; notes that got pinned
+    keep a persistent ring for the session.
 - **Session controls**: start/stop listening; status indicator (ASR
   connected / reconnecting, index freshness, note count).
 - **Open in Notes**: clicking a card asks the sidecar to run AppleScript
@@ -111,7 +149,14 @@ Electron ↔ sidecar protocol (`ws://127.0.0.1:8930/session`):
     replacement list, sent on slate revision)
   - `{type:"pin", card:{card_id, note_id, title, summary, provenance, heard}}`
   - `{type:"unpin", card_id}` (dismiss ack / expiry)
+  - `{type:"retrieval", heard, hits:[{note_id, rank, score}],
+     expansions:[{from_note_id, note_id, hop, score}]}` (one per C2 pass;
+     drives the map's live edges)
   - `{type:"status", asr, index:{notes, last_sync}}`
+
+REST (same server): `GET /graph` →
+`{nodes:[{note_id, title, degree}], edges:[{src, dst, type, weight,
+shared:[…]}]}` · `POST /index/sync`.
 
 ### 2. taurine-core (`core/`)
 
@@ -123,11 +168,13 @@ core/taurine_core/
 ├── config.py          # ALL tunables as in-code constants
 ├── schemas.py         # pydantic models for ws protocol + internal types
 ├── asr.py             # Taurine ASR ws client (one connection per channel)
+├── llm.py             # OpenRouter client (ALL LLM calls go through this)
 ├── indexer/
 │   ├── notes.py       # Apple Notes extraction (macnotesapp / AppleScript)
-│   ├── enrich.py      # per-note LLM enrichment (gist, utterances, aliases)
+│   ├── enrich.py      # per-note LLM enrichment (gist, utterances, aliases, topics)
 │   ├── embed.py       # sentence-transformers wrapper
-│   └── store.py       # sqlite + FTS5 + in-memory embedding matrix
+│   ├── graph.py       # note-graph builder (semantic kNN + shared topic/entity)
+│   └── store.py       # sqlite + FTS5 + in-memory embedding matrix + edges
 └── live/
     ├── ingest.py      # chunk router: transcript → C1/C2, UI fanout
     ├── exact.py       # C1 exact-reference collector
@@ -139,7 +186,15 @@ core/taurine_core/
 
 Config lives in `config.py` as constants (project convention: no env vars
 for config). The only env vars are secrets: `TAURINE_ASR_API_KEY`,
-`DEEPSEEK_API_KEY`, `GEMINI_API_KEY`.
+`OPENROUTER_API_KEY`, `COHERE_API_KEY` (the latter two sourced from
+`~/wink/server/.env` into `core/.env` at setup — note: `OPENROUTER_API_KEY`
+is not present there yet and must be added before the build).
+
+**All LLM calls — enrichment and presenter — go through the OpenRouter
+chat-completions API** (`llm.py`, single client). Model strings are config
+constants; provider fallback is just a second model string on the same
+client. Cohere Rerank is the one non-OpenRouter remote call (OpenRouter
+does not proxy rerank endpoints), hit directly with `COHERE_API_KEY`.
 
 ### 3. ASR client (`asr.py`)
 
@@ -163,8 +218,8 @@ UI, not fatal). HTML body → plain text. Incremental sync keyed on
 5 minutes and on an explicit `POST /index/sync`. Sync failures are non-fatal
 — the live loop keeps serving the last good index.
 
-**Enrichment** (`enrich.py`): one LLM call per new/changed note
-(DeepSeek Flash, JSON output) producing:
+**Enrichment** (`enrich.py`): one LLM call per new/changed note (flash-tier
+model via OpenRouter, JSON output) producing:
 - `gist`: one line, ≤120 chars — shown in the ambient list and given to the
   presenter.
 - `utterances`: 4 synthetic spoken sentences someone might say in a meeting
@@ -172,10 +227,14 @@ UI, not fatal). HTML body → plain text. Incremental sync keyed on
   speech-against-speech instead of speech-against-notes).
 - `aliases`: up to 6 short strings people would call this note or its
   subject (feeds C1).
+- `topics`: 2–4 normalized topic tags (lowercase, canonical phrasing) and
+  `entities`: named people/projects/products in the note — both feed the
+  note graph.
 
 Cached in sqlite by content hash; only changed notes re-enrich. Enrichment
 failures degrade gracefully: the note is still indexed on raw text, with
-title-only aliases and a truncated first line as gist.
+title-only aliases, a truncated first line as gist, and no topic/entity
+edges (semantic edges still apply).
 
 **Embedding** (`embed.py`): `BAAI/bge-small-en-v1.5` via
 sentence-transformers (local, CPU/MPS, 384-dim). Embedded units per note:
@@ -183,10 +242,30 @@ each text chunk (~300 tokens, sentence-boundary splits), the gist, and each
 synthetic utterance. All units map back to their note_id.
 
 **Store** (`store.py`): single sqlite file (`taurine.db`) — notes, aliases,
-enrichment cache, embedding blobs — plus an FTS5 table over title+body for
-BM25. At startup the embedding matrix loads into one numpy array; the corpus
-is small enough that dense search is brute-force cosine over the full
-matrix (microseconds at this scale — no vector DB, no ANN index).
+enrichment cache, embedding blobs, and an `edges` table — plus an FTS5 table
+over title+body for BM25. At startup the embedding matrix loads into one
+numpy array; the corpus is small enough that dense search is brute-force
+cosine over the full matrix (microseconds at this scale — no vector DB, no
+ANN index).
+
+**Note graph** (`graph.py`): built at index time, rebuilt incrementally —
+when a note changes, only its incident edges are recomputed. Two edge
+mechanisms, both cheap and off-the-shelf (no extra LLM pass beyond the
+enrichment call that already ran):
+- **Semantic edges**: per-note embedding = the gist embedding (fallback:
+  mean of chunk embeddings). Each note connects to its top
+  `GRAPH_KNN=6` nearest notes with cosine ≥ `GRAPH_MIN_SIM=0.60`;
+  weight = cosine.
+- **Topic/entity edges**: notes sharing a topic tag or entity get an edge;
+  weight = shared-term count damped by term frequency across the corpus
+  (a topic held by half the notes contributes ~nothing; a rare shared
+  entity is a strong link). Floor `GRAPH_MIN_SHARED_W=0.25`.
+
+Parallel edges merge into one edge carrying `type` (semantic | topic |
+entity | mixed), combined `weight = 1 - Π(1 - wᵢ)`, and the `shared` terms
+for hover display. Undirected. Per-note edge cap `GRAPH_MAX_DEGREE=12`
+(keep strongest) so hub notes don't turn the map into a hairball or flood
+retrieval expansion.
 
 ### 5. Live loop
 
@@ -208,21 +287,39 @@ match) against each chunk. A hit:
 
 **C2 — ambient retriever** (`ambient.py`): at most once per
 `C2_THROTTLE_S=8`, takes the rolling window (last 3 final chunks or ~12s of
-speech, whichever is more text), embeds it, and runs hybrid search:
-- dense: cosine against all embedding units; per-note score = max over its
-  units;
-- sparse: FTS5 BM25 over title+body with the window's content words;
-- fusion: reciprocal-rank fusion (k=60) over the two lists.
+speech, whichever is more text), embeds it, and runs a four-step pass:
 
-Top `C2_TOP_K=5` fused notes above a loose floor (`MIN_COSINE=0.35` on the
-dense side, applied only to notes with no BM25 hit) are added to the slate
-(`source=search`, decay 2, `heard=` the window text). The floor is
-deliberately permissive — precision is the presenter's job; the floor only
-keeps pure noise out of the ambient list.
+1. **Hybrid search** — dense: cosine against all embedding units, per-note
+   score = max over its units; sparse: FTS5 BM25 over title+body with the
+   window's content words; fused with reciprocal-rank fusion (k=60).
+2. **Graph expansion** — the top `EXPAND_SEEDS=5` fused notes seed a 1-hop
+   walk over the note graph: each neighbor joins the candidate pool with
+   `score = seed_fused_score × edge_weight × HOP_DECAY (0.5)`, tagged
+   `{from_note_id, hop:1}`. Already-retrieved notes keep their direct
+   ranking (a note reached both ways counts as direct). One hop only at
+   MVP.
+3. **Cohere Rerank** — the pooled candidates (direct ∪ expanded, ≤ ~20) go
+   to Cohere Rerank (`rerank-v3.5`): query = the window text, document =
+   title + gist + best-matching chunk per note. Rerank scores replace
+   fusion scores for ordering and for the slate/ambient/map displays. On
+   Cohere error or timeout (`RERANK_TIMEOUT_S=2`), fall back to the
+   fused+expanded order — the pass never dies on the reranker. Latency
+   (~100–300 ms) is fine inside an 8 s throttle.
+4. **Slate add** — top `C2_TOP_K=5` reranked notes above a loose floor
+   (`MIN_COSINE=0.35` on the dense side, applied only to notes with
+   neither a BM25 hit nor a graph path) are added to the slate
+   (`source=search`, decay 2, `heard=` the window text, carrying
+   `via_note_id`/`hop` when they arrived through the graph). The floor is
+   deliberately permissive — precision is the presenter's job.
+
+Every pass also emits the `retrieval` event (direct hits with ranks +
+expansions with hops) that drives the map view's live edges — this is UI
+fanout, not persistence.
 
 **Slate** (`slate.py`): one per session, in-memory (no Redis — single local
 session). `SlateItem: {note_id, title, gist, score, source, heard, views,
-decay, added_rev}`.
+decay, added_rev, via_note_id?, hop?}` (`via_note_id`/`hop` set when the
+item entered the pool through graph expansion).
 - Quotas: `exact` 3 · `search` 8 (max 11 total). A lane over quota evicts
   its own stalest item (most-viewed, then oldest).
 - Lifecycle: add → each presenter pass increments `views` on every item it
@@ -237,20 +334,25 @@ decay, added_rev}`.
 - The ambient feed is the slate sorted by (provenance strength, score),
   full list on every revision.
 
-**Presenter** (`presenter.py`): one-shot structured call to
-`deepseek-chat` (DeepSeek native API; on any error, one retry via
-`gemini-flash`; if both fail, the pass is skipped silently — no card is
-always an acceptable outcome). Input:
+**Presenter** (`presenter.py`): one-shot structured call through OpenRouter
+(`PRESENTER_MODEL` = a flash-tier model, e.g. `deepseek/deepseek-chat`; on
+any error, one retry with `PRESENTER_FALLBACK_MODEL` = e.g.
+`google/gemini-2.5-flash` on the same client; if both fail, the pass is
+skipped silently — no card is always an acceptable outcome). Input:
 - `<recent_transcript>`: last 15 final chunks, channel-labeled.
 - `<slate>`: one line per item —
   `[exact: title spoken] {note_id} "title" — gist` /
-  `[search: matched "…window text…"] {note_id} "title" — gist`.
+  `[search: matched "…window text…"] {note_id} "title" — gist` /
+  `[linked: connected to "seed note title", matched "…"] {note_id} "title"
+  — gist` for graph-expanded items, so the model knows the evidence is
+  indirect.
 
 Contract: pick **0–2** notes worth putting in front of the user *right
 now*; for each, write `why` (≤140 chars) grounded in what was just said;
 copy `note_id` exactly (a pick whose note_id isn't on the slate is
 dropped); empty pick is the correct output when the moment is wrong —
-provenance strength `exact > search`; prefer the moment over the score.
+provenance strength `exact > search > linked`; prefer the moment over the
+score.
 After the call returns: promoted items become `pin` events, get kicked from
 the slate; every item that was in the prompt gets `views += 1`.
 
@@ -272,8 +374,9 @@ past the 3-card stack; displacement emits `unpin`.
 |---|---|
 | ASR ws drops | auto-reconnect w/ backoff; UI status chip; audio frames dropped meanwhile (no buffering) |
 | Notes automation permission denied | status event with remediation hint; loop runs with empty/stale index |
-| Enrichment LLM error | note indexed un-enriched (raw text, title alias, first-line gist) |
-| Presenter both-provider failure | pass skipped; next trigger per cadence |
+| Enrichment LLM error | note indexed un-enriched (raw text, title alias, first-line gist, semantic-only edges) |
+| Cohere Rerank error/timeout | fall back to fused+expanded order; pass continues |
+| Presenter both-model failure (via OpenRouter) | pass skipped; next trigger per cadence |
 | Empty index | ambient list shows empty state; C1/C2 no-op |
 | Sidecar not running | Electron shows connect error + retry |
 
@@ -292,6 +395,13 @@ captured data):
 - C2 + store: hybrid fusion ordering on the fixture corpus, cosine floor,
   BM25 exact-title behavior; incremental sync (changed hash re-enriches,
   unchanged skips);
+- graph builder: semantic kNN edges, topic/entity edge weights and
+  frequency damping, parallel-edge merge, degree cap, incremental edge
+  recompute on note change;
+- graph expansion: neighbor scoring (seed × weight × hop decay),
+  direct-beats-expanded rule, `retrieval` event payload shape;
+- rerank integration: candidate-pool assembly and fallback-on-error with a
+  mocked Cohere client;
 - presenter: prompt assembly + response validation (unknown note_id
   dropped, >2 picks truncated) with a mocked LLM client — **no
   prompt-substring assertions** (project convention);
@@ -309,18 +419,23 @@ time), launched detached with output to log files and explicit DONE/ERROR
 markers, polled rather than awaited. Claude orchestrates: decomposes into
 the component boundaries above, writes task briefs referencing this spec,
 reviews diffs, and integrates. Suggested delegation units: (1) store +
-indexer + embed, (2) slate + cadence + C1/C2, (3) asr client + server +
-ingest wiring, (4) presenter, (5) Electron app. Units 1–4 are testable
-headless before the app exists.
+indexer + embed + graph builder, (2) slate + cadence + C1/C2 (incl. graph
+expansion + rerank), (3) asr client + server + ingest wiring, (4) llm
+client + presenter, (5) Electron app: feed view + chrome, (6) Electron map
+view. Units 1–4 are testable headless before the app exists.
 
 ## Milestones
 
 1. Repo scaffold: `core/` (uv, FastAPI skeleton, config, schemas) +
    `app/` (electron-vite skeleton).
-2. Indexer end-to-end: real Apple Notes → enriched, embedded, queryable
-   store (CLI smoke: `python -m taurine_core.indexer.sync`).
-3. Live loop headless: C1/C2/slate/cadence/presenter passing unit tests;
-   manual smoke via a stdin chunk-feeder dev entrypoint.
+2. Indexer end-to-end: real Apple Notes → enriched, embedded, graph-built,
+   queryable store (CLI smoke: `python -m taurine_core.indexer.sync`).
+3. Live loop headless: C1/C2 (with graph expansion + rerank)/slate/cadence/
+   presenter passing unit tests; manual smoke via a stdin chunk-feeder dev
+   entrypoint.
 4. ASR client verified against the live Taurine server with a wav file.
-5. Electron app: mic → sidecar → transcript + ambient + pins rendering.
-6. Demo pass: live conversation about topics in Neil's real Notes.
+5. Electron app: mic → sidecar → transcript + ambient + pins rendering
+   (Feed view).
+6. Map view: static graph render + live retrieval/expansion edges.
+7. Demo pass: live conversation about topics in Neil's real Notes, watched
+   from the map.
