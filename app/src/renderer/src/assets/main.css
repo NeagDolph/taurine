@@ -53,14 +53,25 @@ body {
   width: 100vw;
 }
 
-/* ---- shell: fixed rows, workspace owns remaining height ---- */
+/* ---- shell: header/banner/pinned/status are auto-sized; the workspace
+        always owns the remaining height regardless of which conditional
+        siblings (banner, pinned) are mounted ---- */
 .app-shell {
-  display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   gap: 12px;
   height: 100vh;
   padding: 14px;
   position: relative;
+}
+
+.app-shell > * {
+  flex: 0 0 auto;
+}
+
+.app-shell > .workspace {
+  flex: 1 1 0;
+  min-height: 0;
 }
 
 /* ---- header ---- */
@@ -1040,9 +1051,13 @@ button:disabled {
   }
 
   .app-shell {
-    grid-template-rows: none;
     height: auto;
     min-height: 100vh;
+  }
+
+  .app-shell > .workspace {
+    flex: 1 1 auto;
+    min-height: 60vh;
   }
 
   .workspace {
