@@ -113,19 +113,19 @@ class LiveSession:
             note = self._index.note(note_id)
             if note is None:
                 continue
-            if is_title:
-                if self._cadence.instant_pin_allowed(now=now):
-                    await self._pin(
-                        Card(
-                            card_id=_card_id(note_id),
-                            note_id=note_id,
-                            title=note.title,
-                            summary=note.gist,
-                            provenance="exact",
-                            heard=chunk.text,
-                        )
+            if is_title and self._cadence.instant_pin_allowed(now=now):
+                await self._pin(
+                    Card(
+                        card_id=_card_id(note_id),
+                        note_id=note_id,
+                        title=note.title,
+                        summary=note.gist,
+                        provenance="exact",
+                        heard=chunk.text,
                     )
+                )
                 continue
+            # rate-capped title hits fall through to a slate add
 
             self._slate.add(
                 SlateItem(
