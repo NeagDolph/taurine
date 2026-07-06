@@ -12,6 +12,10 @@ from taurine_core import config
 from taurine_core.schemas import Enrichment, NoteRecord
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "slow: requires local model downloads or remote services")
+
+
 def make_note(
     note_id: str,
     title: str,
