@@ -159,6 +159,7 @@ class LiveSession:
                     seq=chunk.seq,
                     alias=alias,
                     note_id=note_id,
+                    title=note.title,
                     is_title=is_title,
                     action="pinned",
                 )
@@ -210,6 +211,7 @@ class LiveSession:
                 seq=chunk.seq,
                 alias=alias,
                 note_id=note_id,
+                title=note.title,
                 is_title=is_title,
                 action=action,
             )
@@ -319,6 +321,7 @@ class LiveSession:
             "pin",
             card_id=card.card_id,
             note_id=card.note_id,
+            title=card.title,
             provenance=card.provenance,
             summary=card.summary,
         )
