@@ -141,11 +141,17 @@ class _UnavailableLLM:
 
 
 def _cli_llm() -> LLMPort:
-    try:
-        from taurine_core.llm import OpenRouterClient
-    except Exception:
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    api_key = os.environ.get("OPEN_ROUTER_API_KEY")
+    if not api_key:
         return _UnavailableLLM()
-    return OpenRouterClient()
+    from taurine_core.llm import OpenRouterClient
+
+    return OpenRouterClient(api_key)
 
 
 if __name__ == "__main__":
