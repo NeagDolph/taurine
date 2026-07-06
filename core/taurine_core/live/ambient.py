@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
+from typing import Any
 from typing import Protocol
 
 from taurine_core import config
@@ -33,15 +35,19 @@ class AmbientRetriever:
         index: IndexPort,
         reranker: RerankerPort,
         clock: Clock,
+        on_debug: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.last_slate_adds: list[SlateItem] = []
+        self.last_debug: dict[str, Any] | None = None
         self._index = index
         self._reranker = reranker
         self._clock = clock
+        self._on_debug = on_debug
         self._last_run_at: float | None = None
 
     async def on_window(self, window_text: str) -> RetrievalResult | None:
         self.last_slate_adds = []
+        self.last_debug = None
         now = self._clock.now()
         if (
             self._last_run_at is not None
@@ -62,15 +68,33 @@ class AmbientRetriever:
         pooled = self._ordered_candidates(candidate_scores)
         docs = self._docs_for_candidates(window_text, pooled)
         if not docs:
+            self._record_debug(
+                window=window_text,
+                dense=dense,
+                bm25=bm25,
+                direct_scores=direct_scores,
+                expansion_arrivals=expansion_arrivals,
+                rerank_used=False,
+                rerank_error=None,
+                ordered=[],
+                floor_dropped=[],
+                slate_adds=[],
+            )
             return RetrievalResult(heard=window_text, hits=[], expansions=[])
 
-        ordered = await self._reranked_or_fallback(window_text, docs, candidate_scores)
+        ordered, rerank_used, rerank_error = await self._reranked_or_fallback(
+            window_text,
+            docs,
+            candidate_scores,
+        )
         filtered = self._apply_floor(
             ordered,
             dense_scores,
             bm25_note_ids,
             set(expansion_arrivals),
         )
+        filtered_ids = {note_id for note_id, _score in filtered}
+        floor_dropped = [note_id for note_id, _score in ordered if note_id not in filtered_ids]
         top = filtered[: config.C2_TOP_K]
 
         expansions = [
@@ -96,6 +120,18 @@ class AmbientRetriever:
             self._slate_item(note_id, score, window_text, expansion_arrivals)
             for note_id, score in top
         ]
+        self._record_debug(
+            window=window_text,
+            dense=dense,
+            bm25=bm25,
+            direct_scores=direct_scores,
+            expansion_arrivals=expansion_arrivals,
+            rerank_used=rerank_used,
+            rerank_error=rerank_error,
+            ordered=ordered,
+            floor_dropped=floor_dropped,
+            slate_adds=[note_id for note_id, _score in top],
+        )
         return RetrievalResult(heard=window_text, hits=hits, expansions=expansions)
 
     def _rrf_scores(
@@ -168,7 +204,7 @@ class AmbientRetriever:
         window_text: str,
         docs: list[tuple[str, str]],
         candidate_scores: dict[str, float],
-    ) -> list[tuple[str, float]]:
+    ) -> tuple[list[tuple[str, float]], bool, str | None]:
         doc_ids = {note_id for note_id, _doc in docs}
         fallback = [
             (candidate.note_id, candidate.score)
@@ -177,8 +213,8 @@ class AmbientRetriever:
         ]
         try:
             reranked = await self._reranker.rerank(window_text, docs)
-        except (RerankError, TimeoutError):
-            return fallback
+        except (RerankError, TimeoutError) as exc:
+            return fallback, False, str(exc)
 
         seen: set[str] = set()
         ordered: list[tuple[str, float]] = []
@@ -189,7 +225,7 @@ class AmbientRetriever:
             seen.add(note_id)
 
         ordered.extend((note_id, score) for note_id, score in fallback if note_id not in seen)
-        return ordered
+        return ordered, True, None
 
     def _apply_floor(
         self,
@@ -235,3 +271,53 @@ class AmbientRetriever:
             via_note_id=arrival.from_note_id if arrival is not None else None,
             hop=arrival.hop if arrival is not None else None,
         )
+
+    def _record_debug(
+        self,
+        *,
+        window: str,
+        dense: list[tuple[str, float]],
+        bm25: list[tuple[str, float]],
+        direct_scores: dict[str, float],
+        expansion_arrivals: dict[str, _ExpansionArrival],
+        rerank_used: bool,
+        rerank_error: str | None,
+        ordered: list[tuple[str, float]],
+        floor_dropped: list[str],
+        slate_adds: list[str],
+    ) -> None:
+        debug = {
+            "window": window,
+            "dense": _rows(dense),
+            "bm25": _rows(bm25),
+            "fused": _rows(
+                [
+                    (candidate.note_id, candidate.score)
+                    for candidate in self._ordered_candidates(direct_scores)
+                ]
+            ),
+            "expansions": [
+                {"from": arrival.from_note_id, "to": arrival.note_id, "score": arrival.score}
+                for arrival in sorted(
+                    expansion_arrivals.values(),
+                    key=lambda item: item.score,
+                    reverse=True,
+                )
+            ],
+            "rerank_used": rerank_used,
+            "rerank_error": rerank_error,
+            "ordered": _rows(ordered),
+            "floor_dropped": floor_dropped,
+            "slate_adds": slate_adds,
+        }
+        self.last_debug = debug
+        if self._on_debug is None:
+            return
+        try:
+            self._on_debug(debug)
+        except Exception:
+            return
+
+
+def _rows(rows: list[tuple[str, float]]) -> list[list[float | str]]:
+    return [[note_id, score] for note_id, score in rows]

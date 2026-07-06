@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 
 from taurine_core import config
@@ -90,3 +92,24 @@ def test_new_revision_escapes_empty_backoff_but_not_debounce(
 
     clock.advance(config.DEBOUNCE_S - 0.1)
     assert not cadence.may_present(rev=2, now=clock.now())
+
+
+def test_explain_is_pure_and_reports_first_blocking_gate(
+    cadence: Cadence,
+    clock: FakeClock,
+) -> None:
+    assert cadence.may_present(rev=1, now=clock.now())
+    cadence.note_attempt(now=clock.now())
+    before = _state_without_clock(cadence)
+
+    assert cadence.explain(revision=2, now=clock.now()) == "debounce"
+    assert cadence.explain(revision=2, now=clock.now()) == "debounce"
+    assert _state_without_clock(cadence) == before
+
+
+def _state_without_clock(cadence: Cadence) -> dict[str, object]:
+    return {
+        key: deepcopy(value)
+        for key, value in vars(cadence).items()
+        if key != "_clock"
+    }

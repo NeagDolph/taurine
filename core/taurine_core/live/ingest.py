@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Awaitable, Callable
 from inspect import isawaitable
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from taurine_core import config
@@ -18,8 +18,11 @@ from taurine_core.schemas import (
     RetrievalEvent,
     SlateItem,
     TranscriptEvent,
+    TriggerEvent,
+    TriggerMatch,
     UnpinEvent,
 )
+from taurine_core.session_log import NullSessionLogger
 
 from .ambient import AmbientRetriever
 from .cadence import Cadence
@@ -27,7 +30,7 @@ from .exact import ExactCollector
 from .slate import Slate
 
 
-Event = TranscriptEvent | AmbientEvent | PinEvent | UnpinEvent | RetrievalEvent
+Event = TranscriptEvent | AmbientEvent | PinEvent | UnpinEvent | RetrievalEvent | TriggerEvent
 EventSink = Callable[[Event], Awaitable[None] | None]
 
 
@@ -42,7 +45,14 @@ class PresenterLike(Protocol):
         transcript: list[Chunk],
         slate: list[SlateItem],
         via_titles: dict[str, str],
+        *,
+        revision: int | None = None,
     ) -> list[Pick]:
+        ...
+
+
+class LoggerLike(Protocol):
+    def log(self, kind: str, **payload: Any) -> None:
         ...
 
 
@@ -63,6 +73,7 @@ class LiveSession:
         presenter: PresenterLike,
         emit: EventSink,
         clock: Clock | None = None,
+        logger: LoggerLike | None = None,
     ) -> None:
         self._index = index
         self._slate = slate
@@ -72,16 +83,28 @@ class LiveSession:
         self._presenter = presenter
         self._emit = emit
         self._clock = clock or _SystemClock()
+        self._logger = logger or NullSessionLogger()
         self._transcript: list[Chunk] = []
         self._pinned: list[Card] = []
+        self._next_seq = 1
 
     async def on_chunk(self, chunk: Chunk) -> None:
+        chunk = self._chunk_with_seq(chunk)
+        self._logger.log(
+            "chunk",
+            seq=chunk.seq,
+            channel=chunk.channel,
+            text=chunk.text,
+            ts=chunk.ts,
+            final=chunk.final,
+        )
         await self._emit_event(
             TranscriptEvent(
                 channel=chunk.channel,
                 text=chunk.text,
                 final=chunk.final,
                 ts=chunk.ts,
+                seq=chunk.seq,
             )
         )
         if not chunk.final:
@@ -100,6 +123,7 @@ class LiveSession:
         before_revision = self._slate.revision
         self._pinned = [candidate for candidate in self._pinned if candidate.card_id != card_id]
         self._slate.dismiss(card.note_id, now=self._clock.now())
+        self._logger.log("unpin", card_id=card_id, reason="dismissed")
         await self._emit_event(UnpinEvent(card_id=card_id))
         await self._emit_ambient_if_changed(before_revision)
 
@@ -109,11 +133,35 @@ class LiveSession:
     async def _run_c1(self, chunk: Chunk) -> None:
         before_revision = self._slate.revision
         now = self._clock.now()
-        for note_id, _alias, is_title in self._exact.on_chunk(chunk):
+        for note_id, alias, is_title in self._exact.on_chunk(chunk):
             note = self._index.note(note_id)
             if note is None:
                 continue
             if is_title and self._cadence.instant_pin_allowed(now=now):
+                await self._emit_trigger(
+                    TriggerEvent(
+                        trigger_id=_trigger_id(),
+                        kind="exact",
+                        seqs=[chunk.seq],
+                        span=alias,
+                        matches=[
+                            TriggerMatch(
+                                note_id=note_id,
+                                title=note.title,
+                                score=1.0,
+                            )
+                        ],
+                        action="pinned",
+                    )
+                )
+                self._logger.log(
+                    "c1_hit",
+                    seq=chunk.seq,
+                    alias=alias,
+                    note_id=note_id,
+                    is_title=is_title,
+                    action="pinned",
+                )
                 await self._pin(
                     Card(
                         card_id=_card_id(note_id),
@@ -127,6 +175,7 @@ class LiveSession:
                 continue
             # rate-capped title hits fall through to a slate add
 
+            add_revision = self._slate.revision
             self._slate.add(
                 SlateItem(
                     note_id=note_id,
@@ -139,10 +188,36 @@ class LiveSession:
                     added_rev=0,
                 )
             )
+            action = "slated" if self._slate.revision != add_revision else "none"
+            await self._emit_trigger(
+                TriggerEvent(
+                    trigger_id=_trigger_id(),
+                    kind="exact",
+                    seqs=[chunk.seq],
+                    span=alias,
+                    matches=[
+                        TriggerMatch(
+                            note_id=note_id,
+                            title=note.title,
+                            score=1.0,
+                        )
+                    ],
+                    action=action,
+                )
+            )
+            self._logger.log(
+                "c1_hit",
+                seq=chunk.seq,
+                alias=alias,
+                note_id=note_id,
+                is_title=is_title,
+                action=action,
+            )
         await self._emit_ambient_if_changed(before_revision)
 
     async def _run_c2(self) -> None:
-        window_text = self._window_text()
+        window_chunks = self._window_chunks()
+        window_text = self._window_text(window_chunks)
         if not window_text:
             return
 
@@ -151,14 +226,33 @@ class LiveSession:
         if result is None:
             return
 
+        trigger_id = _trigger_id()
         for item in self._ambient.last_slate_adds:
             self._slate.add(item)
+        slate_ids = {item.note_id for item in self._slate.items()}
+        survived_adds = [
+            item.note_id for item in self._ambient.last_slate_adds if item.note_id in slate_ids
+        ]
+        seqs = [chunk.seq for chunk in window_chunks]
+        await self._emit_trigger(
+            TriggerEvent(
+                trigger_id=trigger_id,
+                kind="search",
+                seqs=seqs,
+                span=result.heard,
+                matches=self._search_trigger_matches(result),
+                action="slated" if survived_adds else "none",
+            )
+        )
+        self._log_c2_pass(trigger_id, seqs, result, survived_adds)
 
         await self._emit_event(
             RetrievalEvent(
                 heard=result.heard,
                 hits=result.hits,
                 expansions=result.expansions,
+                retrieval_id=trigger_id,
+                seqs=seqs,
             )
         )
         await self._emit_ambient_if_changed(before_revision)
@@ -170,7 +264,15 @@ class LiveSession:
 
         now = self._clock.now()
         attempt_revision = self._slate.revision
-        if not self._cadence.may_present(attempt_revision, now=now):
+        reason = self._cadence.explain(attempt_revision, now=now)
+        decision = self._cadence.may_present(attempt_revision, now=now)
+        self._logger.log(
+            "cadence",
+            decision=decision,
+            revision=attempt_revision,
+            reason=reason,
+        )
+        if not decision:
             return
 
         self._cadence.note_attempt(now=now)
@@ -178,6 +280,7 @@ class LiveSession:
             self._transcript,
             prompted_items,
             self._via_titles(prompted_items),
+            revision=attempt_revision,
         )
 
         self._slate.mark_viewed([item.note_id for item in prompted_items])
@@ -208,13 +311,22 @@ class LiveSession:
         ]
         self._pinned = [existing for existing in self._pinned if existing.note_id != card.note_id]
         for card_id in duplicate_ids:
+            self._logger.log("unpin", card_id=card_id, reason="superseded")
             await self._emit_event(UnpinEvent(card_id=card_id))
 
         self._pinned.insert(0, card)
+        self._logger.log(
+            "pin",
+            card_id=card.card_id,
+            note_id=card.note_id,
+            provenance=card.provenance,
+            summary=card.summary,
+        )
         await self._emit_event(PinEvent(card=card))
 
         while len(self._pinned) > config.MAX_PINNED:
             displaced = self._pinned.pop()
+            self._logger.log("unpin", card_id=displaced.card_id, reason="displaced")
             await self._emit_event(UnpinEvent(card_id=displaced.card_id))
 
     async def _emit_ambient_if_changed(self, before_revision: int) -> None:
@@ -234,10 +346,11 @@ class LiveSession:
             )
         )
 
-    def _window_text(self) -> str:
-        return " ".join(
-            chunk.text for chunk in self._transcript[-config.C2_WINDOW_CHUNKS :]
-        ).strip()
+    def _window_chunks(self) -> list[Chunk]:
+        return self._transcript[-config.C2_WINDOW_CHUNKS :]
+
+    def _window_text(self, chunks: list[Chunk]) -> str:
+        return " ".join(chunk.text for chunk in chunks).strip()
 
     def _via_titles(self, items: list[SlateItem]) -> dict[str, str]:
         titles: dict[str, str] = {}
@@ -252,6 +365,72 @@ class LiveSession:
         result = self._emit(event)
         if isawaitable(result):
             await result
+
+    async def _emit_trigger(self, event: TriggerEvent) -> None:
+        await self._emit_event(event)
+
+    def _chunk_with_seq(self, chunk: Chunk) -> Chunk:
+        if not chunk.final:
+            return chunk.model_copy(update={"seq": 0})
+        seq = self._next_seq
+        self._next_seq += 1
+        return chunk.model_copy(update={"seq": seq})
+
+    def _search_trigger_matches(self, result: Any) -> list[TriggerMatch]:
+        matches: list[TriggerMatch] = []
+        for hit in result.hits:
+            note = self._index.note(hit.note_id)
+            matches.append(
+                TriggerMatch(
+                    note_id=hit.note_id,
+                    title=note.title if note is not None else hit.note_id,
+                    rank=hit.rank,
+                    score=hit.score,
+                )
+            )
+        for expansion in result.expansions:
+            note = self._index.note(expansion.note_id)
+            matches.append(
+                TriggerMatch(
+                    note_id=expansion.note_id,
+                    title=note.title if note is not None else expansion.note_id,
+                    score=expansion.score,
+                    via_note_id=expansion.from_note_id,
+                    hop=expansion.hop,
+                )
+            )
+        return matches
+
+    def _log_c2_pass(
+        self,
+        trigger_id: str,
+        seqs: list[int],
+        result: Any,
+        survived_adds: list[str],
+    ) -> None:
+        debug = dict(getattr(self._ambient, "last_debug", None) or {})
+        if not debug:
+            debug = {
+                "window": result.heard,
+                "dense": [],
+                "bm25": [],
+                "fused": [],
+                "expansions": [
+                    {
+                        "from": expansion.from_note_id,
+                        "to": expansion.note_id,
+                        "score": expansion.score,
+                    }
+                    for expansion in result.expansions
+                ],
+                "rerank_used": False,
+                "rerank_error": None,
+                "ordered": [[hit.note_id, hit.score] for hit in result.hits],
+                "floor_dropped": [],
+                "slate_adds": [],
+            }
+        debug["slate_adds"] = survived_adds
+        self._logger.log("c2_pass", trigger_id=trigger_id, seqs=seqs, **debug)
 
 
 def _card_from_pick(pick: Pick, item: SlateItem) -> Card:
@@ -268,3 +447,7 @@ def _card_from_pick(pick: Pick, item: SlateItem) -> Card:
 
 def _card_id(note_id: str) -> str:
     return f"{note_id}:{uuid4().hex[:12]}"
+
+
+def _trigger_id() -> str:
+    return uuid4().hex[:12]

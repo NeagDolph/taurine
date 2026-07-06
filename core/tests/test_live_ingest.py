@@ -8,13 +8,14 @@ import pytest
 from taurine_core import config
 from taurine_core.live.ingest import LiveSession
 from taurine_core.live.slate import Slate
-from taurine_core.schemas import Chunk, Pick, SlateItem
+from taurine_core.schemas import Chunk, Expansion, Hit, Pick, RetrievalResult, SlateItem
 
 from tests.fakes import FakeClock, FakeIndex, note
 
 
 class NoopAmbient:
     last_slate_adds: list[SlateItem] = []
+    last_debug: dict[str, Any] | None = None
 
     async def on_window(self, window_text: str) -> None:
         del window_text
@@ -28,6 +29,24 @@ class SequenceExact:
     def on_chunk(self, chunk: Chunk) -> list[tuple[str, str, bool]]:
         del chunk
         return self.hits.pop(0) if self.hits else []
+
+
+@dataclass
+class SequenceAmbient:
+    results: list[RetrievalResult | None]
+    slate_add_sequences: list[list[SlateItem]]
+    debug_sequences: list[dict[str, Any] | None] = field(default_factory=list)
+    windows: list[str] = field(default_factory=list)
+    last_slate_adds: list[SlateItem] = field(default_factory=list)
+    last_debug: dict[str, Any] | None = None
+
+    async def on_window(self, window_text: str) -> RetrievalResult | None:
+        self.windows.append(window_text)
+        self.last_slate_adds = (
+            self.slate_add_sequences.pop(0) if self.slate_add_sequences else []
+        )
+        self.last_debug = self.debug_sequences.pop(0) if self.debug_sequences else None
+        return self.results.pop(0) if self.results else None
 
 
 @dataclass
@@ -45,6 +64,10 @@ class RecordingCadence:
     def may_present(self, revision: int, now: float | None = None) -> bool:
         del revision, now
         return self.may_present_allowed
+
+    def explain(self, revision: int, now: float | None = None) -> str:
+        del revision, now
+        return "allowed" if self.may_present_allowed else "same_revision"
 
     def note_attempt(self, now: float | None = None) -> None:
         self.attempts.append(float(now or 0.0))
@@ -66,9 +89,23 @@ class StaticPresenter:
         transcript: list[Chunk],
         slate: list[SlateItem],
         via_titles: dict[str, str],
+        *,
+        revision: int | None = None,
     ) -> list[Pick]:
+        del revision
         self.calls.append((transcript, slate, via_titles))
         return self.picks
+
+
+@dataclass
+class RecordingLogger:
+    records: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+
+    def log(self, kind: str, **payload: Any) -> None:
+        self.records.append((kind, payload))
+
+    def close(self) -> None:
+        self.records.append(("closed", {}))
 
 
 def chunk(text: str, ts: float = 1000.0) -> Chunk:
@@ -81,18 +118,22 @@ def session_with(
     clock: FakeClock,
     exact: SequenceExact,
     cadence: RecordingCadence,
+    slate: Slate | None = None,
+    ambient: Any | None = None,
     presenter: StaticPresenter | None = None,
+    logger: RecordingLogger | None = None,
 ) -> tuple[LiveSession, list[Any]]:
     events: list[Any] = []
     session = LiveSession(
         index=index,
-        slate=Slate(clock),
+        slate=slate or Slate(clock),
         cadence=cadence,
         exact=exact,
-        ambient=NoopAmbient(),
+        ambient=ambient or NoopAmbient(),
         presenter=presenter or StaticPresenter([]),
         emit=events.append,
         clock=clock,
+        logger=logger or RecordingLogger(),
     )
     return session, events
 
@@ -117,6 +158,175 @@ async def test_title_hit_produces_instant_pin_without_starting_cooldown() -> Non
     assert pins[0].card.summary == "Roadmap gist"
     assert pins[0].card.provenance == "exact"
     assert cadence.promotions == []
+
+
+@pytest.mark.asyncio
+async def test_transcript_seq_and_c1_trigger_events_cover_pin_slate_and_none() -> None:
+    clock = FakeClock()
+    index = FakeIndex(
+        notes={
+            "pinned": note("pinned", "Pinned Title", "Pinned gist"),
+            "slated": note("slated", "Slated Title", "Slated gist"),
+            "suppressed": note("suppressed", "Suppressed Title", "Suppressed gist"),
+        }
+    )
+    preloaded_slate = Slate(clock)
+    preloaded_slate.add(
+        SlateItem(
+            note_id="suppressed",
+            title="Suppressed Title",
+            gist="Suppressed gist",
+            score=1.0,
+            source="exact",
+            heard="old",
+            decay=config.DECAY_EXACT,
+            added_rev=0,
+        )
+    )
+    preloaded_slate.dismiss("suppressed", now=clock.now())
+    session, events = session_with(
+        index=index,
+        clock=clock,
+        slate=preloaded_slate,
+        exact=SequenceExact(
+            [[
+                ("pinned", "pinned title", True),
+                ("slated", "slated alias", False),
+                ("suppressed", "suppressed alias", False),
+            ]]
+        ),
+        cadence=RecordingCadence(instant_allowed=True, may_present_allowed=False),
+    )
+
+    await session.on_chunk(Chunk(channel=0, text="interim words", ts=10.0, final=False))
+    await session.on_chunk(chunk("pinned title plus slated alias and suppressed alias", ts=11.0))
+
+    transcripts = [event for event in events if event.type == "transcript"]
+    assert [event.seq for event in transcripts] == [0, 1]
+
+    triggers = [event for event in events if event.type == "trigger"]
+    assert [
+        (event.kind, event.seqs, event.span, event.matches[0].note_id, event.action)
+        for event in triggers
+    ] == [
+        ("exact", [1], "pinned title", "pinned", "pinned"),
+        ("exact", [1], "slated alias", "slated", "slated"),
+        ("exact", [1], "suppressed alias", "suppressed", "none"),
+    ]
+    assert all(trigger.matches[0].score == 1.0 for trigger in triggers)
+
+    event_types = [event.type for event in events]
+    assert event_types.index("trigger") < event_types.index("pin")
+    assert "slated" in [item.note_id for item in session.slate_items()]
+    assert "suppressed" not in [item.note_id for item in session.slate_items()]
+
+
+@pytest.mark.asyncio
+async def test_c2_trigger_event_correlates_with_retrieval_event_and_logger() -> None:
+    clock = FakeClock()
+    logger = RecordingLogger()
+    index = FakeIndex(
+        notes={
+            "direct": note("direct", "Direct Note", "Direct gist"),
+            "expanded": note("expanded", "Expanded Note", "Expanded gist"),
+        }
+    )
+    result = RetrievalResult(
+        heard="window text",
+        hits=[Hit(note_id="direct", rank=1, score=0.91)],
+        expansions=[
+            Expansion(
+                from_note_id="direct",
+                note_id="expanded",
+                hop=1,
+                score=0.31,
+            )
+        ],
+    )
+    debug = {
+        "window": "window text",
+        "dense": [["direct", 0.9]],
+        "bm25": [],
+        "fused": [["direct", 0.016]],
+        "expansions": [{"from": "direct", "to": "expanded", "score": 0.31}],
+        "rerank_used": True,
+        "rerank_error": None,
+        "ordered": [["direct", 0.91]],
+        "floor_dropped": [],
+        "slate_adds": ["direct"],
+    }
+    ambient = SequenceAmbient(
+        results=[result],
+        slate_add_sequences=[
+            [
+                SlateItem(
+                    note_id="direct",
+                    title="Direct Note",
+                    gist="Direct gist",
+                    score=0.91,
+                    source="search",
+                    heard="window text",
+                    decay=config.DECAY_SEARCH,
+                    added_rev=0,
+                )
+            ]
+        ],
+        debug_sequences=[debug],
+    )
+    session, events = session_with(
+        index=index,
+        clock=clock,
+        exact=SequenceExact([[]]),
+        cadence=RecordingCadence(may_present_allowed=False),
+        ambient=ambient,
+        logger=logger,
+    )
+
+    await session.on_chunk(chunk("window text"))
+
+    [trigger] = [event for event in events if event.type == "trigger"]
+    [retrieval] = [event for event in events if event.type == "retrieval"]
+    assert trigger.kind == "search"
+    assert trigger.seqs == [1]
+    assert trigger.span == "window text"
+    assert trigger.action == "slated"
+    assert [(match.note_id, match.rank, match.score, match.via_note_id, match.hop) for match in trigger.matches] == [
+        ("direct", 1, 0.91, None, None),
+        ("expanded", None, 0.31, "direct", 1),
+    ]
+    assert retrieval.retrieval_id == trigger.trigger_id
+    assert retrieval.seqs == [1]
+    assert [kind for kind, _payload in logger.records].count("c2_pass") == 1
+    c2_payload = [payload for kind, payload in logger.records if kind == "c2_pass"][0]
+    assert c2_payload["trigger_id"] == trigger.trigger_id
+    assert c2_payload["seqs"] == [1]
+    assert c2_payload["slate_adds"] == ["direct"]
+
+
+@pytest.mark.asyncio
+async def test_c2_trigger_event_action_none_when_no_slate_add_survives() -> None:
+    clock = FakeClock()
+    index = FakeIndex(notes={"direct": note("direct", "Direct Note", "Direct gist")})
+    result = RetrievalResult(
+        heard="window text",
+        hits=[Hit(note_id="direct", rank=1, score=0.91)],
+        expansions=[],
+    )
+    ambient = SequenceAmbient(results=[result], slate_add_sequences=[[]])
+    session, events = session_with(
+        index=index,
+        clock=clock,
+        exact=SequenceExact([[]]),
+        cadence=RecordingCadence(may_present_allowed=False),
+        ambient=ambient,
+    )
+
+    await session.on_chunk(chunk("window text"))
+
+    [trigger] = [event for event in events if event.type == "trigger"]
+    assert trigger.kind == "search"
+    assert trigger.action == "none"
+    assert trigger.seqs == [1]
 
 
 @pytest.mark.asyncio

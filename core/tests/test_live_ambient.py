@@ -198,3 +198,53 @@ async def test_min_cosine_floor_only_filters_dense_only_low_scores() -> None:
     assert "bm25-low" in hit_ids
     assert "expanded-low" in hit_ids
     assert "low" not in [item.note_id for item in retriever.last_slate_adds]
+
+
+async def test_debug_callback_reports_one_c2_pass_with_internal_rows() -> None:
+    debug_records: list[dict[str, object]] = []
+    index = FakeIndex(
+        notes={
+            "seed": note("seed", "Seed Topic"),
+            "low": note("low", "Low Dense"),
+            "expanded": note("expanded", "Expanded Topic"),
+        },
+        dense=[("seed", 0.9), ("low", 0.1)],
+        bm25=[("seed", 5.0)],
+        links={"seed": [("expanded", 0.8)]},
+        chunks={
+            "seed": "seed chunk",
+            "low": "low chunk",
+            "expanded": "expanded chunk",
+        },
+    )
+    reranker = OkReranker({"low": 0.99, "seed": 0.7, "expanded": 0.6})
+
+    res = await AmbientRetriever(
+        index,
+        reranker,
+        FakeClock(),
+        on_debug=debug_records.append,
+    ).on_window("seed topic")
+
+    assert res is not None
+    assert len(debug_records) == 1
+    debug = debug_records[0]
+    assert debug["window"] == "seed topic"
+    assert debug["dense"] == [["seed", 0.9], ["low", 0.1]]
+    assert debug["bm25"] == [["seed", 5.0]]
+    assert debug["fused"] == [
+        ["seed", pytest.approx((1 / (config.RRF_K + 1)) * 2)],
+        ["low", pytest.approx(1 / (config.RRF_K + 2))],
+    ]
+    assert debug["expansions"] == [
+        {
+            "from": "seed",
+            "to": "expanded",
+            "score": pytest.approx((1 / (config.RRF_K + 1)) * 2 * 0.8 * config.HOP_DECAY),
+        }
+    ]
+    assert debug["rerank_used"] is True
+    assert debug["rerank_error"] is None
+    assert debug["ordered"][:3] == [["low", 0.99], ["seed", 0.7], ["expanded", 0.6]]
+    assert debug["floor_dropped"] == ["low"]
+    assert debug["slate_adds"] == ["seed", "expanded"]
