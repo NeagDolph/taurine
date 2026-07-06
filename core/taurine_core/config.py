@@ -62,19 +62,18 @@ ALIAS_STOPWORDS = frozenset(
 SALIENT_TERMS = 6                        # top rare window terms forming the salient query
 SALIENT_MIN_TERM_LEN = 3
 
-# ── C2 GLiNER span extraction ──────────────────────────────────────────
-GLINER_MODEL = "urchade/gliner_medium-v2.1"
-GLINER_LABELS = [
-    "person",
-    "company",
-    "project",
-    "product",
-    "document topic",
-    "task",
-    "event",
-    "place",
-]
-GLINER_THRESHOLD = 0.38
+# ── C2 GLiNER2 span extraction (schema-based, label descriptions) ─────
+GLINER2_MODEL = "fastino/gliner2-large-v1"
+# label → description; descriptions are per-label prompt engineering and the
+# main precision lever — edit freely. Schema order = span priority at the cap.
+GLINER2_SCHEMA = {
+    "person": "Names of people mentioned or addressed in the conversation",
+    "organization": "Companies, teams, clients, or vendors discussed",
+    "project": "Internal work initiatives, codenames, or features under discussion",
+    "topic": "The concrete subject matter being discussed, e.g. 'checkout flow', 'Q3 roadmap'",
+    "commitment": "Tasks, action items, or promises someone agrees to do",
+    "event": "Meetings, deadlines, launches, or scheduled occurrences",
+}
 GLINER_MAX_SPANS = 4
 
 # ── slate ──────────────────────────────────────────────────────────────

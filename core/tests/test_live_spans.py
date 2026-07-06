@@ -8,65 +8,75 @@ from taurine_core import config
 
 
 class FakeModel:
-    def __init__(self, predictions: list[dict[str, object]]) -> None:
-        self.predictions = predictions
-        self.calls: list[tuple[str, list[str], float]] = []
+    def __init__(self, entities: dict[str, list[object]]) -> None:
+        self.entities = entities
+        self.calls: list[tuple[str, dict[str, str]]] = []
 
-    def predict_entities(
-        self,
-        text: str,
-        labels: list[str],
-        *,
-        threshold: float,
-    ) -> list[dict[str, object]]:
-        self.calls.append((text, labels, threshold))
-        return self.predictions
+    def extract_entities(self, text: str, schema: dict[str, str]) -> dict[str, object]:
+        self.calls.append((text, schema))
+        return {"entities": self.entities}
 
 
-def test_gliner_span_extractor_dedupes_thresholds_sorts_and_caps(monkeypatch) -> None:
+def test_gliner2_extractor_orders_by_schema_dedupes_and_caps(monkeypatch) -> None:
     from taurine_core.live import spans
-    from taurine_core.live.spans import GlinerSpanExtractor
+    from taurine_core.live.spans import Gliner2SpanExtractor
 
     model = FakeModel(
-        [
-            {"text": "Ashish", "score": 0.41},
-            {"text": "ashish", "score": 0.91},
-            {"text": "below threshold", "score": 0.37},
-            {"text": "Shopify checkout", "score": 0.8},
-            {"text": "Roadmap", "score": 0.7},
-        ]
+        {
+            "topic": ["checkout flow", "Checkout Flow", "roadmap", "pricing", "sync"],
+            "person": ["Ashish", " "],
+            "organization": [{"text": "Shopify"}],
+        }
     )
     monkeypatch.setattr(spans, "_MODEL", model)
     monkeypatch.setattr(spans, "_MODEL_LOAD_FAILED", False)
-    monkeypatch.setattr(config, "GLINER_THRESHOLD", 0.38)
-    monkeypatch.setattr(config, "GLINER_MAX_SPANS", 2)
+    monkeypatch.setattr(config, "GLINER_MAX_SPANS", 4)
 
-    result = GlinerSpanExtractor().extract(" ask ashish about checkout ")
+    result = Gliner2SpanExtractor().extract(" ask ashish about checkout ")
 
-    assert result == [("ashish", 0.91), ("Shopify checkout", 0.8)]
-    assert model.calls == [
-        ("ask ashish about checkout", config.GLINER_LABELS, 0.38)
+    # schema order: person > organization > ... > topic; dedupe case-insensitive; cap 4
+    assert result == [
+        ("Ashish", 1.0, "person"),
+        ("Shopify", 1.0, "organization"),
+        ("checkout flow", 1.0, "topic"),
+        ("roadmap", 1.0, "topic"),
     ]
+    assert model.calls == [("ask ashish about checkout", dict(config.GLINER2_SCHEMA))]
 
 
-def test_gliner_span_extractor_returns_empty_on_model_exception(monkeypatch) -> None:
+def test_gliner2_extractor_returns_empty_on_model_exception(monkeypatch) -> None:
     from taurine_core.live import spans
-    from taurine_core.live.spans import GlinerSpanExtractor
+    from taurine_core.live.spans import Gliner2SpanExtractor
 
     class RaisingModel:
-        def predict_entities(self, *args, **kwargs) -> list[dict[str, object]]:
+        def extract_entities(self, *args, **kwargs) -> dict[str, object]:
             del args, kwargs
             raise RuntimeError("prediction failed")
 
     monkeypatch.setattr(spans, "_MODEL", RaisingModel())
     monkeypatch.setattr(spans, "_MODEL_LOAD_FAILED", False)
 
-    assert GlinerSpanExtractor().extract("checkout flow") == []
+    assert Gliner2SpanExtractor().extract("checkout flow") == []
 
 
-def test_gliner_span_extractor_logs_model_load_failure_once(monkeypatch, caplog) -> None:
+def test_gliner2_extractor_tolerates_malformed_result(monkeypatch) -> None:
     from taurine_core.live import spans
-    from taurine_core.live.spans import GlinerSpanExtractor
+    from taurine_core.live.spans import Gliner2SpanExtractor
+
+    class WeirdModel:
+        def extract_entities(self, *args, **kwargs) -> object:
+            del args, kwargs
+            return {"entities": {"person": "not-a-list", "topic": [42, {"no": "text"}]}}
+
+    monkeypatch.setattr(spans, "_MODEL", WeirdModel())
+    monkeypatch.setattr(spans, "_MODEL_LOAD_FAILED", False)
+
+    assert Gliner2SpanExtractor().extract("checkout flow") == []
+
+
+def test_gliner2_extractor_logs_model_load_failure_once(monkeypatch, caplog) -> None:
+    from taurine_core.live import spans
+    from taurine_core.live.spans import Gliner2SpanExtractor
 
     def fail_load() -> object:
         raise RuntimeError("offline")
@@ -76,22 +86,22 @@ def test_gliner_span_extractor_logs_model_load_failure_once(monkeypatch, caplog)
     monkeypatch.setattr(spans, "_load_model", fail_load)
 
     with caplog.at_level("WARNING", logger="taurine.session"):
-        assert GlinerSpanExtractor().extract("checkout flow") == []
-        assert GlinerSpanExtractor().extract("checkout flow") == []
+        assert Gliner2SpanExtractor().extract("checkout flow") == []
+        assert Gliner2SpanExtractor().extract("checkout flow") == []
 
     messages = [record.message for record in caplog.records]
-    assert messages == ["GLiNER model load failed: offline"]
+    assert messages == ["GLiNER2 model load failed: offline"]
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.environ.get("RUN_SLOW") != "1", reason="RUN_SLOW is unset")
-def test_real_gliner_span_extractor_smoke() -> None:
-    from taurine_core.live.spans import GlinerSpanExtractor
+def test_real_gliner2_extractor_smoke() -> None:
+    from taurine_core.live.spans import Gliner2SpanExtractor
 
-    result = GlinerSpanExtractor().extract(
+    result = Gliner2SpanExtractor().extract(
         "we should ask ashish about the shopify checkout flow"
     )
-    lowered = [span.lower() for span, _score in result]
+    lowered = [span.lower() for span, _score, _label in result]
 
     assert any("ashish" in span for span in lowered)
     assert any("shopify" in span or "checkout" in span for span in lowered)

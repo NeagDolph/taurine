@@ -45,9 +45,9 @@ class IndexPort(Protocol):
 
 
 class SpanExtractorPort(Protocol):
-    def extract(self, text: str) -> list[tuple[str, float]]:
-        """Salient spans in the text -> [(span, score)] desc, deduped, capped.
-        Must never raise; returns [] on any failure."""
+    def extract(self, text: str) -> list[tuple[str, float, str]]:
+        """Salient spans in the text -> [(span, score, label)], deduped, capped,
+        strongest first. Must never raise; returns [] on any failure."""
         ...
 
 

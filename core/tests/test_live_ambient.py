@@ -67,11 +67,11 @@ class QueryAwareIndex(FakeIndex):
 
 
 class FakeSpanExtractor:
-    def __init__(self, spans: list[tuple[str, float]]) -> None:
+    def __init__(self, spans: list[tuple[str, float, str]]) -> None:
         self.spans = spans
         self.calls: list[str] = []
 
-    def extract(self, text: str) -> list[tuple[str, float]]:
+    def extract(self, text: str) -> list[tuple[str, float, str]]:
         self.calls.append(text)
         return self.spans
 
@@ -333,7 +333,7 @@ async def test_salient_query_uses_rare_terms_and_dense_salient_joins_rrf() -> No
 async def test_span_queries_form_dense_gliner_list_and_survive_floor() -> None:
     window = "alpha checkout"
     span_extractor = FakeSpanExtractor(
-        [("shopify checkout", 0.95), ("Ashish", 0.9)]
+        [("shopify checkout", 0.95, "topic"), ("Ashish", 0.9, "person")]
     )
     index = QueryAwareIndex(
         notes={
@@ -366,7 +366,7 @@ async def test_span_queries_form_dense_gliner_list_and_survive_floor() -> None:
     assert res.extracted == ["shopify checkout", "Ashish"]
     assert [hit.note_id for hit in res.hits] == ["span-only", "window"]
     debug = debug_records[0]
-    assert debug["gliner_spans"] == [["shopify checkout", 0.95], ["Ashish", 0.9]]
+    assert debug["gliner_spans"] == [["shopify checkout", 0.95, "topic"], ["Ashish", 0.9, "person"]]
     assert debug["dense_gliner"] == [["span-only", 0.94], ["window", 0.4]]
     assert debug["fused"] == [
         ["window", pytest.approx((1 / (config.RRF_K + 1)) * 2 + (1 / (config.RRF_K + 2)))],

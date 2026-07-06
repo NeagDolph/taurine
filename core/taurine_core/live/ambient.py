@@ -61,7 +61,7 @@ class AmbientRetriever:
 
         salient = self._salient_query(window_text)
         gliner_spans = self._extract_spans(window_text)
-        extracted = [span for span, _score in gliner_spans]
+        extracted = [span for span, _score, _label in gliner_spans]
         dense = self._index.dense_search(window_text, config.RERANK_MAX_CANDIDATES)
         dense_salient = (
             self._index.dense_search(salient, config.RERANK_MAX_CANDIDATES)
@@ -201,7 +201,7 @@ class AmbientRetriever:
         query = " ".join(term for _index, term in terms if term in selected)
         return query or None
 
-    def _extract_spans(self, window_text: str) -> list[tuple[str, float]]:
+    def _extract_spans(self, window_text: str) -> list[tuple[str, float, str]]:
         if self._span_extractor is None:
             return []
         try:
@@ -211,10 +211,10 @@ class AmbientRetriever:
 
     def _dense_gliner(
         self,
-        gliner_spans: list[tuple[str, float]],
+        gliner_spans: list[tuple[str, float, str]],
     ) -> list[tuple[str, float]]:
         scores: dict[str, float] = {}
-        for span, _span_score in gliner_spans:
+        for span, _span_score, _label in gliner_spans:
             for note_id, score in self._index.dense_search(
                 span,
                 config.RERANK_MAX_CANDIDATES,
@@ -414,5 +414,5 @@ class AmbientRetriever:
             return
 
 
-def _rows(rows: list[tuple[str, float]]) -> list[list[float | str]]:
-    return [[note_id, score] for note_id, score in rows]
+def _rows(rows: list[tuple[Any, ...]]) -> list[list[Any]]:
+    return [list(row) for row in rows]
