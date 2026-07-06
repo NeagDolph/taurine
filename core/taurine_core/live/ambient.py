@@ -1,0 +1,237 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Protocol
+
+from taurine_core import config
+from taurine_core.ports import IndexPort, RerankerPort, RerankError
+from taurine_core.schemas import Expansion, Hit, RetrievalResult, SlateItem
+
+
+class Clock(Protocol):
+    def now(self) -> float:
+        ...
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    note_id: str
+    score: float
+
+
+@dataclass(frozen=True)
+class _ExpansionArrival:
+    from_note_id: str
+    note_id: str
+    hop: int
+    score: float
+
+
+class AmbientRetriever:
+    def __init__(
+        self,
+        index: IndexPort,
+        reranker: RerankerPort,
+        clock: Clock,
+    ) -> None:
+        self.last_slate_adds: list[SlateItem] = []
+        self._index = index
+        self._reranker = reranker
+        self._clock = clock
+        self._last_run_at: float | None = None
+
+    async def on_window(self, window_text: str) -> RetrievalResult | None:
+        self.last_slate_adds = []
+        now = self._clock.now()
+        if (
+            self._last_run_at is not None
+            and now - self._last_run_at < config.C2_THROTTLE_S
+        ):
+            return None
+        self._last_run_at = now
+
+        dense = self._index.dense_search(window_text, config.RERANK_MAX_CANDIDATES)
+        bm25 = self._index.bm25_search(window_text, config.RERANK_MAX_CANDIDATES)
+        dense_scores = {note_id: score for note_id, score in dense}
+        bm25_note_ids = {note_id for note_id, _score in bm25}
+
+        direct_scores = self._rrf_scores(dense, bm25)
+        candidate_scores = dict(direct_scores)
+        expansion_arrivals = self._expand(candidate_scores, direct_scores)
+
+        pooled = self._ordered_candidates(candidate_scores)
+        docs = self._docs_for_candidates(window_text, pooled)
+        if not docs:
+            return RetrievalResult(heard=window_text, hits=[], expansions=[])
+
+        ordered = await self._reranked_or_fallback(window_text, docs, candidate_scores)
+        filtered = self._apply_floor(
+            ordered,
+            dense_scores,
+            bm25_note_ids,
+            set(expansion_arrivals),
+        )
+        top = filtered[: config.C2_TOP_K]
+
+        expansions = [
+            Expansion(
+                from_note_id=arrival.from_note_id,
+                note_id=arrival.note_id,
+                hop=arrival.hop,
+                score=arrival.score,
+            )
+            for arrival in sorted(
+                expansion_arrivals.values(),
+                key=lambda item: item.score,
+                reverse=True,
+            )
+            if arrival.note_id in {note_id for note_id, _score in docs}
+        ]
+
+        hits = [
+            Hit(note_id=note_id, rank=rank, score=score)
+            for rank, (note_id, score) in enumerate(top, start=1)
+        ]
+        self.last_slate_adds = [
+            self._slate_item(note_id, score, window_text, expansion_arrivals)
+            for note_id, score in top
+        ]
+        return RetrievalResult(heard=window_text, hits=hits, expansions=expansions)
+
+    def _rrf_scores(
+        self,
+        dense: list[tuple[str, float]],
+        bm25: list[tuple[str, float]],
+    ) -> dict[str, float]:
+        scores: dict[str, float] = {}
+        for rows in (dense, bm25):
+            for rank, (note_id, _score) in enumerate(rows, start=1):
+                scores[note_id] = scores.get(note_id, 0.0) + (
+                    1.0 / (config.RRF_K + rank)
+                )
+        return scores
+
+    def _expand(
+        self,
+        candidate_scores: dict[str, float],
+        direct_scores: dict[str, float],
+    ) -> dict[str, _ExpansionArrival]:
+        arrivals: dict[str, _ExpansionArrival] = {}
+        seeds = self._ordered_candidates(direct_scores)[: config.EXPAND_SEEDS]
+        for seed in seeds:
+            for neighbor_id, edge_weight in self._index.neighbors(seed.note_id):
+                if neighbor_id in direct_scores:
+                    continue
+                score = seed.score * edge_weight * config.HOP_DECAY
+                if score <= candidate_scores.get(neighbor_id, float("-inf")):
+                    continue
+                candidate_scores[neighbor_id] = score
+                arrivals[neighbor_id] = _ExpansionArrival(
+                    from_note_id=seed.note_id,
+                    note_id=neighbor_id,
+                    hop=1,
+                    score=score,
+                )
+        return arrivals
+
+    def _ordered_candidates(self, scores: dict[str, float]) -> list[_Candidate]:
+        return [
+            _Candidate(note_id, score)
+            for note_id, score in sorted(
+                scores.items(),
+                key=lambda item: (item[1], item[0]),
+                reverse=True,
+            )
+        ][: config.RERANK_MAX_CANDIDATES]
+
+    def _docs_for_candidates(
+        self,
+        window_text: str,
+        candidates: list[_Candidate],
+    ) -> list[tuple[str, str]]:
+        docs: list[tuple[str, str]] = []
+        for candidate in candidates:
+            note = self._index.note(candidate.note_id)
+            if note is None:
+                continue
+            best_chunk = self._index.best_chunk(candidate.note_id, window_text)
+            docs.append(
+                (
+                    candidate.note_id,
+                    f"{note.title} — {note.gist}\n{best_chunk}",
+                )
+            )
+        return docs
+
+    async def _reranked_or_fallback(
+        self,
+        window_text: str,
+        docs: list[tuple[str, str]],
+        candidate_scores: dict[str, float],
+    ) -> list[tuple[str, float]]:
+        doc_ids = {note_id for note_id, _doc in docs}
+        fallback = [
+            (candidate.note_id, candidate.score)
+            for candidate in self._ordered_candidates(candidate_scores)
+            if candidate.note_id in doc_ids
+        ]
+        try:
+            reranked = await self._reranker.rerank(window_text, docs)
+        except (RerankError, TimeoutError):
+            return fallback
+
+        seen: set[str] = set()
+        ordered: list[tuple[str, float]] = []
+        for note_id, score in reranked:
+            if note_id not in doc_ids or note_id in seen:
+                continue
+            ordered.append((note_id, score))
+            seen.add(note_id)
+
+        ordered.extend((note_id, score) for note_id, score in fallback if note_id not in seen)
+        return ordered
+
+    def _apply_floor(
+        self,
+        ordered: list[tuple[str, float]],
+        dense_scores: dict[str, float],
+        bm25_note_ids: set[str],
+        graph_note_ids: set[str],
+    ) -> list[tuple[str, float]]:
+        filtered: list[tuple[str, float]] = []
+        for note_id, score in ordered:
+            has_bm25_hit = note_id in bm25_note_ids
+            has_graph_path = note_id in graph_note_ids
+            dense_score = dense_scores.get(note_id)
+            if (
+                not has_bm25_hit
+                and not has_graph_path
+                and (dense_score is None or dense_score < config.MIN_COSINE)
+            ):
+                continue
+            filtered.append((note_id, score))
+        return filtered
+
+    def _slate_item(
+        self,
+        note_id: str,
+        score: float,
+        window_text: str,
+        expansion_arrivals: dict[str, _ExpansionArrival],
+    ) -> SlateItem:
+        note = self._index.note(note_id)
+        if note is None:
+            raise ValueError(f"missing note for candidate {note_id}")
+        arrival = expansion_arrivals.get(note_id)
+        return SlateItem(
+            note_id=note_id,
+            title=note.title,
+            gist=note.gist,
+            score=score,
+            source="search",
+            heard=window_text,
+            decay=config.DECAY_SEARCH,
+            added_rev=0,
+            via_note_id=arrival.from_note_id if arrival is not None else None,
+            hop=arrival.hop if arrival is not None else None,
+        )
