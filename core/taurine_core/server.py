@@ -268,7 +268,14 @@ async def _send_events(
 async def _periodic_sync(runtime: Runtime) -> None:
     while True:
         await asyncio.sleep(config.SYNC_INTERVAL_S)
+        await run_sync_once_safely(runtime)
+
+
+async def run_sync_once_safely(runtime: Runtime) -> None:
+    try:
         await asyncio.to_thread(runtime.sync_once)
+    except Exception:
+        pass
 
 
 def _index_status(runtime: Runtime) -> IndexStatus:

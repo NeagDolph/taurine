@@ -15,7 +15,7 @@ from taurine_core.schemas import (
     IndexStatus,
     TranscriptEvent,
 )
-from taurine_core.server import Runtime, create_app, required_secrets
+from taurine_core.server import Runtime, create_app, required_secrets, run_sync_once_safely
 
 
 @dataclass
@@ -170,3 +170,29 @@ def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
 def test_required_secrets_error_names_missing_key() -> None:
     with pytest.raises(RuntimeError, match="TAURINE_ASR_TOKEN"):
         required_secrets({})
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_failure_is_nonfatal() -> None:
+    calls = 0
+
+    def failing_sync() -> SyncReport:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("notes unavailable")
+
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=failing_sync,
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+    )
+
+    await run_sync_once_safely(runtime)
+
+    assert calls == 1
