@@ -83,3 +83,16 @@ def test_best_chunk_returns_nearest_chunk_text(store, monkeypatch):
     )
 
     assert store.best_chunk("alpha", "matching query") == "matching chunk"
+
+
+def test_doc_frequency_is_case_insensitive_cached_and_quotes_punctuation(store):
+    alpha = make_note("alpha", "Alpha: Plan", "Launch alpha:plan details.")
+    beta = make_note("beta", "Beta", "Alpha only.")
+    enrich_alpha = enrichment("Alpha gist", topics=["alpha", "work"])
+    enrich_beta = enrichment("Beta gist", topics=["beta", "work"])
+    store.upsert_note(alpha, enrich_alpha, fixture_units(unit_vec(31), enrich_alpha))
+    store.upsert_note(beta, enrich_beta, fixture_units(unit_vec(32), enrich_beta))
+
+    assert store.doc_frequency("ALPHA") == 2
+    assert store.doc_frequency("alpha") == 2
+    assert store.doc_frequency("alpha:plan") == 1

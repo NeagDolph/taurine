@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any
@@ -56,12 +57,18 @@ class AmbientRetriever:
             return None
         self._last_run_at = now
 
+        salient = self._salient_query(window_text)
         dense = self._index.dense_search(window_text, config.RERANK_MAX_CANDIDATES)
+        dense_salient = (
+            self._index.dense_search(salient, config.RERANK_MAX_CANDIDATES)
+            if salient
+            else []
+        )
         bm25 = self._index.bm25_search(window_text, config.RERANK_MAX_CANDIDATES)
-        dense_scores = {note_id: score for note_id, score in dense}
+        dense_scores = self._dense_scores(dense, dense_salient)
         bm25_note_ids = {note_id for note_id, _score in bm25}
 
-        direct_scores = self._rrf_scores(dense, bm25)
+        direct_scores = self._rrf_scores(dense, dense_salient, bm25)
         candidate_scores = dict(direct_scores)
         expansion_arrivals = self._expand(candidate_scores, direct_scores)
 
@@ -70,7 +77,9 @@ class AmbientRetriever:
         if not docs:
             self._record_debug(
                 window=window_text,
+                salient=salient,
                 dense=dense,
+                dense_salient=dense_salient,
                 bm25=bm25,
                 direct_scores=direct_scores,
                 expansion_arrivals=expansion_arrivals,
@@ -122,7 +131,9 @@ class AmbientRetriever:
         ]
         self._record_debug(
             window=window_text,
+            salient=salient,
             dense=dense,
+            dense_salient=dense_salient,
             bm25=bm25,
             direct_scores=direct_scores,
             expansion_arrivals=expansion_arrivals,
@@ -136,15 +147,54 @@ class AmbientRetriever:
 
     def _rrf_scores(
         self,
-        dense: list[tuple[str, float]],
-        bm25: list[tuple[str, float]],
+        *ranked_lists: list[tuple[str, float]],
     ) -> dict[str, float]:
         scores: dict[str, float] = {}
-        for rows in (dense, bm25):
+        for rows in ranked_lists:
             for rank, (note_id, _score) in enumerate(rows, start=1):
                 scores[note_id] = scores.get(note_id, 0.0) + (
                     1.0 / (config.RRF_K + rank)
                 )
+        return scores
+
+    def _salient_query(self, window_text: str) -> str | None:
+        seen: set[str] = set()
+        terms: list[tuple[int, str]] = []
+        for index, term in enumerate(re.findall(r"[a-z0-9]+", window_text.lower())):
+            if (
+                len(term) < config.SALIENT_MIN_TERM_LEN
+                or term in config.ALIAS_STOPWORDS
+                or term in seen
+            ):
+                continue
+            seen.add(term)
+            terms.append((index, term))
+
+        if not terms:
+            return None
+
+        scored = [
+            (1.0 / (1 + self._index.doc_frequency(term)), index, term)
+            for index, term in terms
+        ]
+        selected = {
+            term
+            for _score, _index, term in sorted(
+                scored,
+                key=lambda item: (-item[0], item[1]),
+            )[: config.SALIENT_TERMS]
+        }
+        query = " ".join(term for _index, term in terms if term in selected)
+        return query or None
+
+    @staticmethod
+    def _dense_scores(
+        dense: list[tuple[str, float]],
+        dense_salient: list[tuple[str, float]],
+    ) -> dict[str, float]:
+        scores: dict[str, float] = {}
+        for note_id, score in [*dense, *dense_salient]:
+            scores[note_id] = max(scores.get(note_id, float("-inf")), score)
         return scores
 
     def _expand(
@@ -276,7 +326,9 @@ class AmbientRetriever:
         self,
         *,
         window: str,
+        salient: str | None,
         dense: list[tuple[str, float]],
+        dense_salient: list[tuple[str, float]],
         bm25: list[tuple[str, float]],
         direct_scores: dict[str, float],
         expansion_arrivals: dict[str, _ExpansionArrival],
@@ -288,7 +340,9 @@ class AmbientRetriever:
     ) -> None:
         debug = {
             "window": window,
+            "salient": salient,
             "dense": _rows(dense),
+            "dense_salient": _rows(dense_salient),
             "bm25": _rows(bm25),
             "fused": _rows(
                 [

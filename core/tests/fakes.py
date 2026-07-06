@@ -24,6 +24,7 @@ class FakeIndex:
     links: dict[str, list[tuple[str, float]]] = field(default_factory=dict)
     alias_rows: list[tuple[str, str, bool]] = field(default_factory=list)
     chunks: dict[str, str] = field(default_factory=dict)
+    doc_frequencies: dict[str, int] = field(default_factory=dict)
 
     def dense_search(self, text: str, k: int) -> list[tuple[str, float]]:
         return self.dense[:k]
@@ -42,6 +43,9 @@ class FakeIndex:
 
     def aliases(self) -> list[tuple[str, str, bool]]:
         return self.alias_rows
+
+    def doc_frequency(self, term: str) -> int:
+        return self.doc_frequencies.get(term.lower(), 0)
 
     def graph(self) -> GraphResponse:
         return GraphResponse(nodes=[], edges=[])

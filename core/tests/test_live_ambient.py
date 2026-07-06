@@ -50,6 +50,22 @@ class RecordingReranker(OkReranker):
         return await super().rerank(query, docs)
 
 
+class QueryAwareIndex(FakeIndex):
+    def __init__(
+        self,
+        *,
+        dense_by_query: dict[str, list[tuple[str, float]]],
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.dense_by_query = dense_by_query
+        self.dense_queries: list[str] = []
+
+    def dense_search(self, text: str, k: int) -> list[tuple[str, float]]:
+        self.dense_queries.append(text)
+        return self.dense_by_query.get(text, [])[:k]
+
+
 @pytest.fixture
 def ok_reranker() -> OkReranker:
     return OkReranker()
@@ -103,7 +119,7 @@ async def test_expanded_neighbor_joins_pool_with_decayed_score(
     assert res is not None
     exp = [e for e in res.expansions if e.note_id == "neighbor"]
     assert exp and exp[0].hop == 1 and exp[0].from_note_id == "seed"
-    assert exp[0].score == pytest.approx((1 / (config.RRF_K + 1)) * 0.8 * config.HOP_DECAY)
+    assert exp[0].score == pytest.approx((2 / (config.RRF_K + 1)) * 0.8 * config.HOP_DECAY)
     assert [
         (item.note_id, item.via_note_id, item.hop)
         for item in r.last_slate_adds
@@ -230,17 +246,19 @@ async def test_debug_callback_reports_one_c2_pass_with_internal_rows() -> None:
     assert len(debug_records) == 1
     debug = debug_records[0]
     assert debug["window"] == "seed topic"
+    assert debug["salient"] == "seed topic"
     assert debug["dense"] == [["seed", 0.9], ["low", 0.1]]
+    assert debug["dense_salient"] == [["seed", 0.9], ["low", 0.1]]
     assert debug["bm25"] == [["seed", 5.0]]
     assert debug["fused"] == [
-        ["seed", pytest.approx((1 / (config.RRF_K + 1)) * 2)],
-        ["low", pytest.approx(1 / (config.RRF_K + 2))],
+        ["seed", pytest.approx((1 / (config.RRF_K + 1)) * 3)],
+        ["low", pytest.approx(2 / (config.RRF_K + 2))],
     ]
     assert debug["expansions"] == [
         {
             "from": "seed",
             "to": "expanded",
-            "score": pytest.approx((1 / (config.RRF_K + 1)) * 2 * 0.8 * config.HOP_DECAY),
+            "score": pytest.approx((1 / (config.RRF_K + 1)) * 3 * 0.8 * config.HOP_DECAY),
         }
     ]
     assert debug["rerank_used"] is True
@@ -248,3 +266,55 @@ async def test_debug_callback_reports_one_c2_pass_with_internal_rows() -> None:
     assert debug["ordered"][:3] == [["low", 0.99], ["seed", 0.7], ["expanded", 0.6]]
     assert debug["floor_dropped"] == ["low"]
     assert debug["slate_adds"] == ["seed", "expanded"]
+
+
+async def test_salient_query_uses_rare_terms_and_dense_salient_joins_rrf() -> None:
+    window = "alpha beta gamma delta epsilon zeta theta"
+    salient = "beta gamma delta epsilon zeta theta"
+    index = QueryAwareIndex(
+        notes={
+            "window": note("window", "Window Note"),
+            "salient": note("salient", "Salient Note"),
+            "bm": note("bm", "BM Note"),
+        },
+        dense_by_query={
+            window: [("window", 0.9)],
+            salient: [("salient", 0.88), ("window", 0.5)],
+        },
+        bm25=[("bm", 5.0)],
+        chunks={
+            "window": "window chunk",
+            "salient": "salient chunk",
+            "bm": "bm chunk",
+        },
+        doc_frequencies={
+            "alpha": 10,
+            "beta": 0,
+            "gamma": 1,
+            "delta": 0,
+            "epsilon": 2,
+            "zeta": 3,
+            "theta": 0,
+        },
+    )
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker({"salient": 0.99, "window": 0.8, "bm": 0.7}),
+        FakeClock(),
+        on_debug=debug_records.append,
+    ).on_window(window)
+
+    assert res is not None
+    assert index.dense_queries == [window, salient]
+    assert [hit.note_id for hit in res.hits] == ["salient", "window", "bm"]
+    debug = debug_records[0]
+    assert debug["salient"] == salient
+    assert debug["dense"] == [["window", 0.9]]
+    assert debug["dense_salient"] == [["salient", 0.88], ["window", 0.5]]
+    assert debug["fused"] == [
+        ["window", pytest.approx((1 / (config.RRF_K + 1)) + (1 / (config.RRF_K + 2)))],
+        ["salient", pytest.approx(1 / (config.RRF_K + 1))],
+        ["bm", pytest.approx(1 / (config.RRF_K + 1))],
+    ]

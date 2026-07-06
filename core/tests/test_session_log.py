@@ -14,7 +14,9 @@ def test_session_logger_writes_jsonl_records_and_session_end(tmp_path) -> None:
         trigger_id="abc123",
         seqs=[1],
         window="hello",
+        salient="hello",
         dense=[["n1", 0.9]],
+        dense_salient=[["n1", 0.8]],
         bm25=[],
         fused=[["n1", 0.016]],
         expansions=[{"from": "n1", "to": "n2", "score": 0.4}],
@@ -59,6 +61,8 @@ def test_session_logger_writes_jsonl_records_and_session_end(tmp_path) -> None:
         "final": True,
     }
     assert records[1]["trigger_id"] == "abc123"
+    assert records[1]["salient"] == "hello"
+    assert records[1]["dense_salient"] == [["n1", 0.8]]
     assert records[2]["op"] == "add"
     assert records[3]["reason"] == "debounce"
     assert records[4]["picks"] == []

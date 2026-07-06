@@ -33,6 +33,7 @@ class Index:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._embedding_rows: list[tuple[int, str, EmbeddingKind, str]] = []
         self._matrix = np.empty((0, config.EMBED_DIM), dtype=np.float32)
+        self._doc_frequency_cache: dict[str, int] = {}
         self._init_schema()
         self.load()
 
@@ -116,6 +117,7 @@ class Index:
                 (stored.note_id, stored.content_hash, enrichment.model_dump_json()),
             )
             self._set_last_sync(time.time())
+        self._doc_frequency_cache.clear()
         self.load()
 
     def delete_note(self, note_id: str) -> None:
@@ -129,6 +131,7 @@ class Index:
                 (note_id, note_id),
             )
             self._set_last_sync(time.time())
+        self._doc_frequency_cache.clear()
         self.load()
 
     def cache_enrichment(
@@ -268,6 +271,31 @@ class Index:
             (row["alias_lowercase"], row["note_id"], bool(row["is_title"]))
             for row in rows
         ]
+
+    def doc_frequency(self, term: str) -> int:
+        key = term.strip().lower()
+        if not key:
+            return 0
+        cached = self._doc_frequency_cache.get(key)
+        if cached is not None:
+            return cached
+        escaped = key.replace('"', '""')
+        query = f'"{escaped}"'
+        try:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(DISTINCT note_id) AS count
+                FROM notes_fts
+                WHERE notes_fts MATCH ?
+                """,
+                (query,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            count = 0
+        else:
+            count = int(row["count"]) if row is not None else 0
+        self._doc_frequency_cache[key] = count
+        return count
 
     def graph(self) -> GraphResponse:
         degree: dict[str, int] = defaultdict(int)
