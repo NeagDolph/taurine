@@ -230,27 +230,28 @@ export function MapView({
       if (flashOpacity > 0) {
         ctx.beginPath()
         ctx.arc(x, y, radius + 7, 0, Math.PI * 2)
-        ctx.strokeStyle = rgba('#f7f4c5', flashOpacity * 0.72)
+        ctx.strokeStyle = rgba('#ffe08a', flashOpacity * 0.78)
         ctx.lineWidth = Math.max(1.4 / globalScale, 1)
         ctx.stroke()
       }
 
       if (isPinned) {
+        // yellow ring for pinned notes
         ctx.beginPath()
         ctx.arc(x, y, radius + 5, 0, Math.PI * 2)
-        ctx.strokeStyle = 'rgba(157, 226, 192, 0.92)'
+        ctx.strokeStyle = 'rgba(245, 197, 24, 0.95)'
         ctx.lineWidth = Math.max(2 / globalScale, 1.2)
         ctx.stroke()
       }
 
       ctx.beginPath()
       ctx.arc(x, y, radius, 0, Math.PI * 2)
-      ctx.fillStyle = isNow ? '#ffd166' : '#92a4b0'
+      ctx.fillStyle = isNow ? '#f5c518' : '#6b7480'
       ctx.fill()
 
       ctx.beginPath()
       ctx.arc(x, y, Math.max(2.4, radius * 0.32), 0, Math.PI * 2)
-      ctx.fillStyle = isNow ? '#38270f' : '#10151a'
+      ctx.fillStyle = isNow ? '#231b06' : '#0b0b0c'
       ctx.fill()
 
       const label = isNow ? nowLabel : node.title
@@ -277,7 +278,7 @@ export function MapView({
       ctx.beginPath()
       ctx.moveTo(source.x, source.y)
       ctx.lineTo(target.x, target.y)
-      ctx.strokeStyle = isStatic ? `rgba(138, 160, 171, ${opacity})` : rgba(link.color, opacity)
+      ctx.strokeStyle = isStatic ? `rgba(108, 116, 128, ${opacity})` : rgba(link.color, opacity)
       ctx.lineWidth = isStatic
         ? Math.max(0.75 / globalScale, 0.35)
         : Math.max((link.kind === 'rank' ? 2.6 : 1.8) / globalScale, 0.8)
@@ -294,11 +295,14 @@ export function MapView({
     []
   )
 
+  const noteCount = Math.max(0, baseGraph.nodes.length - 1)
   const overlayText = error
     ? error
     : isLoading
-      ? 'Loading map'
-      : `${Math.max(0, baseGraph.nodes.length - 1)} notes / ${baseGraph.links.length} links`
+      ? 'Loading map…'
+      : noteCount === 0
+        ? 'No notes indexed'
+        : `${noteCount} notes · ${baseGraph.links.length} links`
 
   return (
     <section
@@ -306,19 +310,11 @@ export function MapView({
       aria-label="Map view"
       className="map-view"
       ref={containerRef}
-      style={{
-        background: '#0b0f14',
-        height: '100%',
-        minHeight: 300,
-        overflow: 'hidden',
-        position: 'relative',
-        width: '100%'
-      }}
     >
       <ForceGraph2D<MapNode, MapLink>
         ref={graphRef}
         autoPauseRedraw={!visible}
-        backgroundColor="#0b0f14"
+        backgroundColor="#0b0b0c"
         cooldownTicks={80}
         d3AlphaDecay={0.025}
         d3VelocityDecay={0.34}
@@ -343,22 +339,25 @@ export function MapView({
       <div
         aria-live="polite"
         role={error ? 'alert' : 'status'}
-        style={{
-          background: error ? 'rgba(89, 39, 39, 0.88)' : 'rgba(11, 15, 20, 0.72)',
-          border: '1px solid rgba(177, 190, 196, 0.14)',
-          borderRadius: 999,
-          color: error ? '#ffc7c2' : 'rgba(225, 232, 224, 0.76)',
-          fontSize: 12,
-          fontWeight: 750,
-          left: 12,
-          lineHeight: 1,
-          padding: '7px 10px',
-          pointerEvents: 'none',
-          position: 'absolute',
-          top: 12
-        }}
+        className={`map-overlay-chip${error ? ' map-overlay-error' : ''}`}
       >
         {overlayText}
+      </div>
+
+      <div className="map-legend" aria-label="Map legend">
+        <span className="map-legend-title">Legend</span>
+        <span className="map-legend-row">
+          <span className="map-legend-gradient" aria-hidden="true" />
+          rank hot → cold
+        </span>
+        <span className="map-legend-row">
+          <span className="map-legend-dash" aria-hidden="true" />
+          hop expansion
+        </span>
+        <span className="map-legend-row">
+          <span className="map-legend-ring" aria-hidden="true" />
+          pinned note
+        </span>
       </div>
     </section>
   )
@@ -403,11 +402,11 @@ function drawNodeLabel(
   const paddingY = 2 / globalScale
   const height = fontSize + paddingY * 2
 
-  ctx.fillStyle = isNow ? 'rgba(33, 23, 9, 0.82)' : 'rgba(11, 15, 20, 0.66)'
+  ctx.fillStyle = isNow ? 'rgba(35, 27, 6, 0.86)' : 'rgba(11, 11, 12, 0.72)'
   roundedRect(ctx, x - width / 2 - paddingX, y, width + paddingX * 2, height, 4 / globalScale)
   ctx.fill()
 
-  ctx.fillStyle = isNow ? '#fff6d3' : 'rgba(241, 245, 240, 0.82)'
+  ctx.fillStyle = isNow ? '#ffe9a6' : 'rgba(226, 224, 218, 0.82)'
   ctx.fillText(text, x, y + paddingY)
 }
 
@@ -432,7 +431,7 @@ function drawHopLabel(
   const paddingY = 2 / globalScale
   const height = fontSize + paddingY * 2
 
-  ctx.fillStyle = `rgba(10, 13, 18, ${Math.min(0.84, opacity + 0.18)})`
+  ctx.fillStyle = `rgba(11, 11, 12, ${Math.min(0.86, opacity + 0.18)})`
   roundedRect(
     ctx,
     x - width / 2 - paddingX,
@@ -443,7 +442,7 @@ function drawHopLabel(
   )
   ctx.fill()
 
-  ctx.fillStyle = rgba('#f0c888', Math.min(0.95, opacity + 0.28))
+  ctx.fillStyle = rgba('#e5b23c', Math.min(0.95, opacity + 0.28))
   ctx.fillText(text, x, y)
 }
 
