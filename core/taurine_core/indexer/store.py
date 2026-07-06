@@ -108,6 +108,13 @@ class Index:
             self._conn.execute("DELETE FROM embeddings WHERE note_id = ?", (stored.note_id,))
             for kind, text, vector in embedding_units:
                 self._insert_embedding(stored.note_id, kind, text, vector)
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO enrich_cache(note_id, content_hash, enrichment_json)
+                VALUES (?, ?, ?)
+                """,
+                (stored.note_id, stored.content_hash, enrichment.model_dump_json()),
+            )
             self._set_last_sync(time.time())
         self.load()
 
