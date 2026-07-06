@@ -51,6 +51,11 @@ class ExactCollector:
             return None
 
         compact_len = len(alias.replace(" ", ""))
+        if compact_len < config.ALIAS_MIN_COMPACT_LEN:
+            return None
+        words = alias.split()
+        if words and all(word in config.ALIAS_STOPWORDS for word in words):
+            return None
         needs_boundary = compact_len < config.ALIAS_WORD_BOUNDARY_UNDER
         pattern = (
             re.compile(rf"(?<!\w){re.escape(alias)}(?!\w)")

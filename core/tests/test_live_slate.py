@@ -168,3 +168,25 @@ def test_slate_on_event_reports_quota_evictions(clock: FakeClock) -> None:
             },
         )
     ]
+
+
+def test_mark_shown_blocks_readd_and_emits_shown_drop(clock: FakeClock) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    slate = Slate(clock=clock, on_event=lambda op, payload: events.append((op, payload)))
+
+    slate.mark_shown("n1")
+    slate.add(item("n1", source="search"))
+
+    assert slate.items() == []
+    assert slate.shown == {"n1"}
+    assert events == [
+        (
+            "shown_drop",
+            {
+                "note_id": "n1",
+                "source": "search",
+                "reason": "shown",
+                "revision": 0,
+            },
+        )
+    ]

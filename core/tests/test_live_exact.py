@@ -28,12 +28,12 @@ def test_aliases_are_normalized_for_punctuation_and_case() -> None:
 
 
 def test_short_alias_requires_word_boundary_match() -> None:
-    index = FakeIndex(alias_rows=[("Q3", "q3", True)])
+    index = FakeIndex(alias_rows=[("Q3A", "q3a", True)])
     collector = ExactCollector(index)
 
-    assert collector.on_chunk(chunk("q3 planning")) == [("q3", "q3", True)]
-    assert collector.on_chunk(chunk("xq3 planning")) == []
-    assert collector.on_chunk(chunk("q30 planning")) == []
+    assert collector.on_chunk(chunk("q3a planning")) == [("q3a", "q3a", True)]
+    assert collector.on_chunk(chunk("xq3a planning")) == []
+    assert collector.on_chunk(chunk("q3alpha planning")) == []
 
 
 def test_long_alias_allows_normalized_substring_match() -> None:
@@ -50,3 +50,25 @@ def test_empty_or_whitespace_aliases_are_ignored() -> None:
     collector = ExactCollector(index)
 
     assert collector.on_chunk(chunk("the deck is ready")) == [("deck", "deck", False)]
+
+
+def test_short_and_all_stopword_aliases_are_filtered() -> None:
+    index = FakeIndex(
+        alias_rows=[
+            ("me", "me", True),
+            ("note", "note", True),
+            ("New Note", "new-note", True),
+            ("Sunil", "sunil", True),
+            ("Ashish Parik", "ashish", False),
+            ("note to sunil", "note-to-sunil", False),
+        ]
+    )
+    collector = ExactCollector(index)
+
+    hits = collector.on_chunk(chunk("me note new note sunil ashish parik note to sunil"))
+
+    assert hits == [
+        ("sunil", "sunil", True),
+        ("ashish", "ashish parik", False),
+        ("note-to-sunil", "note to sunil", False),
+    ]

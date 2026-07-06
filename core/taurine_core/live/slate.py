@@ -30,8 +30,18 @@ class Slate:
         self._on_event = on_event
         self._items: dict[str, SlateItem] = {}
         self._suppressed_until: dict[str, float] = {}
+        self.shown: set[str] = set()
 
     def add(self, item: SlateItem) -> None:
+        if item.note_id in self.shown:
+            self._emit_event(
+                "shown_drop",
+                note_id=item.note_id,
+                source=item.source,
+                reason="shown",
+            )
+            return
+
         suppressed_until = self._suppressed_until.get(item.note_id)
         if suppressed_until is not None:
             if self._clock.now() < suppressed_until:
@@ -66,6 +76,9 @@ class Slate:
         del self._items[note_id]
         self.revision += 1
         self._emit_event("kick", note_id=note_id, source=item.source, reason=reason)
+
+    def mark_shown(self, note_id: str) -> None:
+        self.shown.add(note_id)
 
     def dismiss(self, note_id: str, now: float) -> None:
         self._suppressed_until[note_id] = now + config.SUPPRESS_S
