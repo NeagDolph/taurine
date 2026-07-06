@@ -32,6 +32,10 @@ class IndexPort(Protocol):
         """[(alias_lowercase, note_id, is_title)] for C1."""
         ...
 
+    def doc_frequency(self, term: str) -> int:
+        """Number of notes containing the term (for salient-query rarity scoring)."""
+        ...
+
     def graph(self) -> GraphResponse:
         ...
 

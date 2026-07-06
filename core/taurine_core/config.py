@@ -15,11 +15,12 @@ EMBED_DIM = 384
 CHUNK_MAX_TOKENS = 300                   # sentence-boundary chunking
 
 # ── LLM (ALL calls via OpenRouter) ─────────────────────────────────────
+# demo-first: gemini-3.5-flash is pricier but much faster than deepseek
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-ENRICH_MODEL = "deepseek/deepseek-chat"
-PRESENTER_MODEL = "deepseek/deepseek-chat"
-PRESENTER_FALLBACK_MODEL = "google/gemini-2.5-flash"
-LLM_TIMEOUT_S = 25.0
+ENRICH_MODEL = "google/gemini-3.5-flash"
+PRESENTER_MODEL = "google/gemini-3.5-flash"
+PRESENTER_FALLBACK_MODEL = "deepseek/deepseek-chat"
+LLM_TIMEOUT_S = 15.0
 
 # ── notes sync ─────────────────────────────────────────────────────────
 SYNC_INTERVAL_S = 300.0
@@ -45,6 +46,21 @@ MIN_COSINE = 0.35                        # floor only when no BM25 hit AND no gr
 
 # ── C1 exact collector ─────────────────────────────────────────────────
 ALIAS_WORD_BOUNDARY_UNDER = 4            # aliases shorter than this need word-boundary match
+ALIAS_MIN_COMPACT_LEN = 3                # aliases shorter than this (spaces stripped) are dropped
+# aliases that are generic english/note words trigger constantly in speech —
+# dropped at alias-table build regardless of source
+ALIAS_STOPWORDS = frozenset(
+    """a an and are as at be but by for from had has have he her his i if in is it its me my
+    no not of on or our she so that the their them they this to was we what when where which
+    who will with you your yes yeah okay ok right well just like really actually
+    note notes new list lists todo todos task tasks work stuff things idea ideas item items
+    untitled misc random daily journal draft drafts meeting call chat talk plan plans
+    """.split()
+)
+
+# ── C2 salient-query formulation ───────────────────────────────────────
+SALIENT_TERMS = 6                        # top rare window terms forming the salient query
+SALIENT_MIN_TERM_LEN = 3
 
 # ── slate ──────────────────────────────────────────────────────────────
 QUOTA_EXACT = 3
