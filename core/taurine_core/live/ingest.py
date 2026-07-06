@@ -47,6 +47,7 @@ class PresenterLike(Protocol):
         via_titles: dict[str, str],
         *,
         revision: int | None = None,
+        partials: dict[int, str] | None = None,
     ) -> list[Pick]:
         ...
 
@@ -85,6 +86,8 @@ class LiveSession:
         self._clock = clock or _SystemClock()
         self._logger = logger or NullSessionLogger()
         self._transcript: list[Chunk] = []
+        self._partials: dict[int, str] = {}
+        self._c1_segment_seen: dict[int, set[str]] = {}
         self._pinned: list[Card] = []
         self._next_seq = 1
 
@@ -108,10 +111,16 @@ class LiveSession:
             )
         )
         if not chunk.final:
+            self._partials[chunk.channel] = chunk.text
+            await self._run_c1(chunk)
+            await self._run_c2()
+            await self._run_presenter()
             return
 
+        self._partials.pop(chunk.channel, None)
         self._transcript.append(chunk)
         await self._run_c1(chunk)
+        self._c1_segment_seen.pop(chunk.channel, None)
         await self._run_c2()
         await self._run_presenter()
 
@@ -133,16 +142,25 @@ class LiveSession:
     async def _run_c1(self, chunk: Chunk) -> None:
         before_revision = self._slate.revision
         now = self._clock.now()
+        segment_seen = self._c1_segment_seen.setdefault(chunk.channel, set())
+        seqs = [chunk.seq] if chunk.final else []
         for note_id, alias, is_title in self._exact.on_chunk(chunk):
+            if note_id in segment_seen:
+                continue
+            segment_seen.add(note_id)
             note = self._index.note(note_id)
             if note is None:
                 continue
-            if is_title and self._cadence.instant_pin_allowed(now=now):
+            if (
+                is_title
+                and note_id not in self._slate.shown
+                and self._cadence.instant_pin_allowed(now=now)
+            ):
                 await self._emit_trigger(
                     TriggerEvent(
                         trigger_id=_trigger_id(),
                         kind="exact",
-                        seqs=[chunk.seq],
+                        seqs=seqs,
                         span=alias,
                         matches=[
                             TriggerMatch(
@@ -194,7 +212,7 @@ class LiveSession:
                 TriggerEvent(
                     trigger_id=_trigger_id(),
                     kind="exact",
-                    seqs=[chunk.seq],
+                    seqs=seqs,
                     span=alias,
                     matches=[
                         TriggerMatch(
@@ -219,7 +237,7 @@ class LiveSession:
 
     async def _run_c2(self) -> None:
         window_chunks = self._window_chunks()
-        window_text = self._window_text(window_chunks)
+        window_text = self._window_text(window_chunks, self._active_partials())
         if not window_text:
             return
 
@@ -283,6 +301,7 @@ class LiveSession:
             prompted_items,
             self._via_titles(prompted_items),
             revision=attempt_revision,
+            partials=self._active_partials() or None,
         )
 
         self._slate.mark_viewed([item.note_id for item in prompted_items])
@@ -298,7 +317,8 @@ class LiveSession:
             item = item_by_id.get(pick.note_id)
             if item is None:
                 continue
-            await self._pin(_card_from_pick(pick, item))
+            if not await self._pin(_card_from_pick(pick, item)):
+                continue
             self._slate.kick(item.note_id, "pinned")
             self._cadence.note_promotion(now=now)
             promoted += 1
@@ -307,7 +327,11 @@ class LiveSession:
             self._cadence.note_empty(attempt_revision, now=now)
         await self._emit_ambient_if_changed(before_revision)
 
-    async def _pin(self, card: Card) -> None:
+    async def _pin(self, card: Card) -> bool:
+        if card.note_id in self._slate.shown:
+            return False
+        self._slate.mark_shown(card.note_id)
+        self._slate.kick(card.note_id, "pinned")
         duplicate_ids = [
             existing.card_id for existing in self._pinned if existing.note_id == card.note_id
         ]
@@ -331,6 +355,7 @@ class LiveSession:
             displaced = self._pinned.pop()
             self._logger.log("unpin", card_id=displaced.card_id, reason="displaced")
             await self._emit_event(UnpinEvent(card_id=displaced.card_id))
+        return True
 
     async def _emit_ambient_if_changed(self, before_revision: int) -> None:
         if self._slate.revision == before_revision:
@@ -352,8 +377,17 @@ class LiveSession:
     def _window_chunks(self) -> list[Chunk]:
         return self._transcript[-config.C2_WINDOW_CHUNKS :]
 
-    def _window_text(self, chunks: list[Chunk]) -> str:
-        return " ".join(chunk.text for chunk in chunks).strip()
+    def _window_text(self, chunks: list[Chunk], partials: dict[int, str]) -> str:
+        parts = [chunk.text for chunk in chunks]
+        parts.extend(text for _channel, text in sorted(partials.items()))
+        return " ".join(parts).strip()
+
+    def _active_partials(self) -> dict[int, str]:
+        return {
+            channel: text.strip()
+            for channel, text in self._partials.items()
+            if text.strip()
+        }
 
     def _via_titles(self, items: list[SlateItem]) -> dict[str, str]:
         titles: dict[str, str] = {}
@@ -415,7 +449,9 @@ class LiveSession:
         if not debug:
             debug = {
                 "window": result.heard,
+                "salient": None,
                 "dense": [],
+                "dense_salient": [],
                 "bm25": [],
                 "fused": [],
                 "expansions": [

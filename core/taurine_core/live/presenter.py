@@ -31,6 +31,7 @@ class Presenter:
         via_titles: dict[str, str] | None = None,
         *,
         revision: int | None = None,
+        partials: dict[int, str] | None = None,
     ) -> list[Pick]:
         started = time.monotonic()
         raw_response: dict[str, Any] | None = None
@@ -49,7 +50,7 @@ class Presenter:
             )
             return []
 
-        user_prompt = _build_user_prompt(transcript, slate, via_titles or {})
+        user_prompt = _build_user_prompt(transcript, slate, via_titles or {}, partials)
         try:
             raw_response = await self._llm.complete_json(
                 config.PRESENTER_MODEL,
@@ -105,9 +106,15 @@ def _build_user_prompt(
     transcript: list[Chunk],
     slate: list[SlateItem],
     via_titles: dict[str, str],
+    partials: dict[int, str] | None = None,
 ) -> str:
     recent = transcript[-config.PRESENTER_TRANSCRIPT_CHUNKS :]
     transcript_lines = [f"channel {chunk.channel}: {chunk.text}" for chunk in recent]
+    transcript_lines.extend(
+        f"channel {channel} (in progress): {text}"
+        for channel, text in sorted((partials or {}).items())
+        if text.strip()
+    )
     slate_lines = [_slate_line(item, via_titles) for item in slate]
     return "\n".join(
         [

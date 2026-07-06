@@ -122,6 +122,25 @@ async def test_presenter_prompt_contains_current_slate_and_recent_transcript_dat
 
 
 @pytest.mark.asyncio
+async def test_presenter_prompt_includes_partials_after_recent_finals() -> None:
+    llm = FakeLLM([{"picks": []}])
+    presenter = Presenter(llm)
+
+    await presenter.present(
+        [Chunk(channel=0, text="final words", ts=1.0, final=True, seq=1)],
+        [slate_item("n1")],
+        partials={2: "second channel partial", 0: "mic partial"},
+    )
+
+    _model, _system, user = llm.calls[0]
+    final_pos = user.index("channel 0: final words")
+    mic_partial_pos = user.index("channel 0 (in progress): mic partial")
+    channel_two_pos = user.index("channel 2 (in progress): second channel partial")
+    slate_pos = user.index("<slate>")
+    assert final_pos < mic_partial_pos < channel_two_pos < slate_pos
+
+
+@pytest.mark.asyncio
 async def test_presenter_on_log_records_success_payload() -> None:
     log_records: list[dict[str, Any]] = []
     llm = FakeLLM([{"picks": [{"note_id": "n1", "why": "useful now"}]}])

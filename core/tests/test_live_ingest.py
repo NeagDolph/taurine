@@ -82,7 +82,7 @@ class RecordingCadence:
 @dataclass
 class StaticPresenter:
     picks: list[Pick]
-    calls: list[tuple[list[Chunk], list[SlateItem], dict[str, str]]] = field(default_factory=list)
+    calls: list[tuple[list[Chunk], list[SlateItem], dict[str, str], dict[int, str] | None]] = field(default_factory=list)
 
     async def present(
         self,
@@ -91,9 +91,10 @@ class StaticPresenter:
         via_titles: dict[str, str],
         *,
         revision: int | None = None,
+        partials: dict[int, str] | None = None,
     ) -> list[Pick]:
         del revision
-        self.calls.append((transcript, slate, via_titles))
+        self.calls.append((transcript, slate, via_titles, partials))
         return self.picks
 
 
@@ -110,6 +111,10 @@ class RecordingLogger:
 
 def chunk(text: str, ts: float = 1000.0) -> Chunk:
     return Chunk(channel=0, text=text, ts=ts, final=True)
+
+
+def interim(text: str, ts: float = 1000.0, channel: int = 0) -> Chunk:
+    return Chunk(channel=channel, text=text, ts=ts, final=False)
 
 
 def session_with(
@@ -189,11 +194,14 @@ async def test_transcript_seq_and_c1_trigger_events_cover_pin_slate_and_none() -
         clock=clock,
         slate=preloaded_slate,
         exact=SequenceExact(
-            [[
-                ("pinned", "pinned title", True),
-                ("slated", "slated alias", False),
-                ("suppressed", "suppressed alias", False),
-            ]]
+            [
+                [],
+                [
+                    ("pinned", "pinned title", True),
+                    ("slated", "slated alias", False),
+                    ("suppressed", "suppressed alias", False),
+                ],
+            ]
         ),
         cadence=RecordingCadence(instant_allowed=True, may_present_allowed=False),
     )
@@ -330,6 +338,122 @@ async def test_c2_trigger_event_action_none_when_no_slate_add_survives() -> None
 
 
 @pytest.mark.asyncio
+async def test_interim_c1_fires_once_per_segment_and_resets_after_final() -> None:
+    clock = FakeClock()
+    logger = RecordingLogger()
+    index = FakeIndex(notes={"roadmap": note("roadmap", "Roadmap Note", "Roadmap gist")})
+    session, events = session_with(
+        index=index,
+        clock=clock,
+        exact=SequenceExact(
+            [
+                [("roadmap", "roadmap", False)],
+                [("roadmap", "roadmap", False)],
+                [("roadmap", "roadmap", False)],
+            ]
+        ),
+        cadence=RecordingCadence(may_present_allowed=False),
+        logger=logger,
+    )
+
+    await session.on_chunk(interim("roadmap is coming together", ts=10.0))
+    await session.on_chunk(chunk("roadmap is coming together", ts=11.0))
+    await session.on_chunk(interim("roadmap follow-up", ts=12.0))
+
+    transcripts = [event for event in events if event.type == "transcript"]
+    assert [(event.final, event.seq) for event in transcripts] == [(False, 0), (True, 1), (False, 0)]
+
+    triggers = [event for event in events if event.type == "trigger"]
+    assert [(event.kind, event.seqs, event.span, event.matches[0].note_id) for event in triggers] == [
+        ("exact", [], "roadmap", "roadmap"),
+        ("exact", [], "roadmap", "roadmap"),
+    ]
+    assert [payload["seq"] for kind, payload in logger.records if kind == "c1_hit"] == [0, 0]
+
+
+@pytest.mark.asyncio
+async def test_c2_window_appends_partials_and_fires_on_interim_with_final_seqs_only() -> None:
+    clock = FakeClock()
+    index = FakeIndex(notes={"direct": note("direct", "Direct Note", "Direct gist")})
+    result = RetrievalResult(
+        heard="final context partial insight",
+        hits=[Hit(note_id="direct", rank=1, score=0.91)],
+        expansions=[],
+    )
+    ambient = SequenceAmbient(
+        results=[None, result],
+        slate_add_sequences=[
+            [],
+            [
+                SlateItem(
+                    note_id="direct",
+                    title="Direct Note",
+                    gist="Direct gist",
+                    score=0.91,
+                    source="search",
+                    heard="final context partial insight",
+                    decay=config.DECAY_SEARCH,
+                    added_rev=0,
+                )
+            ],
+        ],
+    )
+    session, events = session_with(
+        index=index,
+        clock=clock,
+        exact=SequenceExact([[], []]),
+        cadence=RecordingCadence(may_present_allowed=False),
+        ambient=ambient,
+    )
+
+    await session.on_chunk(chunk("final context", ts=10.0))
+    await session.on_chunk(interim("partial insight", ts=11.0))
+
+    assert ambient.windows == ["final context", "final context partial insight"]
+    [trigger] = [event for event in events if event.type == "trigger"]
+    [retrieval] = [event for event in events if event.type == "retrieval"]
+    assert trigger.seqs == [1]
+    assert retrieval.seqs == [1]
+    assert trigger.span == "final context partial insight"
+
+
+@pytest.mark.asyncio
+async def test_presenter_receives_current_partials_on_interim_attempt() -> None:
+    clock = FakeClock()
+    index = FakeIndex(notes={"roadmap": note("roadmap", "Roadmap Note", "Roadmap gist")})
+    slate = Slate(clock)
+    slate.add(
+        SlateItem(
+            note_id="roadmap",
+            title="Roadmap Note",
+            gist="Roadmap gist",
+            score=0.8,
+            source="search",
+            heard="previous",
+            decay=config.DECAY_SEARCH,
+            added_rev=0,
+        )
+    )
+    presenter = StaticPresenter([])
+    session, _events = session_with(
+        index=index,
+        clock=clock,
+        slate=slate,
+        exact=SequenceExact([[]]),
+        cadence=RecordingCadence(may_present_allowed=True),
+        presenter=presenter,
+    )
+
+    await session.on_chunk(interim("still describing the roadmap", ts=10.0))
+
+    assert len(presenter.calls) == 1
+    transcript, prompted, _via_titles, partials = presenter.calls[0]
+    assert transcript == []
+    assert [item.note_id for item in prompted] == ["roadmap"]
+    assert partials == {0: "still describing the roadmap"}
+
+
+@pytest.mark.asyncio
 async def test_presenter_empty_emits_no_pin_and_notes_empty_backoff() -> None:
     clock = FakeClock()
     index = FakeIndex(notes={"roadmap": note("roadmap", "Q3 Roadmap")})
@@ -353,7 +477,7 @@ async def test_presenter_empty_emits_no_pin_and_notes_empty_backoff() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dismiss_unpins_and_suppresses_slate_reentry() -> None:
+async def test_dismiss_unpins_and_shown_note_never_reenters_slate() -> None:
     clock = FakeClock()
     index = FakeIndex(notes={"roadmap": note("roadmap", "Q3 Roadmap")})
     cadence = RecordingCadence(instant_allowed=True, may_present_allowed=False)
@@ -381,4 +505,4 @@ async def test_dismiss_unpins_and_suppresses_slate_reentry() -> None:
     clock.advance(config.SUPPRESS_S + 0.1)
     await session.on_chunk(chunk("roadmap can enter the slate later"))
 
-    assert [item.note_id for item in session.slate_items()] == ["roadmap"]
+    assert session.slate_items() == []
