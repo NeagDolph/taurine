@@ -35,8 +35,9 @@ pool before reranking.
 
 ## Non-goals (explicitly out of MVP scope)
 
-- **No logging / data capture of any kind.** No decision logs, no feedback
-  capture for future training. Dismiss buttons exist purely as UX.
+- ~~**No logging / data capture of any kind.**~~ REVERSED 2026-07-06 (post-MVP,
+  by user request): full per-session JSONL logging now exists — see the
+  addendum at the bottom of this spec.
 - No replay harness.
 - No custom-trained models (no gate, no custom reranker, no fine-tuned
   embeddings). Cohere Rerank (hosted, off-the-shelf) is in scope.
@@ -439,3 +440,31 @@ view. Units 1–4 are testable headless before the app exists.
 6. Map view: static graph render + live retrieval/expansion edges.
 7. Demo pass: live conversation about topics in Neil's real Notes, watched
    from the map.
+
+## Addendum (2026-07-06, post-MVP)
+
+**Session logging (reverses the original non-goal).** One JSONL file per ws
+session under `core/sessions/` (`session_log.SessionLogger`; never raises
+into the live loop). Record kinds: `session_start/end`, `chunk` (finals +
+interims), `asr_status`, `control`, `c1_hit`, `c2_pass` (full retrieval
+internals: dense/bm25/fused rows, expansions, rerank status, floor drops,
+slate adds), `slate` (every mutation w/ op+reason+revision), `cadence`
+(decision + first blocking gate via `Cadence.explain`), `presenter` (model,
+raw response, picks, latency), `pin`/`unpin`. REST: `GET /sessions`,
+`GET /sessions/{id}`. devfeed logs too.
+
+**Trigger provenance (debug UI).** Final chunks carry monotonic `seq`.
+C1 hits and C2 passes emit `TriggerEvent` (trigger_id, kind exact|search,
+seqs, span, matches incl. rank/via/hop, action pinned|slated|none);
+`RetrievalEvent` carries the correlating `retrieval_id` + `seqs`. The feed
+renders exact-match spans as clickable highlights and retrieval windows as
+edge accents + chips; clicking opens the trigger inspector (matches table,
+Open in Notes, trigger_id/seqs footer for log cross-reference).
+
+**Fixes of note.** OpenRouter calls set `provider.require_parameters` and
+parse fence-wrapped JSON (some providers ignore response_format); failed
+enrichments are never cached (they retry on later syncs). The REST API has
+CORS enabled (the ws never needed it). The app shell is a flex column so the
+workspace keeps its height regardless of which conditional banners are
+mounted; `/graph` fetch retries every 4s on failure; an initial status event
+is pushed on ws connect.
