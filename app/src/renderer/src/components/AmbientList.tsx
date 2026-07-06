@@ -16,7 +16,7 @@ export function AmbientList({ items }: AmbientListProps): React.JSX.Element {
       </div>
 
       {items.length === 0 ? (
-        <div className="empty-surface">No ambient candidates</div>
+        <div className="empty-surface ambient-empty">No matches yet</div>
       ) : (
         <ol className="ambient-list">
           {items.map((item) => {

@@ -18,7 +18,7 @@ export function PinnedStack({ cards, onOpenNote, onDismiss }: PinnedStackProps):
       <div className="section-label">Pinned</div>
       <div className="pinned-stack">
         {cards.length === 0 ? (
-          <div className="empty-surface">No pinned notes</div>
+          <div className="empty-surface pinned-empty">No pinned notes yet</div>
         ) : (
           cards.slice(0, 3).map((card) => (
             <article className="pinned-card" key={card.card_id}>

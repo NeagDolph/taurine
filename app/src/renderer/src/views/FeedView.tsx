@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import type { TranscriptEvent, TriggerEvent } from '../lib/sidecar'
 
 export interface FeedTranscript extends TranscriptEvent {
@@ -24,29 +24,85 @@ interface TriggerAnnotations {
   ranges: SpanRange[]
 }
 
+const AUTOSCROLL_THRESHOLD_PX = 48
+
 export function FeedView({
   chunks,
   interims,
   triggersBySeq,
   onInspectTrigger
 }: FeedViewProps): React.JSX.Element {
+  const listRef = useRef<HTMLDivElement | null>(null)
+  const [atBottom, setAtBottom] = useState(true)
+  const isEmpty = chunks.length === 0 && interims.length === 0
+
+  const computeAtBottom = useCallback((): boolean => {
+    const el = listRef.current
+    if (!el) {
+      return true
+    }
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= AUTOSCROLL_THRESHOLD_PX
+  }, [])
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    const el = listRef.current
+    if (!el) {
+      return
+    }
+    el.scrollTo({ top: el.scrollHeight, behavior })
+    setAtBottom(true)
+  }, [])
+
+  const handleScroll = useCallback(() => {
+    setAtBottom(computeAtBottom())
+  }, [computeAtBottom])
+
+  // Auto-follow newest content only when the user is already pinned to the bottom.
+  useLayoutEffect(() => {
+    if (atBottom) {
+      const el = listRef.current
+      if (el) {
+        el.scrollTop = el.scrollHeight
+      }
+    }
+  }, [chunks, interims, atBottom])
+
+  useEffect(() => {
+    setAtBottom(computeAtBottom())
+  }, [computeAtBottom, isEmpty])
+
   return (
     <section className="feed-view" aria-label="Transcript feed">
-      {chunks.length === 0 && interims.length === 0 ? (
-        <div className="empty-surface feed-empty">No transcript yet</div>
+      {isEmpty ? (
+        <div className="feed-empty">
+          <span className="empty-glyph" aria-hidden="true">◎</span>
+          <p className="empty-title">Listening…</p>
+          <p className="empty-hint">Transcript and matched notes appear here as you talk.</p>
+        </div>
       ) : (
-        <div className="transcript-list" aria-live="polite">
-          {chunks.map((chunk) => (
-            <TranscriptRow
-              chunk={chunk}
-              key={chunk.id}
-              onInspectTrigger={onInspectTrigger}
-              triggers={triggersBySeq.get(chunk.seq) ?? []}
-            />
-          ))}
-          {interims.map((chunk) => (
-            <TranscriptRow chunk={chunk} key={`interim-${chunk.channel}`} interim />
-          ))}
+        <div className="transcript-scroll">
+          <div className="transcript-list" aria-live="polite" ref={listRef} onScroll={handleScroll}>
+            {chunks.map((chunk) => (
+              <TranscriptRow
+                chunk={chunk}
+                key={chunk.id}
+                onInspectTrigger={onInspectTrigger}
+                triggers={triggersBySeq.get(chunk.seq) ?? []}
+              />
+            ))}
+            {interims.map((chunk) => (
+              <TranscriptRow chunk={chunk} key={`interim-${chunk.channel}`} interim />
+            ))}
+          </div>
+          {atBottom ? null : (
+            <button
+              className="jump-latest"
+              type="button"
+              onClick={() => scrollToLatest()}
+            >
+              Jump to latest ↓
+            </button>
+          )}
         </div>
       )}
     </section>

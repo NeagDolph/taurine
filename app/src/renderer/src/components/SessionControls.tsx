@@ -17,7 +17,7 @@ export function SessionControls({ state, error, onStart, onStop }: SessionContro
     <div className="session-controls">
       <div className={`mic-state mic-${state}`}>
         <span className="mic-dot" />
-        <span>{labelForState(state)}</span>
+        <span className="mic-label">{labelForState(state)}</span>
       </div>
       <button
         className={`primary-button ${isListening ? 'stop-button' : ''}`}
@@ -25,9 +25,9 @@ export function SessionControls({ state, error, onStart, onStop }: SessionContro
         onClick={isListening || isStarting ? onStop : onStart}
         disabled={isBusy}
       >
-        {isListening || isStarting ? 'Stop' : 'Start'}
+        {isListening || isStarting ? 'Stop listening' : 'Start listening'}
       </button>
-      {error ? <span className="control-error">{error}</span> : null}
+      {error ? <span className="control-error" role="alert">{error}</span> : null}
     </div>
   )
 }
