@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { AmbientList } from './components/AmbientList'
 import { PinnedStack } from './components/PinnedStack'
 import { SessionControls, type ListeningState } from './components/SessionControls'
@@ -15,6 +15,7 @@ import {
   type TranscriptEvent
 } from './lib/sidecar'
 import { FeedView, type FeedTranscript } from './views/FeedView'
+import { MapView } from './views/MapView'
 
 function App(): React.JSX.Element {
   const clientRef = useRef<SidecarClient | null>(null)
@@ -35,6 +36,7 @@ function App(): React.JSX.Element {
   const [interimsByChannel, setInterimsByChannel] = useState<Record<number, TranscriptEvent>>({})
   const [ambientItems, setAmbientItems] = useState<AmbientItem[]>([])
   const [pinnedCards, setPinnedCards] = useState<Card[]>([])
+  const [pinnedNoteIds, setPinnedNoteIds] = useState<string[]>([])
   const [lastRetrieval, setLastRetrieval] = useState<RetrievalEvent | null>(null)
 
   useEffect(() => {
@@ -75,6 +77,7 @@ function App(): React.JSX.Element {
         setAmbientItems(event.items)
       }),
       client.onPin((event) => {
+        setPinnedNoteIds((current) => (current.includes(event.card.note_id) ? current : [...current, event.card.note_id]))
         setPinnedCards((current) => {
           const withoutDuplicate = current.filter(
             (card) => card.card_id !== event.card.card_id && card.note_id !== event.card.note_id
@@ -108,6 +111,7 @@ function App(): React.JSX.Element {
   }, [])
 
   const interims = useMemo(() => Object.values(interimsByChannel), [interimsByChannel])
+  const latestFinalText = chunks.length > 0 ? chunks[chunks.length - 1].text : ''
 
   const startListening = useCallback(async () => {
     const client = clientRef.current
@@ -214,23 +218,20 @@ function App(): React.JSX.Element {
             </button>
           </div>
 
-          {activeView === 'feed' ? (
-            <FeedView chunks={chunks} interims={interims} />
-          ) : (
-            <section className="map-placeholder" aria-label="Map view">
-              <div>
-                <span className="section-label">Map</span>
-                <h2>Placeholder</h2>
-                <p>{lastRetrieval ? lastRetrieval.heard : 'No retrieval pass yet'}</p>
-              </div>
-              {lastRetrieval ? (
-                <div className="retrieval-summary">
-                  <span>{lastRetrieval.hits.length} hits</span>
-                  <span>{lastRetrieval.expansions.length} linked</span>
-                </div>
-              ) : null}
-            </section>
-          )}
+          <div style={viewStackStyle}>
+            <div aria-hidden={activeView !== 'feed'} style={viewLayerStyle(activeView === 'feed')}>
+              <FeedView chunks={chunks} interims={interims} />
+            </div>
+            <div aria-hidden={activeView !== 'map'} style={viewLayerStyle(activeView === 'map')}>
+              <MapView
+                latestFinalText={latestFinalText}
+                lastSync={index.last_sync}
+                pinnedNoteIds={pinnedNoteIds}
+                retrieval={lastRetrieval}
+                visible={activeView === 'map'}
+              />
+            </div>
+          </div>
         </main>
 
         <AmbientList items={ambientItems} />
@@ -247,6 +248,27 @@ function App(): React.JSX.Element {
       />
     </div>
   )
+}
+
+const viewStackStyle: CSSProperties = {
+  height: '100%',
+  minHeight: 0,
+  overflow: 'hidden',
+  position: 'relative'
+}
+
+function viewLayerStyle(active: boolean): CSSProperties {
+  return {
+    display: 'grid',
+    gridTemplateRows: 'minmax(0, 1fr)',
+    inset: 0,
+    minHeight: 0,
+    opacity: active ? 1 : 0,
+    pointerEvents: active ? 'auto' : 'none',
+    position: 'absolute',
+    transition: 'opacity 120ms ease',
+    visibility: active ? 'visible' : 'hidden'
+  }
 }
 
 export default App
