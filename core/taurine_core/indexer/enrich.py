@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 
 from taurine_core import config
@@ -13,15 +14,20 @@ async def enrich_note(note: NoteRecord, llm: LLMPort) -> Enrichment:
 
 
 async def enrich_note_with_status(note: NoteRecord, llm: LLMPort) -> tuple[Enrichment, bool]:
-    try:
-        response = await llm.complete_json(
-            config.ENRICH_MODEL,
-            _system_prompt(),
-            _user_prompt(note),
-        )
-    except LLMError:
-        return fallback_enrichment(note), True
-    return validate_enrichment(response, note), False
+    for attempt in range(2):  # one retry absorbs transient provider errors
+        try:
+            response = await llm.complete_json(
+                config.ENRICH_MODEL,
+                _system_prompt(),
+                _user_prompt(note),
+            )
+        except LLMError:
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+            return fallback_enrichment(note), True
+        return validate_enrichment(response, note), False
+    return fallback_enrichment(note), True  # unreachable; satisfies type checkers
 
 
 def validate_enrichment(data: dict, note: NoteRecord) -> Enrichment:

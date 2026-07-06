@@ -27,6 +27,8 @@ class OpenRouterClient:
                 {"role": "user", "content": user},
             ],
             "response_format": {"type": "json_object"},
+            # only route to providers that honor response_format
+            "provider": {"require_parameters": True},
         }
         headers = {"Authorization": f"Bearer {self._api_key}"}
 
@@ -43,9 +45,21 @@ class OpenRouterClient:
             response.raise_for_status()
             body = response.json()
             content = body["choices"][0]["message"]["content"]
-            parsed = json.loads(content) if isinstance(content, str) else content
+            parsed = _parse_json_content(content) if isinstance(content, str) else content
             if not isinstance(parsed, dict):
                 raise TypeError("OpenRouter content was not a JSON object")
             return parsed
         except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMError(str(exc)) from exc
+
+
+def _parse_json_content(content: str) -> Any:
+    """Parse model output that may wrap JSON in markdown fences or prose."""
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(content[start : end + 1])

@@ -58,7 +58,8 @@ def sync_once(index: Index, notes_source: NotesSource, llm: LLMPort) -> SyncRepo
         if enrichment is None:
             enrichment, failed = _run_async(enrich_note_with_status(note, llm))
             enrich_failures += int(failed)
-            index.cache_enrichment(note.note_id, note.content_hash, enrichment)
+            if not failed:  # fallback enrichments must retry on the next sync
+                index.cache_enrichment(note.note_id, note.content_hash, enrichment)
 
         index.upsert_note(note, enrichment, _embedding_units(note, enrichment))
         rebuilt.append(note.note_id)
