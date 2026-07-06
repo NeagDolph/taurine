@@ -15,19 +15,27 @@ async def run_devfeed(
     *,
     runtime: Runtime | None = None,
     output: TextIO = sys.stdout,
+    error_output: TextIO = sys.stderr,
     now: Callable[[], float] = time.time,
 ) -> None:
     active_runtime = runtime or build_runtime()
+    logger = active_runtime.make_session_logger()
+    if logger.path is not None:
+        print(f"session log: {logger.path}", file=error_output, flush=True)
+    logger.log("session_start", channels=[{"id": 0, "label": "devfeed"}])
 
     async def emit(event) -> None:
         print(event.model_dump_json(), file=output, flush=True)
 
-    session = active_runtime.make_live_session(emit)
-    for raw_line in lines:
-        text = raw_line.strip()
-        if not text:
-            continue
-        await session.on_chunk(Chunk(channel=0, text=text, ts=now(), final=True))
+    session = active_runtime.make_live_session(emit, logger)
+    try:
+        for raw_line in lines:
+            text = raw_line.strip()
+            if not text:
+                continue
+            await session.on_chunk(Chunk(channel=0, text=text, ts=now(), final=True))
+    finally:
+        logger.close()
 
 
 def main() -> int:

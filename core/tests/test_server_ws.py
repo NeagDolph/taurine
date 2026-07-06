@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from taurine_core import session_log
 from taurine_core.indexer.sync import SyncReport
 from taurine_core.schemas import (
     Chunk,
@@ -89,7 +91,7 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
         sync_once=lambda: sync_calls.append(True)
         or SyncReport(added=1, changed=2, removed=3, enrich_failures=4),
         open_note=lambda note_id: None,
-        make_live_session=lambda emit: EchoLiveSession(emit),
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
         make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
             on_chunk,
             on_status,
@@ -124,7 +126,8 @@ def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
     asr_clients: list[FakeASRClient] = []
     opened: list[str] = []
 
-    def make_live_session(emit: Any) -> EchoLiveSession:
+    def make_live_session(emit: Any, logger: Any) -> EchoLiveSession:
+        del logger
         live = EchoLiveSession(emit)
         live_sessions.append(live)
         return live
@@ -189,7 +192,7 @@ async def test_periodic_sync_failure_is_nonfatal() -> None:
         index=GraphIndex(),
         sync_once=failing_sync,
         open_note=lambda note_id: None,
-        make_live_session=lambda emit: EchoLiveSession(emit),
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
         make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
             on_chunk,
             on_status,
@@ -200,3 +203,36 @@ async def test_periodic_sync_failure_is_nonfatal() -> None:
     await run_sync_once_safely(runtime)
 
     assert calls == 1
+
+
+def test_sessions_endpoints_list_and_parse_jsonl_fixture(tmp_path, monkeypatch) -> None:
+    session_file = tmp_path / "20260706-120000-abcdef12.jsonl"
+    records = [
+        {"ts": 111.0, "kind": "session_start", "channels": [{"id": 0, "label": "mic"}]},
+        {"ts": 112.0, "kind": "chunk", "seq": 1, "channel": 0, "text": "hello", "final": True},
+    ]
+    session_file.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+    monkeypatch.setattr(session_log, "SESSIONS_DIR", tmp_path)
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.get("/sessions").json() == [
+            {
+                "id": "20260706-120000-abcdef12",
+                "path": str(session_file),
+                "started": 111.0,
+                "size_bytes": session_file.stat().st_size,
+            }
+        ]
+        assert client.get("/sessions/20260706-120000-abcdef12").json() == records
+        assert client.get("/sessions/missing").status_code == 404

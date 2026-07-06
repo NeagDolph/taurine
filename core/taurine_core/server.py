@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
 from taurine_core import config
+from taurine_core import session_log
 from taurine_core.asr import ASRClient, ChunkCallback, IndexStatusProvider, StatusCallback
 from taurine_core.indexer.notes import extract_notes, open_note
 from taurine_core.indexer.store import Index
@@ -28,6 +29,7 @@ from taurine_core.live.presenter import Presenter
 from taurine_core.live.rerank import CohereReranker
 from taurine_core.live.slate import Slate
 from taurine_core.llm import OpenRouterClient
+from taurine_core.session_log import NullSessionLogger, SessionLogger
 from taurine_core.schemas import (
     DismissMsg,
     GraphResponse,
@@ -66,11 +68,12 @@ class Runtime:
     index: Any
     sync_once: Callable[[], SyncReport]
     open_note: Callable[[str], None]
-    make_live_session: Callable[[EventSink], LiveSessionLike]
+    make_live_session: Callable[[EventSink, Any], LiveSessionLike]
     make_asr_client: Callable[
         [ChunkCallback, StatusCallback, IndexStatusProvider],
         ASRClientLike,
     ]
+    make_session_logger: Callable[[], Any] = NullSessionLogger
     enable_periodic_sync: bool = False
 
 
@@ -115,16 +118,31 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         report = await asyncio.to_thread(active_runtime.sync_once)
         return _report_dict(report)
 
+    @app.get("/sessions")
+    async def sessions() -> list[dict[str, Any]]:
+        return [_session_summary(path) for path in _session_files()]
+
+    @app.get("/sessions/{session_id}")
+    async def session_records(session_id: str) -> list[dict[str, Any]]:
+        path = _session_path(session_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return _read_session_records(path)
+
     @app.websocket("/session")
     async def session(websocket: WebSocket) -> None:
         await websocket.accept()
         active_runtime: Runtime = app.state.runtime
+        logger = active_runtime.make_session_logger()
+        session_started = False
         events: asyncio.Queue[Event | StatusEvent] = asyncio.Queue()
 
         async def emit(event: Event | StatusEvent) -> None:
+            if isinstance(event, StatusEvent):
+                logger.log("asr_status", state=event.asr, detail=event.detail)
             await events.put(event)
 
-        live = active_runtime.make_live_session(emit)
+        live = active_runtime.make_live_session(emit, logger)
         asr = active_runtime.make_asr_client(
             live.on_chunk,
             emit,
@@ -141,12 +159,14 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 if kind == "websocket.disconnect":
                     break
                 if message.get("text") is not None:
-                    await _handle_control(
+                    session_started = await _handle_control(
                         message["text"],
                         asr=asr,
                         live=live,
                         runtime=active_runtime,
                         emit=emit,
+                        logger=logger,
+                        session_started=session_started,
                     )
                 elif message.get("bytes") is not None:
                     try:
@@ -158,9 +178,12 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except WebSocketDisconnect:
             pass
         finally:
+            if not session_started:
+                logger.log("session_start", channels=[])
             await asr.stop()
             sender.cancel()
             await asyncio.gather(sender, return_exceptions=True)
+            logger.close()
 
     return app
 
@@ -172,17 +195,21 @@ def build_runtime() -> Runtime:
     llm = OpenRouterClient(secrets["OPEN_ROUTER_API_KEY"])
     reranker = CohereReranker(secrets["COHERE_API_KEY"])
 
-    def make_live_session(emit: EventSink) -> LiveSession:
+    def make_live_session(emit: EventSink, logger: SessionLogger) -> LiveSession:
         clock = _MonotonicClock()
         return LiveSession(
             index=index,
-            slate=Slate(clock),
+            slate=Slate(
+                clock,
+                on_event=lambda op, payload: logger.log("slate", op=op, **payload),
+            ),
             cadence=Cadence(clock),
             exact=ExactCollector(index),
             ambient=AmbientRetriever(index, reranker, clock),
-            presenter=Presenter(llm),
+            presenter=Presenter(llm, on_log=lambda payload: logger.log("presenter", **payload)),
             emit=emit,
             clock=clock,
+            logger=logger,
         )
 
     def make_asr_client(
@@ -203,6 +230,7 @@ def build_runtime() -> Runtime:
         open_note=open_note,
         make_live_session=make_live_session,
         make_asr_client=make_asr_client,
+        make_session_logger=lambda: SessionLogger.create(session_log.SESSIONS_DIR),
         enable_periodic_sync=True,
     )
 
@@ -231,14 +259,21 @@ async def _handle_control(
     live: LiveSessionLike,
     runtime: Runtime,
     emit: EventSink,
-) -> None:
+    logger: Any,
+    session_started: bool,
+) -> bool:
     try:
         message = _parse_control(raw)
     except (json.JSONDecodeError, ValidationError, ValueError) as exc:
         await emit(_status_error(runtime, f"invalid control message: {exc}"))
-        return
+        return session_started
+
+    logger.log("control", message=message.model_dump())
 
     if isinstance(message, StartMsg):
+        if not session_started:
+            logger.log("session_start", channels=message.channels)
+            session_started = True
         channel_ids = [int(channel["id"]) for channel in message.channels if "id" in channel]
         await asr.start(channel_ids)
     elif isinstance(message, StopMsg):
@@ -250,6 +285,7 @@ async def _handle_control(
             await asyncio.to_thread(runtime.open_note, message.note_id)
         except Exception as exc:  # pragma: no cover - platform integration guard
             await emit(_status_error(runtime, str(exc)))
+    return session_started
 
 
 def _parse_control(raw: str) -> StartMsg | StopMsg | DismissMsg | OpenNoteMsg:
@@ -305,6 +341,45 @@ def _report_dict(report: Any) -> dict[str, Any]:
     if isinstance(report, dict):
         return report
     return dict(report)
+
+
+def _session_files() -> list[Path]:
+    base_dir = session_log.SESSIONS_DIR
+    if not base_dir.exists() or not base_dir.is_dir():
+        return []
+    return sorted(base_dir.glob("*.jsonl"), key=lambda path: path.name, reverse=True)
+
+
+def _session_path(session_id: str) -> Path | None:
+    for path in _session_files():
+        if path.stem == session_id:
+            return path
+    return None
+
+
+def _session_summary(path: Path) -> dict[str, Any]:
+    records = _read_session_records(path)
+    started = records[0].get("ts") if records else path.stat().st_mtime
+    return {
+        "id": path.stem,
+        "path": str(path),
+        "started": started,
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def _read_session_records(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if isinstance(record, dict):
+                records.append(record)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return records
 
 
 app = create_app()

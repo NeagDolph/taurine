@@ -34,7 +34,8 @@ class CapturingSession:
 async def test_devfeed_turns_stdin_lines_into_final_chunks_and_json_events() -> None:
     sessions: list[CapturingSession] = []
 
-    def make_session(emit: Any) -> CapturingSession:
+    def make_session(emit: Any, logger: Any) -> CapturingSession:
+        del logger
         session = CapturingSession(emit)
         sessions.append(session)
         return session

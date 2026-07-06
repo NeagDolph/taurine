@@ -119,3 +119,47 @@ async def test_presenter_prompt_contains_current_slate_and_recent_transcript_dat
     for recent in transcript[-config.PRESENTER_TRANSCRIPT_CHUNKS :]:
         assert recent.text in user
     assert transcript[0].text not in user
+
+
+@pytest.mark.asyncio
+async def test_presenter_on_log_records_success_payload() -> None:
+    log_records: list[dict[str, Any]] = []
+    llm = FakeLLM([{"picks": [{"note_id": "n1", "why": "useful now"}]}])
+    presenter = Presenter(llm, on_log=log_records.append)
+
+    picks = await presenter.present([chunk(1), chunk(2)], [slate_item("n1")], revision=7)
+
+    assert [(pick.note_id, pick.why) for pick in picks] == [("n1", "useful now")]
+    assert log_records == [
+        {
+            "revision": 7,
+            "model_used": config.PRESENTER_MODEL,
+            "transcript_chunks": 2,
+            "slate_note_ids": ["n1"],
+            "raw_response": {"picks": [{"note_id": "n1", "why": "useful now"}]},
+            "picks": [{"note_id": "n1", "why": "useful now"}],
+            "latency_ms": pytest.approx(log_records[0]["latency_ms"]),
+            "error": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_presenter_on_log_records_failure_payload() -> None:
+    log_records: list[dict[str, Any]] = []
+    llm = FakeLLM([LLMError("primary failed"), LLMError("fallback failed")])
+    presenter = Presenter(llm, on_log=log_records.append)
+
+    assert await presenter.present([chunk(1)], [slate_item("n1")], revision=3) == []
+
+    assert len(log_records) == 1
+    payload = log_records[0]
+    assert payload["revision"] == 3
+    assert payload["model_used"] is None
+    assert payload["transcript_chunks"] == 1
+    assert payload["slate_note_ids"] == ["n1"]
+    assert payload["raw_response"] is None
+    assert payload["picks"] == []
+    assert isinstance(payload["latency_ms"], float)
+    assert "primary failed" in str(payload["error"])
+    assert "fallback failed" in str(payload["error"])

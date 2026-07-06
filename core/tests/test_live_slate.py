@@ -110,3 +110,61 @@ def test_items_sorted_by_provenance_strength_then_score(slate: Slate) -> None:
     slate.add(item("high-exact", source="exact", score=0.9))
 
     assert [i.note_id for i in slate.items()] == ["high-exact", "low-exact", "high-search"]
+
+
+def test_slate_on_event_reports_mutations_and_suppressed_readds(clock: FakeClock) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    slate = Slate(clock=clock, on_event=lambda op, payload: events.append((op, payload)))
+
+    slate.add(item("n1", source="search"))
+    slate.add(item("n1", source="exact"))
+    slate.dismiss("n1", now=clock.now())
+    slate.add(item("n1", source="search"))
+
+    assert [op for op, _payload in events] == ["add", "renew", "dismiss", "suppressed_drop"]
+    assert events[0][1] == {
+        "note_id": "n1",
+        "source": "search",
+        "reason": "added",
+        "revision": 1,
+    }
+    assert events[1][1] == {
+        "note_id": "n1",
+        "source": "exact",
+        "reason": "renewed",
+        "revision": 2,
+    }
+    assert events[2][1] == {
+        "note_id": "n1",
+        "source": "exact",
+        "reason": "dismissed",
+        "revision": 3,
+    }
+    assert events[3][1] == {
+        "note_id": "n1",
+        "source": "search",
+        "reason": "suppressed",
+        "revision": 3,
+    }
+
+
+def test_slate_on_event_reports_quota_evictions(clock: FakeClock) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    slate = Slate(clock=clock, on_event=lambda op, payload: events.append((op, payload)))
+    for idx in range(QUOTA_SEARCH):
+        slate.add(item(f"n{idx}", source="search"))
+
+    slate.add(item("new", source="search"))
+
+    evictions = [(op, payload) for op, payload in events if op == "evict"]
+    assert evictions == [
+        (
+            "evict",
+            {
+                "note_id": "n0",
+                "source": "search",
+                "reason": "quota",
+                "revision": QUOTA_SEARCH + 2,
+            },
+        )
+    ]

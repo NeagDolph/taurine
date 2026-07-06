@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from typing import Any
 
 from taurine_core import config
@@ -14,32 +16,89 @@ SYSTEM_PROMPT = (
 
 
 class Presenter:
-    def __init__(self, llm: LLMPort) -> None:
+    def __init__(
+        self,
+        llm: LLMPort,
+        on_log: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self._llm = llm
+        self._on_log = on_log
 
     async def present(
         self,
         transcript: list[Chunk],
         slate: list[SlateItem],
         via_titles: dict[str, str] | None = None,
+        *,
+        revision: int | None = None,
     ) -> list[Pick]:
+        started = time.monotonic()
+        raw_response: dict[str, Any] | None = None
+        model_used: str | None = None
+        error: str | None = None
         if not slate:
+            self._log(
+                revision=revision,
+                model_used=None,
+                transcript_chunks=len(transcript),
+                slate_note_ids=[],
+                raw_response=None,
+                picks=[],
+                latency_ms=_elapsed_ms(started),
+                error=None,
+            )
             return []
 
         user_prompt = _build_user_prompt(transcript, slate, via_titles or {})
         try:
-            response = await self._llm.complete_json(config.PRESENTER_MODEL, SYSTEM_PROMPT, user_prompt)
-        except LLMError:
+            raw_response = await self._llm.complete_json(
+                config.PRESENTER_MODEL,
+                SYSTEM_PROMPT,
+                user_prompt,
+            )
+            model_used = config.PRESENTER_MODEL
+        except LLMError as primary_error:
             try:
-                response = await self._llm.complete_json(
+                raw_response = await self._llm.complete_json(
                     config.PRESENTER_FALLBACK_MODEL,
                     SYSTEM_PROMPT,
                     user_prompt,
                 )
-            except LLMError:
+                model_used = config.PRESENTER_FALLBACK_MODEL
+            except LLMError as fallback_error:
+                error = f"{primary_error}; {fallback_error}"
+                self._log(
+                    revision=revision,
+                    model_used=None,
+                    transcript_chunks=len(transcript),
+                    slate_note_ids=[item.note_id for item in slate],
+                    raw_response=None,
+                    picks=[],
+                    latency_ms=_elapsed_ms(started),
+                    error=error,
+                )
                 return []
 
-        return _validated_picks(response, slate)
+        picks = _validated_picks(raw_response, slate)
+        self._log(
+            revision=revision,
+            model_used=model_used,
+            transcript_chunks=len(transcript),
+            slate_note_ids=[item.note_id for item in slate],
+            raw_response=raw_response,
+            picks=[pick.model_dump() for pick in picks],
+            latency_ms=_elapsed_ms(started),
+            error=None,
+        )
+        return picks
+
+    def _log(self, **payload: Any) -> None:
+        if self._on_log is None:
+            return
+        try:
+            self._on_log(payload)
+        except Exception:
+            return
 
 
 def _build_user_prompt(
@@ -95,3 +154,7 @@ def _validated_picks(response: dict[str, Any], slate: list[SlateItem]) -> list[P
         if len(picks) >= config.PRESENTER_MAX_PICKS:
             break
     return picks
+
+
+def _elapsed_ms(started: float) -> float:
+    return (time.monotonic() - started) * 1000.0
