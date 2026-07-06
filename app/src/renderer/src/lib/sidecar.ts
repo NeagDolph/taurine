@@ -3,6 +3,8 @@ export const SIDECAR_WS_URL = 'ws://127.0.0.1:8930/session'
 export type AsrState = 'disconnected' | 'connecting' | 'connected' | 'error'
 export type CardProvenance = 'exact' | 'search' | 'linked'
 export type SidecarConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
+export type TriggerAction = 'pinned' | 'slated' | 'none'
+export type TriggerKind = 'exact' | 'search'
 
 export interface TranscriptEvent {
   type: 'transcript'
@@ -10,6 +12,7 @@ export interface TranscriptEvent {
   text: string
   final: boolean
   ts: number
+  seq: number
 }
 
 export interface AmbientItem {
@@ -61,6 +64,27 @@ export interface RetrievalEvent {
   heard: string
   hits: Hit[]
   expansions: Expansion[]
+  retrieval_id: string
+  seqs: number[]
+}
+
+export interface TriggerMatch {
+  note_id: string
+  title: string
+  rank?: number | null
+  score: number
+  via_note_id?: string | null
+  hop?: number | null
+}
+
+export interface TriggerEvent {
+  type: 'trigger'
+  trigger_id: string
+  kind: TriggerKind
+  seqs: number[]
+  span: string
+  matches: TriggerMatch[]
+  action: TriggerAction
 }
 
 export interface IndexStatus {
@@ -81,6 +105,7 @@ export type SidecarEvent =
   | PinEvent
   | UnpinEvent
   | RetrievalEvent
+  | TriggerEvent
   | StatusEvent
 
 export interface SidecarConnectionEvent {
@@ -112,6 +137,7 @@ export class SidecarClient {
   private readonly pinCallbacks = new Set<Callback<PinEvent>>()
   private readonly unpinCallbacks = new Set<Callback<UnpinEvent>>()
   private readonly retrievalCallbacks = new Set<Callback<RetrievalEvent>>()
+  private readonly triggerCallbacks = new Set<Callback<TriggerEvent>>()
   private readonly statusCallbacks = new Set<Callback<StatusEvent>>()
   private readonly connectionCallbacks = new Set<Callback<SidecarConnectionEvent>>()
 
@@ -190,6 +216,10 @@ export class SidecarClient {
 
   onRetrieval(callback: Callback<RetrievalEvent>): Unsubscribe {
     return this.addCallback(this.retrievalCallbacks, callback)
+  }
+
+  onTrigger(callback: Callback<TriggerEvent>): Unsubscribe {
+    return this.addCallback(this.triggerCallbacks, callback)
   }
 
   onStatus(callback: Callback<StatusEvent>): Unsubscribe {
@@ -292,6 +322,9 @@ export class SidecarClient {
       case 'retrieval':
         this.emit(this.retrievalCallbacks, event)
         break
+      case 'trigger':
+        this.emit(this.triggerCallbacks, event)
+        break
       case 'status':
         this.emit(this.statusCallbacks, event)
         break
@@ -337,6 +370,8 @@ function parseSidecarEvent(raw: string): SidecarEvent | null {
       return parseUnpin(record)
     case 'retrieval':
       return parseRetrieval(record)
+    case 'trigger':
+      return parseTrigger(record)
     case 'status':
       return parseStatus(record)
     default:
@@ -349,7 +384,8 @@ function parseTranscript(record: Record<string, unknown>): TranscriptEvent | nul
     typeof record.channel !== 'number' ||
     typeof record.text !== 'string' ||
     typeof record.final !== 'boolean' ||
-    typeof record.ts !== 'number'
+    typeof record.ts !== 'number' ||
+    typeof record.seq !== 'number'
   ) {
     return null
   }
@@ -359,7 +395,8 @@ function parseTranscript(record: Record<string, unknown>): TranscriptEvent | nul
     channel: record.channel,
     text: record.text,
     final: record.final,
-    ts: record.ts
+    ts: record.ts,
+    seq: record.seq
   }
 }
 
@@ -444,7 +481,13 @@ function parseRetrieval(record: Record<string, unknown>): RetrievalEvent | null 
 
   const hits = record.hits.map(parseHit)
   const expansions = record.expansions.map(parseExpansion)
-  if (hits.some((hit) => hit === null) || expansions.some((expansion) => expansion === null)) {
+  const seqs = record.seqs === undefined ? [] : parseNumberArray(record.seqs)
+  if (
+    hits.some((hit) => hit === null) ||
+    expansions.some((expansion) => expansion === null) ||
+    seqs === null ||
+    (record.retrieval_id !== undefined && typeof record.retrieval_id !== 'string')
+  ) {
     return null
   }
 
@@ -452,7 +495,9 @@ function parseRetrieval(record: Record<string, unknown>): RetrievalEvent | null 
     type: 'retrieval',
     heard: record.heard,
     hits: hits as Hit[],
-    expansions: expansions as Expansion[]
+    expansions: expansions as Expansion[],
+    retrieval_id: typeof record.retrieval_id === 'string' ? record.retrieval_id : '',
+    seqs
   }
 }
 
@@ -494,6 +539,70 @@ function parseExpansion(value: unknown): Expansion | null {
   }
 }
 
+function parseTrigger(record: Record<string, unknown>): TriggerEvent | null {
+  if (
+    typeof record.trigger_id !== 'string' ||
+    !isTriggerKind(record.kind) ||
+    !Array.isArray(record.seqs) ||
+    typeof record.span !== 'string' ||
+    !Array.isArray(record.matches) ||
+    !isTriggerAction(record.action)
+  ) {
+    return null
+  }
+
+  const seqs = parseNumberArray(record.seqs)
+  const matches = record.matches.map(parseTriggerMatch)
+  if (seqs === null || matches.some((match) => match === null)) {
+    return null
+  }
+
+  return {
+    type: 'trigger',
+    trigger_id: record.trigger_id,
+    kind: record.kind,
+    seqs,
+    span: record.span,
+    matches: matches as TriggerMatch[],
+    action: record.action
+  }
+}
+
+function parseTriggerMatch(value: unknown): TriggerMatch | null {
+  const record = asRecord(value)
+  if (
+    !record ||
+    typeof record.note_id !== 'string' ||
+    typeof record.title !== 'string' ||
+    typeof record.score !== 'number'
+  ) {
+    return null
+  }
+
+  if (record.rank !== undefined && record.rank !== null && typeof record.rank !== 'number') {
+    return null
+  }
+  if (
+    record.via_note_id !== undefined &&
+    record.via_note_id !== null &&
+    typeof record.via_note_id !== 'string'
+  ) {
+    return null
+  }
+  if (record.hop !== undefined && record.hop !== null && typeof record.hop !== 'number') {
+    return null
+  }
+
+  return {
+    note_id: record.note_id,
+    title: record.title,
+    rank: typeof record.rank === 'number' ? record.rank : null,
+    score: record.score,
+    via_note_id: typeof record.via_note_id === 'string' ? record.via_note_id : null,
+    hop: typeof record.hop === 'number' ? record.hop : null
+  }
+}
+
 function parseStatus(record: Record<string, unknown>): StatusEvent | null {
   const index = asRecord(record.index)
   if (!isAsrState(record.asr) || !index || typeof index.notes !== 'number') {
@@ -520,8 +629,24 @@ function isCardProvenance(value: unknown): value is CardProvenance {
   return value === 'exact' || value === 'search' || value === 'linked'
 }
 
+function isTriggerKind(value: unknown): value is TriggerKind {
+  return value === 'exact' || value === 'search'
+}
+
+function isTriggerAction(value: unknown): value is TriggerAction {
+  return value === 'pinned' || value === 'slated' || value === 'none'
+}
+
 function isAsrState(value: unknown): value is AsrState {
   return value === 'disconnected' || value === 'connecting' || value === 'connected' || value === 'error'
+}
+
+function parseNumberArray(value: unknown): number[] | null {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'number')) {
+    return null
+  }
+
+  return value
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

@@ -3,6 +3,7 @@ import { AmbientList } from './components/AmbientList'
 import { PinnedStack } from './components/PinnedStack'
 import { SessionControls, type ListeningState } from './components/SessionControls'
 import { StatusBar } from './components/StatusBar'
+import { TriggerInspector } from './components/TriggerInspector'
 import { PcmAudioCapture } from './lib/audio'
 import {
   SidecarClient,
@@ -12,6 +13,7 @@ import {
   type IndexStatus,
   type RetrievalEvent,
   type SidecarConnectionState,
+  type TriggerEvent,
   type TranscriptEvent
 } from './lib/sidecar'
 import { FeedView, type FeedTranscript } from './views/FeedView'
@@ -34,6 +36,8 @@ function App(): React.JSX.Element {
   const [syncError, setSyncError] = useState('')
   const [chunks, setChunks] = useState<FeedTranscript[]>([])
   const [interimsByChannel, setInterimsByChannel] = useState<Record<number, TranscriptEvent>>({})
+  const [triggersBySeq, setTriggersBySeq] = useState<Map<number, TriggerEvent[]>>(new Map())
+  const [inspectedTrigger, setInspectedTrigger] = useState<TriggerEvent | null>(null)
   const [ambientItems, setAmbientItems] = useState<AmbientItem[]>([])
   const [pinnedCards, setPinnedCards] = useState<Card[]>([])
   const [pinnedNoteIds, setPinnedNoteIds] = useState<string[]>([])
@@ -51,15 +55,7 @@ function App(): React.JSX.Element {
       client.onTranscript((event) => {
         if (event.final) {
           transcriptIdRef.current += 1
-          setChunks((current) =>
-            [
-              ...current,
-              {
-                ...event,
-                id: `${event.ts}-${transcriptIdRef.current}`
-              }
-            ].slice(-200)
-          )
+          setChunks((current) => appendFinalChunk(current, event, transcriptIdRef.current))
           setInterimsByChannel((current) => {
             const next = { ...current }
             delete next[event.channel]
@@ -93,6 +89,9 @@ function App(): React.JSX.Element {
       client.onRetrieval((event) => {
         setLastRetrieval(event)
       }),
+      client.onTrigger((event) => {
+        setTriggersBySeq((current) => registerTrigger(current, event))
+      }),
       client.onStatus((event) => {
         setAsr(event.asr)
         setIndex(event.index)
@@ -111,6 +110,10 @@ function App(): React.JSX.Element {
       clientRef.current = null
     }
   }, [])
+
+  useEffect(() => {
+    setTriggersBySeq((current) => pruneTriggersByChunks(current, chunks))
+  }, [chunks])
 
   const interims = useMemo(() => Object.values(interimsByChannel), [interimsByChannel])
   const latestFinalText = chunks.length > 0 ? chunks[chunks.length - 1].text : ''
@@ -227,7 +230,12 @@ function App(): React.JSX.Element {
 
           <div style={viewStackStyle}>
             <div aria-hidden={activeView !== 'feed'} style={viewLayerStyle(activeView === 'feed')}>
-              <FeedView chunks={chunks} interims={interims} />
+              <FeedView
+                chunks={chunks}
+                interims={interims}
+                triggersBySeq={triggersBySeq}
+                onInspectTrigger={setInspectedTrigger}
+              />
             </div>
             <div aria-hidden={activeView !== 'map'} style={viewLayerStyle(activeView === 'map')}>
               <MapView
@@ -244,6 +252,12 @@ function App(): React.JSX.Element {
         <AmbientList items={ambientItems} />
       </div>
 
+      <TriggerInspector
+        trigger={inspectedTrigger}
+        onClose={() => setInspectedTrigger(null)}
+        onOpenNote={openNote}
+      />
+
       <StatusBar
         asr={asr}
         connection={connection}
@@ -255,6 +269,65 @@ function App(): React.JSX.Element {
       />
     </div>
   )
+}
+
+const MAX_FINAL_CHUNKS = 500
+
+function appendFinalChunk(
+  current: FeedTranscript[],
+  event: TranscriptEvent,
+  transcriptId: number
+): FeedTranscript[] {
+  const chunk = {
+    ...event,
+    id: event.seq > 0 ? `seq-${event.seq}` : `${event.ts}-${transcriptId}`
+  }
+
+  const next =
+    event.seq > 0 ? [...current.filter((item) => item.seq !== event.seq), chunk] : [...current, chunk]
+  return next.sort(compareTranscriptChunks).slice(-MAX_FINAL_CHUNKS)
+}
+
+function compareTranscriptChunks(left: FeedTranscript, right: FeedTranscript): number {
+  if (left.seq > 0 && right.seq > 0) {
+    return left.seq - right.seq
+  }
+
+  return left.ts - right.ts
+}
+
+function registerTrigger(current: Map<number, TriggerEvent[]>, trigger: TriggerEvent): Map<number, TriggerEvent[]> {
+  const next = new Map(current)
+
+  for (const seq of trigger.seqs) {
+    if (seq <= 0) {
+      continue
+    }
+
+    const existing = next.get(seq) ?? []
+    next.set(seq, [...existing.filter((item) => item.trigger_id !== trigger.trigger_id), trigger])
+  }
+
+  return next
+}
+
+function pruneTriggersByChunks(
+  current: Map<number, TriggerEvent[]>,
+  chunks: FeedTranscript[]
+): Map<number, TriggerEvent[]> {
+  const retainedSeqs = new Set(chunks.map((chunk) => chunk.seq).filter((seq) => seq > 0))
+  let changed = false
+  const next = new Map<number, TriggerEvent[]>()
+
+  for (const [seq, triggers] of current) {
+    if (retainedSeqs.has(seq)) {
+      next.set(seq, triggers)
+    } else {
+      changed = true
+    }
+  }
+
+  return changed ? next : current
 }
 
 const viewStackStyle: CSSProperties = {
