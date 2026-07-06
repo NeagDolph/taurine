@@ -1,0 +1,27 @@
+[project]
+name = "taurine-core"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.139.0",
+    "httpx>=0.28.1",
+    "macnotesapp>=0.8.2",
+    "numpy>=2.5.1",
+    "pydantic>=2.13.4",
+    "python-dotenv>=1.2.2",
+    "sentence-transformers>=5.6.0",
+    "uvicorn[standard]>=0.50.2",
+    "websockets>=16.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.15.20",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
