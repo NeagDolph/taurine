@@ -186,9 +186,9 @@ core/taurine_core/
 
 Config lives in `config.py` as constants (project convention: no env vars
 for config). The only env vars are secrets: `TAURINE_ASR_API_KEY`,
-`OPENROUTER_API_KEY`, `COHERE_API_KEY` (the latter two sourced from
-`~/wink/server/.env` into `core/.env` at setup — note: `OPENROUTER_API_KEY`
-is not present there yet and must be added before the build).
+`OPEN_ROUTER_API_KEY`, `COHERE_API_KEY` (the latter two copied from
+`~/wink/server/.env` into `core/.env` at setup — both confirmed present
+there under exactly these names).
 
 **All LLM calls — enrichment and presenter — go through the OpenRouter
 chat-completions API** (`llm.py`, single client). Model strings are config

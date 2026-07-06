@@ -1,0 +1,7 @@
+.build/
+.env
+*.db
+node_modules/
+dist/
+out/
+__pycache__/
