@@ -250,8 +250,11 @@ export class SidecarClient {
     await requestSidecar('/index/sync', { method: 'POST' }, { baseUrl: this.restBaseUrl })
   }
 
-  async reenrichIndex(): Promise<ReenrichStatus> {
-    const payload = await requestSidecarJson('/index/reenrich', { method: 'POST' }, { baseUrl: this.restBaseUrl })
+  async reenrichIndex(source?: string): Promise<ReenrichStatus> {
+    const path = source
+      ? `/index/reenrich?source=${encodeURIComponent(source)}`
+      : '/index/reenrich'
+    const payload = await requestSidecarJson(path, { method: 'POST' }, { baseUrl: this.restBaseUrl })
     return parseReenrichStatus(payload) ?? {
       running: true,
       phase: 'profile',

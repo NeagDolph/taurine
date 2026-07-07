@@ -99,3 +99,32 @@ async def test_reenrich_all_keeps_old_card_when_profile_fails(store) -> None:
     assert report.profile_failed is True
     assert store.user_card() == "## User\nExisting card."
     assert store.enrichment_for("alpha").gist == "Fresh alpha gist"
+
+
+@pytest.mark.asyncio
+async def test_reenrich_scoped_to_source_skips_profile_and_other_sources(store) -> None:
+    from taurine_core.indexer.reenrich import reenrich_all
+
+    alpha = make_note("alpha", "Alpha", "Alpha body")
+    chat = make_note("imsg", "iMessage: Jonah", "chat body").model_copy(
+        update={"source": "imessage"}
+    )
+    prior_alpha = enrichment("Old alpha gist", topics=["old"])
+    prior_chat = enrichment("Old chat gist", topics=["old"])
+    store.upsert_note(alpha, prior_alpha, fixture_units(unit_vec(1), prior_alpha))
+    store.upsert_note(chat, prior_chat, fixture_units(unit_vec(2), prior_chat))
+    store.set_user_card("existing card")
+    progress = []
+    llm = ScriptedLLM()
+
+    report = await reenrich_all(store, llm, progress.append, source="imessage")
+
+    assert report.total == 1
+    assert report.changed == 1
+    assert report.profile_failed is False
+    assert store.user_card() == "existing card"          # profile phase skipped
+    assert store.enrichment_for("alpha") == prior_alpha  # other source untouched
+    assert store.enrichment_for("imsg").gist == "Fresh alpha gist"
+    assert all(status.phase != "profile" for status in progress)
+    # scoped enrichment still receives the existing user card as context
+    assert any("existing card" in call[2] for call in llm.calls)

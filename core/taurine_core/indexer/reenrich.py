@@ -25,19 +25,32 @@ async def reenrich_all(
     index: object,
     llm: LLMPort,
     progress: Callable[[ReenrichStatus], None],
+    source: str | None = None,
 ) -> ReenrichReport:
-    notes = list(index.notes())  # type: ignore[attr-defined]
+    """Re-enrich every note, or only one connector's notes when `source` is set.
+
+    Scoped runs skip the profile phase: the user card is corpus-wide and only
+    worth regenerating on a full pass.
+    """
+    notes = [
+        note
+        for note in index.notes()  # type: ignore[attr-defined]
+        if source is None or note.source == source
+    ]
     total = len(notes)
 
-    progress(ReenrichStatus(running=True, phase="profile", done=0, total=total))
-    old_card = index.user_card()  # type: ignore[attr-defined]
     profile_failed = False
-    try:
-        user_card = await build_user_card(index, llm)
-        index.set_user_card(user_card)  # type: ignore[attr-defined]
-    except Exception:
-        profile_failed = True
-        user_card = old_card
+    if source is None:
+        progress(ReenrichStatus(running=True, phase="profile", done=0, total=total))
+        old_card = index.user_card()  # type: ignore[attr-defined]
+        try:
+            user_card = await build_user_card(index, llm)
+            index.set_user_card(user_card)  # type: ignore[attr-defined]
+        except Exception:
+            profile_failed = True
+            user_card = old_card
+    else:
+        user_card = index.user_card()  # type: ignore[attr-defined]
 
     progress(ReenrichStatus(running=True, phase="notes", done=0, total=total))
 

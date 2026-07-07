@@ -87,7 +87,7 @@ class Runtime:
     connector_registry: Any = None
     connector_llm: Any = None
     connector_sync_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
-    reenrich_all: Callable[[Callable[[ReenrichStatus], None]], Awaitable[Any]] | None = None
+    reenrich_all: Callable[..., Awaitable[Any]] | None = None
     reenrich_status: ReenrichStatus = field(
         default_factory=lambda: ReenrichStatus(running=False)
     )
@@ -215,7 +215,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         return preview
 
     @app.post("/index/reenrich", status_code=202)
-    async def index_reenrich() -> ReenrichStatus:
+    async def index_reenrich(source: str | None = None) -> ReenrichStatus:
         active_runtime: Runtime = app.state.runtime
         if (
             active_runtime.reenrich_status.running
@@ -228,10 +228,17 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
         _set_reenrich_status(
             active_runtime,
-            ReenrichStatus(running=True, phase="profile", done=0, total=0),
+            ReenrichStatus(
+                running=True,
+                phase="notes" if source else "profile",
+                done=0,
+                total=0,
+            ),
             force_emit=True,
         )
-        active_runtime.reenrich_task = asyncio.create_task(_run_reenrich(active_runtime))
+        active_runtime.reenrich_task = asyncio.create_task(
+            _run_reenrich(active_runtime, source)
+        )
         return active_runtime.reenrich_status
 
     @app.get("/index/reenrich")
@@ -393,7 +400,7 @@ def build_runtime() -> Runtime:
         enable_periodic_sync=True,
         connector_registry=connector_registry,
         connector_llm=llm,
-        reenrich_all=lambda progress: reenrich_all(index, llm, progress),
+        reenrich_all=lambda progress, source=None: reenrich_all(index, llm, progress, source=source),
     )
 
 
@@ -509,11 +516,12 @@ async def _run_connector_sync(runtime: Runtime, connector_id: str) -> None:
         await _emit_index_status(runtime)
 
 
-async def _run_reenrich(runtime: Runtime) -> None:
+async def _run_reenrich(runtime: Runtime, source: str | None = None) -> None:
     assert runtime.reenrich_all is not None
     try:
         await runtime.reenrich_all(
-            lambda status: _set_reenrich_status(runtime, status)
+            lambda status: _set_reenrich_status(runtime, status),
+            source,
         )
     except asyncio.CancelledError:
         raise

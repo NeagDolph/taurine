@@ -5,7 +5,8 @@ interface ConnectorsViewProps {
   reenriching: boolean
   reenrichError: string
   reenrichDisabled: boolean
-  onReenrich: () => void
+  reenrichTarget: string | null
+  onReenrich: (source?: string) => void
   onDataChanged: () => void
 }
 
@@ -14,6 +15,7 @@ export function ConnectorsView({
   reenriching,
   reenrichError,
   reenrichDisabled,
+  reenrichTarget,
   onReenrich,
   onDataChanged
 }: ConnectorsViewProps): React.JSX.Element {
@@ -33,6 +35,7 @@ export function ConnectorsView({
         reenrichDisabled={reenrichDisabled}
         reenrichError={reenrichError}
         reenriching={reenriching}
+        reenrichTarget={reenrichTarget}
         visible={visible}
       />
     </div>

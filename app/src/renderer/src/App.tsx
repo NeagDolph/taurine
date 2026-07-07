@@ -46,6 +46,7 @@ function App(): React.JSX.Element {
   const [syncError, setSyncError] = useState('')
   const [reenriching, setReenriching] = useState(false)
   const [reenrichError, setReenrichError] = useState('')
+  const [reenrichTarget, setReenrichTarget] = useState<string | null>(null)
   const [chunks, setChunks] = useState<FeedTranscript[]>([])
   const [interimsByChannel, setInterimsByChannel] = useState<Record<number, TranscriptEvent>>({})
   const [triggersBySeq, setTriggersBySeq] = useState<Map<number, TriggerEvent[]>>(new Map())
@@ -127,6 +128,12 @@ function App(): React.JSX.Element {
     setTriggersBySeq((current) => pruneTriggersByChunks(current, chunks))
   }, [chunks])
 
+  useEffect(() => {
+    if (!index.reenrich?.running && !reenriching) {
+      setReenrichTarget(null)
+    }
+  }, [index.reenrich?.running, reenriching])
+
   const interims = useMemo(() => Object.values(interimsByChannel), [interimsByChannel])
   const latestFinalText = chunks.length > 0 ? chunks[chunks.length - 1].text : ''
   const isReenriching = reenriching || Boolean(index.reenrich?.running)
@@ -192,16 +199,17 @@ function App(): React.JSX.Element {
     }
   }, [index.reenrich?.running, syncing])
 
-  const reenrichIndex = useCallback(async () => {
+  const reenrichIndex = useCallback(async (source?: string) => {
     const client = clientRef.current
     if (!client || reenriching || syncing || index.reenrich?.running) {
       return
     }
 
     setReenriching(true)
+    setReenrichTarget(source ?? 'all')
     setReenrichError('')
     try {
-      const status = await client.reenrichIndex()
+      const status = await client.reenrichIndex(source)
       setIndex((current) => ({
         ...current,
         reenrich: status
@@ -290,6 +298,7 @@ function App(): React.JSX.Element {
           <ConnectorsView
             onDataChanged={() => setMapRefreshKey((current) => current + 1)}
             onReenrich={reenrichIndex}
+            reenrichTarget={reenrichTarget}
             reenrichDisabled={syncing || isReenriching}
             reenrichError={reenrichError}
             reenriching={isReenriching}

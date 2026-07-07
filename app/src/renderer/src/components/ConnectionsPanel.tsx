@@ -13,8 +13,9 @@ interface ConnectionsPanelProps {
   reenriching: boolean
   reenrichError: string
   reenrichDisabled: boolean
+  reenrichTarget: string | null
   onDataChanged: () => void
-  onReenrich: () => void
+  onReenrich: (source?: string) => void
 }
 
 type PendingAction = 'enable' | 'disable' | 'purge' | 'sync' | 'config'
@@ -28,6 +29,7 @@ export function ConnectionsPanel({
   reenriching,
   reenrichError,
   reenrichDisabled,
+  reenrichTarget,
   onDataChanged,
   onReenrich
 }: ConnectionsPanelProps): React.JSX.Element {
@@ -151,10 +153,30 @@ export function ConnectionsPanel({
     <section className="connections-panel" aria-label="Connections">
       <div className="connections-panel-header">
         <span className="section-label">Sources</span>
-        <button className="secondary-button compact" type="button" onClick={() => void refreshConnectors()}>
-          Refresh
-        </button>
+        <div className="panel-card-actions">
+          <button
+            className="secondary-button compact"
+            type="button"
+            disabled={reenrichDisabled}
+            onClick={() => onReenrich()}
+            title="Regenerate the user card, then re-enrich every document from every connector"
+          >
+            {reenriching && reenrichTarget === 'all' ? (
+              <span className="inline-spinner" aria-hidden="true" />
+            ) : null}
+            {reenriching && reenrichTarget === 'all' ? 'Re-enriching all' : 'Re-enrich all'}
+          </button>
+          <button className="secondary-button compact" type="button" onClick={() => void refreshConnectors()}>
+            Refresh
+          </button>
+        </div>
       </div>
+
+      {reenrichError ? (
+        <div className="connections-panel-error" role="alert">
+          {reenrichError}
+        </div>
+      ) : null}
 
       {panelError ? (
         <div className="connections-panel-error" role="alert">
@@ -178,8 +200,7 @@ export function ConnectionsPanel({
               key={connector.connector_id}
               pendingAction={pendingById[connector.connector_id]}
               reenrichDisabled={reenrichDisabled}
-              reenrichError={connector.connector_id === APPLE_NOTES_CONNECTOR_ID ? reenrichError : ''}
-              reenriching={reenriching}
+              reenriching={reenriching && reenrichTarget === connector.connector_id}
               onCancelDisable={() => setConfirmDisableId(null)}
               onConfirmDisable={(purge) =>
                 void runConnectorAction(connector.connector_id, purge ? 'purge' : 'disable', () =>
@@ -192,7 +213,7 @@ export function ConnectionsPanel({
                   enableConnector(connector.connector_id)
                 )
               }
-              onReenrich={onReenrich}
+              onReenrich={() => onReenrich(connector.connector_id)}
               onSaveConfig={() => void saveObsidianConfig(connector.connector_id)}
               onSync={() =>
                 void runConnectorAction(connector.connector_id, 'sync', async () => {
@@ -216,7 +237,6 @@ function ConnectorCard({
   configDirty,
   confirmDisable,
   reenriching,
-  reenrichError,
   reenrichDisabled,
   onEnable,
   onDisable,
@@ -234,7 +254,6 @@ function ConnectorCard({
   configDirty: boolean
   confirmDisable: boolean
   reenriching: boolean
-  reenrichError: string
   reenrichDisabled: boolean
   onEnable: () => void
   onDisable: () => void
@@ -245,7 +264,6 @@ function ConnectorCard({
   onSaveConfig: () => void
   onReenrich: () => void
 }): React.JSX.Element {
-  const isAppleNotes = connector.connector_id === APPLE_NOTES_CONNECTOR_ID
   const isObsidian = connector.connector_id === OBSIDIAN_CONNECTOR_ID
   const syncRunning = connector.syncing || pendingAction === 'sync'
   const syncDisabled = syncRunning || !connector.available || !connector.enabled
@@ -323,19 +341,18 @@ function ConnectorCard({
           {syncRunning ? 'Syncing' : 'Sync'}
         </button>
 
-        {isAppleNotes ? (
-          <button
-            className="secondary-button compact"
-            type="button"
-            disabled={reenrichDisabled}
-            onClick={onReenrich}
-          >
-            {reenriching ? (
-              <span className="inline-spinner" aria-hidden="true" />
-            ) : null}
-            {reenriching ? 'Re-enriching' : 'Re-enrich'}
-          </button>
-        ) : null}
+        <button
+          className="secondary-button compact"
+          type="button"
+          disabled={reenrichDisabled || !connector.enabled || connector.docs === 0}
+          onClick={onReenrich}
+          title={`Re-run enrichment for the ${connector.docs} ${connector.label} document${connector.docs === 1 ? '' : 's'} already indexed`}
+        >
+          {reenriching ? (
+            <span className="inline-spinner" aria-hidden="true" />
+          ) : null}
+          {reenriching ? 'Re-enriching' : 'Re-enrich'}
+        </button>
       </div>
 
       {confirmDisable ? (
@@ -356,11 +373,6 @@ function ConnectorCard({
       {error ? (
         <div className="connector-error" role="alert">
           {error}
-        </div>
-      ) : null}
-      {reenrichError ? (
-        <div className="connector-error" role="alert">
-          {reenrichError}
         </div>
       ) : null}
     </article>

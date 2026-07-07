@@ -334,7 +334,8 @@ def test_note_preview_route_handles_url_encoded_note_ids() -> None:
 
 
 def test_reenrich_endpoint_is_single_flight_and_exposes_status() -> None:
-    async def slow_reenrich(progress: Any) -> dict[str, int]:
+    async def slow_reenrich(progress: Any, source: Any = None) -> dict[str, int]:
+        del source
         await asyncio.sleep(0.2)
         progress(ReenrichStatus(running=True, phase="notes", done=0, total=1))
         progress(ReenrichStatus(running=False, phase="idle", done=1, total=1))
