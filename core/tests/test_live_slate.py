@@ -70,6 +70,45 @@ def test_search_lane_tiebreak_evicts_oldest(slate: Slate) -> None:
     assert len(ids) == QUOTA_SEARCH
 
 
+def test_eviction_same_views_evicts_lowest_score_not_oldest(slate: Slate) -> None:
+    # oldest (n0) is strong; a mid-pack item (n3) is weak — score decides
+    for idx in range(QUOTA_SEARCH):
+        score = 0.9 if idx == 0 else (0.1 if idx == 3 else 0.5)
+        slate.add(item(f"n{idx}", added_rev=idx, score=score))
+
+    slate.add(item("new", score=0.6))
+
+    ids = [i.note_id for i in slate.items()]
+    assert "new" in ids
+    assert "n0" in ids          # oldest survives: it outscores n3
+    assert "n3" not in ids      # lowest score among the views tie is evicted
+    assert len(ids) == QUOTA_SEARCH
+
+
+def test_eviction_weak_newcomer_evicts_itself(slate: Slate) -> None:
+    for idx in range(QUOTA_SEARCH):
+        slate.add(item(f"n{idx}", score=0.5))
+
+    slate.add(item("weak", score=0.05))
+
+    ids = [i.note_id for i in slate.items()]
+    assert "weak" not in ids    # must not displace a stronger candidate
+    assert len(ids) == QUOTA_SEARCH
+
+
+def test_eviction_views_still_dominate_score(slate: Slate) -> None:
+    for idx in range(QUOTA_SEARCH):
+        slate.add(item(f"n{idx}", score=0.5))
+    slate.mark_viewed(["n1"])   # n1: high score after renewal? no — just viewed once
+
+    slate.add(item("new", score=0.05))
+
+    ids = [i.note_id for i in slate.items()]
+    assert "n1" not in ids      # the presenter already saw n1 and passed
+    assert "new" in ids         # even a weak newcomer beats a passed-on item
+    assert len(ids) == QUOTA_SEARCH
+
+
 def test_renewal_resets_views_and_upgrades_provenance(slate: Slate) -> None:
     slate.add(item("n1", source="search", score=0.2))
     slate.mark_viewed(["n1"])

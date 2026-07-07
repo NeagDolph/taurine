@@ -121,7 +121,13 @@ class Slate:
         if len(lane_items) <= quota:
             return
 
-        evicted = max(lane_items, key=lambda item: (item.views, -item.added_rev))
+        # most-viewed first (the presenter already passed on them), then the
+        # LOWEST score among ties, then oldest — a weak newcomer must not
+        # displace a stronger existing candidate (audit: score-aware eviction)
+        evicted = max(
+            lane_items,
+            key=lambda item: (item.views, -item.score, -item.added_rev),
+        )
         del self._items[evicted.note_id]
         self.revision += 1
         self._emit_event(
