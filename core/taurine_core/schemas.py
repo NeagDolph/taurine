@@ -32,6 +32,7 @@ class NoteRecord(BaseModel):
     content_hash: str
     text: str                      # plain text body
     gist: str = ""                 # filled after enrichment (fallback: first line)
+    source: str = "apple_notes"    # connector_id that produced this document
 
 
 EdgeType = Literal["semantic", "topic", "entity", "mixed"]
@@ -49,6 +50,7 @@ class GraphNode(BaseModel):
     note_id: str
     title: str
     degree: int
+    source: str = "apple_notes"
 
 
 class GraphResponse(BaseModel):
@@ -169,6 +171,45 @@ class TriggerEvent(BaseModel):
     span: str                      # matched alias (exact) / window text (search)
     matches: list[TriggerMatch]    # notes this trigger brought about
     action: Literal["pinned", "slated", "none"]
+
+
+# ── connectors ─────────────────────────────────────────────────────────
+class ConnectorInfo(BaseModel):
+    connector_id: str
+    label: str
+    kind: Literal["local", "oauth"] = "local"
+    enabled: bool
+    available: bool
+    detail: str = ""               # remediation hint when unavailable
+    docs: int = 0
+    last_sync: Optional[float] = None
+    syncing: bool = False
+    config: dict = {}
+
+
+class ConnectorSyncReport(BaseModel):
+    connector_id: str
+    added: int = 0
+    changed: int = 0
+    removed: int = 0
+    enrich_failures: int = 0
+    error: str = ""
+
+
+class NeighborRef(BaseModel):
+    note_id: str
+    title: str
+    source: str = "apple_notes"
+    weight: float = 0.0
+
+
+class NotePreview(BaseModel):
+    note_id: str
+    title: str
+    source: str
+    gist: str
+    text: str
+    neighbors: list[NeighborRef] = []
 
 
 class ReenrichStatus(BaseModel):

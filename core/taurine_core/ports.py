@@ -51,6 +51,29 @@ class SpanExtractorPort(Protocol):
         ...
 
 
+class ConnectorPort(Protocol):
+    """A local (or later OAuth) data source producing NoteRecords."""
+
+    connector_id: str              # stable id; also the NoteRecord.source value
+    label: str                     # human name for the UI
+    kind: str                      # "local" | "oauth"
+
+    def available(self) -> tuple[bool, str]:
+        """(usable, remediation detail when not). Must never raise."""
+        ...
+
+    def default_config(self) -> dict:
+        ...
+
+    def extract(self, config: dict) -> list["NoteRecord"]:
+        """Full snapshot of this source's documents. Raises ConnectorError."""
+        ...
+
+
+class ConnectorError(Exception):
+    pass
+
+
 class RerankerPort(Protocol):
     async def rerank(self, query: str, docs: list[tuple[str, str]]) -> list[tuple[str, float]]:
         """docs=[(note_id, doc_text)] -> [(note_id, relevance)] desc.

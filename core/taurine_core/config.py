@@ -34,8 +34,15 @@ PROFILE_NOTE_CHAR_BUDGET = 2400          # per-note truncation when building car
 PROFILE_MAX_CHARS = 6000                 # cap on the generated card itself
 REENRICH_CONCURRENCY = 4
 
-# ── notes sync ─────────────────────────────────────────────────────────
+# ── notes sync / connectors ────────────────────────────────────────────
 SYNC_INTERVAL_S = 300.0
+CONNECTOR_DOC_MAX_CHARS = 12000          # per-document body cap at extraction
+IMESSAGE_WINDOW_DAYS = 14
+IMESSAGE_MAX_CHARS = 5000                # per-conversation transcript cap
+CLAUDE_MEMORY_GLOB = "~/.claude/projects/*/memory/*.md"
+CODEX_MEMORY_GLOBS = ("~/.codex/AGENTS.md", "~/.codex/memory/**/*.md", "~/.codex/memories/**/*.md")
+OBSIDIAN_APP_JSON = "~/Library/Application Support/obsidian/obsidian.json"
+IMESSAGE_DB = "~/Library/Messages/chat.db"
 GIST_MAX_CHARS = 220                     # was 120: mid-word truncation degraded rerank docs
                                          # and card copy (audit finding #5)
 
