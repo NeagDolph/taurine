@@ -184,6 +184,29 @@ class Index:
         ).fetchone()
         return str(row["value"]) if row is not None else None
 
+    def connector_state(self, connector_id: str) -> dict:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (_connector_meta_key(connector_id),),
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            value = json.loads(row["value"])
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def set_connector_state(self, connector_id: str, state: dict) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO meta(key, value, updated)
+                VALUES (?, ?, ?)
+                """,
+                (_connector_meta_key(connector_id), json.dumps(state, sort_keys=True), time.time()),
+            )
+
     def dense_search(self, text: str, k: int) -> list[tuple[str, float]]:
         if k <= 0 or self._matrix.size == 0:
             return []
@@ -624,3 +647,7 @@ def _rerank_evidence_text(kind: EmbeddingKind, text: str) -> str:
     if kind == "utterance":
         return f"(spoken reference) {text}"
     return text
+
+
+def _connector_meta_key(connector_id: str) -> str:
+    return f"connector:{connector_id}"
