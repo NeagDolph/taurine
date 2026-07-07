@@ -6,6 +6,8 @@ from collections.abc import Callable
 from typing import Any
 from typing import Protocol
 
+from rapidfuzz.distance import Levenshtein
+
 from taurine_core import config
 from taurine_core.ports import IndexPort, RerankerPort, RerankError, SpanExtractorPort
 from taurine_core.schemas import Expansion, Hit, RetrievalResult, SlateItem
@@ -47,6 +49,7 @@ class AmbientRetriever:
         self._on_debug = on_debug
         self._span_extractor = span_extractor
         self._last_run_at: float | None = None
+        self._snap_vocabulary = _snap_vocabulary(index.aliases())
 
     async def on_window(self, window_text: str) -> RetrievalResult | None:
         self.last_slate_adds = []
@@ -61,6 +64,7 @@ class AmbientRetriever:
 
         salient = self._salient_query(window_text)
         gliner_spans = self._extract_spans(window_text)
+        gliner_queries, snapped = self._gliner_queries(gliner_spans)
         extracted = [span for span, _score, _label in gliner_spans]
         dense = self._index.dense_search(window_text, config.RERANK_MAX_CANDIDATES)
         dense_salient = (
@@ -68,8 +72,9 @@ class AmbientRetriever:
             if salient
             else []
         )
-        dense_gliner = self._dense_gliner(gliner_spans)
-        bm25 = self._index.bm25_search(window_text, config.RERANK_MAX_CANDIDATES)
+        dense_gliner = self._dense_gliner(gliner_queries)
+        bm25_query = _bm25_query(window_text, snapped)
+        bm25 = self._index.bm25_search(bm25_query, config.RERANK_MAX_CANDIDATES)
         dense_scores = self._dense_scores(dense, dense_salient, dense_gliner)
         bm25_note_ids = {note_id for note_id, _score in bm25}
 
@@ -88,6 +93,7 @@ class AmbientRetriever:
                 dense_salient=dense_salient,
                 dense_gliner=dense_gliner,
                 bm25=bm25,
+                bm25_query=bm25_query,
                 direct_scores=direct_scores,
                 expansion_arrivals=expansion_arrivals,
                 rerank_used=False,
@@ -95,6 +101,8 @@ class AmbientRetriever:
                 ordered=[],
                 floor_dropped=[],
                 slate_adds=[],
+                protected=[],
+                snapped=snapped,
             )
             return RetrievalResult(heard=window_text, hits=[], expansions=[], extracted=extracted)
 
@@ -111,7 +119,18 @@ class AmbientRetriever:
         )
         filtered_ids = {note_id for note_id, _score in filtered}
         floor_dropped = [note_id for note_id, _score in ordered if note_id not in filtered_ids]
-        top = filtered[: config.C2_TOP_K]
+        ordered_ranks = {
+            note_id: rank
+            for rank, (note_id, _score) in enumerate(ordered, start=1)
+        }
+        protected_ids = self._floor_passing_fused_protected_ids(
+            direct_scores,
+            dense_scores,
+            bm25_note_ids,
+            set(expansion_arrivals),
+            ordered_ranks,
+        )
+        top, protected = self._protect_fused(filtered, protected_ids, ordered_ranks)
 
         expansions = [
             Expansion(
@@ -129,7 +148,7 @@ class AmbientRetriever:
         ]
 
         hits = [
-            Hit(note_id=note_id, rank=rank, score=score)
+            Hit(note_id=note_id, rank=ordered_ranks.get(note_id, rank), score=score)
             for rank, (note_id, score) in enumerate(top, start=1)
         ]
         self.last_slate_adds = [
@@ -144,6 +163,7 @@ class AmbientRetriever:
             dense_salient=dense_salient,
             dense_gliner=dense_gliner,
             bm25=bm25,
+            bm25_query=bm25_query,
             direct_scores=direct_scores,
             expansion_arrivals=expansion_arrivals,
             rerank_used=rerank_used,
@@ -151,6 +171,8 @@ class AmbientRetriever:
             ordered=ordered,
             floor_dropped=floor_dropped,
             slate_adds=[note_id for note_id, _score in top],
+            protected=protected,
+            snapped=snapped,
         )
         return RetrievalResult(
             heard=window_text,
@@ -209,14 +231,50 @@ class AmbientRetriever:
         except Exception:
             return []
 
-    def _dense_gliner(
+    def _gliner_queries(
         self,
         gliner_spans: list[tuple[str, float, str]],
+    ) -> tuple[list[str], list[tuple[str, str]]]:
+        queries: list[str] = []
+        snapped: list[tuple[str, str]] = []
+        for span, _span_score, label in gliner_spans:
+            queries.append(span)
+            snapped_span = self._snap_span(span, label)
+            if snapped_span is None:
+                continue
+            queries.append(snapped_span)
+            snapped.append((span, snapped_span))
+        return queries, snapped
+
+    def _snap_span(self, span: str, label: str) -> str | None:
+        normalized = span.strip().lower()
+        if (
+            not normalized
+            or label.lower() not in config.FUZZY_SNAP_LABELS
+            or len(normalized) < config.FUZZY_SNAP_MIN_LEN
+            or not self._snap_vocabulary
+        ):
+            return None
+
+        best: tuple[int, str] | None = None
+        for candidate in self._snap_vocabulary:
+            if candidate == normalized:
+                continue
+            distance = Levenshtein.distance(normalized, candidate)
+            if best is None or (distance, candidate) < best:
+                best = (distance, candidate)
+        if best is None or best[0] > config.FUZZY_SNAP_MAX_DIST:
+            return None
+        return best[1]
+
+    def _dense_gliner(
+        self,
+        gliner_queries: list[str],
     ) -> list[tuple[str, float]]:
         scores: dict[str, float] = {}
-        for span, _span_score, _label in gliner_spans:
+        for query in gliner_queries:
             for note_id, score in self._index.dense_search(
-                span,
+                query,
                 config.RERANK_MAX_CANDIDATES,
             ):
                 scores[note_id] = max(scores.get(note_id, float("-inf")), score)
@@ -335,6 +393,60 @@ class AmbientRetriever:
             filtered.append((note_id, score))
         return filtered
 
+    def _floor_passing_fused_protected_ids(
+        self,
+        direct_scores: dict[str, float],
+        dense_scores: dict[str, float],
+        bm25_note_ids: set[str],
+        graph_note_ids: set[str],
+        ordered_ranks: dict[str, int],
+    ) -> set[str]:
+        fused_protected = [
+            (candidate.note_id, candidate.score)
+            for candidate in self._ordered_candidates(direct_scores)[: config.FUSED_PROTECT]
+            if candidate.note_id in ordered_ranks
+        ]
+        return {
+            note_id
+            for note_id, _score in self._apply_floor(
+                fused_protected,
+                dense_scores,
+                bm25_note_ids,
+                graph_note_ids,
+            )
+        }
+
+    def _protect_fused(
+        self,
+        filtered: list[tuple[str, float]],
+        protected_ids: set[str],
+        ordered_ranks: dict[str, int],
+    ) -> tuple[list[tuple[str, float]], list[str]]:
+        top = list(filtered[: config.C2_TOP_K])
+        top_ids = {note_id for note_id, _score in top}
+        appended: list[str] = []
+        for note_id, score in filtered[config.C2_TOP_K :]:
+            if note_id not in protected_ids or note_id in top_ids:
+                continue
+            top.append((note_id, score))
+            top_ids.add(note_id)
+            appended.append(note_id)
+
+        while len(top) > config.C2_TOP_K:
+            drop_candidates = [
+                index
+                for index, (note_id, _score) in enumerate(top)
+                if note_id not in protected_ids
+            ] or list(range(len(top)))
+            drop_index = max(
+                drop_candidates,
+                key=lambda index: ordered_ranks.get(top[index][0], index + 1),
+            )
+            dropped_id = top[drop_index][0]
+            del top[drop_index]
+            top_ids.discard(dropped_id)
+        return top, [note_id for note_id in appended if note_id in top_ids]
+
     def _slate_item(
         self,
         note_id: str,
@@ -364,11 +476,12 @@ class AmbientRetriever:
         *,
         window: str,
         salient: str | None,
-        gliner_spans: list[tuple[str, float]],
+        gliner_spans: list[tuple[str, float, str]],
         dense: list[tuple[str, float]],
         dense_salient: list[tuple[str, float]],
         dense_gliner: list[tuple[str, float]],
         bm25: list[tuple[str, float]],
+        bm25_query: str,
         direct_scores: dict[str, float],
         expansion_arrivals: dict[str, _ExpansionArrival],
         rerank_used: bool,
@@ -376,6 +489,8 @@ class AmbientRetriever:
         ordered: list[tuple[str, float]],
         floor_dropped: list[str],
         slate_adds: list[str],
+        protected: list[str],
+        snapped: list[tuple[str, str]],
     ) -> None:
         debug = {
             "window": window,
@@ -404,7 +519,12 @@ class AmbientRetriever:
             "ordered": _rows(ordered),
             "floor_dropped": floor_dropped,
             "slate_adds": slate_adds,
+            "protected": protected,
         }
+        if bm25_query != window:
+            debug["bm25_query"] = bm25_query
+        if snapped:
+            debug["snapped"] = _rows(snapped)
         self.last_debug = debug
         if self._on_debug is None:
             return
@@ -416,3 +536,28 @@ class AmbientRetriever:
 
 def _rows(rows: list[tuple[Any, ...]]) -> list[list[Any]]:
     return [list(row) for row in rows]
+
+
+def _snap_vocabulary(alias_rows: list[tuple[str, str, bool]]) -> tuple[str, ...]:
+    vocabulary: set[str] = set()
+    for alias, _note_id, is_title in alias_rows:
+        normalized = alias.strip().lower()
+        if not normalized:
+            continue
+        vocabulary.add(normalized)
+        if is_title:
+            vocabulary.update(token for token in normalized.split() if token)
+    return tuple(sorted(vocabulary))
+
+
+def _bm25_query(window_text: str, snapped: list[tuple[str, str]]) -> str:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for _original, snapped_term in snapped:
+        if snapped_term in seen:
+            continue
+        seen.add(snapped_term)
+        terms.append(snapped_term)
+    if not terms:
+        return window_text
+    return " ".join([window_text, *terms])

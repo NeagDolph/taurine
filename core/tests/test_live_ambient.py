@@ -55,15 +55,24 @@ class QueryAwareIndex(FakeIndex):
         self,
         *,
         dense_by_query: dict[str, list[tuple[str, float]]],
+        bm25_by_query: dict[str, list[tuple[str, float]]] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.dense_by_query = dense_by_query
+        self.bm25_by_query = bm25_by_query or {}
         self.dense_queries: list[str] = []
+        self.bm25_queries: list[str] = []
 
     def dense_search(self, text: str, k: int) -> list[tuple[str, float]]:
         self.dense_queries.append(text)
         return self.dense_by_query.get(text, [])[:k]
+
+    def bm25_search(self, text: str, k: int) -> list[tuple[str, float]]:
+        self.bm25_queries.append(text)
+        if text in self.bm25_by_query:
+            return self.bm25_by_query[text][:k]
+        return super().bm25_search(text, k)
 
 
 class FakeSpanExtractor:
@@ -226,6 +235,51 @@ async def test_min_cosine_floor_only_filters_dense_only_low_scores() -> None:
     assert "low" not in [item.note_id for item in retriever.last_slate_adds]
 
 
+async def test_fused_protect_rescues_fused_top_note_demoted_by_rerank() -> None:
+    ordered_ids = [f"ordered-{idx}" for idx in range(1, config.C2_TOP_K + 2)]
+    note_ids = ["protected", *ordered_ids]
+    index = FakeIndex(
+        notes={note_id: note(note_id, note_id.title()) for note_id in note_ids},
+        dense=[
+            ("protected", 0.95),
+            *[
+                (note_id, 0.9 - idx * 0.01)
+                for idx, note_id in enumerate(ordered_ids)
+            ],
+        ],
+        chunks={note_id: f"chunk {note_id}" for note_id in note_ids},
+    )
+    rerank_scores = {
+        note_id: float(config.C2_TOP_K + 2 - idx)
+        for idx, note_id in enumerate(ordered_ids, start=1)
+    }
+    rerank_scores["protected"] = 0.1
+    debug_records: list[dict[str, object]] = []
+
+    retriever = AmbientRetriever(
+        index,
+        OkReranker(rerank_scores),
+        FakeClock(),
+        on_debug=debug_records.append,
+    )
+    res = await retriever.on_window("protect retrieval")
+
+    assert res is not None
+    slate_ids = [item.note_id for item in retriever.last_slate_adds]
+    assert "protected" in slate_ids
+    assert ordered_ids[config.C2_TOP_K - 1] not in slate_ids
+    assert len(slate_ids) == config.C2_TOP_K
+    protected_hit = next(hit for hit in res.hits if hit.note_id == "protected")
+    assert protected_hit.rank == config.C2_TOP_K + 2
+    assert protected_hit.score == pytest.approx(0.1)
+    protected_score = next(
+        item.score for item in retriever.last_slate_adds if item.note_id == "protected"
+    )
+    assert protected_score == pytest.approx(0.1)
+    assert debug_records[0]["protected"] == ["protected"]
+    assert debug_records[0]["slate_adds"][-1] == "protected"
+
+
 async def test_debug_callback_reports_one_c2_pass_with_internal_rows() -> None:
     debug_records: list[dict[str, object]] = []
     index = FakeIndex(
@@ -372,6 +426,111 @@ async def test_span_queries_form_dense_gliner_list_and_survive_floor() -> None:
         ["window", pytest.approx((1 / (config.RRF_K + 1)) * 2 + (1 / (config.RRF_K + 2)))],
         ["span-only", pytest.approx(1 / (config.RRF_K + 1))],
     ]
+
+
+async def test_fuzzy_snap_queries_original_and_snapped_span_and_logs_snap() -> None:
+    window = "ask armand"
+    span_extractor = FakeSpanExtractor([("armand", 0.95, "person")])
+    index = QueryAwareIndex(
+        notes={"armaan": note("armaan", "Armaan Talk")},
+        dense_by_query={
+            window: [],
+            "armand": [],
+            "armaan": [("armaan", 0.92)],
+        },
+        alias_rows=[("armaan talk", "armaan", True)],
+        chunks={"armaan": "Armaan Talk chunk"},
+    )
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker({"armaan": 0.88}),
+        FakeClock(),
+        on_debug=debug_records.append,
+        span_extractor=span_extractor,
+    ).on_window(window)
+
+    assert res is not None
+    assert res.extracted == ["armand"]
+    assert "armaan" in index.dense_queries
+    assert [hit.note_id for hit in res.hits] == ["armaan"]
+    debug = debug_records[0]
+    assert debug["snapped"] == [["armand", "armaan"]]
+    assert debug["dense_gliner"] == [["armaan", 0.92]]
+
+
+@pytest.mark.parametrize(
+    ("span", "label"),
+    [
+        ("armand", "topic"),
+        ("xylophone", "person"),
+    ],
+)
+async def test_fuzzy_snap_skips_ineligible_labels_and_distant_spans(
+    span: str,
+    label: str,
+) -> None:
+    window = f"ask {span}"
+    span_extractor = FakeSpanExtractor([(span, 0.95, label)])
+    index = QueryAwareIndex(
+        notes={"armaan": note("armaan", "Armaan Talk")},
+        dense_by_query={
+            window: [],
+            span: [],
+            "armaan": [("armaan", 0.92)],
+        },
+        alias_rows=[("armaan talk", "armaan", True)],
+        chunks={"armaan": "Armaan Talk chunk"},
+    )
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker({"armaan": 0.88}),
+        FakeClock(),
+        on_debug=debug_records.append,
+        span_extractor=span_extractor,
+    ).on_window(window)
+
+    assert res is not None
+    assert res.hits == []
+    assert "armaan" not in index.dense_queries
+    assert "snapped" not in debug_records[0]
+    assert "bm25_query" not in debug_records[0]
+
+
+async def test_snapped_terms_extend_bm25_query_and_log_query() -> None:
+    window = "ask armand about timeline"
+    span_extractor = FakeSpanExtractor([("armand", 0.95, "person")])
+    bm25_query = f"{window} armaan"
+    index = QueryAwareIndex(
+        notes={"bm25": note("bm25", "Armaan Talk")},
+        dense_by_query={
+            window: [],
+            "armand": [],
+            "armaan": [],
+        },
+        bm25_by_query={bm25_query: [("bm25", 4.0)]},
+        alias_rows=[("armaan talk", "bm25", True)],
+        chunks={"bm25": "Armaan Talk chunk"},
+    )
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker({"bm25": 0.77}),
+        FakeClock(),
+        on_debug=debug_records.append,
+        span_extractor=span_extractor,
+    ).on_window(window)
+
+    assert res is not None
+    assert index.bm25_queries == [bm25_query]
+    assert [hit.note_id for hit in res.hits] == ["bm25"]
+    debug = debug_records[0]
+    assert debug["bm25_query"] == bm25_query
+    assert debug["bm25"] == [["bm25", 4.0]]
 
 
 async def test_empty_span_extractor_degrades_to_three_list_rrf() -> None:
