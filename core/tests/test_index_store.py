@@ -85,6 +85,30 @@ def test_best_chunk_returns_nearest_chunk_text(store, monkeypatch):
     assert store.best_chunk("alpha", "matching query") == "matching chunk"
 
 
+def test_best_chunk_considers_utterance_units_and_prefixes_spoken_reference(store, monkeypatch):
+    note = make_note("alpha", "Alpha", "Alpha body")
+    enrich = enrichment("Alpha gist", utterances=["matching spoken sentence"])
+    query_vec = unit_vec(15)
+    store.upsert_note(
+        note,
+        enrich,
+        [
+            ("chunk", "unrelated chunk", unit_vec(16)),
+            ("gist", "unrelated gist", unit_vec(17)),
+            ("utterance", "matching spoken sentence", query_vec),
+        ],
+    )
+    monkeypatch.setattr(
+        "taurine_core.indexer.store.embed_texts",
+        lambda texts: np.array([query_vec for _ in texts], dtype=np.float32),
+    )
+
+    assert (
+        store.best_chunk("alpha", "matching query")
+        == "(spoken reference) matching spoken sentence"
+    )
+
+
 def test_doc_frequency_is_case_insensitive_cached_and_quotes_punctuation(store):
     alpha = make_note("alpha", "Alpha: Plan", "Launch alpha:plan details.")
     beta = make_note("beta", "Beta", "Alpha only.")

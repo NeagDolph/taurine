@@ -233,23 +233,30 @@ class Index:
         return {row["note_id"] for row in rows}
 
     def best_chunk(self, note_id: str, query_text: str) -> str:
+        """Embedding unit of the note most similar to query_text for rerank docs.
+
+        The method name is historical: candidates may be chunks, gists, or
+        synthetic utterances. Utterance winners are labeled as spoken references
+        so rerank documents read naturally.
+        """
         rows = [
-            (row_id, text)
+            (row_id, kind, text)
             for row_id, row_note_id, kind, text in self._embedding_rows
-            if row_note_id == note_id and kind == "chunk"
+            if row_note_id == note_id
         ]
         if not rows:
             note = self.note(note_id)
             return note.text if note is not None else ""
         if self._matrix.size == 0:
-            return rows[0][1]
+            return _rerank_evidence_text(rows[0][1], rows[0][2])
         query = embed_texts([query_text])[0].astype(np.float32)
         norm = float(np.linalg.norm(query))
         if norm == 0:
-            return rows[0][1]
+            return _rerank_evidence_text(rows[0][1], rows[0][2])
         query = query / norm
-        row_ids = {row_id: text for row_id, text in rows}
-        best_text = rows[0][1]
+        row_ids = {row_id: (kind, text) for row_id, kind, text in rows}
+        best_kind = rows[0][1]
+        best_text = rows[0][2]
         best_score = -1.0
         for index, (row_id, _, _, _) in enumerate(self._embedding_rows):
             if row_id not in row_ids:
@@ -257,8 +264,8 @@ class Index:
             score = float(self._matrix[index] @ query)
             if score > best_score:
                 best_score = score
-                best_text = row_ids[row_id]
-        return best_text
+                best_kind, best_text = row_ids[row_id]
+        return _rerank_evidence_text(best_kind, best_text)
 
     def aliases(self) -> list[tuple[str, str, bool]]:
         rows = self._conn.execute(
@@ -511,3 +518,9 @@ class Index:
 
 def _normalize_alias(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+
+
+def _rerank_evidence_text(kind: EmbeddingKind, text: str) -> str:
+    if kind == "utterance":
+        return f"(spoken reference) {text}"
+    return text
