@@ -42,6 +42,55 @@ async def test_complete_json_posts_openrouter_json_object_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_complete_tools_posts_openrouter_tools_request_and_returns_message() -> None:
+    requests: list[httpx.Request] = []
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_note",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"note_id": {"type": "string"}},
+                    "required": ["note_id"],
+                },
+            },
+        }
+    ]
+    messages = [{"role": "user", "content": "consider the slate"}]
+    assistant_message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_note", "arguments": "{\"note_id\":\"n1\"}"},
+            }
+        ],
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": assistant_message}]})
+
+    client = OpenRouterClient("secret-key", transport=httpx.MockTransport(handler))
+
+    result = await client.complete_tools("model-a", "system text", messages, tools)
+
+    assert result == assistant_message
+    assert len(requests) == 1
+    request = requests[0]
+    assert str(request.url) == f"{config.OPENROUTER_BASE_URL}/chat/completions"
+    assert request.headers["authorization"] == "Bearer secret-key"
+    body = json.loads(request.content)
+    assert body["model"] == "model-a"
+    assert body["messages"] == [{"role": "system", "content": "system text"}, *messages]
+    assert body["tools"] == tools
+    assert "response_format" not in body
+
+
+@pytest.mark.asyncio
 async def test_complete_json_raises_llm_error_on_http_failure() -> None:
     client = OpenRouterClient(
         "secret-key",

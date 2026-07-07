@@ -316,17 +316,36 @@ class LiveSession:
         promoted = 0
         for pick in picks:
             item = item_by_id.get(pick.note_id)
-            if item is None:
+            card = (
+                _card_from_pick(pick, item)
+                if item is not None
+                else self._card_from_index_pick(pick)
+            )
+            if card is None:
                 continue
-            if not await self._pin(_card_from_pick(pick, item)):
+            if not await self._pin(card):
                 continue
-            self._slate.kick(item.note_id, "pinned")
+            if item is not None:
+                self._slate.kick(item.note_id, "pinned")
             self._cadence.note_promotion(now=now)
             promoted += 1
 
         if promoted == 0:
             self._cadence.note_empty(attempt_revision, now=now)
         await self._emit_ambient_if_changed(before_revision)
+
+    def _card_from_index_pick(self, pick: Pick) -> Card | None:
+        note = self._index.note(pick.note_id)
+        if note is None:
+            return None
+        return Card(
+            card_id=_card_id(note.note_id),
+            note_id=note.note_id,
+            title=note.title,
+            summary=pick.why,
+            provenance="linked",
+            heard=self._window_text(self._window_chunks(), self._active_partials()),
+        )
 
     async def _pin(self, card: Card) -> bool:
         if card.note_id in self._slate.shown:

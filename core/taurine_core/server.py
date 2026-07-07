@@ -213,7 +213,7 @@ def build_runtime() -> Runtime:
                 clock,
                 span_extractor=span_extractor,
             ),
-            presenter=Presenter(llm, on_log=lambda payload: logger.log("presenter", **payload)),
+            presenter=Presenter(llm, index, on_log=lambda payload: logger.log("presenter", **payload)),
             emit=emit,
             clock=clock,
             logger=logger,
