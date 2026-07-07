@@ -21,10 +21,18 @@ CHUNK_MAX_TOKENS = 300                   # sentence-boundary chunking
 # ── LLM (ALL calls via OpenRouter) ─────────────────────────────────────
 # demo-first: gemini-3.5-flash is pricier but much faster than deepseek
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-ENRICH_MODEL = "google/gemini-3.5-flash"
+ENRICH_MODEL = "z-ai/glm-5.2"            # enrichment is offline: quality over latency
+ENRICH_TIMEOUT_S = 60.0
 PRESENTER_MODEL = "google/gemini-3.5-flash"
 PRESENTER_FALLBACK_MODEL = "deepseek/deepseek-chat"
 LLM_TIMEOUT_S = 15.0
+
+# ── user information card (full-corpus profile fed to every enrichment) ─
+PROFILE_MODEL = "z-ai/glm-5.2"           # 1M context: the whole corpus fits
+PROFILE_TIMEOUT_S = 300.0
+PROFILE_NOTE_CHAR_BUDGET = 2400          # per-note truncation when building card input
+PROFILE_MAX_CHARS = 6000                 # cap on the generated card itself
+REENRICH_CONCURRENCY = 4
 
 # ── notes sync ─────────────────────────────────────────────────────────
 SYNC_INTERVAL_S = 300.0

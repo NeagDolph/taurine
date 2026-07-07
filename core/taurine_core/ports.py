@@ -63,8 +63,11 @@ class RerankError(Exception):
 
 
 class LLMPort(Protocol):
-    async def complete_json(self, model: str, system: str, user: str) -> dict:
+    async def complete_json(
+        self, model: str, system: str, user: str, timeout_s: float | None = None
+    ) -> dict:
         """One chat completion via OpenRouter, response_format json_object.
+        timeout_s overrides config.LLM_TIMEOUT_S (long offline calls).
         Raises LLMError on HTTP/parse failure."""
         ...
 

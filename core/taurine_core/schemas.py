@@ -171,9 +171,17 @@ class TriggerEvent(BaseModel):
     action: Literal["pinned", "slated", "none"]
 
 
+class ReenrichStatus(BaseModel):
+    running: bool
+    phase: Literal["idle", "profile", "notes", "finalizing"] = "idle"
+    done: int = 0
+    total: int = 0
+
+
 class IndexStatus(BaseModel):
     notes: int
     last_sync: Optional[float] = None
+    reenrich: Optional[ReenrichStatus] = None
 
 
 class StatusEvent(BaseModel):
