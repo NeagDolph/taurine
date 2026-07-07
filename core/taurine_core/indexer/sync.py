@@ -11,7 +11,7 @@ from typing import Any, TypeVar
 import numpy as np
 
 from taurine_core.ports import LLMError, LLMPort
-from taurine_core.schemas import Enrichment, NoteRecord
+from taurine_core.schemas import ConnectorSyncReport, Enrichment, NoteRecord
 
 from .embed import chunk_text, embed_texts
 from .enrich import enrich_note_with_status
@@ -31,9 +31,24 @@ class SyncReport:
 
 
 def sync_once(index: Index, notes_source: NotesSource, llm: LLMPort) -> SyncReport:
-    incoming = list(_notes_from(notes_source))
+    report = sync_source(index, "apple_notes", _notes_from(notes_source), llm)
+    return SyncReport(
+        added=report.added,
+        changed=report.changed,
+        removed=report.removed,
+        enrich_failures=report.enrich_failures,
+    )
+
+
+def sync_source(
+    index: Index,
+    source_id: str,
+    records: Iterable[NoteRecord],
+    llm: LLMPort,
+) -> ConnectorSyncReport:
+    incoming = [note.model_copy(update={"source": source_id}) for note in records]
     incoming_by_id = {note.note_id: note for note in incoming}
-    existing_by_id = {note.note_id: note for note in index.notes()}
+    existing_by_id = {note.note_id: note for note in index.notes(source_id)}
 
     removed_ids = sorted(set(existing_by_id) - set(incoming_by_id))
     for note_id in removed_ids:
@@ -70,7 +85,8 @@ def sync_once(index: Index, notes_source: NotesSource, llm: LLMPort) -> SyncRepo
     for note_id in rebuilt:
         index.rebuild_for(note_id)
     index.load()
-    return SyncReport(
+    return ConnectorSyncReport(
+        connector_id=source_id,
         added=added,
         changed=changed,
         removed=len(removed_ids),

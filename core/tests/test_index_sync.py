@@ -134,3 +134,37 @@ def test_sync_passes_stored_user_card_to_enrichment(store, stub_llm):
 
     assert len(stub_llm.calls) == 1
     assert "## User\nWorks with Stripe." in stub_llm.calls[0]
+
+
+def test_sync_source_removes_only_notes_from_that_source(store, stub_llm):
+    from taurine_core.indexer.sync import sync_source
+
+    source_a = make_note("source-a:alpha", "Alpha", "Alpha source text").model_copy(
+        update={"source": "source-a"}
+    )
+    source_b = make_note("source-b:beta", "Beta", "Beta source text").model_copy(
+        update={"source": "source-b"}
+    )
+
+    sync_source(store, "source-a", [source_a], stub_llm)
+    sync_source(store, "source-b", [source_b], stub_llm)
+    report = sync_source(store, "source-a", [], stub_llm)
+
+    assert report.connector_id == "source-a"
+    assert report.removed == 1
+    assert store.note(source_a.note_id) is None
+    assert store.note(source_b.note_id) is not None
+
+
+def test_sync_source_tags_records_with_requested_source(store, stub_llm):
+    from taurine_core.indexer.sync import sync_source
+
+    raw = make_note("obsidian:vault/plan.md", "Plan", "Plan body").model_copy(
+        update={"source": "wrong-source"}
+    )
+
+    report = sync_source(store, "obsidian", [raw], stub_llm)
+
+    assert report.connector_id == "obsidian"
+    assert report.added == 1
+    assert store.note(raw.note_id).source == "obsidian"
