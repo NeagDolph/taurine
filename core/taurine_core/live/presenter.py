@@ -11,12 +11,24 @@ from taurine_core.schemas import Chunk, Pick, SlateItem
 
 
 SYSTEM_PROMPT = (
-    "You choose which notes, if any, are worth showing in a live meeting. "
-    "Weigh named entities in the transcript, especially people, companies, and projects, "
-    "above generic topical similarity. Be robust to likely ASR spelling drift in names, "
-    'for example "Armand" may mean "Armaan". Use read_note when a slate item or neighbor '
-    "looks promising but the gist is insufficient. Neighbors of slated notes are legitimate "
-    "picks only after you have read and verified them. "
+    "You decide which notes, if any, get pinned on screen during a live meeting. "
+    "A pin interrupts the user — it is a strong claim that this note is about what is "
+    "being discussed RIGHT NOW. Pin only when you KNOW the note is directly relevant: "
+    "the conversation explicitly involves the note's subject (a person, project, company, "
+    "document, or event named or unmistakably referenced in the transcript), or the note "
+    "answers a question just raised. Topical adjacency, shared themes, or 'might be "
+    "useful' are NOT enough — when in doubt, pick nothing; empty picks are the normal "
+    "outcome, not a failure. "
+    "You receive the FULL conversation so far: use it to tell a passing mention from an "
+    "actual subject of discussion, and favor what the conversation is about now over "
+    "what it was about earlier. "
+    "Weigh named entities (people, companies, projects) above generic similarity, and be "
+    'robust to ASR spelling drift, for example "Armand" may mean "Armaan". '
+    "Certainty requires evidence: if a gist alone does not PROVE direct relevance, call "
+    "read_note and verify the content before picking — never pin on a hunch. Neighbors "
+    "of slated notes are legitimate picks only after you have read and verified them. "
+    "Each pick's 'why' must cite the specific thing said in the conversation AND the "
+    "specific note content it connects to; if you cannot write that sentence, do not pick. "
     "Return only JSON shaped as {\"picks\":[{\"note_id\":\"...\",\"why\":\"...\"}]}."
 )
 
@@ -252,11 +264,14 @@ def _build_user_prompt(
     ]
     return "\n".join(
         [
-            "Contract: pick 0-2 notes, copy note_id exactly, prefer the current moment over score.",
-            "Provenance strength: exact > search > linked. Empty picks are valid.",
-            "<recent_transcript>",
+            "Contract: pick 0-2 notes, copy note_id exactly. Pin only notes DIRECTLY",
+            "relevant to what is being discussed right now — verified, not guessed.",
+            "Empty picks are the normal outcome. Provenance: exact > search > linked.",
+            "The transcript below is the entire conversation so far, oldest first;",
+            "the last lines are the current moment.",
+            "<transcript>",
             *transcript_lines,
-            "</recent_transcript>",
+            "</transcript>",
             "<slate>",
             *slate_lines,
             "</slate>",

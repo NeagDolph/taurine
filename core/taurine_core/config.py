@@ -128,7 +128,11 @@ EMPTY_BACKOFF_S = 15.0
 REOFFER_S = 60.0
 
 # ── presenter / cards ──────────────────────────────────────────────────
-PRESENTER_TRANSCRIPT_CHUNKS = 15
+# the presenter judges conversation-level relevance, so it sees the WHOLE
+# transcript; the cap is a token-safety backstop (~1-2h of speech), not a
+# window. Retrieval (C2) stays moment-bound by design — whole-meeting
+# embeddings blur the query; only the promoter needs global context.
+PRESENTER_TRANSCRIPT_CHUNKS = 400
 PRESENTER_MAX_PICKS = 2
 PRESENTER_MAX_TOOL_CALLS = 3             # read_note tool-loop budget per pass
 PRESENTER_NEIGHBORS_SHOWN = 3            # neighbor ids listed per slate line
