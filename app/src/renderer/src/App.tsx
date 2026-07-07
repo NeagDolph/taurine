@@ -34,6 +34,8 @@ function App(): React.JSX.Element {
   const [micError, setMicError] = useState('')
   const [syncing, setSyncing] = useState(false)
   const [syncError, setSyncError] = useState('')
+  const [reenriching, setReenriching] = useState(false)
+  const [reenrichError, setReenrichError] = useState('')
   const [chunks, setChunks] = useState<FeedTranscript[]>([])
   const [interimsByChannel, setInterimsByChannel] = useState<Record<number, TranscriptEvent>>({})
   const [triggersBySeq, setTriggersBySeq] = useState<Map<number, TriggerEvent[]>>(new Map())
@@ -164,7 +166,7 @@ function App(): React.JSX.Element {
 
   const syncIndex = useCallback(async () => {
     const client = clientRef.current
-    if (!client || syncing) {
+    if (!client || syncing || index.reenrich?.running) {
       return
     }
 
@@ -177,7 +179,28 @@ function App(): React.JSX.Element {
     } finally {
       setSyncing(false)
     }
-  }, [syncing])
+  }, [index.reenrich?.running, syncing])
+
+  const reenrichIndex = useCallback(async () => {
+    const client = clientRef.current
+    if (!client || reenriching || syncing || index.reenrich?.running) {
+      return
+    }
+
+    setReenriching(true)
+    setReenrichError('')
+    try {
+      const status = await client.reenrichIndex()
+      setIndex((current) => ({
+        ...current,
+        reenrich: status
+      }))
+    } catch (error) {
+      setReenrichError(error instanceof Error ? error.message : 'Re-enrich failed')
+    } finally {
+      setReenriching(false)
+    }
+  }, [index.reenrich?.running, reenriching, syncing])
 
   const showDisconnectedBanner = connection !== 'connected'
 
@@ -264,8 +287,11 @@ function App(): React.JSX.Element {
         detail={statusDetail}
         index={index}
         isSyncing={syncing}
+        isReenriching={reenriching || Boolean(index.reenrich?.running)}
         syncError={syncError}
+        reenrichError={reenrichError}
         onSync={syncIndex}
+        onReenrich={reenrichIndex}
       />
     </div>
   )

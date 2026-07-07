@@ -5,6 +5,7 @@ export type CardProvenance = 'exact' | 'search' | 'linked'
 export type SidecarConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
 export type TriggerAction = 'pinned' | 'slated' | 'none'
 export type TriggerKind = 'exact' | 'search'
+export type ReenrichPhase = 'idle' | 'profile' | 'notes' | 'finalizing'
 
 export interface TranscriptEvent {
   type: 'transcript'
@@ -87,9 +88,17 @@ export interface TriggerEvent {
   action: TriggerAction
 }
 
+export interface ReenrichStatus {
+  running: boolean
+  phase: ReenrichPhase
+  done: number
+  total: number
+}
+
 export interface IndexStatus {
   notes: number
   last_sync?: number | null
+  reenrich?: ReenrichStatus | null
 }
 
 export interface StatusEvent {
@@ -195,6 +204,21 @@ export class SidecarClient {
     const response = await fetch(`${this.restBaseUrl}/index/sync`, { method: 'POST' })
     if (!response.ok) {
       throw new Error(`Sync failed with HTTP ${response.status}`)
+    }
+  }
+
+  async reenrichIndex(): Promise<ReenrichStatus> {
+    const response = await fetch(`${this.restBaseUrl}/index/reenrich`, { method: 'POST' })
+    if (!response.ok) {
+      throw new Error(`Re-enrich failed with HTTP ${response.status}`)
+    }
+
+    const payload: unknown = await response.json().catch(() => null)
+    return parseReenrichStatus(payload) ?? {
+      running: true,
+      phase: 'profile',
+      done: 0,
+      total: 0
     }
   }
 
@@ -614,14 +638,41 @@ function parseStatus(record: Record<string, unknown>): StatusEvent | null {
     return null
   }
 
+  const reenrich = parseReenrichStatus(index.reenrich)
+
   return {
     type: 'status',
     asr: record.asr,
     index: {
       notes: index.notes,
-      last_sync: lastSync
+      last_sync: lastSync,
+      reenrich
     },
     detail: typeof record.detail === 'string' ? record.detail : ''
+  }
+}
+
+function parseReenrichStatus(value: unknown): ReenrichStatus | null {
+  if (value === undefined || value === null) {
+    return null
+  }
+
+  const record = asRecord(value)
+  if (
+    !record ||
+    typeof record.running !== 'boolean' ||
+    !isReenrichPhase(record.phase) ||
+    typeof record.done !== 'number' ||
+    typeof record.total !== 'number'
+  ) {
+    return null
+  }
+
+  return {
+    running: record.running,
+    phase: record.phase,
+    done: record.done,
+    total: record.total
   }
 }
 
@@ -635,6 +686,10 @@ function isTriggerKind(value: unknown): value is TriggerKind {
 
 function isTriggerAction(value: unknown): value is TriggerAction {
   return value === 'pinned' || value === 'slated' || value === 'none'
+}
+
+function isReenrichPhase(value: unknown): value is ReenrichPhase {
+  return value === 'idle' || value === 'profile' || value === 'notes' || value === 'finalizing'
 }
 
 function isAsrState(value: unknown): value is AsrState {

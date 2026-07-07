@@ -6,8 +6,11 @@ interface StatusBarProps {
   detail: string
   index: IndexStatus
   isSyncing: boolean
+  isReenriching: boolean
   syncError: string
+  reenrichError: string
   onSync: () => void
+  onReenrich: () => void
 }
 
 export function StatusBar({
@@ -16,10 +19,14 @@ export function StatusBar({
   detail,
   index,
   isSyncing,
+  isReenriching,
   syncError,
-  onSync
+  reenrichError,
+  onSync,
+  onReenrich
 }: StatusBarProps): React.JSX.Element {
-  const detailText = syncError || detail
+  const detailText = syncError || reenrichError || reenrichDetail(index) || detail
+  const controlsDisabled = isSyncing || isReenriching
 
   return (
     <footer className="status-bar">
@@ -31,8 +38,16 @@ export function StatusBar({
       </div>
       <div className="status-group status-group-right">
         {detailText ? <span className="status-detail">{detailText}</span> : null}
-        <button className="secondary-button compact" type="button" onClick={onSync} disabled={isSyncing}>
+        <button className="secondary-button compact" type="button" onClick={onSync} disabled={controlsDisabled}>
           {isSyncing ? 'Syncing' : 'Sync now'}
+        </button>
+        <button
+          className="secondary-button compact"
+          type="button"
+          onClick={onReenrich}
+          disabled={controlsDisabled}
+        >
+          {isReenriching ? 'Re-enriching' : 'Re-enrich'}
         </button>
       </div>
     </footer>
@@ -66,4 +81,16 @@ function formatLastSync(lastSync: number | null | undefined): string {
     hour: 'numeric',
     minute: '2-digit'
   }).format(new Date(millis))
+}
+
+function reenrichDetail(index: IndexStatus): string {
+  const status = index.reenrich
+  if (!status?.running) {
+    return ''
+  }
+
+  if (status.total > 0) {
+    return `Re-enriching ${status.done}/${status.total} (${status.phase})`
+  }
+  return `Re-enriching (${status.phase})`
 }
