@@ -32,10 +32,11 @@ async def reenrich_all(
     Scoped runs skip the profile phase: the user card is corpus-wide and only
     worth regenerating on a full pass.
     """
+    disabled = getattr(index, "disabled_sources", set)()
     notes = [
         note
         for note in index.notes()  # type: ignore[attr-defined]
-        if source is None or note.source == source
+        if (source is None or note.source == source) and note.source not in disabled
     ]
     total = len(notes)
 

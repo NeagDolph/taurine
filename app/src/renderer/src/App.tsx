@@ -10,12 +10,14 @@ import {
   type AmbientItem,
   type AsrState,
   type Card,
+  type ConnectorInfo,
   type IndexStatus,
   type RetrievalEvent,
   type SidecarConnectionState,
   type TriggerEvent,
   type TranscriptEvent
 } from './lib/sidecar'
+import { UpdatesClient } from './lib/updates'
 import { ConnectorsView } from './views/ConnectorsView'
 import { DataView } from './views/DataView'
 import { FeedView, type FeedTranscript } from './views/FeedView'
@@ -34,7 +36,9 @@ function App(): React.JSX.Element {
   const transcriptIdRef = useRef(0)
 
   const [activeTab, setActiveTab] = useState<MainTab>('live')
-  const [mapRefreshKey, setMapRefreshKey] = useState(0)
+  const [connectors, setConnectors] = useState<ConnectorInfo[] | null>(null)
+  const [graphVersion, setGraphVersion] = useState(0)
+  const [profileCard, setProfileCard] = useState<string | null | undefined>(undefined)
   const [connection, setConnection] = useState<SidecarConnectionState>('disconnected')
   const [retryInMs, setRetryInMs] = useState<number | undefined>()
   const [asr, setAsr] = useState<AsrState>('disconnected')
@@ -114,6 +118,27 @@ function App(): React.JSX.Element {
 
     client.connect()
 
+    // all non-live state (connectors, sync progress, re-enrich, graph
+    // version, profile) arrives over the /updates websocket — no polling
+    const updates = new UpdatesClient()
+    const unsubscribeUpdates = updates.onUpdate((event) => {
+      switch (event.type) {
+        case 'connectors':
+          setConnectors(event.connectors)
+          break
+        case 'reenrich':
+          setIndex((current) => ({ ...current, reenrich: event.status }))
+          break
+        case 'graph':
+          setGraphVersion(event.version)
+          break
+        case 'profile':
+          setProfileCard(event.card)
+          break
+      }
+    })
+    updates.connect()
+
     return () => {
       audioRef.current?.stop()
       audioRef.current = null
@@ -121,6 +146,8 @@ function App(): React.JSX.Element {
       unsubscribe.forEach((remove) => remove())
       client.disconnect()
       clientRef.current = null
+      unsubscribeUpdates()
+      updates.disconnect()
     }
   }, [])
 
@@ -283,9 +310,9 @@ function App(): React.JSX.Element {
         <div aria-hidden={activeTab !== 'data'} style={viewLayerStyle(activeTab === 'data')}>
           <DataView
             latestFinalText={latestFinalText}
-            lastSync={index.last_sync}
             pinnedNoteIds={pinnedNoteIds}
-            refreshKey={mapRefreshKey}
+            profileCard={profileCard}
+            refreshKey={graphVersion}
             retrieval={lastRetrieval}
             visible={activeTab === 'data'}
           />
@@ -296,7 +323,7 @@ function App(): React.JSX.Element {
           style={viewLayerStyle(activeTab === 'connectors')}
         >
           <ConnectorsView
-            onDataChanged={() => setMapRefreshKey((current) => current + 1)}
+            connectors={connectors}
             onReenrich={reenrichIndex}
             reenrichTarget={reenrichTarget}
             reenrichDisabled={syncing || isReenriching}

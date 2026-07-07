@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from taurine_core.ports import ConnectorError, ConnectorPort, LLMPort
@@ -30,6 +30,9 @@ class ConnectorRegistry:
         self._by_id = {connector.connector_id: connector for connector in self._connectors}
         self.syncing: set[str] = set()
         self.sync_progress: dict[str, tuple[str, int, int]] = {}
+        # server hook, called (from any thread) whenever connector state or
+        # sync progress changes so the /updates websocket can broadcast
+        self.on_change: Callable[[], None] | None = None
 
     def list_info(self, index: object) -> list[ConnectorInfo]:
         counts = index.note_count_by_source()  # type: ignore[attr-defined]
@@ -38,27 +41,45 @@ class ConnectorRegistry:
             for connector in self._connectors
         ]
 
-    def set_enabled(
-        self,
-        index: object,
-        connector_id: str,
-        enabled: bool,
-        *,
-        purge: bool = False,
-    ) -> None:
+    def set_enabled(self, index: object, connector_id: str, enabled: bool) -> None:
+        """Enable/disable the connector. Data is always kept: the index ledger
+        just deactivates the source. purge_data() is the explicit delete."""
         self._connector(connector_id)
         state = self._state(index, connector_id)
         state["enabled"] = bool(enabled)
         self._save_state(index, connector_id, state)
-        if purge:
-            for note_id in sorted(index.note_ids(connector_id)):  # type: ignore[attr-defined]
-                index.delete_note(note_id)  # type: ignore[attr-defined]
+        set_source_enabled = getattr(index, "set_source_enabled", None)
+        if callable(set_source_enabled):
+            set_source_enabled(connector_id, bool(enabled))
+        self._notify()
+
+    def purge_data(self, index: object, connector_id: str) -> int:
+        self._connector(connector_id)
+        note_ids = sorted(index.note_ids(connector_id))  # type: ignore[attr-defined]
+        for note_id in note_ids:
+            index.delete_note(note_id)  # type: ignore[attr-defined]
+        self._notify()
+        return len(note_ids)
+
+    def reconcile_ledger(self, index: object) -> None:
+        """Align the index's source ledger with persisted enabled flags (covers
+        DBs written before the ledger existed)."""
+        set_source_enabled = getattr(index, "set_source_enabled", None)
+        if not callable(set_source_enabled):
+            return
+        for connector in self._connectors:
+            state = self._state(index, connector.connector_id)
+            set_source_enabled(
+                connector.connector_id,
+                self._enabled(connector.connector_id, state),
+            )
 
     def set_config(self, index: object, connector_id: str, config: dict) -> None:
         self._connector(connector_id)
         state = self._state(index, connector_id)
         state["config"] = dict(config)
         self._save_state(index, connector_id, state)
+        self._notify()
 
     def sync_connector(
         self,
@@ -70,6 +91,7 @@ class ConnectorRegistry:
         state = self._state(index, connector_id)
         self.syncing.add(connector_id)
         self.sync_progress[connector_id] = ("extracting", 0, 0)
+        self._notify()
         try:
             available, detail = connector.available()
             if not available:
@@ -87,8 +109,8 @@ class ConnectorRegistry:
                         connector_id,
                         records,
                         llm,
-                        progress=lambda phase, done, total: self.sync_progress.__setitem__(
-                            connector_id, (phase, done, total)
+                        progress=lambda phase, done, total: self._set_progress(
+                            connector_id, phase, done, total
                         ),
                     )
                 except ConnectorError as exc:
@@ -105,7 +127,20 @@ class ConnectorRegistry:
         state["last_sync"] = time.time()
         state["last_report"] = report.model_dump()
         self._save_state(index, connector_id, state)
+        self._notify()
         return report
+
+    def _set_progress(self, connector_id: str, phase: str, done: int, total: int) -> None:
+        self.sync_progress[connector_id] = (phase, done, total)
+        self._notify()
+
+    def _notify(self) -> None:
+        callback = self.on_change
+        if callback is not None:
+            try:
+                callback()
+            except Exception:  # notification must never break connector work
+                pass
 
     def sync_all_enabled(self, index: object, llm: LLMPort) -> list[ConnectorSyncReport]:
         reports: list[ConnectorSyncReport] = []

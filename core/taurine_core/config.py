@@ -26,6 +26,16 @@ ENRICH_TIMEOUT_S = 60.0
 PRESENTER_MODEL = "google/gemini-3.5-flash"
 PRESENTER_FALLBACK_MODEL = "deepseek/deepseek-chat"
 LLM_TIMEOUT_S = 15.0
+# chain-of-thought off everywhere: enrichment is bulk offline work (GLM-5.2
+# reasons by default and multiplies latency; it can also return reasoning-only
+# responses with empty content) and the presenter is latency-bound. Values are
+# per-model because providers disagree: GLM accepts enabled=false, Gemini
+# mandates reasoning (minimal → 0 thinking tokens), deepseek-chat rejects the
+# parameter entirely (absent from the map → omitted from the request).
+LLM_REASONING_BY_MODEL = {
+    "z-ai/glm-5.2": {"enabled": False},
+    "google/gemini-3.5-flash": {"effort": "minimal"},
+}
 
 # ── user information card (full-corpus profile fed to every enrichment) ─
 PROFILE_MODEL = "z-ai/glm-5.2"           # 1M context: the whole corpus fits

@@ -120,11 +120,19 @@ class Index:
         self._matrix = np.empty((0, config.EMBED_DIM), dtype=np.float32)
         self._doc_frequency_cache: dict[str, int] = {}
         self._init_schema()
+        self._disabled_sources = self._load_disabled_sources()
         self.load()
 
     def load(self) -> None:
+        clause, params = self._active_sources_clause("n.source")
         rows = self._conn.execute(
-            "SELECT id, note_id, kind, text, vec FROM embeddings ORDER BY id"
+            f"""
+            SELECT e.id, e.note_id, e.kind, e.text, e.vec
+            FROM embeddings e JOIN notes n ON n.note_id = e.note_id
+            WHERE 1=1{clause}
+            ORDER BY e.id
+            """,
+            params,
         ).fetchall()
         vectors: list[np.ndarray] = []
         embedding_rows: list[tuple[int, str, EmbeddingKind, str]] = []
@@ -261,6 +269,49 @@ class Index:
         ).fetchone()
         return str(row["value"]) if row is not None else None
 
+    def set_source_enabled(self, source: str, enabled: bool) -> None:
+        """Ledger switch: disabled sources keep their rows but drop out of the
+        active index (graph, search, aliases, counts) until re-enabled."""
+        disabled = set(self._disabled_sources)
+        if enabled:
+            disabled.discard(source)
+        else:
+            disabled.add(source)
+        if disabled == self._disabled_sources:
+            return
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO meta(key, value, updated)
+                VALUES ('disabled_sources', ?, ?)
+                """,
+                (json.dumps(sorted(disabled)), time.time()),
+            )
+        self._disabled_sources = disabled
+        self._doc_frequency_cache.clear()
+        self.load()
+
+    def disabled_sources(self) -> set[str]:
+        return set(self._disabled_sources)
+
+    def _load_disabled_sources(self) -> set[str]:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'disabled_sources'"
+        ).fetchone()
+        if row is None:
+            return set()
+        try:
+            value = json.loads(row["value"])
+        except json.JSONDecodeError:
+            return set()
+        return {str(item) for item in value} if isinstance(value, list) else set()
+
+    def _active_sources_clause(self, column: str) -> tuple[str, tuple]:
+        if not self._disabled_sources:
+            return "", ()
+        placeholders = ",".join("?" for _ in self._disabled_sources)
+        return f" AND {column} NOT IN ({placeholders})", tuple(sorted(self._disabled_sources))
+
     def connector_state(self, connector_id: str) -> dict:
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key = ?",
@@ -304,29 +355,35 @@ class Index:
         query = self._fts_query(text)
         if not query:
             return []
+        clause, params = self._active_sources_clause("source")
         try:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT note_id, -bm25(notes_fts) AS score
                 FROM notes_fts
                 WHERE notes_fts MATCH ?
+                AND note_id IN (SELECT note_id FROM notes WHERE 1=1{clause})
                 ORDER BY score DESC
                 LIMIT ?
                 """,
-                (query, k),
+                (query, *params, k),
             ).fetchall()
         except sqlite3.OperationalError:
             return []
         return [(row["note_id"], float(row["score"])) for row in rows]
 
     def neighbors(self, note_id: str) -> list[tuple[str, float]]:
+        src_clause, src_params = self._active_sources_clause("n1.source")
+        dst_clause, dst_params = self._active_sources_clause("n2.source")
         rows = self._conn.execute(
-            """
+            f"""
             SELECT src, dst, weight FROM edges
-            WHERE src = ? OR dst = ?
+            JOIN notes n1 ON n1.note_id = edges.src
+            JOIN notes n2 ON n2.note_id = edges.dst
+            WHERE (src = ? OR dst = ?){src_clause}{dst_clause}
             ORDER BY weight DESC
             """,
-            (note_id, note_id),
+            (note_id, note_id, *src_params, *dst_params),
         ).fetchall()
         return [
             (row["dst"] if row["src"] == note_id else row["src"], float(row["weight"]))
@@ -445,11 +502,15 @@ class Index:
         return _rerank_evidence_text(best_kind, best_text)
 
     def aliases(self) -> list[tuple[str, str, bool]]:
+        clause, params = self._active_sources_clause("n.source")
         rows = self._conn.execute(
-            """
-            SELECT alias_lowercase, note_id, is_title
-            FROM aliases ORDER BY note_id, is_title DESC, alias_lowercase
-            """
+            f"""
+            SELECT a.alias_lowercase AS alias_lowercase, a.note_id AS note_id, a.is_title AS is_title
+            FROM aliases a JOIN notes n ON n.note_id = a.note_id
+            WHERE 1=1{clause}
+            ORDER BY a.note_id, a.is_title DESC, a.alias_lowercase
+            """,
+            params,
         ).fetchall()
         return [
             (row["alias_lowercase"], row["note_id"], bool(row["is_title"]))
@@ -465,14 +526,16 @@ class Index:
             return cached
         escaped = key.replace('"', '""')
         query = f'"{escaped}"'
+        clause, params = self._active_sources_clause("source")
         try:
             row = self._conn.execute(
-                """
+                f"""
                 SELECT COUNT(DISTINCT note_id) AS count
                 FROM notes_fts
                 WHERE notes_fts MATCH ?
+                AND note_id IN (SELECT note_id FROM notes WHERE 1=1{clause})
                 """,
-                (query,),
+                (query, *params),
             ).fetchone()
         except sqlite3.OperationalError:
             count = 0
@@ -482,6 +545,10 @@ class Index:
         return count
 
     def graph(self) -> GraphResponse:
+        active_notes = [
+            note for note in self.notes() if note.source not in self._disabled_sources
+        ]
+        active_ids = {note.note_id for note in active_notes}
         degree: dict[str, int] = defaultdict(int)
         edge_rows = self._conn.execute(
             """
@@ -491,6 +558,8 @@ class Index:
         ).fetchall()
         edges: list[GraphEdge] = []
         for row in edge_rows:
+            if row["src"] not in active_ids or row["dst"] not in active_ids:
+                continue
             degree[row["src"]] += 1
             degree[row["dst"]] += 1
             edges.append(
@@ -509,12 +578,15 @@ class Index:
                 degree=degree[note.note_id],
                 source=note.source,
             )
-            for note in self.notes()
+            for note in active_notes
         ]
         return GraphResponse(nodes=nodes, edges=edges)
 
     def status(self) -> tuple[int, float | None]:
-        row = self._conn.execute("SELECT COUNT(*) AS count FROM notes").fetchone()
+        clause, params = self._active_sources_clause("source")
+        row = self._conn.execute(
+            f"SELECT COUNT(*) AS count FROM notes WHERE 1=1{clause}", params
+        ).fetchone()
         metadata = self._conn.execute(
             "SELECT value FROM metadata WHERE key = 'last_sync_ts'"
         ).fetchone()

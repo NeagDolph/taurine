@@ -1,50 +1,42 @@
 import { useCallback, useEffect, useState } from 'react'
-import { fetchProfile, saveProfile } from '../lib/sidecar'
+import { saveProfile } from '../lib/sidecar'
 
 interface UserSummaryProps {
-  visible: boolean
+  // undefined = updates channel hasn't delivered a snapshot yet;
+  // null / '' = no card generated; string = the card
+  card: string | null | undefined
 }
 
-type SummaryState = 'loading' | 'ready' | 'missing' | 'error'
-
-export function UserSummary({ visible }: UserSummaryProps): React.JSX.Element {
+export function UserSummary({ card }: UserSummaryProps): React.JSX.Element {
   const [collapsed, setCollapsed] = useState(false)
-  const [state, setState] = useState<SummaryState>('loading')
-  const [card, setCard] = useState('')
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const [loadedOnce, setLoadedOnce] = useState(false)
-
-  const load = useCallback(async () => {
-    setState((current) => (current === 'ready' ? current : 'loading'))
-    try {
-      const value = await fetchProfile()
-      if (value && value.trim()) {
-        setCard(value)
-        setState('ready')
-      } else {
-        setState('missing')
-      }
-    } catch {
-      setState('error')
-    }
-  }, [])
+  // bridges the gap between a successful PUT and the pushed profile update
+  const [savedOverride, setSavedOverride] = useState<string | null>(null)
 
   useEffect(() => {
-    if (visible && !loadedOnce) {
-      setLoadedOnce(true)
-      void load()
+    // once the updates channel reflects any card, the pushed value wins
+    if (typeof card === 'string' && card.trim()) {
+      setSavedOverride(null)
     }
-  }, [visible, loadedOnce, load])
+  }, [card])
+
+  const shownCard = savedOverride ?? (typeof card === 'string' ? card : '')
+  const state: 'loading' | 'missing' | 'ready' =
+    card === undefined && savedOverride === null
+      ? 'loading'
+      : shownCard.trim()
+        ? 'ready'
+        : 'missing'
 
   const beginEdit = useCallback(() => {
-    setDraft(card)
+    setDraft(shownCard)
     setError('')
     setEditing(true)
     setCollapsed(false)
-  }, [card])
+  }, [shownCard])
 
   const cancelEdit = useCallback(() => {
     setEditing(false)
@@ -59,8 +51,7 @@ export function UserSummary({ visible }: UserSummaryProps): React.JSX.Element {
     setError('')
     try {
       await saveProfile(draft.trim())
-      setCard(draft.trim())
-      setState('ready')
+      setSavedOverride(draft.trim())
       setEditing(false)
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Save failed')
@@ -128,13 +119,6 @@ export function UserSummary({ visible }: UserSummaryProps): React.JSX.Element {
             </>
           ) : state === 'loading' ? (
             <p className="muted-note">Loading…</p>
-          ) : state === 'error' ? (
-            <p className="inline-error">
-              Could not load the user summary.{' '}
-              <button type="button" className="link-button" onClick={load}>
-                Retry
-              </button>
-            </p>
           ) : state === 'missing' ? (
             <p className="muted-note">
               No user summary yet — run a re-enrich from the Connectors tab to generate one from
@@ -145,7 +129,7 @@ export function UserSummary({ visible }: UserSummaryProps): React.JSX.Element {
               .
             </p>
           ) : (
-            <pre className="user-summary-text">{card}</pre>
+            <pre className="user-summary-text">{shownCard}</pre>
           )}
         </div>
       )}

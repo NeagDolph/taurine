@@ -1,92 +1,44 @@
 import {
+  deleteConnectorData,
   disableConnector,
   enableConnector,
-  fetchConnectors,
   syncConnector,
   updateConnectorConfig,
   type ConnectorInfo
 } from '../lib/sidecar'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 
 interface ConnectionsPanelProps {
   visible: boolean
+  connectors: ConnectorInfo[] | null
   reenriching: boolean
   reenrichError: string
   reenrichDisabled: boolean
   reenrichTarget: string | null
-  onDataChanged: () => void
   onReenrich: (source?: string) => void
 }
 
-type PendingAction = 'enable' | 'disable' | 'purge' | 'sync' | 'config'
+type PendingAction = 'enable' | 'disable' | 'delete' | 'sync' | 'config'
 
-const CONNECTOR_POLL_MS = 5000
-const CONNECTOR_POLL_ACTIVE_MS = 1200
 const APPLE_NOTES_CONNECTOR_ID = 'apple_notes'
 const OBSIDIAN_CONNECTOR_ID = 'obsidian'
 
 export function ConnectionsPanel({
   visible,
+  connectors,
   reenriching,
   reenrichError,
   reenrichDisabled,
   reenrichTarget,
-  onDataChanged,
   onReenrich
 }: ConnectionsPanelProps): React.JSX.Element {
-  const [connectors, setConnectors] = useState<ConnectorInfo[]>([])
-  const [loading, setLoading] = useState(true)
-  const [panelError, setPanelError] = useState('')
   const [cardErrors, setCardErrors] = useState<Record<string, string>>({})
   const [pendingById, setPendingById] = useState<Record<string, PendingAction | undefined>>({})
-  const [confirmDisableId, setConfirmDisableId] = useState<string | null>(null)
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [configDrafts, setConfigDrafts] = useState<Record<string, string>>({})
   const [dirtyConfigIds, setDirtyConfigIds] = useState<Set<string>>(() => new Set())
 
-  const refreshConnectors = useCallback(
-    async (silent = false) => {
-      if (!silent) {
-        setLoading(true)
-      }
-
-      try {
-        const nextConnectors = await fetchConnectors()
-        setConnectors(nextConnectors)
-        setPanelError('')
-        setConfigDrafts((current) => {
-          const nextDrafts = { ...current }
-          for (const connector of nextConnectors) {
-            if (connector.connector_id === OBSIDIAN_CONNECTOR_ID && !dirtyConfigIds.has(connector.connector_id)) {
-              nextDrafts[connector.connector_id] = configString(connector, 'vault_path')
-            }
-          }
-          return nextDrafts
-        })
-      } catch (error) {
-        setPanelError(error instanceof Error ? error.message : 'Failed to load connectors')
-      } finally {
-        setLoading(false)
-      }
-    },
-    [dirtyConfigIds]
-  )
-
-  useEffect(() => {
-    if (!visible) {
-      return
-    }
-
-    void refreshConnectors(connectors.length > 0)
-    const anySyncing = connectors.some((connector) => connector.syncing)
-    const interval = window.setInterval(
-      () => {
-        void refreshConnectors(true)
-      },
-      anySyncing ? CONNECTOR_POLL_ACTIVE_MS : CONNECTOR_POLL_MS
-    )
-
-    return () => window.clearInterval(interval)
-  }, [connectors, refreshConnectors, visible])
+  void visible
 
   const setCardError = useCallback((connectorId: string, message: string) => {
     setCardErrors((current) => ({ ...current, [connectorId]: message }))
@@ -103,6 +55,8 @@ export function ConnectionsPanel({
     })
   }, [])
 
+  // state refresh arrives over the /updates websocket; actions only fire the
+  // request and surface errors
   const runConnectorAction = useCallback(
     async (connectorId: string, action: PendingAction, request: () => Promise<void>) => {
       setPendingById((current) => ({ ...current, [connectorId]: action }))
@@ -110,16 +64,14 @@ export function ConnectionsPanel({
 
       try {
         await request()
-        setConfirmDisableId(null)
-        await refreshConnectors(true)
-        onDataChanged()
+        setConfirmDeleteId(null)
       } catch (error) {
         setCardError(connectorId, error instanceof Error ? error.message : 'Connector action failed')
       } finally {
         setPendingById((current) => ({ ...current, [connectorId]: undefined }))
       }
     },
-    [clearCardError, onDataChanged, refreshConnectors, setCardError]
+    [clearCardError, setCardError]
   )
 
   const updateConfigDraft = useCallback((connectorId: string, value: string) => {
@@ -143,7 +95,7 @@ export function ConnectionsPanel({
   )
 
   const sortedConnectors = useMemo(() => {
-    return [...connectors].sort((left, right) => {
+    return [...(connectors ?? [])].sort((left, right) => {
       if (left.connector_id === APPLE_NOTES_CONNECTOR_ID) {
         return -1
       }
@@ -171,9 +123,6 @@ export function ConnectionsPanel({
             ) : null}
             {reenriching && reenrichTarget === 'all' ? 'Re-enriching all' : 'Re-enrich all'}
           </button>
-          <button className="secondary-button compact" type="button" onClick={() => void refreshConnectors()}>
-            Refresh
-          </button>
         </div>
       </div>
 
@@ -183,13 +132,7 @@ export function ConnectionsPanel({
         </div>
       ) : null}
 
-      {panelError ? (
-        <div className="connections-panel-error" role="alert">
-          {panelError}
-        </div>
-      ) : null}
-
-      {loading && connectors.length === 0 ? (
+      {connectors === null ? (
         <div className="empty-surface">Loading connections</div>
       ) : sortedConnectors.length === 0 ? (
         <div className="empty-surface">No connectors reported</div>
@@ -198,24 +141,33 @@ export function ConnectionsPanel({
           {sortedConnectors.map((connector) => (
             <ConnectorCard
               configDirty={dirtyConfigIds.has(connector.connector_id)}
-              configDraft={configDrafts[connector.connector_id] ?? ''}
+              configDraft={
+                dirtyConfigIds.has(connector.connector_id)
+                  ? configDrafts[connector.connector_id] ?? ''
+                  : configString(connector, 'vault_path')
+              }
               connector={connector}
-              confirmDisable={confirmDisableId === connector.connector_id}
+              confirmDelete={confirmDeleteId === connector.connector_id}
               error={cardErrors[connector.connector_id] ?? ''}
               key={connector.connector_id}
               pendingAction={pendingById[connector.connector_id]}
               reenrichDisabled={reenrichDisabled}
               reenriching={reenriching && reenrichTarget === connector.connector_id}
-              onCancelDisable={() => setConfirmDisableId(null)}
-              onConfirmDisable={(purge) =>
-                void runConnectorAction(connector.connector_id, purge ? 'purge' : 'disable', () =>
-                  disableConnector(connector.connector_id, purge)
+              onCancelDelete={() => setConfirmDeleteId(null)}
+              onConfirmDelete={() =>
+                void runConnectorAction(connector.connector_id, 'delete', () =>
+                  deleteConnectorData(connector.connector_id)
                 )
               }
-              onDisable={() => setConfirmDisableId(connector.connector_id)}
-              onEnable={() =>
-                void runConnectorAction(connector.connector_id, 'enable', () =>
-                  enableConnector(connector.connector_id)
+              onRequestDelete={() => setConfirmDeleteId(connector.connector_id)}
+              onToggle={() =>
+                void runConnectorAction(
+                  connector.connector_id,
+                  connector.enabled ? 'disable' : 'enable',
+                  () =>
+                    connector.enabled
+                      ? disableConnector(connector.connector_id)
+                      : enableConnector(connector.connector_id)
                 )
               }
               onReenrich={() => onReenrich(connector.connector_id)}
@@ -240,13 +192,13 @@ function ConnectorCard({
   error,
   configDraft,
   configDirty,
-  confirmDisable,
+  confirmDelete,
   reenriching,
   reenrichDisabled,
-  onEnable,
-  onDisable,
-  onConfirmDisable,
-  onCancelDisable,
+  onToggle,
+  onRequestDelete,
+  onConfirmDelete,
+  onCancelDelete,
   onSync,
   onUpdateConfig,
   onSaveConfig,
@@ -257,13 +209,13 @@ function ConnectorCard({
   error: string
   configDraft: string
   configDirty: boolean
-  confirmDisable: boolean
+  confirmDelete: boolean
   reenriching: boolean
   reenrichDisabled: boolean
-  onEnable: () => void
-  onDisable: () => void
-  onConfirmDisable: (purge: boolean) => void
-  onCancelDisable: () => void
+  onToggle: () => void
+  onRequestDelete: () => void
+  onConfirmDelete: () => void
+  onCancelDelete: () => void
   onSync: () => void
   onUpdateConfig: (value: string) => void
   onSaveConfig: () => void
@@ -272,7 +224,9 @@ function ConnectorCard({
   const isObsidian = connector.connector_id === OBSIDIAN_CONNECTOR_ID
   const syncRunning = connector.syncing || pendingAction === 'sync'
   const syncDisabled = syncRunning || !connector.available || !connector.enabled
-  const toggleDisabled = pendingAction === 'enable' || pendingAction === 'disable' || pendingAction === 'purge'
+  const toggleDisabled = pendingAction === 'enable' || pendingAction === 'disable'
+  const deleteDisabled =
+    pendingAction === 'delete' || connector.syncing || connector.docs === 0
   const configInputId = `connector-config-${connector.connector_id}`
 
   return (
@@ -292,7 +246,7 @@ function ConnectorCard({
         <div className="connector-stats">
           <span>
             <strong>{formatCount(connector.docs)}</strong>
-            docs
+            {connector.enabled ? 'docs' : 'docs stored'}
           </span>
           <span>
             <strong>{formatRelativeTime(connector.last_sync)}</strong>
@@ -333,7 +287,12 @@ function ConnectorCard({
           type="button"
           aria-pressed={connector.enabled}
           disabled={toggleDisabled}
-          onClick={connector.enabled ? onDisable : onEnable}
+          onClick={onToggle}
+          title={
+            connector.enabled
+              ? 'Disable — keeps stored data, removes it from the graph and retrieval'
+              : 'Enable — stored data rejoins the graph and retrieval'
+          }
         >
           <span aria-hidden="true" />
           {connector.enabled ? 'Enabled' : 'Disabled'}
@@ -358,18 +317,28 @@ function ConnectorCard({
           ) : null}
           {reenriching ? 'Re-enriching' : 'Re-enrich'}
         </button>
+
+        <button
+          className="secondary-button compact danger"
+          type="button"
+          disabled={deleteDisabled}
+          onClick={onRequestDelete}
+          title={`Delete all ${formatCount(connector.docs)} stored ${connector.label} documents from the index`}
+        >
+          {pendingAction === 'delete' ? 'Deleting' : 'Delete data'}
+        </button>
       </div>
 
-      {confirmDisable ? (
-        <div className="connector-confirm" role="group" aria-label={`Disable ${connector.label}`}>
-          <span>Disable connector</span>
-          <button className="secondary-button compact" type="button" onClick={() => onConfirmDisable(false)}>
-            Keep data
+      {confirmDelete ? (
+        <div className="connector-confirm" role="group" aria-label={`Delete ${connector.label} data`}>
+          <span>
+            Delete all {formatCount(connector.docs)} stored document
+            {connector.docs === 1 ? '' : 's'}? A future sync can re-import them.
+          </span>
+          <button className="secondary-button compact danger" type="button" onClick={onConfirmDelete}>
+            Delete
           </button>
-          <button className="secondary-button compact danger" type="button" onClick={() => onConfirmDisable(true)}>
-            Remove indexed data
-          </button>
-          <button className="icon-button" type="button" aria-label="Cancel disable" onClick={onCancelDisable}>
+          <button className="icon-button" type="button" aria-label="Cancel delete" onClick={onCancelDelete}>
             &times;
           </button>
         </div>

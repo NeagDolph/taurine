@@ -5,7 +5,7 @@ import sqlite3
 import numpy as np
 import pytest
 
-from tests.conftest import enrichment, fixture_units, make_note, unit_vec
+from tests.conftest import enrichment, fixture_units, make_note, shifted_vec, unit_vec
 from taurine_core.schemas import GraphEdge
 
 
@@ -215,3 +215,37 @@ def test_preview_resolves_neighbors_sorted_by_weight(store):
     assert [neighbor.source for neighbor in preview.neighbors] == ["codex_mem", "apple_notes"]
     assert [neighbor.weight for neighbor in preview.neighbors] == [pytest.approx(0.8), pytest.approx(0.4)]
     assert store.preview("missing") is None
+
+
+def test_disabled_source_drops_out_of_active_index_but_keeps_rows(store):
+    kept = make_note("keep:one", "Kept Note", "Shared topic body about billing").model_copy(
+        update={"source": "keep"}
+    )
+    gone = make_note("gone:one", "Gone Note", "Shared topic body about billing").model_copy(
+        update={"source": "gone"}
+    )
+    enrich = enrichment("Shared billing topic.", aliases=["billing sync"])
+    store.upsert_note(kept, enrich, fixture_units(unit_vec(101), enrich))
+    store.upsert_note(
+        gone, enrich, fixture_units(shifted_vec(unit_vec(101), 202, noise=0.02), enrich)
+    )
+    store.rebuild_graph()
+
+    store.set_source_enabled("gone", False)
+
+    assert store.disabled_sources() == {"gone"}
+    graph = store.graph()
+    assert {node.note_id for node in graph.nodes} == {"keep:one"}
+    assert all("gone:one" not in (edge.src, edge.dst) for edge in graph.edges)
+    assert all(note_id != "gone:one" for note_id, _ in store.dense_search("billing topic", 10))
+    assert all(note_id != "gone:one" for note_id, _ in store.bm25_search("billing", 10))
+    assert all(note_id != "gone:one" for _, note_id, _ in store.aliases())
+    assert store.status()[0] == 1
+    # rows stay stored: counts by source and the note itself survive
+    assert store.note_count_by_source() == {"keep": 1, "gone": 1}
+    assert store.note("gone:one") is not None
+
+    store.set_source_enabled("gone", True)
+    assert store.disabled_sources() == set()
+    assert {node.note_id for node in store.graph().nodes} == {"keep:one", "gone:one"}
+    assert store.status()[0] == 2

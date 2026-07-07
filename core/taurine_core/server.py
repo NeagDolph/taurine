@@ -71,6 +71,46 @@ class LiveSessionLike(Protocol):
         ...
 
 
+class UpdateBus:
+    """Fan-out of state-change notifications to /updates websockets.
+
+    publish() is thread-safe — registry callbacks fire from sync worker
+    threads — and only enqueues a kind marker; each websocket builds fresh
+    payloads when it drains its queue, so bursts coalesce naturally.
+    """
+
+    KINDS = ("connectors", "reenrich", "graph", "profile")
+
+    def __init__(self) -> None:
+        self._subscribers: set[asyncio.Queue[str]] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def subscribe(self) -> asyncio.Queue[str]:
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[str]) -> None:
+        self._subscribers.discard(queue)
+
+    def publish(self, kind: str) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+
+        def fanout() -> None:
+            for queue in tuple(self._subscribers):
+                queue.put_nowait(kind)
+
+        try:
+            loop.call_soon_threadsafe(fanout)
+        except RuntimeError:  # loop shut down mid-publish
+            pass
+
+
 @dataclass
 class Runtime:
     index: Any
@@ -94,6 +134,8 @@ class Runtime:
     reenrich_task: asyncio.Task[Any] | None = None
     reenrich_last_emit_s: float = 0.0
     status_sinks: set[Callable[[], Awaitable[None]]] = field(default_factory=set)
+    updates: UpdateBus = field(default_factory=UpdateBus)
+    graph_version: int = 0
 
 
 class _MonotonicClock:
@@ -106,6 +148,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         active_runtime = runtime or build_runtime()
         app.state.runtime = active_runtime
+        active_runtime.updates.bind_loop(asyncio.get_running_loop())
+        if active_runtime.connector_registry is not None:
+            active_runtime.connector_registry.on_change = lambda: active_runtime.updates.publish(
+                "connectors"
+            )
         periodic_task: asyncio.Task[None] | None = None
         if active_runtime.enable_periodic_sync:
             periodic_task = asyncio.create_task(_periodic_sync(active_runtime))
@@ -146,6 +193,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         active_runtime: Runtime = app.state.runtime
         sync = active_runtime.sync_all_enabled or active_runtime.sync_once
         report = await asyncio.to_thread(sync)
+        _bump_graph(active_runtime)
         return _report_payload(report)
 
     @app.get("/connectors")
@@ -162,16 +210,31 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             registry.set_enabled(active_runtime.index, connector_id, True)
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
+        _bump_graph(active_runtime)
         return _connector_info(active_runtime, connector_id)
 
     @app.post("/connectors/{connector_id}/disable")
-    async def connector_disable(connector_id: str, purge: bool = False) -> ConnectorInfo:
+    async def connector_disable(connector_id: str) -> ConnectorInfo:
         active_runtime: Runtime = app.state.runtime
         registry = _connector_registry(active_runtime)
         try:
-            registry.set_enabled(active_runtime.index, connector_id, False, purge=purge)
+            registry.set_enabled(active_runtime.index, connector_id, False)
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
+        _bump_graph(active_runtime)
+        return _connector_info(active_runtime, connector_id)
+
+    @app.post("/connectors/{connector_id}/data/delete")
+    async def connector_delete_data(connector_id: str) -> ConnectorInfo:
+        active_runtime: Runtime = app.state.runtime
+        registry = _connector_registry(active_runtime)
+        if connector_id in registry.syncing:
+            raise HTTPException(status_code=409, detail="connector sync running — wait for it to finish")
+        try:
+            await asyncio.to_thread(registry.purge_data, active_runtime.index, connector_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="connector not found") from None
+        _bump_graph(active_runtime)
         return _connector_info(active_runtime, connector_id)
 
     @app.post("/connectors/{connector_id}/sync", status_code=202)
@@ -259,6 +322,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if not isinstance(card, str) or not card.strip():
             raise HTTPException(status_code=422, detail="card must be a non-empty string")
         active_runtime.index.set_user_card(card.strip())  # type: ignore[attr-defined]
+        active_runtime.updates.publish("profile")
         return {"card": card.strip()}
 
     @app.get("/sessions")
@@ -271,6 +335,35 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if path is None:
             raise HTTPException(status_code=404, detail="session not found")
         return _read_session_records(path)
+
+    @app.websocket("/updates")
+    async def updates(websocket: WebSocket) -> None:
+        await websocket.accept()
+        active_runtime: Runtime = app.state.runtime
+        queue = active_runtime.updates.subscribe()
+
+        async def pump() -> None:
+            while True:
+                kinds = {await queue.get()}
+                while not queue.empty():
+                    kinds.add(queue.get_nowait())
+                await _send_updates(websocket, active_runtime, kinds)
+
+        pump_task: asyncio.Task[None] | None = None
+        try:
+            await _send_updates(websocket, active_runtime, set(UpdateBus.KINDS))
+            pump_task = asyncio.create_task(pump())
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+        except WebSocketDisconnect:
+            pass
+        finally:
+            active_runtime.updates.unsubscribe(queue)
+            if pump_task is not None:
+                pump_task.cancel()
+                await asyncio.gather(pump_task, return_exceptions=True)
 
     @app.websocket("/session")
     async def session(websocket: WebSocket) -> None:
@@ -354,6 +447,7 @@ def build_runtime() -> Runtime:
     reranker = CohereReranker(secrets["COHERE_API_KEY"])
     span_extractor = Gliner2SpanExtractor()
     connector_registry = ConnectorRegistry()
+    connector_registry.reconcile_ledger(index)
 
     def make_live_session(emit: EventSink, logger: SessionLogger) -> LiveSession:
         clock = _MonotonicClock()
@@ -513,6 +607,7 @@ async def _run_connector_sync(runtime: Runtime, connector_id: str) -> None:
     finally:
         registry.syncing.discard(connector_id)
         runtime.connector_sync_tasks.pop(connector_id, None)
+        _bump_graph(runtime)
         await _emit_index_status(runtime)
 
 
@@ -552,6 +647,10 @@ async def _run_reenrich(runtime: Runtime, source: str | None = None) -> None:
             )
         else:
             await _emit_index_status(runtime)
+        # re-enrichment rewrites gists/edges and (on full runs) the user card
+        _bump_graph(runtime)
+        runtime.updates.publish("profile")
+        runtime.updates.publish("connectors")
 
 
 def _set_reenrich_status(
@@ -570,7 +669,47 @@ def _set_reenrich_status(
     if not should_emit:
         return
     runtime.reenrich_last_emit_s = now
+    runtime.updates.publish("reenrich")
     asyncio.create_task(_emit_index_status(runtime))
+
+
+def _bump_graph(runtime: Runtime) -> None:
+    runtime.graph_version += 1
+    runtime.updates.publish("graph")
+
+
+async def _send_updates(
+    websocket: WebSocket,
+    runtime: Runtime,
+    kinds: set[str],
+) -> None:
+    """One JSON message per changed kind; payloads are built fresh at send
+    time so coalesced bursts reflect the latest state."""
+    if "connectors" in kinds and runtime.connector_registry is not None:
+        infos = await asyncio.to_thread(
+            runtime.connector_registry.list_info, runtime.index
+        )
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "connectors",
+                    "connectors": [info.model_dump() for info in infos],
+                }
+            )
+        )
+    if "reenrich" in kinds:
+        await websocket.send_text(
+            json.dumps(
+                {"type": "reenrich", "status": runtime.reenrich_status.model_dump()}
+            )
+        )
+    if "graph" in kinds:
+        await websocket.send_text(
+            json.dumps({"type": "graph", "version": runtime.graph_version})
+        )
+    if "profile" in kinds:
+        card = getattr(runtime.index, "user_card", lambda: None)()
+        await websocket.send_text(json.dumps({"type": "profile", "card": card}))
 
 
 async def _emit_index_status(runtime: Runtime) -> None:

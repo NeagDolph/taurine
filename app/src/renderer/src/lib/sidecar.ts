@@ -433,12 +433,21 @@ export async function enableConnector(
 
 export async function disableConnector(
   connectorId: string,
-  purge: boolean,
   options: SidecarRequestOptions = {}
 ): Promise<void> {
-  const suffix = purge ? '?purge=true' : ''
   await requestSidecar(
-    `/connectors/${encodeURIComponent(connectorId)}/disable${suffix}`,
+    `/connectors/${encodeURIComponent(connectorId)}/disable`,
+    { method: 'POST' },
+    options
+  )
+}
+
+export async function deleteConnectorData(
+  connectorId: string,
+  options: SidecarRequestOptions = {}
+): Promise<void> {
+  await requestSidecar(
+    `/connectors/${encodeURIComponent(connectorId)}/data/delete`,
     { method: 'POST' },
     options
   )
@@ -829,7 +838,7 @@ function parseStatus(record: Record<string, unknown>): StatusEvent | null {
   }
 }
 
-function parseConnectorInfo(value: unknown): ConnectorInfo {
+export function parseConnectorInfo(value: unknown): ConnectorInfo {
   const record = asRecord(value)
   if (
     !record ||
@@ -924,7 +933,7 @@ function parseNeighborRef(value: unknown): NeighborRef {
   }
 }
 
-function parseReenrichStatus(value: unknown): ReenrichStatus | null {
+export function parseReenrichStatus(value: unknown): ReenrichStatus | null {
   if (value === undefined || value === null) {
     return null
   }

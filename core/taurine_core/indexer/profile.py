@@ -5,7 +5,12 @@ from taurine_core.ports import LLMPort
 
 
 async def build_user_card(index: object, llm: LLMPort) -> str:
-    notes = index.notes()  # type: ignore[attr-defined]
+    disabled = getattr(index, "disabled_sources", set)()
+    notes = [
+        note
+        for note in index.notes()  # type: ignore[attr-defined]
+        if note.source not in disabled
+    ]
     response = await llm.complete_json(
         config.PROFILE_MODEL,
         _system_prompt(),

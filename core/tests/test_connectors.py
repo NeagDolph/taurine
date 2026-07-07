@@ -177,7 +177,14 @@ def test_registry_enable_disable_purge_and_sync_updates_state(store):
     assert synced.last_sync is not None
     assert synced.config == {"path": "/tmp/custom"}
 
-    registry.set_enabled(store, "fake", False, purge=True)
+    registry.set_enabled(store, "fake", False)
+
+    kept = registry.list_info(store)[0]
+    assert kept.enabled is False
+    assert kept.docs == 1                      # disable keeps data stored
+    assert store.note(note.note_id) is not None
+
+    registry.purge_data(store, "fake")
 
     purged = registry.list_info(store)[0]
     assert purged.enabled is False

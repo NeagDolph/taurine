@@ -35,6 +35,7 @@ async def test_complete_json_posts_openrouter_json_object_request() -> None:
     body = json.loads(request.content)
     assert body["model"] == "model-a"
     assert body["response_format"] == {"type": "json_object"}
+    assert "reasoning" not in body  # unknown model: no reasoning parameter sent
     assert body["messages"] == [
         {"role": "system", "content": "system text"},
         {"role": "user", "content": "user text"},
@@ -102,6 +103,25 @@ async def test_complete_tools_posts_openrouter_tools_request_and_returns_message
     assert body["messages"] == [{"role": "system", "content": "system text"}, *messages]
     assert body["tools"] == tools
     assert "response_format" not in body
+
+
+@pytest.mark.asyncio
+async def test_reasoning_parameter_is_per_model() -> None:
+    bodies: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    client = OpenRouterClient("secret-key", transport=httpx.MockTransport(handler))
+
+    await client.complete_json("z-ai/glm-5.2", "system", "user")
+    await client.complete_json("google/gemini-3.5-flash", "system", "user")
+    await client.complete_json("deepseek/deepseek-chat", "system", "user")
+
+    assert bodies[0]["reasoning"] == {"enabled": False}
+    assert bodies[1]["reasoning"] == {"effort": "minimal"}
+    assert "reasoning" not in bodies[2]  # deepseek providers reject the parameter
 
 
 @pytest.mark.asyncio

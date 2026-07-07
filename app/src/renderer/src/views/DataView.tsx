@@ -5,10 +5,10 @@ import { MapView } from './MapView'
 
 interface DataViewProps {
   visible: boolean
-  lastSync?: number | null
   latestFinalText: string
   retrieval: RetrievalEvent | null
   pinnedNoteIds: string[]
+  profileCard: string | null | undefined
   refreshKey: number
 }
 
@@ -26,10 +26,10 @@ function initialMapHeight(): number {
 
 export function DataView({
   visible,
-  lastSync,
   latestFinalText,
   retrieval,
   pinnedNoteIds,
+  profileCard,
   refreshKey
 }: DataViewProps): React.JSX.Element {
   const [mapHeight, setMapHeight] = useState(initialMapHeight)
@@ -69,7 +69,6 @@ export function DataView({
       <section className="panel-card map-panel" style={{ height: mapHeight }}>
         <MapView
           latestFinalText={latestFinalText}
-          lastSync={lastSync}
           pinnedNoteIds={pinnedNoteIds}
           refreshKey={refreshKey}
           retrieval={retrieval}
@@ -91,7 +90,7 @@ export function DataView({
         <span className="resize-grip" aria-hidden="true" />
       </div>
 
-      <UserSummary visible={visible} />
+      <UserSummary card={profileCard} />
     </div>
   )
 }

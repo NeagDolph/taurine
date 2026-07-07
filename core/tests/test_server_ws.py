@@ -113,9 +113,11 @@ class FakeASRClient:
 @dataclass
 class FakeConnectorRegistry:
     syncing: set[str] = field(default_factory=set)
-    enabled_calls: list[tuple[str, bool, bool]] = field(default_factory=list)
+    enabled_calls: list[tuple[str, bool]] = field(default_factory=list)
+    purge_calls: list[str] = field(default_factory=list)
     config_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     sync_calls: list[str] = field(default_factory=list)
+    on_change: Any = None
 
     def list_info(self, index: object) -> list[ConnectorInfo]:
         del index
@@ -132,18 +134,18 @@ class FakeConnectorRegistry:
             )
         ]
 
-    def set_enabled(
-        self,
-        index: object,
-        connector_id: str,
-        enabled: bool,
-        *,
-        purge: bool = False,
-    ) -> None:
+    def set_enabled(self, index: object, connector_id: str, enabled: bool) -> None:
         del index
         if connector_id != "fake":
             raise KeyError(connector_id)
-        self.enabled_calls.append((connector_id, enabled, purge))
+        self.enabled_calls.append((connector_id, enabled))
+
+    def purge_data(self, index: object, connector_id: str) -> int:
+        del index
+        if connector_id != "fake":
+            raise KeyError(connector_id)
+        self.purge_calls.append(connector_id)
+        return 3
 
     def set_config(self, index: object, connector_id: str, config: dict) -> None:
         del index
@@ -274,8 +276,10 @@ def test_connector_rest_endpoints_and_single_flight_sync() -> None:
             }
         ]
         assert client.post("/connectors/fake/enable").status_code == 200
-        assert client.post("/connectors/fake/disable?purge=true").status_code == 200
-        assert registry.enabled_calls == [("fake", True, False), ("fake", False, True)]
+        assert client.post("/connectors/fake/disable").status_code == 200
+        assert registry.enabled_calls == [("fake", True), ("fake", False)]
+        assert client.post("/connectors/fake/data/delete").status_code == 200
+        assert registry.purge_calls == ["fake"]
 
         assert client.put("/connectors/fake/config", json={"path": "/tmp/new"}).status_code == 200
         assert registry.config_calls == [("fake", {"path": "/tmp/new"})]
@@ -522,3 +526,39 @@ def test_profile_endpoints_roundtrip() -> None:
         }
         assert client.get("/profile").json() == {"card": "Neil builds Taurine."}
         assert client.put("/profile", json={"card": "   "}).status_code == 422
+
+
+def test_updates_websocket_sends_snapshot_and_change_events() -> None:
+    registry = FakeConnectorRegistry()
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+        connector_registry=registry,
+        connector_llm=object(),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/updates") as websocket:
+            snapshot = {}
+            for _ in range(4):
+                message = websocket.receive_json()
+                snapshot[message["type"]] = message
+            assert set(snapshot) == {"connectors", "reenrich", "graph", "profile"}
+            assert snapshot["connectors"]["connectors"][0]["connector_id"] == "fake"
+            assert snapshot["reenrich"]["status"]["running"] is False
+            assert snapshot["graph"]["version"] == 0
+            assert snapshot["profile"]["card"] is None
+
+            # a state change publishes fresh events over the socket
+            assert client.post("/connectors/fake/disable").status_code == 200
+            kinds = set()
+            while "graph" not in kinds:
+                kinds.add(websocket.receive_json()["type"])
+            assert runtime.graph_version == 1

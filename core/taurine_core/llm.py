@@ -35,6 +35,7 @@ class OpenRouterClient:
             "response_format": {"type": "json_object"},
             # only route to providers that honor response_format
             "provider": {"require_parameters": True},
+            **_reasoning_for(model),
         }
         headers = {"Authorization": f"Bearer {self._api_key}"}
 
@@ -74,6 +75,7 @@ class OpenRouterClient:
             "tools": tools,
             # only route to providers that honor tool parameters
             "provider": {"require_parameters": True},
+            **_reasoning_for(model),
         }
         headers = {"Authorization": f"Bearer {self._api_key}"}
 
@@ -95,6 +97,11 @@ class OpenRouterClient:
             return message
         except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMError(str(exc)) from exc
+
+
+def _reasoning_for(model: str) -> dict[str, Any]:
+    reasoning = config.LLM_REASONING_BY_MODEL.get(model)
+    return {"reasoning": dict(reasoning)} if reasoning else {}
 
 
 def _parse_json_content(content: str) -> Any:

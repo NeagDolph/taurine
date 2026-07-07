@@ -29,7 +29,6 @@ import type { RetrievalEvent } from '../lib/sidecar'
 
 interface MapViewProps {
   visible: boolean
-  lastSync?: number | null
   refreshKey?: number
   latestFinalText: string
   retrieval: RetrievalEvent | null
@@ -43,7 +42,6 @@ const EMPTY_GRAPH: MapGraphData = graphResponseToMapData({ nodes: [], edges: [] 
 
 export function MapView({
   visible,
-  lastSync,
   refreshKey = 0,
   latestFinalText,
   retrieval,
@@ -211,7 +209,7 @@ export function MapView({
       cancelled = true
       window.clearTimeout(loadingTimer)
     }
-  }, [lastSync, refreshKey, retryNonce])
+  }, [refreshKey, retryNonce])
 
   useEffect(() => {
     if (!error) {
