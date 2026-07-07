@@ -78,9 +78,22 @@ class AmbientRetriever:
         dense_scores = self._dense_scores(dense, dense_salient, dense_gliner)
         bm25_note_ids = {note_id for note_id, _score in bm25}
 
-        direct_scores = self._rrf_scores(dense, dense_salient, dense_gliner, bm25)
-        candidate_scores = dict(direct_scores)
-        expansion_arrivals = self._expand(candidate_scores, direct_scores)
+        base_direct_scores = self._rrf_scores(dense, dense_salient, dense_gliner, bm25)
+        graph_vote = self._graph_vote(base_direct_scores)
+        direct_scores = self._rrf_scores(
+            dense,
+            dense_salient,
+            dense_gliner,
+            bm25,
+            graph_vote,
+        )
+        candidate_scores = dict(base_direct_scores)
+        expansion_arrivals = self._expand(candidate_scores, base_direct_scores)
+        for candidate in self._ordered_candidates(direct_scores):
+            candidate_scores[candidate.note_id] = max(
+                candidate_scores.get(candidate.note_id, float("-inf")),
+                candidate.score,
+            )
 
         pooled = self._ordered_candidates(candidate_scores)
         docs = self._docs_for_candidates(window_text, pooled)
@@ -93,6 +106,7 @@ class AmbientRetriever:
                 dense_salient=dense_salient,
                 dense_gliner=dense_gliner,
                 bm25=bm25,
+                graph_vote=graph_vote,
                 bm25_query=bm25_query,
                 direct_scores=direct_scores,
                 expansion_arrivals=expansion_arrivals,
@@ -123,8 +137,9 @@ class AmbientRetriever:
             note_id: rank
             for rank, (note_id, _score) in enumerate(ordered, start=1)
         }
-        protected_ids = self._floor_passing_fused_protected_ids(
+        protected_ids = self._floor_passing_protected_ids(
             direct_scores,
+            dense,
             dense_scores,
             bm25_note_ids,
             set(expansion_arrivals),
@@ -163,6 +178,7 @@ class AmbientRetriever:
             dense_salient=dense_salient,
             dense_gliner=dense_gliner,
             bm25=bm25,
+            graph_vote=graph_vote,
             bm25_query=bm25_query,
             direct_scores=direct_scores,
             expansion_arrivals=expansion_arrivals,
@@ -195,7 +211,7 @@ class AmbientRetriever:
 
     def _salient_query(self, window_text: str) -> str | None:
         seen: set[str] = set()
-        terms: list[tuple[int, str]] = []
+        terms: list[tuple[int, str, int]] = []
         for index, term in enumerate(re.findall(r"[a-z0-9]+", window_text.lower())):
             if (
                 len(term) < config.SALIENT_MIN_TERM_LEN
@@ -203,15 +219,18 @@ class AmbientRetriever:
                 or term in seen
             ):
                 continue
+            doc_frequency = self._index.doc_frequency(term)
+            if doc_frequency < config.SALIENT_MIN_DF:
+                continue
             seen.add(term)
-            terms.append((index, term))
+            terms.append((index, term, doc_frequency))
 
         if not terms:
             return None
 
         scored = [
-            (1.0 / (1 + self._index.doc_frequency(term)), index, term)
-            for index, term in terms
+            (1.0 / (1 + doc_frequency), index, term)
+            for index, term, doc_frequency in terms
         ]
         selected = {
             term
@@ -220,7 +239,9 @@ class AmbientRetriever:
                 key=lambda item: (-item[0], item[1]),
             )[: config.SALIENT_TERMS]
         }
-        query = " ".join(term for _index, term in terms if term in selected)
+        query = " ".join(
+            term for _index, term, _doc_frequency in terms if term in selected
+        )
         return query or None
 
     def _extract_spans(self, window_text: str) -> list[tuple[str, float, str]]:
@@ -281,6 +302,22 @@ class AmbientRetriever:
         return sorted(scores.items(), key=lambda item: item[1], reverse=True)[
             : config.RERANK_MAX_CANDIDATES
         ]
+
+    def _graph_vote(
+        self,
+        direct_scores: dict[str, float],
+    ) -> list[tuple[str, float]]:
+        vote_scores: dict[str, float] = {}
+        for candidate in self._ordered_candidates(direct_scores)[: config.GRAPH_VOTE_TOP]:
+            for neighbor_id, edge_weight in self._index.neighbors(candidate.note_id):
+                vote_scores[neighbor_id] = vote_scores.get(neighbor_id, 0.0) + (
+                    candidate.score * edge_weight * config.GRAPH_VOTE_WEIGHT
+                )
+        return sorted(
+            vote_scores.items(),
+            key=lambda item: (item[1], item[0]),
+            reverse=True,
+        )[: config.RERANK_MAX_CANDIDATES]
 
     @staticmethod
     def _dense_scores(
@@ -393,9 +430,10 @@ class AmbientRetriever:
             filtered.append((note_id, score))
         return filtered
 
-    def _floor_passing_fused_protected_ids(
+    def _floor_passing_protected_ids(
         self,
         direct_scores: dict[str, float],
+        dense: list[tuple[str, float]],
         dense_scores: dict[str, float],
         bm25_note_ids: set[str],
         graph_note_ids: set[str],
@@ -406,10 +444,15 @@ class AmbientRetriever:
             for candidate in self._ordered_candidates(direct_scores)[: config.FUSED_PROTECT]
             if candidate.note_id in ordered_ranks
         ]
+        dense_protected = [
+            (note_id, score)
+            for note_id, score in dense[: config.DENSE_PROTECT]
+            if note_id in ordered_ranks
+        ]
         return {
             note_id
             for note_id, _score in self._apply_floor(
-                fused_protected,
+                [*fused_protected, *dense_protected],
                 dense_scores,
                 bm25_note_ids,
                 graph_note_ids,
@@ -481,6 +524,7 @@ class AmbientRetriever:
         dense_salient: list[tuple[str, float]],
         dense_gliner: list[tuple[str, float]],
         bm25: list[tuple[str, float]],
+        graph_vote: list[tuple[str, float]],
         bm25_query: str,
         direct_scores: dict[str, float],
         expansion_arrivals: dict[str, _ExpansionArrival],
@@ -500,6 +544,7 @@ class AmbientRetriever:
             "dense_salient": _rows(dense_salient),
             "dense_gliner": _rows(dense_gliner),
             "bm25": _rows(bm25),
+            "graph_vote": _rows(graph_vote[:10]),
             "fused": _rows(
                 [
                     (candidate.note_id, candidate.score)

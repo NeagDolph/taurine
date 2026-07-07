@@ -108,6 +108,7 @@ def fake_index() -> FakeIndex:
             "seed": "seed chunk",
             "neighbor": "neighbor chunk",
         },
+        doc_frequencies={"seed": 1, "topic": 1},
     )
 
 
@@ -280,6 +281,51 @@ async def test_fused_protect_rescues_fused_top_note_demoted_by_rerank() -> None:
     assert debug_records[0]["slate_adds"][-1] == "protected"
 
 
+async def test_dense_protect_rescues_dense_window_note_buried_by_fusion_and_rerank() -> None:
+    ordered_ids = [f"ordered-{idx}" for idx in range(1, config.C2_TOP_K + 2)]
+    dense_protected = "dense-protected"
+    window = "protect dense candidate"
+    index = QueryAwareIndex(
+        notes={
+            note_id: note(note_id, note_id.title())
+            for note_id in [*ordered_ids, dense_protected]
+        },
+        dense_by_query={
+            window: [
+                (ordered_ids[0], 0.99),
+                (dense_protected, 0.98),
+                *[
+                    (note_id, 0.9 - idx * 0.01)
+                    for idx, note_id in enumerate(ordered_ids[1:], start=1)
+                ],
+            ],
+        },
+        bm25=[(note_id, 20.0 - idx) for idx, note_id in enumerate(ordered_ids)],
+        chunks={note_id: f"chunk {note_id}" for note_id in [*ordered_ids, dense_protected]},
+    )
+    rerank_scores = {
+        note_id: float(config.C2_TOP_K + 2 - idx)
+        for idx, note_id in enumerate(ordered_ids, start=1)
+    }
+    rerank_scores[dense_protected] = 0.1
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker(rerank_scores),
+        FakeClock(),
+        on_debug=debug_records.append,
+    ).on_window(window)
+
+    assert res is not None
+    slate_ids = [item.note_id for item in res.hits]
+    assert dense_protected in slate_ids
+    assert ordered_ids[config.C2_TOP_K - 1] not in slate_ids
+    assert len(slate_ids) == config.C2_TOP_K
+    assert debug_records[0]["protected"] == [dense_protected]
+    assert debug_records[0]["slate_adds"][-1] == dense_protected
+
+
 async def test_debug_callback_reports_one_c2_pass_with_internal_rows() -> None:
     debug_records: list[dict[str, object]] = []
     index = FakeIndex(
@@ -296,6 +342,7 @@ async def test_debug_callback_reports_one_c2_pass_with_internal_rows() -> None:
             "low": "low chunk",
             "expanded": "expanded chunk",
         },
+        doc_frequencies={"seed": 1, "topic": 1},
     )
     reranker = OkReranker({"low": 0.99, "seed": 0.7, "expanded": 0.6})
 
@@ -317,6 +364,13 @@ async def test_debug_callback_reports_one_c2_pass_with_internal_rows() -> None:
     assert debug["fused"] == [
         ["seed", pytest.approx((1 / (config.RRF_K + 1)) * 3)],
         ["low", pytest.approx(2 / (config.RRF_K + 2))],
+        ["expanded", pytest.approx(1 / (config.RRF_K + 1))],
+    ]
+    assert debug["graph_vote"] == [
+        [
+            "expanded",
+            pytest.approx((1 / (config.RRF_K + 1)) * 3 * 0.8 * config.GRAPH_VOTE_WEIGHT),
+        ]
     ]
     assert debug["expansions"] == [
         {
@@ -332,9 +386,9 @@ async def test_debug_callback_reports_one_c2_pass_with_internal_rows() -> None:
     assert debug["slate_adds"] == ["seed", "expanded"]
 
 
-async def test_salient_query_uses_rare_terms_and_dense_salient_joins_rrf() -> None:
+async def test_salient_query_excludes_terms_below_df_floor_and_dense_salient_joins_rrf() -> None:
     window = "alpha beta gamma delta epsilon zeta theta"
-    salient = "beta gamma delta epsilon zeta theta"
+    salient = "alpha gamma epsilon zeta"
     index = QueryAwareIndex(
         notes={
             "window": note("window", "Window Note"),
@@ -384,6 +438,93 @@ async def test_salient_query_uses_rare_terms_and_dense_salient_joins_rrf() -> No
     ]
 
 
+async def test_salient_query_skips_dense_salient_when_df_floor_removes_all_terms() -> None:
+    window = "mored armand shopif"
+    index = QueryAwareIndex(
+        notes={"window": note("window", "Window Note")},
+        dense_by_query={window: [("window", 0.9)]},
+        chunks={"window": "window chunk"},
+        doc_frequencies={"mored": 0, "armand": 0, "shopif": 0},
+    )
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker({"window": 0.8}),
+        FakeClock(),
+        on_debug=debug_records.append,
+    ).on_window(window)
+
+    assert res is not None
+    assert index.dense_queries == [window]
+    assert debug_records[0]["salient"] is None
+    assert debug_records[0]["dense_salient"] == []
+
+
+async def test_graph_vote_adds_fifth_rrf_list_and_lifts_direct_neighbor() -> None:
+    index = FakeIndex(
+        notes={
+            "seed-a": note("seed-a", "Seed A"),
+            "seed-b": note("seed-b", "Seed B"),
+            "filler-1": note("filler-1", "Filler 1"),
+            "filler-2": note("filler-2", "Filler 2"),
+            "voted": note("voted", "Voted"),
+        },
+        dense=[
+            ("seed-a", 0.95),
+            ("seed-b", 0.94),
+            ("filler-1", 0.93),
+            ("filler-2", 0.92),
+            ("voted", 0.91),
+        ],
+        bm25=[
+            ("seed-a", 12.0),
+            ("seed-b", 11.0),
+            ("filler-1", 10.0),
+            ("filler-2", 9.0),
+        ],
+        links={
+            "seed-a": [("voted", 1.0)],
+            "seed-b": [("voted", 1.0)],
+        },
+        chunks={
+            "seed-a": "seed a chunk",
+            "seed-b": "seed b chunk",
+            "filler-1": "filler 1 chunk",
+            "filler-2": "filler 2 chunk",
+            "voted": "voted chunk",
+        },
+    )
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker(),
+        FakeClock(),
+        on_debug=debug_records.append,
+    ).on_window("graph vote")
+
+    assert res is not None
+    debug = debug_records[0]
+    assert debug["graph_vote"] == [
+        [
+            "voted",
+            pytest.approx(
+                (
+                    (2 / (config.RRF_K + 1))
+                    + (2 / (config.RRF_K + 2))
+                )
+                * config.GRAPH_VOTE_WEIGHT
+            ),
+        ]
+    ]
+    assert [note_id for note_id, _score in debug["fused"][:3]] == [
+        "seed-a",
+        "seed-b",
+        "voted",
+    ]
+
+
 async def test_span_queries_form_dense_gliner_list_and_survive_floor() -> None:
     window = "alpha checkout"
     span_extractor = FakeSpanExtractor(
@@ -403,6 +544,7 @@ async def test_span_queries_form_dense_gliner_list_and_survive_floor() -> None:
             "window": "window chunk",
             "span-only": "span chunk",
         },
+        doc_frequencies={"alpha": 1, "checkout": 1},
     )
     debug_records: list[dict[str, object]] = []
 
@@ -535,7 +677,7 @@ async def test_snapped_terms_extend_bm25_query_and_log_query() -> None:
 
 async def test_empty_span_extractor_degrades_to_three_list_rrf() -> None:
     window = "alpha beta gamma delta epsilon zeta theta"
-    salient = "beta gamma delta epsilon zeta theta"
+    salient = "alpha gamma epsilon zeta"
     span_extractor = FakeSpanExtractor([])
     index = QueryAwareIndex(
         notes={
