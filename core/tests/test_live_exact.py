@@ -45,6 +45,22 @@ def test_long_alias_allows_normalized_substring_match() -> None:
     ]
 
 
+def test_aliases_always_require_word_boundaries() -> None:
+    index = FakeIndex(
+        alias_rows=[
+            ("comp", "comp", False),
+            ("dan ham", "dan-ham", True),
+            ("wink", "wink", False),
+        ]
+    )
+    collector = ExactCollector(index)
+
+    assert collector.on_chunk(chunk("our company is growing and winking")) == []
+    assert collector.on_chunk(chunk("talked to Dan Ham today")) == [
+        ("dan-ham", "dan ham", True)
+    ]
+
+
 def test_empty_or_whitespace_aliases_are_ignored() -> None:
     index = FakeIndex(alias_rows=[("  ", "blank", True), ("deck", "deck", False)])
     collector = ExactCollector(index)

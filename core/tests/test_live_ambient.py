@@ -76,8 +76,13 @@ class QueryAwareIndex(FakeIndex):
 
 
 class FakeSpanExtractor:
-    def __init__(self, spans: list[tuple[str, float, str]]) -> None:
+    def __init__(
+        self,
+        spans: list[tuple[str, float, str]],
+        dropped: list[tuple[str, float, str]] | None = None,
+    ) -> None:
         self.spans = spans
+        self.last_dropped = dropped or []
         self.calls: list[str] = []
 
     def extract(self, text: str) -> list[tuple[str, float, str]]:
@@ -568,6 +573,88 @@ async def test_span_queries_form_dense_gliner_list_and_survive_floor() -> None:
         ["window", pytest.approx((1 / (config.RRF_K + 1)) * 2 + (1 / (config.RRF_K + 2)))],
         ["span-only", pytest.approx(1 / (config.RRF_K + 1))],
     ]
+
+
+async def test_span_context_query_uses_context_text_before_window_and_logs_drops() -> None:
+    window = "Deepgram follow-up"
+    context = "Shopify handles checkout payments. The team moved to Deepgram follow-up."
+    span_extractor = FakeSpanExtractor(
+        [("Shopify", 0.96, "organization")],
+        dropped=[("dude", 0.7, "person")],
+    )
+    index = QueryAwareIndex(
+        notes={"context": note("context", "Context Note")},
+        dense_by_query={
+            window: [],
+            "Shopify": [],
+            context: [("context", 0.93)],
+        },
+        chunks={"context": "context chunk"},
+    )
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker({"context": 0.91}),
+        FakeClock(),
+        on_debug=debug_records.append,
+        span_extractor=span_extractor,
+    ).on_window(window, context_text=context)
+
+    assert res is not None
+    assert span_extractor.calls == [window]
+    assert index.dense_queries == [window, "Shopify", context]
+    assert [hit.note_id for hit in res.hits] == ["context"]
+    debug = debug_records[0]
+    assert debug["gliner_context_queries"] == [context]
+    assert debug["gliner_dropped"] == [["dude", 0.7, "person"]]
+
+
+async def test_span_context_query_caps_around_span(monkeypatch) -> None:
+    monkeypatch.setattr(config, "SPAN_CONTEXT_MAX_CHARS", 64)
+    window = "Deepgram follow-up"
+    context = (
+        "Earlier alpha beta gamma delta epsilon zeta eta theta iota kappa lambda. "
+        "Then the roadmap team mentioned Shopify while comparing checkout operations "
+        "against a very long implementation timeline. "
+        "After that they moved to Deepgram follow-up details."
+    )
+    span_extractor = FakeSpanExtractor([("Shopify", 0.96, "organization")])
+    index = QueryAwareIndex(dense_by_query={window: [], "Shopify": []})
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker(),
+        FakeClock(),
+        on_debug=debug_records.append,
+        span_extractor=span_extractor,
+    ).on_window(window, context_text=context)
+
+    assert res is not None
+    [context_query] = debug_records[0]["gliner_context_queries"]
+    assert len(context_query) <= 64
+    assert "Shopify" in context_query
+    assert context_query in index.dense_queries
+
+
+async def test_span_context_query_skips_absent_span() -> None:
+    window = "Deepgram follow-up"
+    span_extractor = FakeSpanExtractor([("Shopify", 0.96, "organization")])
+    index = QueryAwareIndex(dense_by_query={window: [], "Shopify": []})
+    debug_records: list[dict[str, object]] = []
+
+    res = await AmbientRetriever(
+        index,
+        OkReranker(),
+        FakeClock(),
+        on_debug=debug_records.append,
+        span_extractor=span_extractor,
+    ).on_window(window, context_text="No vendor appears in this context.")
+
+    assert res is not None
+    assert index.dense_queries == [window, "Shopify"]
+    assert debug_records[0]["gliner_context_queries"] == []
 
 
 async def test_fuzzy_snap_queries_original_and_snapped_span_and_logs_snap() -> None:

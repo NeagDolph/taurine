@@ -448,6 +448,10 @@ def build_runtime() -> Runtime:
     span_extractor = Gliner2SpanExtractor()
     connector_registry = ConnectorRegistry()
     connector_registry.reconcile_ledger(index)
+    from taurine_core.indexer.reembed import needs_reembed, reembed_all
+
+    if needs_reembed(index):
+        reembed_all(index)
 
     def make_live_session(emit: EventSink, logger: SessionLogger) -> LiveSession:
         clock = _MonotonicClock()

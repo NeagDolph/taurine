@@ -13,14 +13,24 @@ _MODEL: Any | None = None
 
 
 def embed_texts(texts: list[str]) -> np.ndarray:
+    return _embed(texts)
+
+
+def embed_queries(texts: list[str]) -> np.ndarray:
+    return _embed(texts, prompt=config.EMBED_QUERY_PROMPT)
+
+
+def _embed(texts: list[str], *, prompt: str | None = None) -> np.ndarray:
     if not texts:
         return np.empty((0, config.EMBED_DIM), dtype=np.float32)
     model = _get_model()
-    encoded = model.encode(
-        texts,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-    )
+    kwargs: dict[str, Any] = {
+        "convert_to_numpy": True,
+        "show_progress_bar": False,
+    }
+    if prompt is not None:
+        kwargs["prompt"] = prompt
+    encoded = model.encode(texts, **kwargs)
     matrix = np.asarray(encoded, dtype=np.float32)
     if matrix.ndim == 1:
         matrix = matrix.reshape(1, -1)

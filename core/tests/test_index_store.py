@@ -42,7 +42,7 @@ def test_dense_search_uses_per_note_max_unit_score(store, monkeypatch):
     store.upsert_note(note_b, enrich_b, [("gist", "beta", unit_vec(9))])
 
     monkeypatch.setattr(
-        "taurine_core.indexer.store.embed_texts",
+        "taurine_core.indexer.store.embed_queries",
         lambda texts: np.array([query_vec for _ in texts], dtype=np.float32),
     )
 
@@ -80,7 +80,7 @@ def test_best_chunk_returns_nearest_chunk_text(store, monkeypatch):
         ],
     )
     monkeypatch.setattr(
-        "taurine_core.indexer.store.embed_texts",
+        "taurine_core.indexer.store.embed_queries",
         lambda texts: np.array([query_vec for _ in texts], dtype=np.float32),
     )
 
@@ -101,7 +101,7 @@ def test_best_chunk_considers_utterance_units_and_prefixes_spoken_reference(stor
         ],
     )
     monkeypatch.setattr(
-        "taurine_core.indexer.store.embed_texts",
+        "taurine_core.indexer.store.embed_queries",
         lambda texts: np.array([query_vec for _ in texts], dtype=np.float32),
     )
 
@@ -217,7 +217,12 @@ def test_preview_resolves_neighbors_sorted_by_weight(store):
     assert store.preview("missing") is None
 
 
-def test_disabled_source_drops_out_of_active_index_but_keeps_rows(store):
+def test_disabled_source_drops_out_of_active_index_but_keeps_rows(store, monkeypatch):
+    query_vec = unit_vec(101)
+    monkeypatch.setattr(
+        "taurine_core.indexer.store.embed_queries",
+        lambda texts: np.array([query_vec for _ in texts], dtype=np.float32),
+    )
     kept = make_note("keep:one", "Kept Note", "Shared topic body about billing").model_copy(
         update={"source": "keep"}
     )

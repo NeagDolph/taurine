@@ -108,6 +108,12 @@ def embed_texts(texts: list[str]) -> np.ndarray:
     return real_embed_texts(texts)
 
 
+def embed_queries(texts: list[str]) -> np.ndarray:
+    from .embed import embed_queries as real_embed_queries
+
+    return real_embed_queries(texts)
+
+
 class Index:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -336,16 +342,17 @@ class Index:
             )
 
     def dense_search(self, text: str, k: int) -> list[tuple[str, float]]:
-        if k <= 0 or self._matrix.size == 0:
+        embedding_rows, matrix = self._dense_snapshot()
+        if k <= 0 or matrix.size == 0:
             return []
-        query = embed_texts([text])[0].astype(np.float32)
+        query = embed_queries([text])[0].astype(np.float32)
         norm = float(np.linalg.norm(query))
         if norm == 0:
             return []
         query = query / norm
-        scores = self._matrix @ query
+        scores = matrix @ query
         per_note: dict[str, float] = {}
-        for (_, note_id, _, _), score in zip(self._embedding_rows, scores, strict=True):
+        for (_, note_id, _, _), score in zip(embedding_rows, scores, strict=True):
             per_note[note_id] = max(per_note.get(note_id, -1.0), float(score))
         return sorted(per_note.items(), key=lambda item: item[1], reverse=True)[:k]
 
@@ -483,7 +490,7 @@ class Index:
             return note.text if note is not None else ""
         if self._matrix.size == 0:
             return _rerank_evidence_text(rows[0][1], rows[0][2])
-        query = embed_texts([query_text])[0].astype(np.float32)
+        query = embed_queries([query_text])[0].astype(np.float32)
         norm = float(np.linalg.norm(query))
         if norm == 0:
             return _rerank_evidence_text(rows[0][1], rows[0][2])
@@ -619,6 +626,42 @@ class Index:
                         json.dumps(sorted(set(edge.shared))),
                     ),
                 )
+
+    def _dense_snapshot(self) -> tuple[list[tuple[int, str, EmbeddingKind, str]], np.ndarray]:
+        for _attempt in range(3):
+            embedding_rows = self._embedding_rows
+            matrix = self._matrix
+            if len(embedding_rows) == matrix.shape[0]:
+                return embedding_rows, matrix
+            time.sleep(0)
+        self.load()
+        return self._embedding_rows, self._matrix
+
+    def _embedding_rows_raw(self) -> list[tuple[int, str, EmbeddingKind, str]]:
+        rows = self._conn.execute(
+            """
+            SELECT id, note_id, kind, text
+            FROM embeddings
+            ORDER BY id
+            """
+        ).fetchall()
+        return [
+            (int(row["id"]), row["note_id"], row["kind"], row["text"])
+            for row in rows
+        ]
+
+    def update_embedding_vec(self, row_id: int, vector: np.ndarray) -> None:
+        values = np.asarray(vector, dtype=np.float32)
+        if values.shape != (config.EMBED_DIM,):
+            raise ValueError(f"embedding must have shape ({config.EMBED_DIM},)")
+        norm = float(np.linalg.norm(values))
+        if norm > 0:
+            values = values / norm
+        with self._conn:
+            self._conn.execute(
+                "UPDATE embeddings SET vec = ? WHERE id = ?",
+                (values.astype(np.float32).tobytes(), int(row_id)),
+            )
 
     def embedding_vectors(self, note_id: str, kind: EmbeddingKind | None = None) -> list[np.ndarray]:
         rows = self._conn.execute(

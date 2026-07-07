@@ -240,9 +240,13 @@ class LiveSession:
         window_text = self._window_text(window_chunks, self._active_partials())
         if not window_text:
             return
+        context_chunks = self._transcript[
+            -(config.C2_WINDOW_CHUNKS + config.C2_CONTEXT_CHUNKS) :
+        ]
+        context_text = self._window_text(context_chunks, self._active_partials())
 
         before_revision = self._slate.revision
-        result = await self._ambient.on_window(window_text)
+        result = await self._ambient.on_window(window_text, context_text=context_text)
         if result is None:
             return
 
@@ -471,6 +475,8 @@ class LiveSession:
                 "window": result.heard,
                 "salient": None,
                 "gliner_spans": [],
+                "gliner_dropped": [],
+                "gliner_context_queries": [],
                 "dense": [],
                 "dense_salient": [],
                 "dense_gliner": [],
@@ -491,6 +497,8 @@ class LiveSession:
                 "slate_adds": [],
             }
         debug.setdefault("gliner_spans", [])
+        debug.setdefault("gliner_dropped", [])
+        debug.setdefault("gliner_context_queries", [])
         debug.setdefault("dense_gliner", [])
         debug["slate_adds"] = survived_adds
         self._logger.log("c2_pass", trigger_id=trigger_id, seqs=seqs, **debug)

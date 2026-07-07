@@ -17,8 +17,8 @@ class NoopAmbient:
     last_slate_adds: list[SlateItem] = []
     last_debug: dict[str, Any] | None = None
 
-    async def on_window(self, window_text: str) -> None:
-        del window_text
+    async def on_window(self, window_text: str, context_text: str | None = None) -> None:
+        del window_text, context_text
         return None
 
 
@@ -37,11 +37,17 @@ class SequenceAmbient:
     slate_add_sequences: list[list[SlateItem]]
     debug_sequences: list[dict[str, Any] | None] = field(default_factory=list)
     windows: list[str] = field(default_factory=list)
+    contexts: list[str | None] = field(default_factory=list)
     last_slate_adds: list[SlateItem] = field(default_factory=list)
     last_debug: dict[str, Any] | None = None
 
-    async def on_window(self, window_text: str) -> RetrievalResult | None:
+    async def on_window(
+        self,
+        window_text: str,
+        context_text: str | None = None,
+    ) -> RetrievalResult | None:
         self.windows.append(window_text)
+        self.contexts.append(context_text)
         self.last_slate_adds = (
             self.slate_add_sequences.pop(0) if self.slate_add_sequences else []
         )
@@ -418,11 +424,32 @@ async def test_c2_window_appends_partials_and_fires_on_interim_with_final_seqs_o
     await session.on_chunk(interim("partial insight", ts=11.0))
 
     assert ambient.windows == ["final context", "final context partial insight"]
+    assert ambient.contexts == ["final context", "final context partial insight"]
     [trigger] = [event for event in events if event.type == "trigger"]
     [retrieval] = [event for event in events if event.type == "retrieval"]
     assert trigger.seqs == [1]
     assert retrieval.seqs == [1]
     assert trigger.span == "final context partial insight"
+
+
+@pytest.mark.asyncio
+async def test_c2_passes_context_text_with_extra_pre_window_chunks() -> None:
+    clock = FakeClock()
+    index = FakeIndex()
+    ambient = SequenceAmbient(results=[None, None, None, None, None], slate_add_sequences=[])
+    session, _events = session_with(
+        index=index,
+        clock=clock,
+        exact=SequenceExact([[], [], [], [], []]),
+        cadence=RecordingCadence(may_present_allowed=False),
+        ambient=ambient,
+    )
+
+    for idx in range(1, config.C2_WINDOW_CHUNKS + config.C2_CONTEXT_CHUNKS + 1):
+        await session.on_chunk(chunk(f"chunk {idx}", ts=float(idx)))
+
+    assert ambient.windows[-1] == "chunk 3 chunk 4 chunk 5"
+    assert ambient.contexts[-1] == "chunk 1 chunk 2 chunk 3 chunk 4 chunk 5"
 
 
 @pytest.mark.asyncio

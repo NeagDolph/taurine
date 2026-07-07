@@ -14,8 +14,15 @@ ASR_RECONNECT_MIN_S = 1.0
 ASR_RECONNECT_MAX_S = 30.0
 
 # ── embedding / chunking ───────────────────────────────────────────────
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"   # 384-dim, local, CPU/MPS
-EMBED_DIM = 384
+# Qwen3-Embedding-0.6B (2025): 1024-dim, instruction-aware, runs on MPS.
+# Documents embed bare; queries get the instruction prefix (asymmetric
+# retrieval). Replaced bge-small-en-v1.5 (384-dim) — see 2026-07-07 upgrade.
+EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+EMBED_DIM = 1024
+EMBED_QUERY_PROMPT = (
+    "Instruct: Given a snippet of spoken conversation, retrieve personal "
+    "notes relevant to what is being discussed\nQuery: "
+)
 CHUNK_MAX_TOKENS = 300                   # sentence-boundary chunking
 
 # ── LLM (ALL calls via OpenRouter) ─────────────────────────────────────
@@ -44,6 +51,15 @@ PROFILE_NOTE_CHAR_BUDGET = 2400          # per-note truncation when building car
 PROFILE_MAX_CHARS = 6000                 # cap on the generated card itself
 REENRICH_CONCURRENCY = 4
 
+# ── batched enrichment (similarity-clustered, keyed by note_id) ────────
+# Related notes enriched in one call converge on consistent entity/topic
+# vocabulary, which is what builds graph edges; batching also amortizes the
+# user card prefix. Any note missing/invalid in a batch response falls back
+# to a per-note call.
+ENRICH_BATCH_SIZE = 10                   # max notes per LLM call
+ENRICH_BATCH_CHAR_BUDGET = 24_000        # max summed note-text chars per call
+ENRICH_BATCH_MIN_NOTES = 3               # below this, per-note calls (batch overhead loses)
+
 # ── notes sync / connectors ────────────────────────────────────────────
 SYNC_INTERVAL_S = 300.0
 CONNECTOR_DOC_MAX_CHARS = 12000          # per-document body cap at extraction
@@ -59,7 +75,8 @@ GIST_MAX_CHARS = 220                     # was 120: mid-word truncation degraded
 
 # ── note graph ─────────────────────────────────────────────────────────
 GRAPH_KNN = 6
-GRAPH_MIN_SIM = 0.60
+GRAPH_MIN_SIM = 0.55                     # percentile-matched to Qwen3-Embedding cosines
+                                         # (bge 0.60 = p93.6 of pairwise sims → 0.550)
 GRAPH_MIN_SHARED_W = 0.25
 GRAPH_MAX_DEGREE = 12
 
@@ -84,7 +101,8 @@ SALIENT_MIN_DF = 1                       # drop df=0 window terms: they are ASR 
                                          # not rare gold (audit finding #2)
 GRAPH_VOTE_TOP = 10                      # fused candidates whose neighbors get vote credit
 GRAPH_VOTE_WEIGHT = 0.5                  # vote strength multiplier (5th RRF list)
-MIN_COSINE = 0.35                        # floor only when no BM25 hit AND no graph path
+MIN_COSINE = 0.22                        # floor only when no BM25 hit AND no graph path;
+                                         # percentile-matched to Qwen3 (bge 0.35 = p6.8 → 0.219)
 
 # ── fuzzy entity snapping (ASR spelling drift: "Armand" → "Armaan") ────
 FUZZY_SNAP_MIN_LEN = 4                   # only snap spans at least this long
@@ -92,7 +110,8 @@ FUZZY_SNAP_MAX_DIST = 2                  # max Levenshtein distance to an alias/
 FUZZY_SNAP_LABELS = ("person", "organization", "project")  # spans eligible for snapping
 
 # ── C1 exact collector ─────────────────────────────────────────────────
-ALIAS_WORD_BOUNDARY_UNDER = 4            # aliases shorter than this need word-boundary match
+# ALL aliases require word-boundary matches: substring matching fired 'comp'
+# inside "company" and 'bing' inside unrelated words (2026-07-07 triage)
 ALIAS_MIN_COMPACT_LEN = 3                # aliases shorter than this (spaces stripped) are dropped
 # aliases that are generic english/note words trigger constantly in speech —
 # dropped at alias-table build regardless of source
@@ -111,6 +130,28 @@ SALIENT_MIN_TERM_LEN = 3
 
 # ── C2 GLiNER2 span extraction (schema-based, label descriptions) ─────
 GLINER2_MODEL = "fastino/gliner2-large-v1"
+GLINER2_THRESHOLD = 0.6                  # was the 0.5 default with confidence discarded;
+                                         # 2026-07-07 triage: ~half of spans were junk
+# pronouns/vocatives/generic nouns GLiNER tags as entities in casual speech —
+# dropped regardless of label or confidence (lowercase-normalized match)
+GLINER_SPAN_STOPLIST = frozenset(
+    """i you me he she we they them him her it this that these those
+    someone somebody anyone everybody everyone person people persons
+    dude bro bruh man guy guys girl girls kid kids friend friends
+    parent parents mom dad brother sister family
+    thing things stuff okay ok yeah yep nah alright right cool damn
+    meeting call session note notes list money data company business
+    all the people one person someone else
+    """.split()
+)
+# these labels are proper nouns by definition: a span must contain an
+# uppercase character (as spoken/ASR-cased) or be multiword to survive
+GLINER_PROPER_LABELS = ("person", "organization", "project")
+# span-context queries: dense-search the sentence(s) around a triggered span,
+# not just the span words; the context window extends before the C2 window
+C2_CONTEXT_CHUNKS = 2                    # extra transcript chunks before the window
+SPAN_CONTEXT_SENTENCES = 1               # sentences around the span occurrence, each side
+SPAN_CONTEXT_MAX_CHARS = 240             # hard cap per context query
 # label → description; descriptions are per-label prompt engineering and the
 # main precision lever — edit freely. Schema order = span priority at the cap.
 GLINER2_SCHEMA = {

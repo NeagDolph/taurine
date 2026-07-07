@@ -15,7 +15,6 @@ from taurine_core.ports import LLMError, LLMPort
 from taurine_core.schemas import ConnectorSyncReport, Enrichment, NoteRecord
 
 from .embed import chunk_text, embed_texts
-from .enrich import enrich_note_with_status
 from .notes import extract_notes
 from .store import EmbeddingInput, Index
 
@@ -113,6 +112,7 @@ def sync_source(
 
     rebuilt: list[str] = []
     for position, note in enumerate(pending, start=1):
+        failed = False
         if note.note_id in cached:
             enrichment = cached[note.note_id]
         else:
@@ -121,6 +121,8 @@ def sync_source(
             if not failed:  # fallback enrichments must retry on the next sync
                 index.cache_enrichment(note.note_id, note.content_hash, enrichment)
         index.upsert_note(note, enrichment, _embedding_units(note, enrichment))
+        if failed:
+            _drop_cached_enrichment(index, note)
         rebuilt.append(note.note_id)
         report("indexing", position, len(pending))
 
@@ -149,27 +151,20 @@ async def _enrich_concurrently(
     on_progress: Callable[[int], None],
     already_done: int,
 ) -> dict[str, tuple[Enrichment, bool]]:
-    from taurine_core import config
+    from .batch_enrich import enrich_all_batched
 
-    semaphore = asyncio.Semaphore(config.REENRICH_CONCURRENCY)
     done = already_done
-    lock = asyncio.Lock()
-    results: dict[str, tuple[Enrichment, bool]] = {}
 
-    async def one(note: NoteRecord) -> None:
+    def note_done(note_id: str, enrichment: Enrichment, failed: bool) -> None:
         nonlocal done
-        async with semaphore:
-            result = await enrich_note_with_status(note, llm, user_card=user_card)
-        results[note.note_id] = result
-        async with lock:
-            done += 1
-            current = done
+        del note_id, enrichment, failed
+        done += 1
+        current = done
         on_progress(current)
         if current % 5 == 0 or current == already_done + len(notes):
             _LOG.info("sync %s: enriched %d/%d", source_id, current, already_done + len(notes))
 
-    await asyncio.gather(*(one(note) for note in notes))
-    return results
+    return await enrich_all_batched(notes, llm, user_card, embed_texts, note_done)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -204,6 +199,17 @@ def _embedding_units(note: NoteRecord, enrichment: Enrichment) -> list[Embedding
     for kind, text, vector in zip(kinds, texts, vectors, strict=True):
         units.append((kind, text, np.asarray(vector, dtype=np.float32)))  # type: ignore[arg-type]
     return units
+
+
+def _drop_cached_enrichment(index: Index, note: NoteRecord) -> None:
+    with index._conn:  # type: ignore[attr-defined]
+        index._conn.execute(  # type: ignore[attr-defined]
+            """
+            DELETE FROM enrich_cache
+            WHERE note_id = ? AND content_hash = ?
+            """,
+            (note.note_id, note.content_hash),
+        )
 
 
 def _notes_from(source: NotesSource) -> Iterable[NoteRecord]:

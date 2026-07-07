@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from taurine_core import config
-from taurine_core.ports import LLMPort
-from taurine_core.schemas import ReenrichStatus
+import numpy as np
 
-from .enrich import enrich_note_with_status
+from taurine_core.ports import LLMPort
+from taurine_core.schemas import Enrichment, NoteRecord, ReenrichStatus
+
+from .batch_enrich import enrich_all_batched
 from .profile import build_user_card
 from .sync import _embedding_units
 
@@ -55,19 +55,16 @@ async def reenrich_all(
 
     progress(ReenrichStatus(running=True, phase="notes", done=0, total=total))
 
-    semaphore = asyncio.Semaphore(config.REENRICH_CONCURRENCY)
     changed_note_ids: list[str] = []
     done = 0
     failures = 0
 
-    async def one(note: object) -> None:
+    typed_notes: list[NoteRecord] = notes  # type: ignore[assignment]
+    notes_by_id: dict[str, NoteRecord] = {note.note_id: note for note in typed_notes}
+
+    def on_note_done(note_id: str, enrichment: Enrichment, failed: bool) -> None:
         nonlocal done, failures
-        async with semaphore:
-            enrichment, failed = await enrich_note_with_status(
-                note,  # type: ignore[arg-type]
-                llm,
-                user_card=user_card,
-            )
+        note = notes_by_id[note_id]
         if failed:
             failures += 1
         else:
@@ -85,7 +82,13 @@ async def reenrich_all(
         done += 1
         progress(ReenrichStatus(running=True, phase="notes", done=done, total=total))
 
-    await asyncio.gather(*(one(note) for note in notes))
+    await enrich_all_batched(
+        typed_notes,
+        llm,
+        user_card,
+        _embed_texts,
+        on_note_done,
+    )
 
     progress(ReenrichStatus(running=True, phase="finalizing", done=done, total=total))
     for note_id in changed_note_ids:
@@ -99,3 +102,9 @@ async def reenrich_all(
         failures=failures,
         profile_failed=profile_failed,
     )
+
+
+def _embed_texts(texts: list[str]) -> np.ndarray:
+    from . import sync
+
+    return sync.embed_texts(texts)

@@ -85,6 +85,7 @@ def _stub_embeddings(monkeypatch):
         return rng.normal(size=(len(texts), config.EMBED_DIM)).astype(np.float32)
 
     monkeypatch.setattr(store_mod, "embed_texts", fake_embed, raising=False)
+    monkeypatch.setattr(store_mod, "embed_queries", fake_embed, raising=False)
     monkeypatch.setattr(sync_mod, "embed_texts", fake_embed, raising=False)
     yield
 

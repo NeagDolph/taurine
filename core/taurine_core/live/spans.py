@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from taurine_core import config
@@ -15,12 +16,15 @@ _LOGGER = logging.getLogger("taurine.session")
 class Gliner2SpanExtractor:
     """GLiNER2 schema-based extraction (label → description) as a C2 query head.
 
-    The model returns {"entities": {label: [span, ...]}} with no scores;
-    spans are prioritized by schema order, then in-text order, and scored
-    uniformly at 1.0 (fusion only needs the span texts).
+    Spans are prioritized by schema order, then in-text order. GLiNER2 can return
+    either plain span strings or richer dicts containing confidence.
     """
 
+    def __init__(self) -> None:
+        self.last_dropped: list[tuple[str, float, str]] = []
+
     def extract(self, text: str) -> list[tuple[str, float, str]]:
+        self.last_dropped = []
         query = text.strip()
         if not query:
             return []
@@ -30,11 +34,18 @@ class Gliner2SpanExtractor:
             return []
 
         try:
-            result = model.extract_entities(query, dict(config.GLINER2_SCHEMA))
+            result = model.extract_entities(
+                query,
+                dict(config.GLINER2_SCHEMA),
+                threshold=config.GLINER2_THRESHOLD,
+                include_confidence=True,
+            )
         except Exception:
             return []
 
-        return _normalize_result(result)
+        kept, dropped = _normalize_result(result)
+        self.last_dropped = dropped
+        return kept
 
 
 def _get_model() -> Any | None:
@@ -59,30 +70,64 @@ def _load_model() -> Any:
     return GLiNER2.from_pretrained(model_ref(config.GLINER2_MODEL))
 
 
-def _normalize_result(result: object) -> list[tuple[str, float, str]]:
+def _normalize_result(
+    result: object,
+) -> tuple[list[tuple[str, float, str]], list[tuple[str, float, str]]]:
     entities = result.get("entities") if isinstance(result, dict) else None
     if not isinstance(entities, dict):
-        return []
+        return [], []
 
     deduped: dict[str, tuple[str, float, str]] = {}
+    dropped: list[tuple[str, float, str]] = []
+    stoplist = {_lower_normalized(item) for item in config.GLINER_SPAN_STOPLIST}
     # schema order defines priority at the cap
     for label in config.GLINER2_SCHEMA:
-        for raw in _spans_for_label(entities.get(label)):
+        for raw, score in _spans_for_label(entities.get(label)):
             span = raw.strip()
-            key = span.lower()
-            if not span or key in deduped:
+            if _drop_span(span, label, stoplist):
+                dropped.append((span, score, label))
                 continue
-            deduped[key] = (span, 1.0, label)
-    return list(deduped.values())[: config.GLINER_MAX_SPANS]
+            key = _lower_normalized(span)
+            if key in deduped:
+                continue
+            deduped[key] = (span, score, label)
+    return list(deduped.values())[: config.GLINER_MAX_SPANS], dropped
 
 
-def _spans_for_label(value: object) -> list[str]:
+def _spans_for_label(value: object) -> list[tuple[str, float]]:
     if not isinstance(value, list):
         return []
-    spans: list[str] = []
+    spans: list[tuple[str, float]] = []
     for item in value:
         if isinstance(item, str):
-            spans.append(item)
+            spans.append((item, 1.0))
         elif isinstance(item, dict) and isinstance(item.get("text"), str):
-            spans.append(item["text"])  # tolerate richer per-span dicts
+            confidence = item.get("confidence")
+            score = float(confidence) if isinstance(confidence, (int, float)) else 1.0
+            spans.append((item["text"], score))
     return spans
+
+
+def _drop_span(span: str, label: str, stoplist: set[str]) -> bool:
+    if len(span) < 3:
+        return True
+
+    normalized = _lower_normalized(span)
+    if normalized in stoplist:
+        return True
+
+    without_article = re.sub(r"^(?:the|a|an)\s+", "", normalized)
+    if without_article in stoplist:
+        return True
+
+    if label in config.GLINER_PROPER_LABELS:
+        has_uppercase = any(char.isupper() for char in span)
+        has_multiple_words = len(normalized.split()) >= 2
+        if not has_uppercase and not has_multiple_words:
+            return True
+
+    return False
+
+
+def _lower_normalized(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower()).strip()

@@ -16,8 +16,7 @@ class _Alias:
     alias: str
     note_id: str
     is_title: bool
-    needs_boundary: bool
-    pattern: re.Pattern[str] | None
+    pattern: re.Pattern[str]
 
 
 class ExactCollector:
@@ -30,13 +29,7 @@ class ExactCollector:
         hits: list[C1Hit] = []
 
         for alias in self._aliases:
-            if alias.needs_boundary:
-                assert alias.pattern is not None
-                matched = alias.pattern.search(normalized_text) is not None
-            else:
-                matched = alias.alias in normalized_text
-
-            if matched:
+            if alias.pattern.search(normalized_text) is not None:
                 hits.append((alias.note_id, alias.alias, alias.is_title))
 
         return hits
@@ -56,13 +49,8 @@ class ExactCollector:
         words = alias.split()
         if words and all(word in config.ALIAS_STOPWORDS for word in words):
             return None
-        needs_boundary = compact_len < config.ALIAS_WORD_BOUNDARY_UNDER
-        pattern = (
-            re.compile(rf"(?<!\w){re.escape(alias)}(?!\w)")
-            if needs_boundary
-            else None
-        )
-        return _Alias(alias, note_id, is_title, needs_boundary, pattern)
+        pattern = re.compile(rf"(?<!\w){re.escape(alias)}(?!\w)")
+        return _Alias(alias, note_id, is_title, pattern)
 
 
 def normalize(text: str) -> str:

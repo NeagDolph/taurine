@@ -51,9 +51,14 @@ class AmbientRetriever:
         self._last_run_at: float | None = None
         self._snap_vocabulary = _snap_vocabulary(index.aliases())
 
-    async def on_window(self, window_text: str) -> RetrievalResult | None:
+    async def on_window(
+        self,
+        window_text: str,
+        context_text: str | None = None,
+    ) -> RetrievalResult | None:
         self.last_slate_adds = []
         self.last_debug = None
+        span_context_text = context_text if context_text is not None else window_text
         now = self._clock.now()
         if (
             self._last_run_at is not None
@@ -64,7 +69,11 @@ class AmbientRetriever:
 
         salient = self._salient_query(window_text)
         gliner_spans = self._extract_spans(window_text)
-        gliner_queries, snapped = self._gliner_queries(gliner_spans)
+        gliner_dropped = list(getattr(self._span_extractor, "last_dropped", []))
+        gliner_queries, snapped, gliner_context_queries = self._gliner_queries(
+            gliner_spans,
+            span_context_text,
+        )
         extracted = [span for span, _score, _label in gliner_spans]
         dense = self._index.dense_search(window_text, config.RERANK_MAX_CANDIDATES)
         dense_salient = (
@@ -102,6 +111,8 @@ class AmbientRetriever:
                 window=window_text,
                 salient=salient,
                 gliner_spans=gliner_spans,
+                gliner_dropped=gliner_dropped,
+                gliner_context_queries=gliner_context_queries,
                 dense=dense,
                 dense_salient=dense_salient,
                 dense_gliner=dense_gliner,
@@ -174,6 +185,8 @@ class AmbientRetriever:
             window=window_text,
             salient=salient,
             gliner_spans=gliner_spans,
+            gliner_dropped=gliner_dropped,
+            gliner_context_queries=gliner_context_queries,
             dense=dense,
             dense_salient=dense_salient,
             dense_gliner=dense_gliner,
@@ -255,17 +268,26 @@ class AmbientRetriever:
     def _gliner_queries(
         self,
         gliner_spans: list[tuple[str, float, str]],
-    ) -> tuple[list[str], list[tuple[str, str]]]:
+        context_text: str,
+    ) -> tuple[list[str], list[tuple[str, str]], list[str]]:
         queries: list[str] = []
+        seen_queries: set[str] = set()
         snapped: list[tuple[str, str]] = []
+        context_queries: list[str] = []
         for span, _span_score, label in gliner_spans:
-            queries.append(span)
+            _append_query(queries, seen_queries, span)
             snapped_span = self._snap_span(span, label)
-            if snapped_span is None:
-                continue
-            queries.append(snapped_span)
-            snapped.append((span, snapped_span))
-        return queries, snapped
+            if snapped_span is not None:
+                _append_query(queries, seen_queries, snapped_span)
+                snapped.append((span, snapped_span))
+            context_query = _span_context_query(span, context_text)
+            if context_query is not None and _append_query(
+                queries,
+                seen_queries,
+                context_query,
+            ):
+                context_queries.append(context_query)
+        return queries, snapped, context_queries
 
     def _snap_span(self, span: str, label: str) -> str | None:
         normalized = span.strip().lower()
@@ -520,6 +542,8 @@ class AmbientRetriever:
         window: str,
         salient: str | None,
         gliner_spans: list[tuple[str, float, str]],
+        gliner_dropped: list[tuple[str, float, str]],
+        gliner_context_queries: list[str],
         dense: list[tuple[str, float]],
         dense_salient: list[tuple[str, float]],
         dense_gliner: list[tuple[str, float]],
@@ -540,6 +564,8 @@ class AmbientRetriever:
             "window": window,
             "salient": salient,
             "gliner_spans": _rows(gliner_spans),
+            "gliner_dropped": _rows(gliner_dropped),
+            "gliner_context_queries": gliner_context_queries,
             "dense": _rows(dense),
             "dense_salient": _rows(dense_salient),
             "dense_gliner": _rows(dense_gliner),
@@ -581,6 +607,128 @@ class AmbientRetriever:
 
 def _rows(rows: list[tuple[Any, ...]]) -> list[list[Any]]:
     return [list(row) for row in rows]
+
+
+def _append_query(queries: list[str], seen: set[str], query: str) -> bool:
+    query = query.strip()
+    if not query or query in seen:
+        return False
+    seen.add(query)
+    queries.append(query)
+    return True
+
+
+def _span_context_query(span: str, context_text: str) -> str | None:
+    span = span.strip()
+    if not span or not context_text:
+        return None
+
+    matches = list(re.finditer(re.escape(span), context_text, flags=re.IGNORECASE))
+    if not matches:
+        return None
+
+    match = matches[-1]
+    sentence_spans = _sentence_spans(context_text)
+    if not sentence_spans:
+        return None
+
+    sentence_index = next(
+        (
+            index
+            for index, (start, end) in enumerate(sentence_spans)
+            if start <= match.start() < end
+        ),
+        None,
+    )
+    if sentence_index is None:
+        return None
+
+    start_index = max(0, sentence_index - config.SPAN_CONTEXT_SENTENCES)
+    end_index = min(
+        len(sentence_spans) - 1,
+        sentence_index + config.SPAN_CONTEXT_SENTENCES,
+    )
+    query_start = sentence_spans[start_index][0]
+    query_end = sentence_spans[end_index][1]
+    query = context_text[query_start:query_end].strip()
+    if not query:
+        return None
+
+    span_start = match.start() - query_start
+    return _cap_context_query(query, span_start, len(match.group(0)))
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for match in re.finditer(r"(?<=[.!?])\s+", text):
+        end = match.start()
+        if start < end:
+            spans.append((start, end))
+        start = match.end()
+    if start < len(text):
+        spans.append((start, len(text)))
+    return spans
+
+
+def _cap_context_query(query: str, span_start: int, span_len: int) -> str:
+    max_chars = config.SPAN_CONTEXT_MAX_CHARS
+    if len(query) <= max_chars:
+        return query
+
+    span_end = span_start + span_len
+    spare_chars = max(max_chars - span_len, 0)
+    start = max(0, span_start - (spare_chars // 2))
+    end = min(len(query), start + max_chars)
+    start = max(0, end - max_chars)
+
+    start = _right_word_boundary(query, start)
+    end = _left_word_boundary(query, end)
+
+    if start > span_start:
+        start = _left_word_boundary(query, span_start)
+    if end < span_end:
+        end = _right_word_boundary(query, span_end)
+
+    while end - start > max_chars and start < span_start:
+        next_start = _right_word_boundary(query, start + 1)
+        if next_start <= start or next_start > span_start:
+            break
+        start = next_start
+    while end - start > max_chars and end > span_end:
+        next_end = _left_word_boundary(query, end - 1)
+        if next_end >= end or next_end < span_end:
+            break
+        end = next_end
+
+    capped = query[start:end].strip()
+    if len(capped) <= max_chars:
+        return capped
+    return capped[:max_chars].rsplit(" ", 1)[0].strip() or capped[:max_chars].strip()
+
+
+def _right_word_boundary(text: str, index: int) -> int:
+    if (
+        index <= 0
+        or index >= len(text)
+        or text[index - 1].isspace()
+        or text[index].isspace()
+    ):
+        return index
+    boundary = text.find(" ", index)
+    return len(text) if boundary == -1 else boundary + 1
+
+
+def _left_word_boundary(text: str, index: int) -> int:
+    if (
+        index <= 0
+        or index >= len(text)
+        or text[index - 1].isspace()
+        or text[index].isspace()
+    ):
+        return index
+    boundary = text.rfind(" ", 0, index)
+    return 0 if boundary == -1 else boundary
 
 
 def _snap_vocabulary(alias_rows: list[tuple[str, str, bool]]) -> tuple[str, ...]:

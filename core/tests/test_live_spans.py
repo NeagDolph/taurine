@@ -10,10 +10,15 @@ from taurine_core import config
 class FakeModel:
     def __init__(self, entities: dict[str, list[object]]) -> None:
         self.entities = entities
-        self.calls: list[tuple[str, dict[str, str]]] = []
+        self.calls: list[tuple[str, dict[str, str], dict[str, object]]] = []
 
-    def extract_entities(self, text: str, schema: dict[str, str]) -> dict[str, object]:
-        self.calls.append((text, schema))
+    def extract_entities(
+        self,
+        text: str,
+        schema: dict[str, str],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        self.calls.append((text, schema, kwargs))
         return {"entities": self.entities}
 
 
@@ -23,25 +28,88 @@ def test_gliner2_extractor_orders_by_schema_dedupes_and_caps(monkeypatch) -> Non
 
     model = FakeModel(
         {
-            "topic": ["checkout flow", "Checkout Flow", "roadmap", "pricing", "sync"],
-            "person": ["Ashish", " "],
-            "organization": [{"text": "Shopify"}],
+            "topic": [
+                {"text": "checkout flow", "confidence": 0.81},
+                "Checkout Flow",
+                "roadmap",
+                "pricing",
+                "sync",
+            ],
+            "person": ["Ashish"],
+            "organization": [{"text": "Shopify", "confidence": 0.92}],
         }
     )
     monkeypatch.setattr(spans, "_MODEL", model)
     monkeypatch.setattr(spans, "_MODEL_LOAD_FAILED", False)
     monkeypatch.setattr(config, "GLINER_MAX_SPANS", 4)
 
-    result = Gliner2SpanExtractor().extract(" ask ashish about checkout ")
+    extractor = Gliner2SpanExtractor()
+    result = extractor.extract(" ask ashish about checkout ")
 
     # schema order: person > organization > ... > topic; dedupe case-insensitive; cap 4
     assert result == [
         ("Ashish", 1.0, "person"),
-        ("Shopify", 1.0, "organization"),
-        ("checkout flow", 1.0, "topic"),
+        ("Shopify", 0.92, "organization"),
+        ("checkout flow", 0.81, "topic"),
         ("roadmap", 1.0, "topic"),
     ]
-    assert model.calls == [("ask ashish about checkout", dict(config.GLINER2_SCHEMA))]
+    assert model.calls == [
+        (
+            "ask ashish about checkout",
+            dict(config.GLINER2_SCHEMA),
+            {"threshold": config.GLINER2_THRESHOLD, "include_confidence": True},
+        )
+    ]
+    assert extractor.last_dropped == []
+
+
+def test_gliner2_extractor_filters_junk_and_tracks_drops(monkeypatch) -> None:
+    from taurine_core.live import spans
+    from taurine_core.live.spans import Gliner2SpanExtractor
+
+    model = FakeModel(
+        {
+            "person": [
+                "you",
+                {"text": "dude", "confidence": 0.71},
+                {"text": "Dan Ham", "confidence": 0.96},
+            ],
+            "organization": [
+                {"text": "shopify", "confidence": 0.82},
+                {"text": "Shopify", "confidence": 0.93},
+            ],
+            "project": [{"text": "lowercase initiative", "confidence": 0.74}],
+            "topic": [
+                {"text": "the people", "confidence": 0.67},
+                {"text": "okay", "confidence": 0.66},
+                {"text": "invoicing stuff", "confidence": 0.88},
+            ],
+        }
+    )
+    monkeypatch.setattr(spans, "_MODEL", model)
+    monkeypatch.setattr(spans, "_MODEL_LOAD_FAILED", False)
+    monkeypatch.setattr(config, "GLINER_MAX_SPANS", 10)
+    monkeypatch.setattr(
+        config,
+        "GLINER_SPAN_STOPLIST",
+        config.GLINER_SPAN_STOPLIST - {"dude"},
+    )
+
+    extractor = Gliner2SpanExtractor()
+
+    assert extractor.extract("talk to Dan Ham about Shopify") == [
+        ("Dan Ham", 0.96, "person"),
+        ("Shopify", 0.93, "organization"),
+        ("lowercase initiative", 0.74, "project"),
+        ("invoicing stuff", 0.88, "topic"),
+    ]
+    assert extractor.last_dropped == [
+        ("you", 1.0, "person"),
+        ("dude", 0.71, "person"),
+        ("shopify", 0.82, "organization"),
+        ("the people", 0.67, "topic"),
+        ("okay", 0.66, "topic"),
+    ]
 
 
 def test_gliner2_extractor_returns_empty_on_model_exception(monkeypatch) -> None:
