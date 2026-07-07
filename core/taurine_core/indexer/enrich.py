@@ -38,7 +38,7 @@ def validate_enrichment(data: dict, note: NoteRecord) -> Enrichment:
     entities = _dedupe(_clean_list(data.get("entities")))
     utterances = _clean_list(data.get("utterances"))
     return Enrichment(
-        gist=gist[:120],
+        gist=_clamp_gist(gist),
         utterances=utterances,
         aliases=aliases,
         topics=topics,
@@ -60,7 +60,8 @@ def _system_prompt() -> str:
     keys = ", ".join(Enrichment.model_fields.keys())
     return (
         "Return only a JSON object for a note enrichment. "
-        f"The object must contain exactly these keys: {keys}."
+        f"The object must contain exactly these keys: {keys}. "
+        f"Use a one-line gist of at most {config.GIST_MAX_CHARS} characters."
     )
 
 
@@ -76,8 +77,19 @@ def _fallback_gist(note: NoteRecord) -> str:
     for line in note.text.splitlines():
         cleaned = line.strip()
         if cleaned:
-            return cleaned[:120]
-    return note.title[:120]
+            return _clamp_gist(cleaned)
+    return _clamp_gist(note.title)
+
+
+def _clamp_gist(value: str) -> str:
+    max_chars = config.GIST_MAX_CHARS
+    if len(value) <= max_chars:
+        return value
+    clipped = value[:max_chars]
+    if clipped[-1].isspace() or value[max_chars : max_chars + 1].isspace():
+        return clipped.rstrip()
+    head = clipped.rsplit(" ", 1)[0].rstrip()
+    return head or clipped.rstrip()
 
 
 def _clean_list(value: object) -> list[str]:

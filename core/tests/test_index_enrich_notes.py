@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import pytest
 
 from tests.conftest import make_note
+from taurine_core import config
 from taurine_core.ports import LLMError
 
 
@@ -32,7 +33,7 @@ async def test_enrich_note_validates_and_clamps_response():
     note = make_note("alpha", "Alpha", "First line\nSecond line")
     llm = StubLLM(
         {
-            "gist": "x" * 200,
+            "gist": "alpha " * 50,
             "utterances": ["Talk about alpha", 42, ""],
             "aliases": [" A ", "B", "C", "D", "E", "F", "G"],
             "topics": [" Work ", "Planning", "ROADMAP", "Billing", "Extra"],
@@ -44,7 +45,10 @@ async def test_enrich_note_validates_and_clamps_response():
     result = await enrich_note(note, llm)
 
     assert len(llm.calls) == 1
-    assert len(result.gist) == 120
+    _model, system_prompt, _user_prompt = llm.calls[0]
+    assert str(config.GIST_MAX_CHARS) in system_prompt
+    assert result.gist == ("alpha " * 36).strip()
+    assert len(result.gist) <= config.GIST_MAX_CHARS
     assert result.utterances == ["Talk about alpha", "42"]
     assert result.aliases == ["A", "B", "C", "D", "E", "F"]
     assert result.topics == ["work", "planning", "roadmap", "billing"]
