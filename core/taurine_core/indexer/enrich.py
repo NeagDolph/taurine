@@ -8,18 +8,27 @@ from taurine_core.ports import LLMError, LLMPort
 from taurine_core.schemas import Enrichment, NoteRecord
 
 
-async def enrich_note(note: NoteRecord, llm: LLMPort) -> Enrichment:
-    enrichment, _ = await enrich_note_with_status(note, llm)
+async def enrich_note(
+    note: NoteRecord,
+    llm: LLMPort,
+    user_card: str | None = None,
+) -> Enrichment:
+    enrichment, _ = await enrich_note_with_status(note, llm, user_card=user_card)
     return enrichment
 
 
-async def enrich_note_with_status(note: NoteRecord, llm: LLMPort) -> tuple[Enrichment, bool]:
+async def enrich_note_with_status(
+    note: NoteRecord,
+    llm: LLMPort,
+    user_card: str | None = None,
+) -> tuple[Enrichment, bool]:
     for attempt in range(2):  # one retry absorbs transient provider errors
         try:
             response = await llm.complete_json(
                 config.ENRICH_MODEL,
                 _system_prompt(),
-                _user_prompt(note),
+                _user_prompt(note, user_card),
+                timeout_s=config.ENRICH_TIMEOUT_S,
             )
         except LLMError:
             if attempt == 0:
@@ -65,9 +74,22 @@ def _system_prompt() -> str:
     )
 
 
-def _user_prompt(note: NoteRecord) -> str:
+def _user_prompt(note: NoteRecord, user_card: str | None = None) -> str:
+    card = user_card.strip() if user_card else ""
+    card_block = ""
+    if card:
+        card_block = (
+            "DATA: USER INFORMATION CARD\n"
+            "Use this background only to disambiguate people, companies, "
+            "projects, topics, entities, aliases, and realistic spoken "
+            "utterances for the note below.\n"
+            "----- BEGIN USER CARD -----\n"
+            f"{card}\n"
+            "----- END USER CARD -----\n\n"
+        )
     return (
-        f"Title: {note.title}\n"
+        card_block
+        + f"Title: {note.title}\n"
         f"Folder: {note.folder}\n"
         f"Body:\n{note.text}\n"
     )

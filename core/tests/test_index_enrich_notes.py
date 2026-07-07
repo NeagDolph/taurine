@@ -14,15 +14,20 @@ from taurine_core.ports import LLMError
 class StubLLM:
     def __init__(self, response: dict) -> None:
         self.response = response
-        self.calls: list[tuple[str, str, str]] = []
+        self.calls: list[tuple[str, str, str, float | None]] = []
 
-    async def complete_json(self, model: str, system: str, user: str) -> dict:
-        self.calls.append((model, system, user))
+    async def complete_json(
+        self, model: str, system: str, user: str, timeout_s: float | None = None
+    ) -> dict:
+        self.calls.append((model, system, user, timeout_s))
         return self.response
 
 
 class FailingLLM:
-    async def complete_json(self, model: str, system: str, user: str) -> dict:
+    async def complete_json(
+        self, model: str, system: str, user: str, timeout_s: float | None = None
+    ) -> dict:
+        del model, system, user, timeout_s
         raise LLMError("boom")
 
 
@@ -45,7 +50,8 @@ async def test_enrich_note_validates_and_clamps_response():
     result = await enrich_note(note, llm)
 
     assert len(llm.calls) == 1
-    _model, system_prompt, _user_prompt = llm.calls[0]
+    _model, system_prompt, _user_prompt, timeout_s = llm.calls[0]
+    assert timeout_s == config.ENRICH_TIMEOUT_S
     assert str(config.GIST_MAX_CHARS) in system_prompt
     assert result.gist == ("alpha " * 36).strip()
     assert len(result.gist) <= config.GIST_MAX_CHARS
@@ -53,6 +59,26 @@ async def test_enrich_note_validates_and_clamps_response():
     assert result.aliases == ["A", "B", "C", "D", "E", "F"]
     assert result.topics == ["work", "planning", "roadmap", "billing"]
     assert result.entities == ["Taurine", "123"]
+
+
+@pytest.mark.asyncio
+async def test_enrich_note_includes_user_card_as_data_when_present():
+    from taurine_core.indexer.enrich import enrich_note_with_status
+
+    note = make_note("alpha", "Alpha", "Alpha body")
+    llm = StubLLM({"gist": "Alpha gist", "utterances": [], "aliases": [], "topics": [], "entities": []})
+
+    _result, failed = await enrich_note_with_status(
+        note,
+        llm,
+        user_card="## User\nWorks with Armaan at Taurine.",
+    )
+
+    assert failed is False
+    assert len(llm.calls) == 1
+    _model, _system, user_prompt, _timeout_s = llm.calls[0]
+    assert "## User\nWorks with Armaan at Taurine." in user_prompt
+    assert "Alpha body" in user_prompt
 
 
 @pytest.mark.asyncio

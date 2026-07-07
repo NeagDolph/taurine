@@ -16,14 +16,16 @@ from taurine_core.schemas import Chunk, NoteRecord, SlateItem
 @dataclass
 class FakeLLM:
     responses: list[dict[str, Any] | Exception]
-    calls: list[tuple[str, str, str]] = field(default_factory=list)
+    calls: list[tuple[str, str, str, float | None]] = field(default_factory=list)
     tool_responses: list[dict[str, Any] | Exception] | None = None
     tool_requests: list[
         tuple[str, str, list[dict[str, Any]], list[dict[str, Any]]]
     ] = field(default_factory=list)
 
-    async def complete_json(self, model: str, system: str, user: str) -> dict[str, Any]:
-        self.calls.append((model, system, user))
+    async def complete_json(
+        self, model: str, system: str, user: str, timeout_s: float | None = None
+    ) -> dict[str, Any]:
+        self.calls.append((model, system, user, timeout_s))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response

@@ -24,7 +24,10 @@ class StubLLM:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def complete_json(self, model: str, system: str, user: str) -> dict:
+    async def complete_json(
+        self, model: str, system: str, user: str, timeout_s: float | None = None
+    ) -> dict:
+        del model, system, timeout_s
         self.calls.append(user)
         return {
             "gist": "Alpha rollout and billing launch.",
@@ -41,7 +44,10 @@ class StubLLM:
 
 
 class FailingLLM:
-    async def complete_json(self, model: str, system: str, user: str) -> dict:
+    async def complete_json(
+        self, model: str, system: str, user: str, timeout_s: float | None = None
+    ) -> dict:
+        del model, system, user, timeout_s
         raise LLMError("unavailable")
 
 
@@ -117,3 +123,14 @@ def test_removed_note_is_deleted(store, stub_llm):
 
     assert report.removed == 1
     assert store.note(NOTE_A.note_id) is None
+
+
+def test_sync_passes_stored_user_card_to_enrichment(store, stub_llm):
+    from taurine_core.indexer.sync import sync_once
+
+    store.set_user_card("## User\nWorks with Stripe.")
+
+    sync_once(store, source_with(NOTE_A), stub_llm)
+
+    assert len(stub_llm.calls) == 1
+    assert "## User\nWorks with Stripe." in stub_llm.calls[0]

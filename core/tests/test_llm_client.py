@@ -42,6 +42,20 @@ async def test_complete_json_posts_openrouter_json_object_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_complete_json_accepts_per_call_timeout() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{\"ok\": true}"}}]})
+
+    client = OpenRouterClient("secret-key", transport=httpx.MockTransport(handler))
+
+    assert await client.complete_json("model-a", "system", "user", timeout_s=123.0) == {"ok": True}
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_complete_tools_posts_openrouter_tools_request_and_returns_message() -> None:
     requests: list[httpx.Request] = []
     tools = [

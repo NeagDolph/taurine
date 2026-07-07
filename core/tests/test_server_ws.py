@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,6 +16,7 @@ from taurine_core.schemas import (
     GraphNode,
     GraphResponse,
     IndexStatus,
+    ReenrichStatus,
     TranscriptEvent,
 )
 from taurine_core.server import Runtime, create_app, required_secrets, run_sync_once_safely
@@ -118,7 +120,46 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
             "removed": 3,
             "enrich_failures": 4,
         }
+        assert client.get("/index/reenrich").json() == {
+            "running": False,
+            "phase": "idle",
+            "done": 0,
+            "total": 0,
+        }
     assert sync_calls == [True]
+
+
+def test_reenrich_endpoint_is_single_flight_and_exposes_status() -> None:
+    async def slow_reenrich(progress: Any) -> dict[str, int]:
+        await asyncio.sleep(0.2)
+        progress(ReenrichStatus(running=True, phase="notes", done=0, total=1))
+        progress(ReenrichStatus(running=False, phase="idle", done=1, total=1))
+        return {"total": 1}
+
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+        reenrich_all=slow_reenrich,
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.post("/index/reenrich").status_code == 202
+        assert client.post("/index/reenrich").status_code == 409
+        status = client.get("/index/reenrich").json()
+
+    assert status == {
+        "running": True,
+        "phase": "profile",
+        "done": 0,
+        "total": 0,
+    }
 
 
 def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
@@ -171,7 +212,11 @@ def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
     assert asr_clients[0].stopped
     assert live_sessions[0].dismisses == ["card-1"]
     assert opened == ["n1"]
-    assert asr_clients[0].index_status() == IndexStatus(notes=1, last_sync=123.0)
+    assert asr_clients[0].index_status() == IndexStatus(
+        notes=1,
+        last_sync=123.0,
+        reenrich=ReenrichStatus(running=False),
+    )
 
 
 def test_required_secrets_error_names_missing_key() -> None:

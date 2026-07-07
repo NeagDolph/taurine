@@ -43,6 +43,7 @@ def sync_once(index: Index, notes_source: NotesSource, llm: LLMPort) -> SyncRepo
     changed = 0
     enrich_failures = 0
     rebuilt: list[str] = []
+    user_card = index.user_card()
 
     for note in incoming:
         existing = existing_by_id.get(note.note_id)
@@ -56,7 +57,9 @@ def sync_once(index: Index, notes_source: NotesSource, llm: LLMPort) -> SyncRepo
 
         enrichment = index.cached_enrichment(note.note_id, note.content_hash)
         if enrichment is None:
-            enrichment, failed = _run_async(enrich_note_with_status(note, llm))
+            enrichment, failed = _run_async(
+                enrich_note_with_status(note, llm, user_card=user_card)
+            )
             enrich_failures += int(failed)
             if not failed:  # fallback enrichments must retry on the next sync
                 index.cache_enrichment(note.note_id, note.content_hash, enrichment)
@@ -137,7 +140,10 @@ def _run_async(coro: Coroutine[Any, Any, T]) -> T:
 
 
 class _UnavailableLLM:
-    async def complete_json(self, model: str, system: str, user: str) -> dict:
+    async def complete_json(
+        self, model: str, system: str, user: str, timeout_s: float | None = None
+    ) -> dict:
+        del model, system, user, timeout_s
         raise LLMError("taurine_core.llm.OpenRouterClient is unavailable")
 
 

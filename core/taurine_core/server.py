@@ -6,7 +6,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -19,6 +19,7 @@ from taurine_core import config
 from taurine_core import session_log
 from taurine_core.asr import ASRClient, ChunkCallback, IndexStatusProvider, StatusCallback
 from taurine_core.indexer.notes import extract_notes, open_note
+from taurine_core.indexer.reenrich import reenrich_all
 from taurine_core.indexer.store import Index
 from taurine_core.indexer.sync import SyncReport, sync_once
 from taurine_core.live.ambient import AmbientRetriever
@@ -36,6 +37,7 @@ from taurine_core.schemas import (
     GraphResponse,
     IndexStatus,
     OpenNoteMsg,
+    ReenrichStatus,
     StartMsg,
     StatusEvent,
     StopMsg,
@@ -76,6 +78,13 @@ class Runtime:
     ]
     make_session_logger: Callable[[], Any] = NullSessionLogger
     enable_periodic_sync: bool = False
+    reenrich_all: Callable[[Callable[[ReenrichStatus], None]], Awaitable[Any]] | None = None
+    reenrich_status: ReenrichStatus = field(
+        default_factory=lambda: ReenrichStatus(running=False)
+    )
+    reenrich_task: asyncio.Task[Any] | None = None
+    reenrich_last_emit_s: float = 0.0
+    status_sinks: set[Callable[[], Awaitable[None]]] = field(default_factory=set)
 
 
 class _MonotonicClock:
@@ -97,6 +106,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             if periodic_task is not None:
                 periodic_task.cancel()
                 await asyncio.gather(periodic_task, return_exceptions=True)
+            if active_runtime.reenrich_task is not None:
+                active_runtime.reenrich_task.cancel()
+                await asyncio.gather(active_runtime.reenrich_task, return_exceptions=True)
 
     app = FastAPI(lifespan=lifespan)
     # localhost-bound service consumed by the Electron renderer (vite origin
@@ -119,6 +131,31 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         report = await asyncio.to_thread(active_runtime.sync_once)
         return _report_dict(report)
 
+    @app.post("/index/reenrich", status_code=202)
+    async def index_reenrich() -> ReenrichStatus:
+        active_runtime: Runtime = app.state.runtime
+        if (
+            active_runtime.reenrich_status.running
+            or active_runtime.reenrich_task is not None
+            and not active_runtime.reenrich_task.done()
+        ):
+            raise HTTPException(status_code=409, detail="re-enrich already running")
+        if active_runtime.reenrich_all is None:
+            raise HTTPException(status_code=503, detail="re-enrich unavailable")
+
+        _set_reenrich_status(
+            active_runtime,
+            ReenrichStatus(running=True, phase="profile", done=0, total=0),
+            force_emit=True,
+        )
+        active_runtime.reenrich_task = asyncio.create_task(_run_reenrich(active_runtime))
+        return active_runtime.reenrich_status
+
+    @app.get("/index/reenrich")
+    async def index_reenrich_status() -> ReenrichStatus:
+        active_runtime: Runtime = app.state.runtime
+        return active_runtime.reenrich_status
+
     @app.get("/sessions")
     async def sessions() -> list[dict[str, Any]]:
         return [_session_summary(path) for path in _session_files()]
@@ -137,12 +174,26 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         logger = active_runtime.make_session_logger()
         session_started = False
         events: asyncio.Queue[Event | StatusEvent] = asyncio.Queue()
+        asr_state: dict[str, str] = {"value": "disconnected"}
+        status_detail: dict[str, str] = {"value": ""}
 
         async def emit(event: Event | StatusEvent) -> None:
             if isinstance(event, StatusEvent):
+                asr_state["value"] = event.asr
+                status_detail["value"] = event.detail
                 logger.log("asr_status", state=event.asr, detail=event.detail)
             await events.put(event)
 
+        async def emit_index_status() -> None:
+            await emit(
+                StatusEvent(
+                    asr=asr_state["value"],  # type: ignore[arg-type]
+                    index=_index_status(active_runtime),
+                    detail=status_detail["value"],
+                )
+            )
+
+        active_runtime.status_sinks.add(emit_index_status)
         live = active_runtime.make_live_session(emit, logger)
         asr = active_runtime.make_asr_client(
             live.on_chunk,
@@ -179,6 +230,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except WebSocketDisconnect:
             pass
         finally:
+            active_runtime.status_sinks.discard(emit_index_status)
             if not session_started:
                 logger.log("session_start", channels=[])
             await asr.stop()
@@ -239,6 +291,7 @@ def build_runtime() -> Runtime:
         make_asr_client=make_asr_client,
         make_session_logger=lambda: SessionLogger.create(session_log.SESSIONS_DIR),
         enable_periodic_sync=True,
+        reenrich_all=lambda progress: reenrich_all(index, llm, progress),
     )
 
 
@@ -333,9 +386,78 @@ async def run_sync_once_safely(runtime: Runtime) -> None:
         pass
 
 
+async def _run_reenrich(runtime: Runtime) -> None:
+    assert runtime.reenrich_all is not None
+    try:
+        await runtime.reenrich_all(
+            lambda status: _set_reenrich_status(runtime, status)
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        current = runtime.reenrich_status
+        _set_reenrich_status(
+            runtime,
+            ReenrichStatus(
+                running=False,
+                phase="idle",
+                done=current.done,
+                total=current.total,
+            ),
+            force_emit=True,
+        )
+    finally:
+        if runtime.reenrich_status.running:
+            current = runtime.reenrich_status
+            _set_reenrich_status(
+                runtime,
+                ReenrichStatus(
+                    running=False,
+                    phase="idle",
+                    done=current.done,
+                    total=current.total,
+                ),
+                force_emit=True,
+            )
+        else:
+            await _emit_index_status(runtime)
+
+
+def _set_reenrich_status(
+    runtime: Runtime,
+    status: ReenrichStatus,
+    *,
+    force_emit: bool = False,
+) -> None:
+    runtime.reenrich_status = status
+    now = time.monotonic()
+    should_emit = (
+        force_emit
+        or not status.running
+        or now - runtime.reenrich_last_emit_s >= 2.0
+    )
+    if not should_emit:
+        return
+    runtime.reenrich_last_emit_s = now
+    asyncio.create_task(_emit_index_status(runtime))
+
+
+async def _emit_index_status(runtime: Runtime) -> None:
+    if not runtime.status_sinks:
+        return
+    await asyncio.gather(
+        *(sink() for sink in tuple(runtime.status_sinks)),
+        return_exceptions=True,
+    )
+
+
 def _index_status(runtime: Runtime) -> IndexStatus:
     notes, last_sync = runtime.index.status()
-    return IndexStatus(notes=notes, last_sync=last_sync)
+    return IndexStatus(
+        notes=notes,
+        last_sync=last_sync,
+        reenrich=runtime.reenrich_status,
+    )
 
 
 def _status_error(runtime: Runtime, detail: str) -> StatusEvent:

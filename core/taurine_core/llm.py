@@ -19,7 +19,13 @@ class OpenRouterClient:
         self._api_key = api_key
         self._transport = transport
 
-    async def complete_json(self, model: str, system: str, user: str) -> dict[str, Any]:
+    async def complete_json(
+        self,
+        model: str,
+        system: str,
+        user: str,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
         payload = {
             "model": model,
             "messages": [
@@ -34,7 +40,7 @@ class OpenRouterClient:
 
         try:
             async with httpx.AsyncClient(
-                timeout=config.LLM_TIMEOUT_S,
+                timeout=timeout_s if timeout_s is not None else config.LLM_TIMEOUT_S,
                 transport=self._transport,
             ) as client:
                 response = await client.post(

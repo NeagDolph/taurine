@@ -158,6 +158,22 @@ class Index:
             return None
         return Enrichment.model_validate_json(row["enrichment_json"])
 
+    def set_user_card(self, text: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO meta(key, value, updated)
+                VALUES ('user_card', ?, ?)
+                """,
+                (text, time.time()),
+            )
+
+    def user_card(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'user_card'"
+        ).fetchone()
+        return str(row["value"]) if row is not None else None
+
     def dense_search(self, text: str, k: int) -> list[tuple[str, float]]:
         if k <= 0 or self._matrix.size == 0:
             return []
@@ -469,6 +485,12 @@ class Index:
                 CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated REAL NOT NULL
                 );
 
                 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts
