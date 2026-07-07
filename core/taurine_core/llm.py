@@ -52,6 +52,44 @@ class OpenRouterClient:
         except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMError(str(exc)) from exc
 
+    async def complete_tools(
+        self,
+        model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                *messages,
+            ],
+            "tools": tools,
+            # only route to providers that honor tool parameters
+            "provider": {"require_parameters": True},
+        }
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=config.LLM_TIMEOUT_S,
+                transport=self._transport,
+            ) as client:
+                response = await client.post(
+                    f"{config.OPENROUTER_BASE_URL}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+            response.raise_for_status()
+            body = response.json()
+            message = body["choices"][0]["message"]
+            if not isinstance(message, dict):
+                raise TypeError("OpenRouter message was not a JSON object")
+            return message
+        except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMError(str(exc)) from exc
+
 
 def _parse_json_content(content: str) -> Any:
     """Parse model output that may wrap JSON in markdown fences or prose."""
