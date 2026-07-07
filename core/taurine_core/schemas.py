@@ -184,6 +184,9 @@ class ConnectorInfo(BaseModel):
     docs: int = 0
     last_sync: Optional[float] = None
     syncing: bool = False
+    sync_phase: str = ""           # extracting | enriching | indexing | finalizing
+    sync_done: int = 0
+    sync_total: int = 0
     config: dict = {}
 
 

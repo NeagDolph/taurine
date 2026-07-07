@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from taurine_core import config
+from taurine_core.models_local import model_ref
 
 
 _MODEL: Any | None = None
@@ -55,7 +56,7 @@ def _get_model() -> Any | None:
 def _load_model() -> Any:
     from gliner2 import GLiNER2
 
-    return GLiNER2.from_pretrained(config.GLINER2_MODEL)
+    return GLiNER2.from_pretrained(model_ref(config.GLINER2_MODEL))
 
 
 def _normalize_result(result: object) -> list[tuple[str, float, str]]:

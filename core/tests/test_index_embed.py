@@ -40,7 +40,9 @@ def test_embed_texts_normalizes_rows_and_loads_model_once(monkeypatch):
     first = embed.embed_texts(["alpha", "beta"])
     second = embed.embed_texts(["gamma"])
 
-    assert calls == [config.EMBED_MODEL]
+    from taurine_core.models_local import model_ref
+
+    assert calls == [model_ref(config.EMBED_MODEL)]
     assert first.shape == (2, config.EMBED_DIM)
     assert second.shape == (1, config.EMBED_DIM)
     assert first.dtype == np.float32

@@ -29,6 +29,7 @@ class ConnectorRegistry:
         self._connectors = list(connectors) if connectors is not None else build_connectors()
         self._by_id = {connector.connector_id: connector for connector in self._connectors}
         self.syncing: set[str] = set()
+        self.sync_progress: dict[str, tuple[str, int, int]] = {}
 
     def list_info(self, index: object) -> list[ConnectorInfo]:
         counts = index.note_count_by_source()  # type: ignore[attr-defined]
@@ -68,6 +69,7 @@ class ConnectorRegistry:
         connector = self._connector(connector_id)
         state = self._state(index, connector_id)
         self.syncing.add(connector_id)
+        self.sync_progress[connector_id] = ("extracting", 0, 0)
         try:
             available, detail = connector.available()
             if not available:
@@ -80,7 +82,15 @@ class ConnectorRegistry:
                     records = connector.extract(self._config(connector, state))
                     from taurine_core.indexer.sync import sync_source
 
-                    report = sync_source(index, connector_id, records, llm)  # type: ignore[arg-type]
+                    report = sync_source(
+                        index,  # type: ignore[arg-type]
+                        connector_id,
+                        records,
+                        llm,
+                        progress=lambda phase, done, total: self.sync_progress.__setitem__(
+                            connector_id, (phase, done, total)
+                        ),
+                    )
                 except ConnectorError as exc:
                     report = ConnectorSyncReport(connector_id=connector_id, error=str(exc))
                 except Exception as exc:  # any layer failing must surface, not vanish
@@ -90,6 +100,7 @@ class ConnectorRegistry:
                     )
         finally:
             self.syncing.discard(connector_id)
+            self.sync_progress.pop(connector_id, None)
 
         state["last_sync"] = time.time()
         state["last_report"] = report.model_dump()
@@ -112,6 +123,7 @@ class ConnectorRegistry:
         last_error = str((state.get("last_report") or {}).get("error") or "")
         if available and not detail and last_error:
             detail = f"last sync failed: {last_error}"
+        phase, done, total = self.sync_progress.get(connector.connector_id, ("", 0, 0))
         return ConnectorInfo(
             connector_id=connector.connector_id,
             label=connector.label,
@@ -122,6 +134,9 @@ class ConnectorRegistry:
             docs=docs,
             last_sync=_float_or_none(state.get("last_sync")),
             syncing=connector.connector_id in self.syncing,
+            sync_phase=phase,
+            sync_done=done,
+            sync_total=total,
             config=self._config(connector, state),
         )
 

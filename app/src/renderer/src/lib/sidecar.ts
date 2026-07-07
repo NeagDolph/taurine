@@ -113,6 +113,9 @@ export interface ConnectorInfo {
   docs: number
   last_sync?: number | null
   syncing: boolean
+  sync_phase: string
+  sync_done: number
+  sync_total: number
   config: Record<string, unknown>
 }
 
@@ -854,6 +857,9 @@ function parseConnectorInfo(value: unknown): ConnectorInfo {
     docs: typeof record.docs === 'number' ? record.docs : 0,
     last_sync: typeof lastSync === 'number' ? lastSync : null,
     syncing: typeof record.syncing === 'boolean' ? record.syncing : false,
+    sync_phase: typeof record.sync_phase === 'string' ? record.sync_phase : '',
+    sync_done: typeof record.sync_done === 'number' ? record.sync_done : 0,
+    sync_total: typeof record.sync_total === 'number' ? record.sync_total : 0,
     config: asRecord(record.config) ?? {}
   }
 }

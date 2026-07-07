@@ -21,6 +21,7 @@ interface ConnectionsPanelProps {
 type PendingAction = 'enable' | 'disable' | 'purge' | 'sync' | 'config'
 
 const CONNECTOR_POLL_MS = 5000
+const CONNECTOR_POLL_ACTIVE_MS = 1200
 const APPLE_NOTES_CONNECTOR_ID = 'apple_notes'
 const OBSIDIAN_CONNECTOR_ID = 'obsidian'
 
@@ -76,12 +77,16 @@ export function ConnectionsPanel({
     }
 
     void refreshConnectors(connectors.length > 0)
-    const interval = window.setInterval(() => {
-      void refreshConnectors(true)
-    }, CONNECTOR_POLL_MS)
+    const anySyncing = connectors.some((connector) => connector.syncing)
+    const interval = window.setInterval(
+      () => {
+        void refreshConnectors(true)
+      },
+      anySyncing ? CONNECTOR_POLL_ACTIVE_MS : CONNECTOR_POLL_MS
+    )
 
     return () => window.clearInterval(interval)
-  }, [connectors.length, refreshConnectors, visible])
+  }, [connectors, refreshConnectors, visible])
 
   const setCardError = useCallback((connectorId: string, message: string) => {
     setCardErrors((current) => ({ ...current, [connectorId]: message }))
@@ -338,7 +343,7 @@ function ConnectorCard({
           {syncRunning ? (
             <span className="inline-spinner" aria-hidden="true" />
           ) : null}
-          {syncRunning ? 'Syncing' : 'Sync'}
+          {syncRunning ? syncProgressLabel(connector) : 'Sync'}
         </button>
 
         <button
@@ -418,4 +423,16 @@ function formatRelativeTime(epoch: number | null | undefined): string {
   }
 
   return 'Just now'
+}
+
+
+function syncProgressLabel(connector: ConnectorInfo): string {
+  if (connector.sync_total > 0) {
+    const phase = connector.sync_phase === 'enriching' ? 'Enriching' : 'Indexing'
+    return `${phase} ${connector.sync_done}/${connector.sync_total}`
+  }
+  if (connector.sync_phase === 'extracting') {
+    return 'Extracting'
+  }
+  return 'Syncing'
 }

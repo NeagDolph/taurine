@@ -7,6 +7,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from taurine_core import config
+from taurine_core.models_local import model_ref
 
 _MODEL: Any | None = None
 
@@ -64,7 +65,7 @@ def chunk_text(text: str) -> list[str]:
 def _get_model() -> Any:
     global _MODEL
     if _MODEL is None:
-        _MODEL = SentenceTransformer(config.EMBED_MODEL)
+        _MODEL = SentenceTransformer(model_ref(config.EMBED_MODEL))
     return _MODEL
 
 

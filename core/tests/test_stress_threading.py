@@ -48,18 +48,11 @@ class InstantLLM:
 
 
 class FlakyLLM:
-    """Fails in consecutive pairs (defeats the single retry) — sync must
-    survive and report, never crash."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-        self._lock = threading.Lock()
+    """Deterministically fails every call for one note (attempt AND retry),
+    regardless of concurrency ordering — sync must survive and report."""
 
     async def complete_json(self, model, system, user, timeout_s=None):
-        with self._lock:
-            self.calls += 1
-            n = self.calls
-        if n in (3, 4):  # one note's attempt + retry both fail
+        if "doc 3" in user:
             raise LLMError("synthetic failure")
         return await InstantLLM().complete_json(model, system, user, timeout_s)
 

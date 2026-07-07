@@ -267,6 +267,9 @@ def test_connector_rest_endpoints_and_single_flight_sync() -> None:
                 "docs": 3,
                 "last_sync": None,
                 "syncing": False,
+                "sync_phase": "",
+                "sync_done": 0,
+                "sync_total": 0,
                 "config": {"path": "/tmp/fake"},
             }
         ]
