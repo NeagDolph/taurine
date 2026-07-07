@@ -126,15 +126,23 @@ def _extract_records(
 def _record_for_chat(
     conn: sqlite3.Connection, chat: sqlite3.Row, contacts: dict[str, str]
 ) -> NoteRecord | None:
+    message_columns = {
+        str(info["name"]) for info in conn.execute("PRAGMA table_info(message)")
+    }
+    optional = "".join(
+        f"            m.{column},\n"
+        for column in ("associated_message_type", "item_type")
+        if column in message_columns
+    )
     rows = conn.execute(
-        """
+        f"""
         SELECT
             m.ROWID AS message_rowid,
             m.text,
             m.attributedBody,
             m.date,
             m.is_from_me,
-            h.id AS handle_id
+{optional}            h.id AS handle_id
         FROM chat_message_join cmj
         JOIN message m ON m.ROWID = cmj.message_id
         LEFT JOIN handle h ON h.ROWID = m.handle_id
@@ -201,14 +209,32 @@ def _record_for_chat(
     )
 
 
+_JUNK_TEXT = re.compile(
+    r"^("
+    r"NS[A-Z][A-Za-z]*"                      # NSValue, NSNumber, ... archiver class names
+    r"|.*\$(archiver|version|top|objects|class).*"  # X$versionY$archiverT$topX$objects
+    r"|Mat_[0-9A-Fa-f_-]{16,}.*"             # sticker/attachment resource ids
+    r"|bplist00.*"
+    r"|__kIM[A-Za-z]+"
+    r")$"
+)
+
+
 def _message_from_row(row: sqlite3.Row) -> _Message | None:
+    keys = row.keys()
+    associated = row["associated_message_type"] if "associated_message_type" in keys else 0
+    if associated not in (0, None):
+        return None  # tapbacks/reactions ("Loved ..."), edits, stickers
+    item_type = row["item_type"] if "item_type" in keys else 0
+    if item_type not in (0, None):
+        return None  # group-membership/system events
     text = row["text"]
     if text is None:
         text = _decode_attributed_body(row["attributedBody"])
     if text is None:
         return None
     normalized = " ".join(str(text).split())
-    if not normalized:
+    if not normalized or _JUNK_TEXT.match(normalized):
         return None
     return _Message(
         text=normalized,
@@ -225,22 +251,96 @@ def _apple_date_to_unix(raw: float) -> float:
 
 
 def _decode_attributed_body(blob: object) -> str | None:
+    """Extract the plain text of a typedstream-encoded NSMutableAttributedString.
+
+    Primary path: the pytypedstream parser (a real implementation of Apple's
+    NSArchiver typedstream format). The serialization order guarantees the
+    text (NSMutableString) precedes the attribute-run NSDictionaries, so the
+    first string value in a depth-first walk IS the message text. Fallback:
+    a manual parse of the length-prefixed NSString payload.
+    """
     if blob is None:
         return None
     data = bytes(blob)
-    marker_index = data.find(b"NSString")
-    payload = data[marker_index + len(b"NSString") :] if marker_index >= 0 else data
-    candidates: list[str] = []
-    for raw in re.findall(rb"[\x09\x0a\x0d\x20-\x7e]{2,}", payload):
-        decoded = raw.decode("utf-8", errors="ignore").strip().strip("\x00")
-        if not decoded or decoded in _METADATA_STRINGS:
-            continue
-        if decoded.startswith("__") or decoded.startswith("NS."):
-            continue
-        candidates.append(decoded)
-    if not candidates:
+    text = _typedstream_text(data)
+    if text is None:
+        text = _fallback_nsstring_payload(data)
+    if text is None:
         return None
-    return max(candidates, key=len)
+    # strip attachment placeholders (U+FFFC) and replacement chars
+    text = text.replace("\ufffc", " ").replace("\ufffd", " ").strip()
+    return text or None
+
+
+def _typedstream_text(data: bytes) -> str | None:
+    try:
+        import typedstream
+
+        unarchived = typedstream.unarchive_from_data(data)
+    except Exception:
+        return None
+    return _first_string_value(unarchived, depth=0)
+
+
+def _first_string_value(obj: object, depth: int) -> str | None:
+    """Depth-first search for the first str leaf in a parsed typedstream graph.
+
+    pytypedstream wraps values in objects exposing `.value`, and represents
+    unknown classes generically with `.contents` / `.elements` sequences —
+    field order is preserved, so the first string found is the text field.
+    """
+    if depth > 8 or obj is None:
+        return None
+    if isinstance(obj, str):
+        return obj
+    value = getattr(obj, "value", None)
+    if value is not None and value is not obj:
+        found = _first_string_value(value, depth + 1)
+        if found is not None:
+            return found
+    for attr in ("contents", "elements", "values"):
+        seq = getattr(obj, attr, None)
+        if isinstance(seq, (list, tuple)):
+            for item in seq:
+                found = _first_string_value(item, depth + 1)
+                if found is not None:
+                    return found
+    return None
+
+
+def _fallback_nsstring_payload(data: bytes) -> str | None:
+    """Manual parse per the typedstream layout (kept for parser failures).
+
+    Layout after the b"NSString" class name: class-info bytes, a 0x2B ('+')
+    type tag, then the length (1 byte, or 0x81 + uint16 LE, or 0x82 +
+    uint32 LE), then the UTF-8 payload.
+    """
+    marker_index = data.find(b"NSString")
+    if marker_index == -1:
+        return None
+    cursor = data.find(b"+", marker_index + len(b"NSString"))
+    if cursor == -1 or cursor - marker_index > 16:
+        return None
+    cursor += 1
+    if cursor >= len(data):
+        return None
+    length = data[cursor]
+    cursor += 1
+    if length == 0x81:
+        if cursor + 2 > len(data):
+            return None
+        length = int.from_bytes(data[cursor : cursor + 2], "little")
+        cursor += 2
+    elif length == 0x82:
+        if cursor + 4 > len(data):
+            return None
+        length = int.from_bytes(data[cursor : cursor + 4], "little")
+        cursor += 4
+    raw = data[cursor : cursor + length]
+    if not raw:
+        return None
+    text = raw.decode("utf-8", errors="ignore").strip().strip("\x00")
+    return text or None
 
 
 # ── Contacts.app name resolution (AddressBook sqlite, read via temp copy) ──
