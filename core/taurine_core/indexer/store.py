@@ -12,7 +12,15 @@ from typing import Literal
 import numpy as np
 
 from taurine_core import config
-from taurine_core.schemas import Enrichment, GraphEdge, GraphNode, GraphResponse, NoteRecord
+from taurine_core.schemas import (
+    Enrichment,
+    GraphEdge,
+    GraphNode,
+    GraphResponse,
+    NeighborRef,
+    NotePreview,
+    NoteRecord,
+)
 
 EmbeddingKind = Literal["chunk", "gist", "utterance"]
 EmbeddingInput = tuple[EmbeddingKind, str, np.ndarray]
@@ -72,15 +80,16 @@ class Index:
         with self._conn:
             self._conn.execute(
                 """
-                INSERT INTO notes(note_id, title, folder, modified, content_hash, text, gist)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO notes(note_id, title, folder, modified, content_hash, text, gist, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(note_id) DO UPDATE SET
                     title=excluded.title,
                     folder=excluded.folder,
                     modified=excluded.modified,
                     content_hash=excluded.content_hash,
                     text=excluded.text,
-                    gist=excluded.gist
+                    gist=excluded.gist,
+                    source=excluded.source
                 """,
                 (
                     stored.note_id,
@@ -90,6 +99,7 @@ class Index:
                     stored.content_hash,
                     stored.text,
                     stored.gist,
+                    stored.source,
                 ),
             )
             self._conn.execute("DELETE FROM notes_fts WHERE note_id = ?", (stored.note_id,))
@@ -226,7 +236,7 @@ class Index:
     def note(self, note_id: str) -> NoteRecord | None:
         row = self._conn.execute(
             """
-            SELECT note_id, title, folder, modified, content_hash, text, gist
+            SELECT note_id, title, folder, modified, content_hash, text, gist, source
             FROM notes WHERE note_id = ?
             """,
             (note_id,),
@@ -235,18 +245,69 @@ class Index:
             return None
         return NoteRecord(**dict(row))
 
-    def notes(self) -> list[NoteRecord]:
+    def notes(self, source: str | None = None) -> list[NoteRecord]:
+        if source is not None:
+            rows = self._conn.execute(
+                """
+                SELECT note_id, title, folder, modified, content_hash, text, gist, source
+                FROM notes WHERE source = ? ORDER BY note_id
+                """,
+                (source,),
+            ).fetchall()
+            return [NoteRecord(**dict(row)) for row in rows]
         rows = self._conn.execute(
             """
-            SELECT note_id, title, folder, modified, content_hash, text, gist
+            SELECT note_id, title, folder, modified, content_hash, text, gist, source
             FROM notes ORDER BY note_id
             """
         ).fetchall()
         return [NoteRecord(**dict(row)) for row in rows]
 
-    def note_ids(self) -> set[str]:
+    def note_ids(self, source: str | None = None) -> set[str]:
+        if source is not None:
+            rows = self._conn.execute(
+                "SELECT note_id FROM notes WHERE source = ?",
+                (source,),
+            ).fetchall()
+            return {row["note_id"] for row in rows}
         rows = self._conn.execute("SELECT note_id FROM notes").fetchall()
         return {row["note_id"] for row in rows}
+
+    def note_count_by_source(self) -> dict[str, int]:
+        rows = self._conn.execute(
+            """
+            SELECT source, COUNT(*) AS count
+            FROM notes GROUP BY source ORDER BY source
+            """
+        ).fetchall()
+        return {row["source"]: int(row["count"]) for row in rows}
+
+    def preview(self, note_id: str) -> NotePreview | None:
+        note = self.note(note_id)
+        if note is None:
+            return None
+        neighbors: list[NeighborRef] = []
+        for neighbor_id, weight in self.neighbors(note_id):
+            neighbor = self.note(neighbor_id)
+            if neighbor is None:
+                continue
+            neighbors.append(
+                NeighborRef(
+                    note_id=neighbor.note_id,
+                    title=neighbor.title,
+                    source=neighbor.source,
+                    weight=weight,
+                )
+            )
+        neighbors.sort(key=lambda item: item.weight, reverse=True)
+        return NotePreview(
+            note_id=note.note_id,
+            title=note.title,
+            source=note.source,
+            gist=note.gist,
+            text=note.text,
+            neighbors=neighbors,
+        )
 
     def best_chunk(self, note_id: str, query_text: str) -> str:
         """Embedding unit of the note most similar to query_text for rerank docs.
@@ -342,7 +403,12 @@ class Index:
                 )
             )
         nodes = [
-            GraphNode(note_id=note.note_id, title=note.title, degree=degree[note.note_id])
+            GraphNode(
+                note_id=note.note_id,
+                title=note.title,
+                degree=degree[note.note_id],
+                source=note.source,
+            )
             for note in self.notes()
         ]
         return GraphResponse(nodes=nodes, edges=edges)
@@ -448,7 +514,8 @@ class Index:
                     modified REAL NOT NULL,
                     content_hash TEXT NOT NULL,
                     text TEXT NOT NULL,
-                    gist TEXT NOT NULL
+                    gist TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'apple_notes'
                 );
 
                 CREATE TABLE IF NOT EXISTS aliases (
@@ -497,6 +564,17 @@ class Index:
                 USING fts5(note_id UNINDEXED, title, body);
                 """
             )
+            self._ensure_notes_source_column()
+
+    def _ensure_notes_source_column(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(notes)").fetchall()
+        }
+        if "source" in columns:
+            return
+        self._conn.execute(
+            "ALTER TABLE notes ADD COLUMN source TEXT NOT NULL DEFAULT 'apple_notes'"
+        )
 
     def _insert_embedding(
         self, note_id: str, kind: EmbeddingKind, text: str, vector: np.ndarray

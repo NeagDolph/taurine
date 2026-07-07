@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import numpy as np
 import pytest
 
@@ -120,3 +122,96 @@ def test_doc_frequency_is_case_insensitive_cached_and_quotes_punctuation(store):
     assert store.doc_frequency("ALPHA") == 2
     assert store.doc_frequency("alpha") == 2
     assert store.doc_frequency("alpha:plan") == 1
+
+
+def test_note_source_round_trips_counts_and_graph_nodes(store):
+    obsidian = make_note("obsidian:vault/alpha.md", "Alpha", "Alpha body").model_copy(
+        update={"source": "obsidian"}
+    )
+    apple = make_note("x-coredata://beta", "Beta", "Beta body").model_copy(
+        update={"source": "apple_notes"}
+    )
+    enrich_obsidian = enrichment("Alpha gist", topics=["alpha", "work"])
+    enrich_apple = enrichment("Beta gist", topics=["beta", "work"])
+
+    store.upsert_note(obsidian, enrich_obsidian, fixture_units(unit_vec(41), enrich_obsidian))
+    store.upsert_note(apple, enrich_apple, fixture_units(unit_vec(42), enrich_apple))
+
+    assert store.note(obsidian.note_id).source == "obsidian"
+    assert {note.note_id: note.source for note in store.notes()} == {
+        obsidian.note_id: "obsidian",
+        apple.note_id: "apple_notes",
+    }
+    assert store.note_count_by_source() == {"apple_notes": 1, "obsidian": 1}
+    assert {node.note_id: node.source for node in store.graph().nodes} == {
+        obsidian.note_id: "obsidian",
+        apple.note_id: "apple_notes",
+    }
+
+
+def test_store_migrates_existing_notes_without_source_column(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE notes (
+            note_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            folder TEXT NOT NULL,
+            modified REAL NOT NULL,
+            content_hash TEXT NOT NULL,
+            text TEXT NOT NULL,
+            gist TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO notes(note_id, title, folder, modified, content_hash, text, gist)
+        VALUES ('legacy', 'Legacy', '', 1.0, 'hash', 'Legacy text', 'Legacy gist')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    from taurine_core.indexer.store import Index
+
+    index = Index(db_path)
+
+    columns = {
+        row["name"] for row in index._conn.execute("PRAGMA table_info(notes)").fetchall()
+    }
+    assert "source" in columns
+    assert index.note("legacy").source == "apple_notes"
+    assert index.note_count_by_source() == {"apple_notes": 1}
+
+
+def test_preview_resolves_neighbors_sorted_by_weight(store):
+    alpha = make_note("alpha", "Alpha", "Alpha body").model_copy(update={"source": "obsidian"})
+    beta = make_note("beta", "Beta", "Beta body").model_copy(update={"source": "apple_notes"})
+    gamma = make_note("gamma", "Gamma", "Gamma body").model_copy(update={"source": "codex_mem"})
+    enrich_alpha = enrichment("Alpha gist", topics=["alpha", "work"])
+    enrich_beta = enrichment("Beta gist", topics=["beta", "work"])
+    enrich_gamma = enrichment("Gamma gist", topics=["gamma", "work"])
+    store.upsert_note(alpha, enrich_alpha, fixture_units(unit_vec(51), enrich_alpha))
+    store.upsert_note(beta, enrich_beta, fixture_units(unit_vec(52), enrich_beta))
+    store.upsert_note(gamma, enrich_gamma, fixture_units(unit_vec(53), enrich_gamma))
+    store.replace_edges(
+        [
+            GraphEdge(src="alpha", dst="beta", type="topic", weight=0.4),
+            GraphEdge(src="alpha", dst="gamma", type="semantic", weight=0.8),
+        ]
+    )
+
+    preview = store.preview("alpha")
+
+    assert preview is not None
+    assert preview.title == "Alpha"
+    assert preview.source == "obsidian"
+    assert preview.gist == "Alpha gist"
+    assert preview.text == "Alpha body"
+    assert [neighbor.note_id for neighbor in preview.neighbors] == ["gamma", "beta"]
+    assert [neighbor.title for neighbor in preview.neighbors] == ["Gamma", "Beta"]
+    assert [neighbor.source for neighbor in preview.neighbors] == ["codex_mem", "apple_notes"]
+    assert [neighbor.weight for neighbor in preview.neighbors] == [pytest.approx(0.8), pytest.approx(0.4)]
+    assert store.preview("missing") is None
