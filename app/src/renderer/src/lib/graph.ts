@@ -11,6 +11,7 @@ export interface GraphNode {
   note_id: string
   title: string
   degree: number
+  source: string
 }
 
 export interface GraphEdge {
@@ -34,6 +35,7 @@ export interface MapNode {
   title: string
   label: string
   degree: number
+  source: string
   kind: MapNodeKind
   val: number
   fx?: number
@@ -124,6 +126,7 @@ export function graphResponseToMapData(response: GraphResponse, nowLabel: string
       title: 'Now',
       label: nowLabel || 'Now',
       degree: 0,
+      source: 'live',
       kind: 'now',
       val: nodeRadius(9),
       fx: 0,
@@ -135,6 +138,7 @@ export function graphResponseToMapData(response: GraphResponse, nowLabel: string
       title: node.title,
       label: node.title,
       degree: node.degree,
+      source: node.source,
       kind: 'note' as const,
       val: nodeRadius(node.degree)
     }))
@@ -240,6 +244,44 @@ export function hopColor(hop: number): string {
   return mixHex('#e5b23c', '#5b6577', clamp((hop - 1) / 3, 0, 1))
 }
 
+export function sourceColor(source: string): string {
+  const knownSourceColor = SOURCE_COLORS[source]
+  if (knownSourceColor) {
+    return knownSourceColor
+  }
+
+  return SOURCE_PALETTE[hashString(source) % SOURCE_PALETTE.length]
+}
+
+export function sourceLabel(source: string): string {
+  const knownSourceLabel = SOURCE_LABELS[source]
+  if (knownSourceLabel) {
+    return knownSourceLabel
+  }
+
+  return source
+    .split(/[_:-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toLocaleUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+export function sourcesFromMapData(data: MapGraphData): string[] {
+  const sources = new Set(
+    data.nodes.filter((node) => node.kind === 'note').map((node) => node.source || 'apple_notes')
+  )
+
+  return [...sources].sort((left, right) => {
+    if (left === 'apple_notes') {
+      return -1
+    }
+    if (right === 'apple_notes') {
+      return 1
+    }
+    return sourceLabel(left).localeCompare(sourceLabel(right))
+  })
+}
+
 export function linkTooltip(link: MapLink): string {
   if (link.kind === 'static') {
     const terms = link.shared.length > 0 ? `: ${link.shared.join(', ')}` : ''
@@ -267,7 +309,8 @@ function parseGraphNode(value: unknown): GraphNode {
   return {
     note_id: record.note_id,
     title: record.title,
-    degree: record.degree
+    degree: record.degree,
+    source: typeof record.source === 'string' ? record.source : 'apple_notes'
   }
 }
 
@@ -306,6 +349,32 @@ function mixHex(start: string, end: string, t: number): string {
     g: Math.round(a.g + (b.g - a.g) * t),
     b: Math.round(a.b + (b.b - a.b) * t)
   })
+}
+
+const SOURCE_COLORS: Record<string, string> = {
+  apple_notes: '#7aa7ff',
+  claude_memories: '#ff8da1',
+  codex_memories: '#6dd6d6',
+  imessage: '#5fd18d',
+  obsidian: '#b98cff'
+}
+
+const SOURCE_LABELS: Record<string, string> = {
+  apple_notes: 'Apple Notes',
+  claude_memories: 'Claude',
+  codex_memories: 'Codex',
+  imessage: 'iMessage',
+  obsidian: 'Obsidian'
+}
+
+const SOURCE_PALETTE = ['#8ab4ff', '#8edfd2', '#c99cff', '#ff99ad', '#79d7a2', '#9cc7d8']
+
+function hashString(value: string): number {
+  let hash = 0
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0
+  }
+  return hash
 }
 
 function hexToRgb(hex: string): { r: number; g: number; b: number } {

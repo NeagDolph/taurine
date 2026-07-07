@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import ForceGraph2D, {
   type ForceGraphMethods,
   type LinkObject,
@@ -16,6 +16,9 @@ import {
   liveLinkOpacity,
   nodeRadius,
   nowLabelFromText,
+  sourceColor,
+  sourceLabel,
+  sourcesFromMapData,
   staticLinkOpacity,
   type LiveGraphLink,
   type MapGraphData,
@@ -27,6 +30,7 @@ import type { RetrievalEvent } from '../lib/sidecar'
 interface MapViewProps {
   visible: boolean
   lastSync?: number | null
+  refreshKey?: number
   latestFinalText: string
   retrieval: RetrievalEvent | null
   pinnedNoteIds: string[]
@@ -40,12 +44,13 @@ const EMPTY_GRAPH: MapGraphData = graphResponseToMapData({ nodes: [], edges: [] 
 export function MapView({
   visible,
   lastSync,
+  refreshKey = 0,
   latestFinalText,
   retrieval,
   pinnedNoteIds
 }: MapViewProps): React.JSX.Element {
   const graphRef = useRef<ForceGraphMethods<MapNode, MapLink> | undefined>(undefined)
-  const containerRef = useRef<HTMLElement | null>(null)
+  const containerRef = useRef<HTMLDivElement | null>(null)
   const processedRetrievalRef = useRef<RetrievalEvent | null>(null)
   const pruneTimerRef = useRef<number | null>(null)
   const flashTimerRef = useRef<number | null>(null)
@@ -57,9 +62,12 @@ export function MapView({
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState('')
   const [retryNonce, setRetryNonce] = useState(0)
+  const [query, setQuery] = useState('')
+  const [selectedSources, setSelectedSources] = useState<Set<string>>(() => new Set())
 
   const nowLabel = useMemo(() => nowLabelFromText(latestFinalText), [latestFinalText])
   const pinnedSet = useMemo(() => new Set(pinnedNoteIds), [pinnedNoteIds])
+  const sourceIds = useMemo(() => sourcesFromMapData(baseGraph), [baseGraph])
 
   const schedulePrune = useCallback(() => {
     if (pruneTimerRef.current !== null) {
@@ -84,6 +92,67 @@ export function MapView({
     }, TOUCH_FLASH_MS + 80)
   }, [])
 
+  const graphData = useMemo(() => {
+    const nodeIds = new Set(baseGraph.nodes.map((node) => node.id))
+
+    return {
+      nodes: baseGraph.nodes,
+      links: [
+        ...baseGraph.links.map((link) =>
+          link.kind === 'static' ? { ...link, shared: [...link.shared] } : { ...link }
+        ),
+        ...liveLinks
+          .filter((link) => nodeIds.has(link.source) && nodeIds.has(link.target))
+          .map((link) => ({ ...link }))
+      ]
+    }
+  }, [baseGraph, liveLinks])
+
+  const normalizedQuery = query.trim().toLocaleLowerCase()
+  const hasActiveMapFilter = normalizedQuery.length > 0 || selectedSources.size > 0
+  const matchedNodeIds = useMemo(() => {
+    const sourceFilterActive = selectedSources.size > 0
+    const matches = new Set<string>()
+
+    for (const node of baseGraph.nodes) {
+      if (node.kind !== 'note') {
+        continue
+      }
+
+      const matchesSource = !sourceFilterActive || selectedSources.has(node.source)
+      const matchesTitle =
+        normalizedQuery.length === 0 || node.title.toLocaleLowerCase().includes(normalizedQuery)
+
+      if (matchesSource && matchesTitle) {
+        matches.add(node.id)
+      }
+    }
+
+    return matches
+  }, [baseGraph.nodes, normalizedQuery, selectedSources])
+  const matchedNodeKey = useMemo(() => [...matchedNodeIds].sort().join('\u0000'), [matchedNodeIds])
+
+  const toggleSource = useCallback((source: string) => {
+    setSelectedSources((current) => {
+      if (current.size === 0) {
+        return new Set([source])
+      }
+
+      const next = new Set(current)
+      if (next.has(source)) {
+        next.delete(source)
+      } else {
+        next.add(source)
+      }
+      return next
+    })
+  }, [])
+
+  const clearFilters = useCallback(() => {
+    setQuery('')
+    setSelectedSources(new Set())
+  }, [])
+
   useEffect(() => {
     const element = containerRef.current
     if (!element) {
@@ -101,6 +170,14 @@ export function MapView({
     observer.observe(element)
     return () => observer.disconnect()
   }, [])
+
+  useEffect(() => {
+    const validSources = new Set(sourceIds)
+    setSelectedSources((current) => {
+      const next = new Set([...current].filter((source) => validSources.has(source)))
+      return next.size === current.size ? current : next
+    })
+  }, [sourceIds])
 
   useEffect(() => {
     let cancelled = false
@@ -134,7 +211,7 @@ export function MapView({
       cancelled = true
       window.clearTimeout(loadingTimer)
     }
-  }, [lastSync, retryNonce])
+  }, [lastSync, refreshKey, retryNonce])
 
   useEffect(() => {
     if (!error) {
@@ -179,7 +256,7 @@ export function MapView({
   }, [retrieval, scheduleFlashPrune, schedulePrune])
 
   useEffect(() => {
-    if (!visible || baseGraph.nodes.length <= 1) {
+    if (!visible || hasActiveMapFilter || baseGraph.nodes.length <= 1) {
       return
     }
 
@@ -188,7 +265,23 @@ export function MapView({
     }, 120)
 
     return () => window.clearTimeout(timeout)
-  }, [baseGraph.nodes.length, visible])
+  }, [baseGraph.nodes.length, hasActiveMapFilter, visible])
+
+  useEffect(() => {
+    if (!visible || !hasActiveMapFilter || matchedNodeIds.size === 0) {
+      return
+    }
+
+    const timeout = window.setTimeout(() => {
+      graphRef.current?.zoomToFit(
+        360,
+        64,
+        (node) => node.kind === 'note' && matchedNodeIds.has(String(node.id))
+      )
+    }, 100)
+
+    return () => window.clearTimeout(timeout)
+  }, [hasActiveMapFilter, matchedNodeIds, matchedNodeKey, visible])
 
   useEffect(() => {
     return () => {
@@ -201,22 +294,6 @@ export function MapView({
     }
   }, [])
 
-  const graphData = useMemo(() => {
-    const nodeIds = new Set(baseGraph.nodes.map((node) => node.id))
-
-    return {
-      nodes: baseGraph.nodes,
-      links: [
-        ...baseGraph.links.map((link) =>
-          link.kind === 'static' ? { ...link, shared: [...link.shared] } : { ...link }
-        ),
-        ...liveLinks
-          .filter((link) => nodeIds.has(link.source) && nodeIds.has(link.target))
-          .map((link) => ({ ...link }))
-      ]
-    }
-  }, [baseGraph, liveLinks])
-
   const drawNode = useCallback(
     (node: GraphNodeObject, ctx: CanvasRenderingContext2D, globalScale: number) => {
       const id = String(node.id)
@@ -224,8 +301,12 @@ export function MapView({
       const radius = isNow ? 14 : nodeRadius(node.degree)
       const flashOpacity = nodeFlashOpacity(id, flashUntilByNode)
       const isPinned = !isNow && pinnedSet.has(id)
+      const opacity = nodeOpacity(node, hasActiveMapFilter, matchedNodeIds)
       const x = node.x ?? 0
       const y = node.y ?? 0
+
+      ctx.save()
+      ctx.globalAlpha = opacity
 
       if (flashOpacity > 0) {
         ctx.beginPath()
@@ -246,7 +327,7 @@ export function MapView({
 
       ctx.beginPath()
       ctx.arc(x, y, radius, 0, Math.PI * 2)
-      ctx.fillStyle = isNow ? '#f5c518' : '#6b7480'
+      ctx.fillStyle = isNow ? '#f5c518' : sourceColor(node.source)
       ctx.fill()
 
       ctx.beginPath()
@@ -256,8 +337,9 @@ export function MapView({
 
       const label = isNow ? nowLabel : node.title
       drawNodeLabel(ctx, label, x, y + radius + 4, isNow, globalScale)
+      ctx.restore()
     },
-    [flashUntilByNode, nowLabel, pinnedSet]
+    [flashUntilByNode, hasActiveMapFilter, matchedNodeIds, nowLabel, pinnedSet]
   )
 
   const drawLink = useCallback(
@@ -269,7 +351,8 @@ export function MapView({
       }
 
       const isStatic = link.kind === 'static'
-      const opacity = isStatic ? staticLinkOpacity(link.weight) : liveLinkOpacity(link)
+      const baseOpacity = isStatic ? staticLinkOpacity(link.weight) : liveLinkOpacity(link)
+      const opacity = linkOpacity(link, baseOpacity, hasActiveMapFilter, matchedNodeIds)
       if (opacity <= 0) {
         return
       }
@@ -292,75 +375,182 @@ export function MapView({
         drawHopLabel(ctx, source, target, link.hop, globalScale, opacity)
       }
     },
-    []
+    [hasActiveMapFilter, matchedNodeIds]
   )
 
   const noteCount = Math.max(0, baseGraph.nodes.length - 1)
+  const matchCount = hasActiveMapFilter ? matchedNodeIds.size : noteCount
   const overlayText = error
     ? error
     : isLoading
       ? 'Loading map…'
       : noteCount === 0
         ? 'No notes indexed'
-        : `${noteCount} notes · ${baseGraph.links.length} links`
+        : hasActiveMapFilter
+          ? `${matchCount}/${noteCount} matches · ${baseGraph.links.length} links`
+          : `${noteCount} notes · ${baseGraph.links.length} links`
 
   return (
     <section
       aria-hidden={!visible}
       aria-label="Map view"
       className="map-view"
-      ref={containerRef}
     >
-      <ForceGraph2D<MapNode, MapLink>
-        ref={graphRef}
-        autoPauseRedraw={!visible}
-        backgroundColor="#0b0b0c"
-        cooldownTicks={80}
-        d3AlphaDecay={0.025}
-        d3VelocityDecay={0.34}
-        enableNodeDrag={false}
-        graphData={graphData}
-        height={size.height}
-        linkCanvasObject={drawLink}
-        linkCanvasObjectMode={() => 'replace'}
-        linkHoverPrecision={6}
-        linkLabel={(link) => linkTooltip(link)}
-        linkSource="source"
-        linkTarget="target"
-        nodeCanvasObject={drawNode}
-        nodeCanvasObjectMode={() => 'replace'}
-        nodeId="id"
-        nodeLabel={(node) => (String(node.id) === NOW_NODE_ID ? nowLabel : node.title)}
-        nodeRelSize={1}
-        nodeVal={(node) => node.val}
-        width={size.width}
-      />
+      <div className="map-controls">
+        <label className="map-search-field">
+          <span className="sr-only">Search map titles</span>
+          <input
+            type="search"
+            value={query}
+            placeholder="Search titles"
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </label>
+        <div className="map-source-filters" aria-label="Source filters">
+          {sourceIds.map((source) => {
+            const active = selectedSources.size === 0 || selectedSources.has(source)
+            const style = { '--source-color': sourceColor(source) } as CSSProperties
 
-      <div
-        aria-live="polite"
-        role={error ? 'alert' : 'status'}
-        className={`map-overlay-chip${error ? ' map-overlay-error' : ''}`}
-      >
-        {overlayText}
+            return (
+              <button
+                className={`map-source-chip${active ? ' active' : ''}`}
+                key={source}
+                type="button"
+                aria-pressed={active}
+                style={style}
+                onClick={() => toggleSource(source)}
+              >
+                <span aria-hidden="true" />
+                {sourceLabel(source)}
+              </button>
+            )
+          })}
+        </div>
+        {hasActiveMapFilter ? (
+          <button className="secondary-button compact" type="button" onClick={clearFilters}>
+            Clear
+          </button>
+        ) : null}
       </div>
 
-      <div className="map-legend" aria-label="Map legend">
-        <span className="map-legend-title">Legend</span>
-        <span className="map-legend-row">
-          <span className="map-legend-gradient" aria-hidden="true" />
-          rank hot → cold
-        </span>
-        <span className="map-legend-row">
-          <span className="map-legend-dash" aria-hidden="true" />
-          hop expansion
-        </span>
-        <span className="map-legend-row">
-          <span className="map-legend-ring" aria-hidden="true" />
-          pinned note
-        </span>
+      <div className="map-stage" ref={containerRef}>
+        <ForceGraph2D<MapNode, MapLink>
+          ref={graphRef}
+          autoPauseRedraw={!visible}
+          backgroundColor="#0b0b0c"
+          cooldownTicks={80}
+          d3AlphaDecay={0.025}
+          d3VelocityDecay={0.34}
+          enableNodeDrag={false}
+          graphData={graphData}
+          height={size.height}
+          linkCanvasObject={drawLink}
+          linkCanvasObjectMode={() => 'replace'}
+          linkHoverPrecision={6}
+          linkLabel={(link) => linkTooltip(link)}
+          linkSource="source"
+          linkTarget="target"
+          nodeCanvasObject={drawNode}
+          nodeCanvasObjectMode={() => 'replace'}
+          nodeId="id"
+          nodeLabel={(node) => (String(node.id) === NOW_NODE_ID ? nowLabel : node.title)}
+          nodeRelSize={1}
+          nodeVal={(node) => node.val}
+          showPointerCursor={(item) => isNoteNodeObject(item)}
+          onNodeClick={(node) => openPreview(node)}
+          width={size.width}
+        />
+
+        <div
+          aria-live="polite"
+          role={error ? 'alert' : 'status'}
+          className={`map-overlay-chip${error ? ' map-overlay-error' : ''}`}
+        >
+          {overlayText}
+        </div>
+
+        <div className="map-legend" aria-label="Map legend">
+          <span className="map-legend-title">Legend</span>
+          <span className="map-legend-row">
+            <span className="map-legend-gradient" aria-hidden="true" />
+            rank hot → cold
+          </span>
+          <span className="map-legend-row">
+            <span className="map-legend-dash" aria-hidden="true" />
+            hop expansion
+          </span>
+          <span className="map-legend-row">
+            <span className="map-legend-ring" aria-hidden="true" />
+            pinned note
+          </span>
+          {sourceIds.map((source) => (
+            <span className="map-legend-row" key={`legend-${source}`}>
+              <span
+                className="map-legend-swatch"
+                style={{ '--source-color': sourceColor(source) } as CSSProperties}
+                aria-hidden="true"
+              />
+              {sourceLabel(source)}
+            </span>
+          ))}
+        </div>
       </div>
     </section>
   )
+}
+
+function openPreview(node: GraphNodeObject): void {
+  if (node.kind !== 'note' || !node.note_id) {
+    return
+  }
+
+  void window.api.openPreview(node.note_id).catch((error: unknown) => {
+    console.error('Failed to open preview window', error)
+  })
+}
+
+function isNoteNodeObject(value: unknown): value is GraphNodeObject {
+  if (typeof value !== 'object' || value === null) {
+    return false
+  }
+
+  return (value as Partial<MapNode>).kind === 'note'
+}
+
+function nodeOpacity(
+  node: GraphNodeObject,
+  hasActiveMapFilter: boolean,
+  matchedNodeIds: Set<string>
+): number {
+  if (!hasActiveMapFilter) {
+    return 1
+  }
+
+  return node.kind === 'note' && matchedNodeIds.has(String(node.id)) ? 1 : 0.06
+}
+
+function linkOpacity(
+  link: GraphLinkObject,
+  baseOpacity: number,
+  hasActiveMapFilter: boolean,
+  matchedNodeIds: Set<string>
+): number {
+  if (!hasActiveMapFilter) {
+    return baseOpacity
+  }
+
+  if (link.kind === 'static') {
+    const sourceId = endpointId(link.source)
+    const targetId = endpointId(link.target)
+    return sourceId && targetId && matchedNodeIds.has(sourceId) && matchedNodeIds.has(targetId)
+      ? baseOpacity
+      : 0.06
+  }
+
+  const sourceId = endpointId(link.source)
+  const targetId = endpointId(link.target)
+  const noteIds = [sourceId, targetId].filter((id): id is string => Boolean(id && id !== NOW_NODE_ID))
+  return noteIds.some((id) => matchedNodeIds.has(id)) ? baseOpacity : 0.06
 }
 
 function nodeFlashOpacity(nodeId: string, flashUntilByNode: Map<string, number>): number {
@@ -372,7 +562,7 @@ function nodeFlashOpacity(nodeId: string, flashUntilByNode: Map<string, number>)
   return Math.max(0, Math.min(1, (until - Date.now()) / TOUCH_FLASH_MS))
 }
 
-function endpoint(value: GraphLinkObject['source']): { x: number; y: number } | null {
+function endpoint(value: unknown): { x: number; y: number } | null {
   if (typeof value !== 'object' || value === null) {
     return null
   }
@@ -381,6 +571,23 @@ function endpoint(value: GraphLinkObject['source']): { x: number; y: number } | 
   return typeof maybeNode.x === 'number' && typeof maybeNode.y === 'number'
     ? { x: maybeNode.x, y: maybeNode.y }
     : null
+}
+
+function endpointId(value: unknown): string | null {
+  if (typeof value === 'string' || typeof value === 'number') {
+    return String(value)
+  }
+
+  if (typeof value !== 'object' || value === null) {
+    return null
+  }
+
+  const maybeNode = value as { id?: unknown }
+  if (maybeNode.id === undefined) {
+    return null
+  }
+
+  return String(maybeNode.id)
 }
 
 function drawNodeLabel(

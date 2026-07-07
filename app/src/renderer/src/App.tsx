@@ -16,15 +16,15 @@ import {
   type TriggerEvent,
   type TranscriptEvent
 } from './lib/sidecar'
+import { DataView } from './views/DataView'
 import { FeedView, type FeedTranscript } from './views/FeedView'
-import { MapView } from './views/MapView'
 
 function App(): React.JSX.Element {
   const clientRef = useRef<SidecarClient | null>(null)
   const audioRef = useRef<PcmAudioCapture | null>(null)
   const transcriptIdRef = useRef(0)
 
-  const [activeView, setActiveView] = useState<'feed' | 'map'>('feed')
+  const [activeTab, setActiveTab] = useState<'live' | 'data'>('live')
   const [connection, setConnection] = useState<SidecarConnectionState>('disconnected')
   const [retryInMs, setRetryInMs] = useState<number | undefined>()
   const [asr, setAsr] = useState<AsrState>('disconnected')
@@ -119,6 +119,7 @@ function App(): React.JSX.Element {
 
   const interims = useMemo(() => Object.values(interimsByChannel), [interimsByChannel])
   const latestFinalText = chunks.length > 0 ? chunks[chunks.length - 1].text : ''
+  const isReenriching = reenriching || Boolean(index.reenrich?.running)
 
   const startListening = useCallback(async () => {
     const client = clientRef.current
@@ -228,51 +229,58 @@ function App(): React.JSX.Element {
 
       <PinnedStack cards={pinnedCards} onOpenNote={openNote} onDismiss={dismissCard} />
 
-      <div className="workspace">
-        <main className="main-pane">
-          <div className="view-switch" role="tablist" aria-label="Main view">
-            <button
-              className={activeView === 'feed' ? 'active' : ''}
-              type="button"
-              role="tab"
-              aria-selected={activeView === 'feed'}
-              onClick={() => setActiveView('feed')}
-            >
-              Feed
-            </button>
-            <button
-              className={activeView === 'map' ? 'active' : ''}
-              type="button"
-              role="tab"
-              aria-selected={activeView === 'map'}
-              onClick={() => setActiveView('map')}
-            >
-              Map
-            </button>
-          </div>
+      <div className="view-switch app-tabs" role="tablist" aria-label="Main view">
+        <button
+          className={activeTab === 'live' ? 'active' : ''}
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'live'}
+          onClick={() => setActiveTab('live')}
+        >
+          Live
+        </button>
+        <button
+          className={activeTab === 'data' ? 'active' : ''}
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'data'}
+          onClick={() => setActiveTab('data')}
+        >
+          Data
+        </button>
+      </div>
 
-          <div style={viewStackStyle}>
-            <div aria-hidden={activeView !== 'feed'} style={viewLayerStyle(activeView === 'feed')}>
+      <div className="workspace-stack" style={viewStackStyle}>
+        <div aria-hidden={activeTab !== 'live'} style={viewLayerStyle(activeTab === 'live')}>
+          <div className="workspace">
+            <main className="main-pane live-main">
               <FeedView
                 chunks={chunks}
                 interims={interims}
                 triggersBySeq={triggersBySeq}
                 onInspectTrigger={setInspectedTrigger}
               />
-            </div>
-            <div aria-hidden={activeView !== 'map'} style={viewLayerStyle(activeView === 'map')}>
-              <MapView
-                latestFinalText={latestFinalText}
-                lastSync={index.last_sync}
-                pinnedNoteIds={pinnedNoteIds}
-                retrieval={lastRetrieval}
-                visible={activeView === 'map'}
-              />
-            </div>
-          </div>
-        </main>
+            </main>
 
-        <AmbientList items={ambientItems} />
+            <AmbientList items={ambientItems} />
+          </div>
+        </div>
+
+        <div aria-hidden={activeTab !== 'data'} style={viewLayerStyle(activeTab === 'data')}>
+          <main className="main-pane data-main-pane">
+            <DataView
+              latestFinalText={latestFinalText}
+              lastSync={index.last_sync}
+              onReenrich={reenrichIndex}
+              pinnedNoteIds={pinnedNoteIds}
+              reenrichDisabled={syncing || isReenriching}
+              reenrichError={reenrichError}
+              reenriching={isReenriching}
+              retrieval={lastRetrieval}
+              visible={activeTab === 'data'}
+            />
+          </main>
+        </div>
       </div>
 
       <TriggerInspector
@@ -287,11 +295,9 @@ function App(): React.JSX.Element {
         detail={statusDetail}
         index={index}
         isSyncing={syncing}
-        isReenriching={reenriching || Boolean(index.reenrich?.running)}
+        isReenriching={isReenriching}
         syncError={syncError}
-        reenrichError={reenrichError}
         onSync={syncIndex}
-        onReenrich={reenrichIndex}
       />
     </div>
   )
