@@ -16,15 +16,25 @@ import {
   type TriggerEvent,
   type TranscriptEvent
 } from './lib/sidecar'
+import { ConnectorsView } from './views/ConnectorsView'
 import { DataView } from './views/DataView'
 import { FeedView, type FeedTranscript } from './views/FeedView'
+
+type MainTab = 'live' | 'data' | 'connectors'
+
+const MAIN_TABS: Array<{ id: MainTab; label: string }> = [
+  { id: 'live', label: 'Live' },
+  { id: 'data', label: 'Data' },
+  { id: 'connectors', label: 'Connectors' }
+]
 
 function App(): React.JSX.Element {
   const clientRef = useRef<SidecarClient | null>(null)
   const audioRef = useRef<PcmAudioCapture | null>(null)
   const transcriptIdRef = useRef(0)
 
-  const [activeTab, setActiveTab] = useState<'live' | 'data'>('live')
+  const [activeTab, setActiveTab] = useState<MainTab>('live')
+  const [mapRefreshKey, setMapRefreshKey] = useState(0)
   const [connection, setConnection] = useState<SidecarConnectionState>('disconnected')
   const [retryInMs, setRetryInMs] = useState<number | undefined>()
   const [asr, setAsr] = useState<AsrState>('disconnected')
@@ -212,6 +222,22 @@ function App(): React.JSX.Element {
           <h1>Taurine</h1>
           <span>Live meeting copilot</span>
         </div>
+
+        <nav className="app-tabs" role="tablist" aria-label="Main view">
+          {MAIN_TABS.map((tab) => (
+            <button
+              key={tab.id}
+              className={activeTab === tab.id ? 'active' : ''}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.id}
+              onClick={() => setActiveTab(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+
         <SessionControls
           state={listeningState}
           error={micError}
@@ -227,59 +253,48 @@ function App(): React.JSX.Element {
         </div>
       ) : null}
 
-      <PinnedStack cards={pinnedCards} onOpenNote={openNote} onDismiss={dismissCard} />
-
-      <div className="view-switch app-tabs" role="tablist" aria-label="Main view">
-        <button
-          className={activeTab === 'live' ? 'active' : ''}
-          type="button"
-          role="tab"
-          aria-selected={activeTab === 'live'}
-          onClick={() => setActiveTab('live')}
-        >
-          Live
-        </button>
-        <button
-          className={activeTab === 'data' ? 'active' : ''}
-          type="button"
-          role="tab"
-          aria-selected={activeTab === 'data'}
-          onClick={() => setActiveTab('data')}
-        >
-          Data
-        </button>
-      </div>
-
       <div className="workspace-stack" style={viewStackStyle}>
         <div aria-hidden={activeTab !== 'live'} style={viewLayerStyle(activeTab === 'live')}>
-          <div className="workspace">
-            <main className="main-pane live-main">
-              <FeedView
-                chunks={chunks}
-                interims={interims}
-                triggersBySeq={triggersBySeq}
-                onInspectTrigger={setInspectedTrigger}
-              />
-            </main>
+          <div className="page live-page">
+            <PinnedStack cards={pinnedCards} onOpenNote={openNote} onDismiss={dismissCard} />
+            <div className="workspace">
+              <main className="main-pane live-main">
+                <FeedView
+                  chunks={chunks}
+                  interims={interims}
+                  triggersBySeq={triggersBySeq}
+                  onInspectTrigger={setInspectedTrigger}
+                />
+              </main>
 
-            <AmbientList items={ambientItems} />
+              <AmbientList items={ambientItems} />
+            </div>
           </div>
         </div>
 
         <div aria-hidden={activeTab !== 'data'} style={viewLayerStyle(activeTab === 'data')}>
-          <main className="main-pane data-main-pane">
-            <DataView
-              latestFinalText={latestFinalText}
-              lastSync={index.last_sync}
-              onReenrich={reenrichIndex}
-              pinnedNoteIds={pinnedNoteIds}
-              reenrichDisabled={syncing || isReenriching}
-              reenrichError={reenrichError}
-              reenriching={isReenriching}
-              retrieval={lastRetrieval}
-              visible={activeTab === 'data'}
-            />
-          </main>
+          <DataView
+            latestFinalText={latestFinalText}
+            lastSync={index.last_sync}
+            pinnedNoteIds={pinnedNoteIds}
+            refreshKey={mapRefreshKey}
+            retrieval={lastRetrieval}
+            visible={activeTab === 'data'}
+          />
+        </div>
+
+        <div
+          aria-hidden={activeTab !== 'connectors'}
+          style={viewLayerStyle(activeTab === 'connectors')}
+        >
+          <ConnectorsView
+            onDataChanged={() => setMapRefreshKey((current) => current + 1)}
+            onReenrich={reenrichIndex}
+            reenrichDisabled={syncing || isReenriching}
+            reenrichError={reenrichError}
+            reenriching={isReenriching}
+            visible={activeTab === 'connectors'}
+          />
         </div>
       </div>
 

@@ -987,3 +987,24 @@ function restBaseFromWsUrl(url: string): string {
   parsed.hash = ''
   return parsed.toString().replace(/\/$/, '')
 }
+
+export async function fetchProfile(options: SidecarRequestOptions = {}): Promise<string | null> {
+  const payload = await requestSidecarJson('/profile', { method: 'GET' }, options)
+  if (payload && typeof payload === 'object' && 'card' in payload) {
+    const card = (payload as { card: unknown }).card
+    return typeof card === 'string' ? card : null
+  }
+  return null
+}
+
+export async function saveProfile(card: string, options: SidecarRequestOptions = {}): Promise<void> {
+  await requestSidecar(
+    '/profile',
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ card })
+    },
+    options
+  )
+}

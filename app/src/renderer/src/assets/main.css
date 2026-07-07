@@ -446,38 +446,37 @@ button:disabled {
   height: 100%;
 }
 
-/* ---- view switch (segmented) ---- */
-.view-switch {
+/* ---- main tabs (in the header) ---- */
+.app-tabs {
   align-items: center;
-  border-bottom: 1px solid var(--line);
+  background: var(--surface-inset);
+  border: 1px solid var(--line);
+  border-radius: 999px;
   display: flex;
   gap: 4px;
-  padding: 10px 12px;
+  padding: 4px;
 }
 
-.app-tabs {
-  background: var(--surface-raised);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  flex: 0 0 auto;
-}
-
-.view-switch button {
+.app-tabs button {
   background: transparent;
   border: 1px solid transparent;
+  border-radius: 999px;
   color: var(--text-2);
-  min-width: 76px;
-  padding: 7px 14px;
+  font-weight: 700;
+  min-width: 96px;
+  padding: 8px 18px;
+  transition:
+    background 130ms ease,
+    color 130ms ease;
 }
 
-.view-switch button:hover:not(.active) {
+.app-tabs button:hover:not(.active) {
   color: var(--text-1);
 }
 
-.view-switch button.active {
-  background: var(--accent-tint);
-  border-color: var(--accent-line);
-  color: var(--accent-hi);
+.app-tabs button.active {
+  background: var(--accent);
+  color: var(--accent-ink);
 }
 
 /* ---- feed ---- */
@@ -898,25 +897,198 @@ button:disabled {
   width: 12px;
 }
 
-/* ---- data tab ---- */
-.data-view {
-  display: grid;
+/* ---- pages (each tab is its own scrollable page) ---- */
+.page {
+  display: flex;
+  flex-direction: column;
   gap: 12px;
-  grid-template-rows: minmax(320px, 3fr) minmax(190px, 2fr);
   height: 100%;
   min-height: 0;
-  padding: 12px;
+  overflow-y: auto;
+  padding: 2px 2px 16px;
 }
 
-.connections-panel {
-  background: var(--surface-base);
+.live-page {
+  overflow-y: hidden; /* the transcript owns its scroll; pinned row is auto */
+}
+
+.live-page .workspace {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.page-intro h2 {
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+
+.page-intro p {
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.5;
+  margin-top: 6px;
+  max-width: 640px;
+}
+
+.panel-card {
+  background: var(--surface-raised);
   border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+.panel-card-header {
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 10px 14px;
+}
+
+.panel-card-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.map-panel {
+  flex: 0 0 auto;
   overflow: hidden;
+}
+
+.map-panel > * {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+/* ---- resize handle between map and the rest ---- */
+.resize-handle {
+  align-items: center;
+  cursor: row-resize;
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: center;
+  padding: 2px 0;
+  touch-action: none;
+  user-select: none;
+}
+
+.resize-grip {
+  background: var(--line-strong);
+  border-radius: 999px;
+  display: block;
+  height: 4px;
+  transition: background 130ms ease;
+  width: 64px;
+}
+
+.resize-handle:hover .resize-grip,
+.resize-handle:active .resize-grip {
+  background: var(--accent-line);
+}
+
+/* ---- user summary ---- */
+.collapse-toggle {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  display: inline-flex;
+  gap: 9px;
+  padding: 2px 0;
+}
+
+.chevron {
+  border-right: 2px solid var(--text-3);
+  border-top: 2px solid var(--text-3);
+  display: inline-block;
+  height: 7px;
+  transform: rotate(45deg);
+  transition: transform 130ms ease;
+  width: 7px;
+}
+
+.chevron.open {
+  transform: rotate(135deg);
+}
+
+.user-summary-body {
+  padding: 14px;
+}
+
+.user-summary-text {
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13.5px;
+  line-height: 1.65;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.user-summary-editor {
+  background: var(--surface-base);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-1);
+  font-family: inherit;
+  font-size: 13.5px;
+  line-height: 1.6;
   padding: 12px;
+  resize: vertical;
+  width: 100%;
+}
+
+.user-summary-editor:focus {
+  border-color: var(--accent-line);
+  outline: none;
+}
+
+.user-summary-meta {
+  color: var(--text-3);
+  display: flex;
+  font-size: 12px;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.muted-note {
+  color: var(--text-3);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.inline-error {
+  color: var(--bad);
+  font-size: 12.5px;
+}
+
+.link-button {
+  background: none;
+  border: 0;
+  color: var(--accent-hi);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.primary-button.compact {
+  min-width: 0;
+  padding: 6px 12px;
+}
+
+.connections-panel {
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 14px;
 }
 
 .connections-panel-header {
@@ -944,11 +1116,9 @@ button:disabled {
 
 .connector-list {
   display: grid;
-  flex: 1 1 auto;
-  gap: 10px;
-  min-height: 0;
-  overflow-y: auto;
-  padding-right: 4px;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  margin-top: 12px;
 }
 
 .connector-card {

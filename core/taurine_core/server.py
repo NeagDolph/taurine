@@ -239,6 +239,21 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         active_runtime: Runtime = app.state.runtime
         return active_runtime.reenrich_status
 
+    @app.get("/profile")
+    async def get_profile() -> dict[str, Any]:
+        active_runtime: Runtime = app.state.runtime
+        card = getattr(active_runtime.index, "user_card", lambda: None)()
+        return {"card": card}
+
+    @app.put("/profile")
+    async def put_profile(payload: Any = Body(...)) -> dict[str, Any]:
+        active_runtime: Runtime = app.state.runtime
+        card = payload.get("card") if isinstance(payload, dict) else None
+        if not isinstance(card, str) or not card.strip():
+            raise HTTPException(status_code=422, detail="card must be a non-empty string")
+        active_runtime.index.set_user_card(card.strip())  # type: ignore[attr-defined]
+        return {"card": card.strip()}
+
     @app.get("/sessions")
     async def sessions() -> list[dict[str, Any]]:
         return [_session_summary(path) for path in _session_files()]

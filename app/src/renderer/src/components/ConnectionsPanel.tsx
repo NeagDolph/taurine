@@ -150,7 +150,7 @@ export function ConnectionsPanel({
   return (
     <section className="connections-panel" aria-label="Connections">
       <div className="connections-panel-header">
-        <span className="section-label">Connections</span>
+        <span className="section-label">Sources</span>
         <button className="secondary-button compact" type="button" onClick={() => void refreshConnectors()}>
           Refresh
         </button>

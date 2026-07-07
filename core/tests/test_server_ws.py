@@ -485,3 +485,36 @@ def test_sessions_endpoints_list_and_parse_jsonl_fixture(tmp_path, monkeypatch) 
         ]
         assert client.get("/sessions/20260706-120000-abcdef12").json() == records
         assert client.get("/sessions/missing").status_code == 404
+
+
+def test_profile_endpoints_roundtrip() -> None:
+    class ProfileIndex(GraphIndex):
+        def __init__(self) -> None:
+            super().__init__()
+            self.card: str | None = None
+
+        def user_card(self) -> str | None:
+            return self.card
+
+        def set_user_card(self, text: str) -> None:
+            self.card = text
+
+    runtime = Runtime(
+        index=ProfileIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.get("/profile").json() == {"card": None}
+        assert client.put("/profile", json={"card": "  Neil builds Taurine.  "}).json() == {
+            "card": "Neil builds Taurine."
+        }
+        assert client.get("/profile").json() == {"card": "Neil builds Taurine."}
+        assert client.put("/profile", json={"card": "   "}).status_code == 422
