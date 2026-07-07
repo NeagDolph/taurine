@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,10 +13,14 @@ from taurine_core import session_log
 from taurine_core.indexer.sync import SyncReport
 from taurine_core.schemas import (
     Chunk,
+    ConnectorInfo,
+    ConnectorSyncReport,
     GraphEdge,
     GraphNode,
     GraphResponse,
     IndexStatus,
+    NeighborRef,
+    NotePreview,
     ReenrichStatus,
     TranscriptEvent,
 )
@@ -44,6 +49,25 @@ class GraphIndex:
 
     def status(self) -> tuple[int, float | None]:
         return (1, 123.0)
+
+    def preview(self, note_id: str) -> NotePreview | None:
+        if note_id != "obsidian:vault/alpha.md":
+            return None
+        return NotePreview(
+            note_id=note_id,
+            title="Alpha",
+            source="obsidian",
+            gist="Alpha gist",
+            text="Alpha body",
+            neighbors=[
+                NeighborRef(
+                    note_id="apple:beta",
+                    title="Beta",
+                    source="apple_notes",
+                    weight=0.7,
+                )
+            ],
+        )
 
 
 @dataclass
@@ -84,6 +108,61 @@ class FakeASRClient:
 
     async def stop(self) -> None:
         self.stopped = True
+
+
+@dataclass
+class FakeConnectorRegistry:
+    syncing: set[str] = field(default_factory=set)
+    enabled_calls: list[tuple[str, bool, bool]] = field(default_factory=list)
+    config_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    sync_calls: list[str] = field(default_factory=list)
+
+    def list_info(self, index: object) -> list[ConnectorInfo]:
+        del index
+        return [
+            ConnectorInfo(
+                connector_id="fake",
+                label="Fake",
+                kind="local",
+                enabled=True,
+                available=True,
+                docs=3,
+                syncing="fake" in self.syncing,
+                config={"path": "/tmp/fake"},
+            )
+        ]
+
+    def set_enabled(
+        self,
+        index: object,
+        connector_id: str,
+        enabled: bool,
+        *,
+        purge: bool = False,
+    ) -> None:
+        del index
+        if connector_id != "fake":
+            raise KeyError(connector_id)
+        self.enabled_calls.append((connector_id, enabled, purge))
+
+    def set_config(self, index: object, connector_id: str, config: dict) -> None:
+        del index
+        if connector_id != "fake":
+            raise KeyError(connector_id)
+        self.config_calls.append((connector_id, dict(config)))
+
+    def sync_connector(
+        self,
+        connector_id: str,
+        index: object,
+        llm: object,
+    ) -> ConnectorSyncReport:
+        del index, llm
+        if connector_id != "fake":
+            raise KeyError(connector_id)
+        self.sync_calls.append(connector_id)
+        time.sleep(0.2)
+        return ConnectorSyncReport(connector_id=connector_id, added=1)
 
 
 def test_graph_and_sync_endpoints_use_runtime_services() -> None:
@@ -129,6 +208,129 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
             "total": 0,
         }
     assert sync_calls == [True]
+
+
+def test_index_sync_uses_enabled_connector_sync_callable() -> None:
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+        sync_all_enabled=lambda: [
+            ConnectorSyncReport(connector_id="fake", added=1, changed=0, removed=0)
+        ],
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.post("/index/sync").json() == [
+            {
+                "connector_id": "fake",
+                "added": 1,
+                "changed": 0,
+                "removed": 0,
+                "enrich_failures": 0,
+                "error": "",
+            }
+        ]
+
+
+def test_connector_rest_endpoints_and_single_flight_sync() -> None:
+    registry = FakeConnectorRegistry()
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+        connector_registry=registry,
+        connector_llm=object(),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.get("/connectors").json() == [
+            {
+                "connector_id": "fake",
+                "label": "Fake",
+                "kind": "local",
+                "enabled": True,
+                "available": True,
+                "detail": "",
+                "docs": 3,
+                "last_sync": None,
+                "syncing": False,
+                "config": {"path": "/tmp/fake"},
+            }
+        ]
+        assert client.post("/connectors/fake/enable").status_code == 200
+        assert client.post("/connectors/fake/disable?purge=true").status_code == 200
+        assert registry.enabled_calls == [("fake", True, False), ("fake", False, True)]
+
+        assert client.put("/connectors/fake/config", json={"path": "/tmp/new"}).status_code == 200
+        assert registry.config_calls == [("fake", {"path": "/tmp/new"})]
+        assert client.put("/connectors/fake/config", json={"nested": {"path": "/tmp"}}).status_code == 422
+
+        assert client.post("/connectors/fake/sync").status_code == 202
+        assert client.post("/connectors/fake/sync").status_code == 409
+        assert client.get("/connectors").json()[0]["syncing"] is True
+
+
+def test_connector_and_note_routes_return_404s() -> None:
+    registry = FakeConnectorRegistry()
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+        connector_registry=registry,
+        connector_llm=object(),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.post("/connectors/missing/enable").status_code == 404
+        assert client.post("/connectors/missing/sync").status_code == 404
+        assert client.get("/notes/missing").status_code == 404
+
+
+def test_note_preview_route_handles_url_encoded_note_ids() -> None:
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.get("/notes/obsidian%3Avault%2Falpha.md")
+
+    assert response.status_code == 200
+    assert response.json()["note_id"] == "obsidian:vault/alpha.md"
+    assert response.json()["neighbors"] == [
+        {
+            "note_id": "apple:beta",
+            "title": "Beta",
+            "source": "apple_notes",
+            "weight": 0.7,
+        }
+    ]
 
 
 def test_reenrich_endpoint_is_single_flight_and_exposes_status() -> None:

@@ -11,17 +11,19 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from pydantic import ValidationError
 
 from taurine_core import config
 from taurine_core import session_log
 from taurine_core.asr import ASRClient, ChunkCallback, IndexStatusProvider, StatusCallback
-from taurine_core.indexer.notes import extract_notes, open_note
+from taurine_core.connectors.registry import ConnectorRegistry
+from taurine_core.indexer.notes import open_note
 from taurine_core.indexer.reenrich import reenrich_all
 from taurine_core.indexer.store import Index
-from taurine_core.indexer.sync import SyncReport, sync_once
+from taurine_core.indexer.sync import SyncReport
 from taurine_core.live.ambient import AmbientRetriever
 from taurine_core.live.cadence import Cadence
 from taurine_core.live.exact import ExactCollector
@@ -33,9 +35,11 @@ from taurine_core.live.spans import Gliner2SpanExtractor
 from taurine_core.llm import OpenRouterClient
 from taurine_core.session_log import NullSessionLogger, SessionLogger
 from taurine_core.schemas import (
+    ConnectorInfo,
     DismissMsg,
     GraphResponse,
     IndexStatus,
+    NotePreview,
     OpenNoteMsg,
     ReenrichStatus,
     StartMsg,
@@ -78,6 +82,10 @@ class Runtime:
     ]
     make_session_logger: Callable[[], Any] = NullSessionLogger
     enable_periodic_sync: bool = False
+    sync_all_enabled: Callable[[], Any] | None = None
+    connector_registry: Any = None
+    connector_llm: Any = None
+    connector_sync_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
     reenrich_all: Callable[[Callable[[ReenrichStatus], None]], Awaitable[Any]] | None = None
     reenrich_status: ReenrichStatus = field(
         default_factory=lambda: ReenrichStatus(running=False)
@@ -109,6 +117,13 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             if active_runtime.reenrich_task is not None:
                 active_runtime.reenrich_task.cancel()
                 await asyncio.gather(active_runtime.reenrich_task, return_exceptions=True)
+            for task in tuple(active_runtime.connector_sync_tasks.values()):
+                task.cancel()
+            if active_runtime.connector_sync_tasks:
+                await asyncio.gather(
+                    *active_runtime.connector_sync_tasks.values(),
+                    return_exceptions=True,
+                )
 
     app = FastAPI(lifespan=lifespan)
     # localhost-bound service consumed by the Electron renderer (vite origin
@@ -116,7 +131,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PUT"],
         allow_headers=["*"],
     )
 
@@ -126,10 +141,77 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         return active_runtime.index.graph()
 
     @app.post("/index/sync")
-    async def index_sync() -> dict[str, Any]:
+    async def index_sync() -> Any:
         active_runtime: Runtime = app.state.runtime
-        report = await asyncio.to_thread(active_runtime.sync_once)
-        return _report_dict(report)
+        sync = active_runtime.sync_all_enabled or active_runtime.sync_once
+        report = await asyncio.to_thread(sync)
+        return _report_payload(report)
+
+    @app.get("/connectors")
+    async def connectors() -> list[ConnectorInfo]:
+        active_runtime: Runtime = app.state.runtime
+        registry = _connector_registry(active_runtime)
+        return registry.list_info(active_runtime.index)
+
+    @app.post("/connectors/{connector_id}/enable")
+    async def connector_enable(connector_id: str) -> ConnectorInfo:
+        active_runtime: Runtime = app.state.runtime
+        registry = _connector_registry(active_runtime)
+        try:
+            registry.set_enabled(active_runtime.index, connector_id, True)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="connector not found") from None
+        return _connector_info(active_runtime, connector_id)
+
+    @app.post("/connectors/{connector_id}/disable")
+    async def connector_disable(connector_id: str, purge: bool = False) -> ConnectorInfo:
+        active_runtime: Runtime = app.state.runtime
+        registry = _connector_registry(active_runtime)
+        try:
+            registry.set_enabled(active_runtime.index, connector_id, False, purge=purge)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="connector not found") from None
+        return _connector_info(active_runtime, connector_id)
+
+    @app.post("/connectors/{connector_id}/sync", status_code=202)
+    async def connector_sync(connector_id: str) -> dict[str, str]:
+        active_runtime: Runtime = app.state.runtime
+        registry = _connector_registry(active_runtime)
+        _connector_info(active_runtime, connector_id)
+        task = active_runtime.connector_sync_tasks.get(connector_id)
+        if (
+            connector_id in registry.syncing
+            or task is not None
+            and not task.done()
+        ):
+            raise HTTPException(status_code=409, detail="connector sync already running")
+        registry.syncing.add(connector_id)
+        active_runtime.connector_sync_tasks[connector_id] = asyncio.create_task(
+            _run_connector_sync(active_runtime, connector_id)
+        )
+        return {"connector_id": connector_id, "status": "syncing"}
+
+    @app.put("/connectors/{connector_id}/config")
+    async def connector_config(
+        connector_id: str,
+        payload: Any = Body(...),
+    ) -> ConnectorInfo:
+        active_runtime: Runtime = app.state.runtime
+        registry = _connector_registry(active_runtime)
+        config_payload = _flat_config(payload)
+        try:
+            registry.set_config(active_runtime.index, connector_id, config_payload)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="connector not found") from None
+        return _connector_info(active_runtime, connector_id)
+
+    @app.get("/notes/{note_id:path}")
+    async def note_preview(note_id: str) -> NotePreview:
+        active_runtime: Runtime = app.state.runtime
+        preview = active_runtime.index.preview(note_id)
+        if preview is None:
+            raise HTTPException(status_code=404, detail="note not found")
+        return preview
 
     @app.post("/index/reenrich", status_code=202)
     async def index_reenrich() -> ReenrichStatus:
@@ -248,6 +330,7 @@ def build_runtime() -> Runtime:
     llm = OpenRouterClient(secrets["OPEN_ROUTER_API_KEY"])
     reranker = CohereReranker(secrets["COHERE_API_KEY"])
     span_extractor = Gliner2SpanExtractor()
+    connector_registry = ConnectorRegistry()
 
     def make_live_session(emit: EventSink, logger: SessionLogger) -> LiveSession:
         clock = _MonotonicClock()
@@ -285,12 +368,15 @@ def build_runtime() -> Runtime:
 
     return Runtime(
         index=index,
-        sync_once=lambda: sync_once(index, extract_notes, llm),
+        sync_once=lambda: connector_registry.sync_all_enabled(index, llm),
+        sync_all_enabled=lambda: connector_registry.sync_all_enabled(index, llm),
         open_note=open_note,
         make_live_session=make_live_session,
         make_asr_client=make_asr_client,
         make_session_logger=lambda: SessionLogger.create(session_log.SESSIONS_DIR),
         enable_periodic_sync=True,
+        connector_registry=connector_registry,
+        connector_llm=llm,
         reenrich_all=lambda progress: reenrich_all(index, llm, progress),
     )
 
@@ -386,6 +472,25 @@ async def run_sync_once_safely(runtime: Runtime) -> None:
         pass
 
 
+async def _run_connector_sync(runtime: Runtime, connector_id: str) -> None:
+    registry = _connector_registry(runtime)
+    try:
+        await asyncio.to_thread(
+            registry.sync_connector,
+            connector_id,
+            runtime.index,
+            runtime.connector_llm,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    finally:
+        registry.syncing.discard(connector_id)
+        runtime.connector_sync_tasks.pop(connector_id, None)
+        await _emit_index_status(runtime)
+
+
 async def _run_reenrich(runtime: Runtime) -> None:
     assert runtime.reenrich_all is not None
     try:
@@ -464,7 +569,38 @@ def _status_error(runtime: Runtime, detail: str) -> StatusEvent:
     return StatusEvent(asr="error", index=_index_status(runtime), detail=detail)
 
 
-def _report_dict(report: Any) -> dict[str, Any]:
+def _connector_registry(runtime: Runtime) -> Any:
+    if runtime.connector_registry is None:
+        raise HTTPException(status_code=503, detail="connectors unavailable")
+    return runtime.connector_registry
+
+
+def _connector_info(runtime: Runtime, connector_id: str) -> ConnectorInfo:
+    registry = _connector_registry(runtime)
+    for info in registry.list_info(runtime.index):
+        if info.connector_id == connector_id:
+            return info
+    raise HTTPException(status_code=404, detail="connector not found")
+
+
+def _flat_config(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="config must be a JSON object")
+    config_payload: dict[str, Any] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str):
+            raise HTTPException(status_code=422, detail="config keys must be strings")
+        if isinstance(value, dict | list | tuple | set):
+            raise HTTPException(status_code=422, detail="config values must be flat")
+        config_payload[key] = value
+    return config_payload
+
+
+def _report_payload(report: Any) -> Any:
+    if isinstance(report, list):
+        return [_report_payload(item) for item in report]
+    if isinstance(report, BaseModel):
+        return report.model_dump()
     if is_dataclass(report):
         return asdict(report)
     if isinstance(report, dict):
