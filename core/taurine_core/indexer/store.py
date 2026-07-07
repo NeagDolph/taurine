@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
@@ -26,6 +27,81 @@ EmbeddingKind = Literal["chunk", "gist", "utterance"]
 EmbeddingInput = tuple[EmbeddingKind, str, np.ndarray]
 
 
+class _Rows:
+    """Fully-materialized query result, safe to consume from any thread."""
+
+    def __init__(self, rows: list[sqlite3.Row]) -> None:
+        self._rows = rows
+
+    def fetchall(self) -> list[sqlite3.Row]:
+        return self._rows
+
+    def fetchone(self) -> sqlite3.Row | None:
+        return self._rows[0] if self._rows else None
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class _ThreadSafeConnection:
+    """Serializes sqlite access across threads.
+
+    The server runs sync/connector/reenrich work in asyncio.to_thread pools;
+    a bare sqlite3 connection is bound to its creating thread. This wrapper
+    opens with check_same_thread=False and guards every operation with an
+    RLock, materializing read results inside the lock so cursors never
+    cross threads.
+    """
+
+    _READ_PREFIXES = ("SELECT", "PRAGMA", "WITH", "EXPLAIN")
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._lock = threading.RLock()
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            if sql.lstrip()[:8].upper().startswith(self._READ_PREFIXES):
+                return _Rows(cursor.fetchall())
+            return cursor
+
+    def executemany(self, sql: str, seq: Any) -> Any:
+        with self._lock:
+            return self._conn.executemany(sql, seq)
+
+    def executescript(self, script: str) -> Any:
+        with self._lock:
+            return self._conn.executescript(script)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def __enter__(self) -> _ThreadSafeConnection:
+        self._lock.acquire()
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        try:
+            return self._conn.__exit__(exc_type, exc, tb)
+        finally:
+            self._lock.release()
+
+    @property
+    def row_factory(self) -> Any:
+        return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value: Any) -> None:
+        self._conn.row_factory = value
+
+
 def embed_texts(texts: list[str]) -> np.ndarray:
     from .embed import embed_texts as real_embed_texts
 
@@ -36,8 +112,9 @@ class Index:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
-        self._conn.row_factory = sqlite3.Row
+        raw = sqlite3.connect(self.db_path, check_same_thread=False)
+        raw.row_factory = sqlite3.Row
+        self._conn = _ThreadSafeConnection(raw)
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._embedding_rows: list[tuple[int, str, EmbeddingKind, str]] = []
         self._matrix = np.empty((0, config.EMBED_DIM), dtype=np.float32)

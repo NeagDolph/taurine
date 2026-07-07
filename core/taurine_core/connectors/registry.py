@@ -83,6 +83,11 @@ class ConnectorRegistry:
                     report = sync_source(index, connector_id, records, llm)  # type: ignore[arg-type]
                 except ConnectorError as exc:
                     report = ConnectorSyncReport(connector_id=connector_id, error=str(exc))
+                except Exception as exc:  # any layer failing must surface, not vanish
+                    report = ConnectorSyncReport(
+                        connector_id=connector_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
         finally:
             self.syncing.discard(connector_id)
 
@@ -104,6 +109,9 @@ class ConnectorRegistry:
             available, detail = connector.available()
         except Exception as exc:
             available, detail = False, str(exc)
+        last_error = str((state.get("last_report") or {}).get("error") or "")
+        if available and not detail and last_error:
+            detail = f"last sync failed: {last_error}"
         return ConnectorInfo(
             connector_id=connector.connector_id,
             label=connector.label,

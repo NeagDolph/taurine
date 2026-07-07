@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -484,7 +485,9 @@ async def _run_connector_sync(runtime: Runtime, connector_id: str) -> None:
     except asyncio.CancelledError:
         raise
     except Exception:
-        pass
+        logging.getLogger("taurine.session").exception(
+            "connector sync crashed: %s", connector_id
+        )
     finally:
         registry.syncing.discard(connector_id)
         runtime.connector_sync_tasks.pop(connector_id, None)
