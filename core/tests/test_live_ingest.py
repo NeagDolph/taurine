@@ -485,6 +485,51 @@ async def test_presenter_empty_emits_no_pin_and_notes_empty_backoff() -> None:
 
 
 @pytest.mark.asyncio
+async def test_presenter_non_slate_pick_pins_index_note_as_linked_card() -> None:
+    clock = FakeClock()
+    index = FakeIndex(
+        notes={
+            "seed": note("seed", "Seed Note", "Seed gist"),
+            "neighbor": note("neighbor", "Neighbor Note", "Neighbor gist"),
+        }
+    )
+    slate = Slate(clock)
+    slate.add(
+        SlateItem(
+            note_id="seed",
+            title="Seed Note",
+            gist="Seed gist",
+            score=0.8,
+            source="search",
+            heard="seed heard",
+            decay=config.DECAY_SEARCH,
+            added_rev=0,
+        )
+    )
+    cadence = RecordingCadence(instant_allowed=False, may_present_allowed=True)
+    presenter = StaticPresenter([Pick(note_id="neighbor", why="Armaan was named")])
+    session, events = session_with(
+        index=index,
+        clock=clock,
+        slate=slate,
+        exact=SequenceExact([[]]),
+        cadence=cadence,
+        presenter=presenter,
+    )
+
+    await session.on_chunk(chunk("Armand came up again"))
+
+    pins = [event for event in events if event.type == "pin"]
+    assert len(pins) == 1
+    assert pins[0].card.note_id == "neighbor"
+    assert pins[0].card.title == "Neighbor Note"
+    assert pins[0].card.summary == "Armaan was named"
+    assert pins[0].card.provenance == "linked"
+    assert cadence.promotions == [clock.now()]
+    assert cadence.empties == []
+
+
+@pytest.mark.asyncio
 async def test_dismiss_unpins_and_shown_note_never_reenters_slate() -> None:
     clock = FakeClock()
     index = FakeIndex(notes={"roadmap": note("roadmap", "Q3 Roadmap")})
