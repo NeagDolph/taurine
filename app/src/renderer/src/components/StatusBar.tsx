@@ -8,9 +8,7 @@ interface StatusBarProps {
   isSyncing: boolean
   isReenriching: boolean
   syncError: string
-  reenrichError: string
   onSync: () => void
-  onReenrich: () => void
 }
 
 export function StatusBar({
@@ -21,11 +19,9 @@ export function StatusBar({
   isSyncing,
   isReenriching,
   syncError,
-  reenrichError,
-  onSync,
-  onReenrich
+  onSync
 }: StatusBarProps): React.JSX.Element {
-  const detailText = syncError || reenrichError || reenrichDetail(index) || detail
+  const detailText = syncError || reenrichDetail(index) || detail
   const controlsDisabled = isSyncing || isReenriching
 
   return (
@@ -40,14 +36,6 @@ export function StatusBar({
         {detailText ? <span className="status-detail">{detailText}</span> : null}
         <button className="secondary-button compact" type="button" onClick={onSync} disabled={controlsDisabled}>
           {isSyncing ? 'Syncing' : 'Sync now'}
-        </button>
-        <button
-          className="secondary-button compact"
-          type="button"
-          onClick={onReenrich}
-          disabled={controlsDisabled}
-        >
-          {isReenriching ? 'Re-enriching' : 'Re-enrich'}
         </button>
       </div>
     </footer>

@@ -1,4 +1,5 @@
 export const SIDECAR_WS_URL = 'ws://127.0.0.1:8930/session'
+export const SIDECAR_REST_URL = restBaseFromWsUrl(SIDECAR_WS_URL)
 
 export type AsrState = 'disconnected' | 'connecting' | 'connected' | 'error'
 export type CardProvenance = 'exact' | 'search' | 'linked'
@@ -6,6 +7,7 @@ export type SidecarConnectionState = 'disconnected' | 'connecting' | 'connected'
 export type TriggerAction = 'pinned' | 'slated' | 'none'
 export type TriggerKind = 'exact' | 'search'
 export type ReenrichPhase = 'idle' | 'profile' | 'notes' | 'finalizing'
+export type ConnectorKind = 'local' | 'oauth'
 
 export interface TranscriptEvent {
   type: 'transcript'
@@ -101,6 +103,44 @@ export interface IndexStatus {
   reenrich?: ReenrichStatus | null
 }
 
+export interface ConnectorInfo {
+  connector_id: string
+  label: string
+  kind: ConnectorKind
+  enabled: boolean
+  available: boolean
+  detail: string
+  docs: number
+  last_sync?: number | null
+  syncing: boolean
+  config: Record<string, unknown>
+}
+
+export interface ConnectorSyncReport {
+  connector_id: string
+  added: number
+  changed: number
+  removed: number
+  enrich_failures: number
+  error: string
+}
+
+export interface NeighborRef {
+  note_id: string
+  title: string
+  source: string
+  weight: number
+}
+
+export interface NotePreview {
+  note_id: string
+  title: string
+  source: string
+  gist: string
+  text: string
+  neighbors: NeighborRef[]
+}
+
 export interface StatusEvent {
   type: 'status'
   asr: AsrState
@@ -120,6 +160,12 @@ export type SidecarEvent =
 export interface SidecarConnectionEvent {
   state: SidecarConnectionState
   retryInMs?: number
+}
+
+interface SidecarRequestOptions {
+  baseUrl?: string
+  fetcher?: typeof fetch
+  signal?: AbortSignal
 }
 
 type Callback<T> = (event: T) => void
@@ -201,19 +247,11 @@ export class SidecarClient {
   }
 
   async syncIndex(): Promise<void> {
-    const response = await fetch(`${this.restBaseUrl}/index/sync`, { method: 'POST' })
-    if (!response.ok) {
-      throw new Error(`Sync failed with HTTP ${response.status}`)
-    }
+    await requestSidecar('/index/sync', { method: 'POST' }, { baseUrl: this.restBaseUrl })
   }
 
   async reenrichIndex(): Promise<ReenrichStatus> {
-    const response = await fetch(`${this.restBaseUrl}/index/reenrich`, { method: 'POST' })
-    if (!response.ok) {
-      throw new Error(`Re-enrich failed with HTTP ${response.status}`)
-    }
-
-    const payload: unknown = await response.json().catch(() => null)
+    const payload = await requestSidecarJson('/index/reenrich', { method: 'POST' }, { baseUrl: this.restBaseUrl })
     return parseReenrichStatus(payload) ?? {
       running: true,
       phase: 'profile',
@@ -367,6 +405,139 @@ export class SidecarClient {
     callbacks.add(callback)
     return () => callbacks.delete(callback)
   }
+}
+
+export async function fetchConnectors(
+  options: SidecarRequestOptions = {}
+): Promise<ConnectorInfo[]> {
+  const payload = await requestSidecarJson('/connectors', { method: 'GET' }, options)
+  if (!Array.isArray(payload)) {
+    throw new Error('Invalid connectors response')
+  }
+
+  return payload.map(parseConnectorInfo)
+}
+
+export async function enableConnector(
+  connectorId: string,
+  options: SidecarRequestOptions = {}
+): Promise<void> {
+  await requestSidecar(`/connectors/${encodeURIComponent(connectorId)}/enable`, { method: 'POST' }, options)
+}
+
+export async function disableConnector(
+  connectorId: string,
+  purge: boolean,
+  options: SidecarRequestOptions = {}
+): Promise<void> {
+  const suffix = purge ? '?purge=true' : ''
+  await requestSidecar(
+    `/connectors/${encodeURIComponent(connectorId)}/disable${suffix}`,
+    { method: 'POST' },
+    options
+  )
+}
+
+export async function syncConnector(
+  connectorId: string,
+  options: SidecarRequestOptions = {}
+): Promise<ConnectorSyncReport | null> {
+  const response = await requestSidecar(
+    `/connectors/${encodeURIComponent(connectorId)}/sync`,
+    { method: 'POST' },
+    options
+  )
+  const payload = await responseJsonOrNull(response)
+  return payload === null ? null : parseConnectorSyncReport(payload)
+}
+
+export async function updateConnectorConfig(
+  connectorId: string,
+  config: Record<string, unknown>,
+  options: SidecarRequestOptions = {}
+): Promise<void> {
+  await requestSidecar(
+    `/connectors/${encodeURIComponent(connectorId)}/config`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    },
+    options
+  )
+}
+
+export async function fetchNotePreview(
+  noteId: string,
+  options: SidecarRequestOptions = {}
+): Promise<NotePreview> {
+  const payload = await requestSidecarJson(`/notes/${encodeURIComponent(noteId)}`, { method: 'GET' }, options)
+  return parseNotePreview(payload)
+}
+
+async function requestSidecarJson(
+  path: string,
+  init: RequestInit,
+  options: SidecarRequestOptions
+): Promise<unknown> {
+  const response = await requestSidecar(path, init, options)
+  return responseJsonOrNull(response)
+}
+
+async function requestSidecar(
+  path: string,
+  init: RequestInit,
+  options: SidecarRequestOptions
+): Promise<Response> {
+  const baseUrl = options.baseUrl ?? SIDECAR_REST_URL
+  const fetcher = options.fetcher ?? globalThis.fetch
+  const response = await fetcher(`${baseUrl}${path}`, { ...init, signal: options.signal })
+
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response, path))
+  }
+
+  return response
+}
+
+async function responseJsonOrNull(response: Response): Promise<unknown> {
+  if (response.status === 204) {
+    return null
+  }
+
+  const text = await response.text()
+  if (!text.trim()) {
+    return null
+  }
+
+  try {
+    return JSON.parse(text) as unknown
+  } catch {
+    throw new Error('Invalid sidecar JSON response')
+  }
+}
+
+async function responseErrorMessage(response: Response, path: string): Promise<string> {
+  const fallback = `Sidecar request ${path} failed with HTTP ${response.status}`
+  const text = await response.text().catch(() => '')
+  if (!text.trim()) {
+    return response.status === 409 ? 'Connector is already syncing' : fallback
+  }
+
+  try {
+    const payload = JSON.parse(text) as unknown
+    const record = asRecord(payload)
+    if (record && typeof record.detail === 'string' && record.detail.trim()) {
+      return record.detail
+    }
+    if (record && typeof record.error === 'string' && record.error.trim()) {
+      return record.error
+    }
+  } catch {
+    // plain-text error body
+  }
+
+  return text.trim()
 }
 
 function parseSidecarEvent(raw: string): SidecarEvent | null {
@@ -652,6 +823,98 @@ function parseStatus(record: Record<string, unknown>): StatusEvent | null {
   }
 }
 
+function parseConnectorInfo(value: unknown): ConnectorInfo {
+  const record = asRecord(value)
+  if (
+    !record ||
+    typeof record.connector_id !== 'string' ||
+    typeof record.label !== 'string' ||
+    !isConnectorKind(record.kind) ||
+    typeof record.enabled !== 'boolean' ||
+    typeof record.available !== 'boolean'
+  ) {
+    throw new Error('Invalid connector info')
+  }
+
+  const lastSync = record.last_sync
+  if (lastSync !== undefined && lastSync !== null && typeof lastSync !== 'number') {
+    throw new Error('Invalid connector info')
+  }
+
+  return {
+    connector_id: record.connector_id,
+    label: record.label,
+    kind: record.kind,
+    enabled: record.enabled,
+    available: record.available,
+    detail: typeof record.detail === 'string' ? record.detail : '',
+    docs: typeof record.docs === 'number' ? record.docs : 0,
+    last_sync: typeof lastSync === 'number' ? lastSync : null,
+    syncing: typeof record.syncing === 'boolean' ? record.syncing : false,
+    config: asRecord(record.config) ?? {}
+  }
+}
+
+function parseConnectorSyncReport(value: unknown): ConnectorSyncReport {
+  const record = asRecord(value)
+  if (!record || typeof record.connector_id !== 'string') {
+    throw new Error('Invalid connector sync report')
+  }
+
+  return {
+    connector_id: record.connector_id,
+    added: typeof record.added === 'number' ? record.added : 0,
+    changed: typeof record.changed === 'number' ? record.changed : 0,
+    removed: typeof record.removed === 'number' ? record.removed : 0,
+    enrich_failures: typeof record.enrich_failures === 'number' ? record.enrich_failures : 0,
+    error: typeof record.error === 'string' ? record.error : ''
+  }
+}
+
+function parseNotePreview(value: unknown): NotePreview {
+  const record = asRecord(value)
+  if (
+    !record ||
+    typeof record.note_id !== 'string' ||
+    typeof record.title !== 'string' ||
+    typeof record.source !== 'string' ||
+    typeof record.gist !== 'string' ||
+    typeof record.text !== 'string' ||
+    !Array.isArray(record.neighbors)
+  ) {
+    throw new Error('Invalid note preview')
+  }
+
+  return {
+    note_id: record.note_id,
+    title: record.title,
+    source: record.source,
+    gist: record.gist,
+    text: record.text,
+    neighbors: record.neighbors.map(parseNeighborRef)
+  }
+}
+
+function parseNeighborRef(value: unknown): NeighborRef {
+  const record = asRecord(value)
+  if (
+    !record ||
+    typeof record.note_id !== 'string' ||
+    typeof record.title !== 'string' ||
+    typeof record.source !== 'string' ||
+    typeof record.weight !== 'number'
+  ) {
+    throw new Error('Invalid preview neighbor')
+  }
+
+  return {
+    note_id: record.note_id,
+    title: record.title,
+    source: record.source,
+    weight: record.weight
+  }
+}
+
 function parseReenrichStatus(value: unknown): ReenrichStatus | null {
   if (value === undefined || value === null) {
     return null
@@ -690,6 +953,10 @@ function isTriggerAction(value: unknown): value is TriggerAction {
 
 function isReenrichPhase(value: unknown): value is ReenrichPhase {
   return value === 'idle' || value === 'profile' || value === 'notes' || value === 'finalizing'
+}
+
+function isConnectorKind(value: unknown): value is ConnectorKind {
+  return value === 'local' || value === 'oauth'
 }
 
 function isAsrState(value: unknown): value is AsrState {

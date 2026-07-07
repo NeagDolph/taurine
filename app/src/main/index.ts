@@ -3,6 +3,8 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 
+let previewWindow: BrowserWindow | null = null
+
 if (is.dev) {
   // dev-only: lets tooling attach to the real renderer for debugging
   app.commandLine.appendSwitch('remote-debugging-port', '9223')
@@ -33,12 +35,63 @@ function createWindow(): void {
     return { action: 'deny' }
   })
 
+  loadRenderer(mainWindow)
+}
+
+function openPreviewWindow(noteId: string): void {
+  const hash = `/preview/${encodeURIComponent(noteId)}`
+
+  if (previewWindow && !previewWindow.isDestroyed()) {
+    loadRenderer(previewWindow, hash)
+    if (previewWindow.isMinimized()) {
+      previewWindow.restore()
+    }
+    previewWindow.show()
+    previewWindow.focus()
+    return
+  }
+
+  previewWindow = new BrowserWindow({
+    width: 520,
+    height: 680,
+    minWidth: 420,
+    minHeight: 520,
+    show: false,
+    autoHideMenuBar: true,
+    backgroundColor: '#0b0b0c',
+    ...(process.platform === 'linux' ? { icon } : {}),
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: false
+    }
+  })
+
+  previewWindow.on('ready-to-show', () => {
+    previewWindow?.show()
+  })
+
+  previewWindow.on('closed', () => {
+    previewWindow = null
+  })
+
+  previewWindow.webContents.setWindowOpenHandler((details) => {
+    shell.openExternal(details.url)
+    return { action: 'deny' }
+  })
+
+  loadRenderer(previewWindow, hash)
+}
+
+function loadRenderer(window: BrowserWindow, hash?: string): void {
   // HMR for renderer base on electron-vite cli.
   // Load the remote URL for development or the local html file for production.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+    const rendererUrl = hash
+      ? `${process.env['ELECTRON_RENDERER_URL']}#${hash}`
+      : process.env['ELECTRON_RENDERER_URL']
+    window.loadURL(rendererUrl)
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    window.loadFile(join(__dirname, '../renderer/index.html'), hash ? { hash } : undefined)
   }
 }
 
@@ -58,6 +111,13 @@ app.whenReady().then(() => {
 
   // IPC test
   ipcMain.on('ping', () => console.log('pong'))
+  ipcMain.handle('preview:open', (_event, noteId: unknown) => {
+    if (typeof noteId !== 'string' || noteId.length === 0) {
+      throw new Error('Invalid preview note id')
+    }
+
+    openPreviewWindow(noteId)
+  })
 
   createWindow()
 
