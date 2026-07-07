@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob as glob_module
 import hashlib
 import re
 import shutil
@@ -57,16 +58,20 @@ class IMessageConnector:
             return False, str(exc)
 
     def default_config(self) -> dict:
-        return {"db": taurine_config.IMESSAGE_DB}
+        return {
+            "db": taurine_config.IMESSAGE_DB,
+            "contacts_glob": taurine_config.CONTACTS_DB_GLOB,
+        }
 
     def extract(self, config: dict) -> list[NoteRecord]:
         db_path = _db_path(config)
         if not db_path.is_file():
             raise ConnectorError(f"iMessage database not found: {db_path}")
+        contacts = _contact_names(config)
         try:
             with _copied_db(db_path) as copied:
                 with _open_readonly(copied) as conn:
-                    return _extract_records(conn)
+                    return _extract_records(conn, contacts)
         except PermissionError as exc:
             raise ConnectorError(f"iMessage database unreadable: {_FULL_DISK_ACCESS_DETAIL}") from exc
         except sqlite3.OperationalError as exc:
@@ -104,19 +109,23 @@ def _open_readonly(path: Path) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def _extract_records(conn: sqlite3.Connection) -> list[NoteRecord]:
+def _extract_records(
+    conn: sqlite3.Connection, contacts: dict[str, str] | None = None
+) -> list[NoteRecord]:
     chats = conn.execute(
         "SELECT ROWID AS chat_rowid, guid, display_name FROM chat ORDER BY ROWID"
     ).fetchall()
     records: list[NoteRecord] = []
     for chat in chats:
-        record = _record_for_chat(conn, chat)
+        record = _record_for_chat(conn, chat, contacts or {})
         if record is not None:
             records.append(record)
     return records
 
 
-def _record_for_chat(conn: sqlite3.Connection, chat: sqlite3.Row) -> NoteRecord | None:
+def _record_for_chat(
+    conn: sqlite3.Connection, chat: sqlite3.Row, contacts: dict[str, str]
+) -> NoteRecord | None:
     rows = conn.execute(
         """
         SELECT
@@ -153,7 +162,11 @@ def _record_for_chat(conn: sqlite3.Connection, chat: sqlite3.Row) -> NoteRecord 
             break
         if newest_ts is None:
             newest_ts = message.timestamp
-        line = f"[{'me' if message.is_from_me else 'them'}] {message.text}"
+        if message.is_from_me:
+            speaker = "me"
+        else:
+            speaker = _resolve_handle(message.handle_id, contacts) or "them"
+        line = f"[{speaker}] {message.text}"
         line_length = len(line) + (1 if lines_desc else 0)
         if accumulated + line_length > taurine_config.IMESSAGE_MAX_CHARS:
             if not lines_desc:
@@ -169,7 +182,14 @@ def _record_for_chat(conn: sqlite3.Connection, chat: sqlite3.Row) -> NoteRecord 
 
     transcript = "\n".join(reversed(lines_desc))
     content_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
-    title_name = str(chat["display_name"] or "").strip() or ", ".join(handle_ids) or str(chat["guid"])
+    participant_names = [
+        _resolve_handle(handle, contacts) or handle for handle in handle_ids
+    ]
+    title_name = (
+        str(chat["display_name"] or "").strip()
+        or ", ".join(participant_names)
+        or str(chat["guid"])
+    )
     return NoteRecord(
         note_id=f"{IMessageConnector.connector_id}:{chat['guid']}",
         title=f"iMessage: {title_name}",
@@ -221,3 +241,78 @@ def _decode_attributed_body(blob: object) -> str | None:
     if not candidates:
         return None
     return max(candidates, key=len)
+
+
+# ── Contacts.app name resolution (AddressBook sqlite, read via temp copy) ──
+
+def _contact_names(config: dict) -> dict[str, str]:
+    """handle (normalized phone digits / lowercase email) → display name.
+
+    Best-effort: any failure yields {} and chats fall back to raw handles.
+    Reads every AddressBook source db (iCloud accounts live under Sources/).
+    """
+    pattern = str(config.get("contacts_glob") or taurine_config.CONTACTS_DB_GLOB)
+    names: dict[str, str] = {}
+    for db in sorted(glob_module.glob(str(Path(pattern).expanduser()), recursive=True)):
+        try:
+            with _copied_db(Path(db)) as copied:
+                with _open_readonly(copied) as conn:
+                    _collect_contacts(conn, names)
+        except (OSError, sqlite3.Error):
+            continue
+    return names
+
+
+def _collect_contacts(conn: sqlite3.Connection, names: dict[str, str]) -> None:
+    phone_rows = conn.execute(
+        """
+        SELECT r.ZFIRSTNAME AS first, r.ZLASTNAME AS last,
+               r.ZORGANIZATION AS org, p.ZFULLNUMBER AS value
+        FROM ZABCDPHONENUMBER p JOIN ZABCDRECORD r ON r.Z_PK = p.ZOWNER
+        """
+    ).fetchall()
+    email_rows = conn.execute(
+        """
+        SELECT r.ZFIRSTNAME AS first, r.ZLASTNAME AS last,
+               r.ZORGANIZATION AS org, e.ZADDRESS AS value
+        FROM ZABCDEMAILADDRESS e JOIN ZABCDRECORD r ON r.Z_PK = e.ZOWNER
+        """
+    ).fetchall()
+    for row in phone_rows:
+        name = _contact_display_name(row)
+        digits = _phone_digits(str(row["value"] or ""))
+        if not name or not digits:
+            continue
+        names.setdefault(digits, name)
+        if len(digits) > 10:
+            names.setdefault(digits[-10:], name)
+    for row in email_rows:
+        name = _contact_display_name(row)
+        email = str(row["value"] or "").strip().lower()
+        if name and email:
+            names.setdefault(email, name)
+
+
+def _contact_display_name(row: sqlite3.Row) -> str:
+    parts = [str(row["first"] or "").strip(), str(row["last"] or "").strip()]
+    full = " ".join(part for part in parts if part)
+    return full or str(row["org"] or "").strip()
+
+
+def _phone_digits(value: str) -> str:
+    return re.sub(r"\D", "", value)
+
+
+def _resolve_handle(handle: str, contacts: dict[str, str]) -> str | None:
+    if not handle or not contacts:
+        return None
+    cleaned = handle.strip()
+    if "@" in cleaned:
+        return contacts.get(cleaned.lower())
+    digits = _phone_digits(cleaned)
+    if not digits:
+        return None
+    return (
+        contacts.get(digits)
+        or (contacts.get(digits[-10:]) if len(digits) >= 10 else None)
+    )

@@ -43,6 +43,7 @@ CLAUDE_MEMORY_GLOB = "~/.claude/projects/*/memory/*.md"
 CODEX_MEMORY_GLOBS = ("~/.codex/AGENTS.md", "~/.codex/memory/**/*.md", "~/.codex/memories/**/*.md")
 OBSIDIAN_APP_JSON = "~/Library/Application Support/obsidian/obsidian.json"
 IMESSAGE_DB = "~/Library/Messages/chat.db"
+CONTACTS_DB_GLOB = "~/Library/Application Support/AddressBook/**/AddressBook-v22.abcddb"
 GIST_MAX_CHARS = 220                     # was 120: mid-word truncation degraded rerank docs
                                          # and card copy (audit finding #5)
 
