@@ -162,6 +162,30 @@ export function graphResponseToMapData(response: GraphResponse, nowLabel: string
   return { nodes, links }
 }
 
+/**
+ * Merge a freshly fetched graph into the previous one, reusing existing node
+ * objects so their simulated x/y/vx/vy survive. Without this, every re-sync
+ * refetch replaced all node objects and d3 re-seeded the whole corpus into
+ * its phyllotaxis spiral — which reads as concentric rings per connector,
+ * because /graph returns notes ordered by namespaced note_id.
+ */
+export function mergeGraphPositions(previous: MapGraphData, next: MapGraphData): MapGraphData {
+  const prevById = new Map(previous.nodes.map((node) => [node.id, node]))
+
+  return {
+    nodes: next.nodes.map((node) => {
+      const existing = prevById.get(node.id)
+      if (!existing) {
+        return node
+      }
+      // fresh nodes carry no x/y keys, so assign refreshes titles/degree/val
+      // while the simulation coordinates on the reused object stay put
+      return Object.assign(existing, node)
+    }),
+    links: next.links
+  }
+}
+
 export function nowLabelFromText(text: string, wordCount = 6): string {
   const words = text.trim().split(/\s+/).filter(Boolean)
   return words.length === 0 ? 'Now' : words.slice(-wordCount).join(' ')

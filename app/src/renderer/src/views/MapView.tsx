@@ -14,6 +14,7 @@ import {
   linkTooltip,
   liveGraphFromRetrieval,
   liveLinkOpacity,
+  mergeGraphPositions,
   nodeRadius,
   nowLabelFromText,
   sourceColor,
@@ -39,6 +40,10 @@ type GraphLinkObject = LinkObject<MapNode, MapLink>
 type GraphNodeObject = NodeObject<MapNode>
 
 const EMPTY_GRAPH: MapGraphData = graphResponseToMapData({ nodes: [], edges: [] }, 'Now')
+const GRAPH_REFETCH_DEBOUNCE_MS = 800
+// ~760 nodes need a few hundred ticks to untangle from d3's initial spiral;
+// the old 80 froze half-laid-out graphs whenever a refetch reset positions
+const LAYOUT_COOLDOWN_TICKS = 300
 
 export function MapView({
   visible,
@@ -49,6 +54,8 @@ export function MapView({
 }: MapViewProps): React.JSX.Element {
   const graphRef = useRef<ForceGraphMethods<MapNode, MapLink> | undefined>(undefined)
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const isInitialGraphLoadRef = useRef(true)
+  const needsReheatRef = useRef(false)
   const processedRetrievalRef = useRef<RetrievalEvent | null>(null)
   const pruneTimerRef = useRef<number | null>(null)
   const flashTimerRef = useRef<number | null>(null)
@@ -179,37 +186,66 @@ export function MapView({
 
   useEffect(() => {
     let cancelled = false
-    const loadingTimer = window.setTimeout(() => {
-      if (!cancelled) {
-        setIsLoading(true)
-        setError('')
-      }
-    }, 120)
+    let loadingTimer: number | null = null
 
-    fetchGraph()
-      .then((response) => {
-        if (!cancelled) {
-          setError('')
-          setBaseGraph(graphResponseToMapData(response, 'Now'))
-        }
-      })
-      .catch((fetchError: unknown) => {
-        if (!cancelled) {
-          setError(fetchError instanceof Error ? fetchError.message : 'Graph fetch failed')
-        }
-      })
-      .finally(() => {
-        window.clearTimeout(loadingTimer)
-        if (!cancelled) {
-          setIsLoading(false)
-        }
-      })
+    // a multi-connector sync bumps the graph version once per connector;
+    // debounce the refetches so the layout is only disturbed once at the end
+    const fetchTimer = window.setTimeout(
+      () => {
+        loadingTimer = window.setTimeout(() => {
+          if (!cancelled) {
+            setIsLoading(true)
+            setError('')
+          }
+        }, 120)
+
+        fetchGraph()
+          .then((response) => {
+            if (!cancelled) {
+              setError('')
+              setBaseGraph((current) =>
+                mergeGraphPositions(current, graphResponseToMapData(response, 'Now'))
+              )
+              needsReheatRef.current = true
+            }
+          })
+          .catch((fetchError: unknown) => {
+            if (!cancelled) {
+              setError(fetchError instanceof Error ? fetchError.message : 'Graph fetch failed')
+            }
+          })
+          .finally(() => {
+            if (loadingTimer !== null) {
+              window.clearTimeout(loadingTimer)
+            }
+            if (!cancelled) {
+              setIsLoading(false)
+            }
+          })
+      },
+      isInitialGraphLoadRef.current ? 0 : GRAPH_REFETCH_DEBOUNCE_MS
+    )
+    isInitialGraphLoadRef.current = false
 
     return () => {
       cancelled = true
-      window.clearTimeout(loadingTimer)
+      window.clearTimeout(fetchTimer)
+      if (loadingTimer !== null) {
+        window.clearTimeout(loadingTimer)
+      }
     }
   }, [refreshKey, retryNonce])
+
+  // if the data changed while this tab was hidden (or rAF was throttled),
+  // the engine can hit force-graph's wall-clock cooldownTime with almost no
+  // ticks executed and freeze in the initial layout — reheat on reveal
+  useEffect(() => {
+    if (!visible || !needsReheatRef.current) {
+      return
+    }
+    needsReheatRef.current = false
+    graphRef.current?.d3ReheatSimulation()
+  }, [visible, baseGraph])
 
   useEffect(() => {
     if (!error) {
@@ -432,7 +468,7 @@ export function MapView({
           ref={graphRef}
           autoPauseRedraw={!visible}
           backgroundColor="#0b0b0c"
-          cooldownTicks={80}
+          cooldownTicks={LAYOUT_COOLDOWN_TICKS}
           d3AlphaDecay={0.025}
           d3VelocityDecay={0.34}
           enableNodeDrag={false}
