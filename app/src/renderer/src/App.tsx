@@ -20,14 +20,16 @@ import {
   type TranscriptEvent
 } from './lib/sidecar'
 import { UpdatesClient } from './lib/updates'
+import { ChatView } from './views/ChatView'
 import { ConnectorsView } from './views/ConnectorsView'
 import { DataView } from './views/DataView'
 import { FeedView, type FeedTranscript } from './views/FeedView'
 
-type MainTab = 'live' | 'data' | 'connectors'
+type MainTab = 'live' | 'chat' | 'data' | 'connectors'
 
 const MAIN_TABS: Array<{ id: MainTab; label: string }> = [
   { id: 'live', label: 'Live' },
+  { id: 'chat', label: 'Chat' },
   { id: 'data', label: 'Data' },
   { id: 'connectors', label: 'Connectors' }
 ]
@@ -328,6 +330,10 @@ function App(): React.JSX.Element {
               <AmbientList items={ambientItems} onOpenNote={openNote} />
             </div>
           </div>
+        </div>
+
+        <div aria-hidden={activeTab !== 'chat'} style={viewLayerStyle(activeTab === 'chat')}>
+          <ChatView visible={activeTab === 'chat'} onOpenNote={openNote} />
         </div>
 
         <div aria-hidden={activeTab !== 'data'} style={viewLayerStyle(activeTab === 'data')}>
