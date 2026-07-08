@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from . import config
 from .ports import LLMError
+
+
+@dataclass
+class StreamEvent:
+    """One event from a streamed chat completion (spec chat §1.4).
+
+    kind: "reasoning" (thinking delta) | "content" (answer delta) |
+    "tool_call" (complete call, arguments parsed) | "usage" | "done".
+    """
+
+    kind: str
+    text: str = ""                                # reasoning/content deltas
+    tool_call: dict[str, Any] | None = None       # {"id", "name", "arguments": dict}
+    usage: dict[str, Any] | None = None            # {"prompt", "completion", "reasoning"}
 
 
 class OpenRouterClient:
@@ -58,6 +74,28 @@ class OpenRouterClient:
             return parsed
         except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMError(str(exc)) from exc
+
+    async def stream_chat(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        reasoning: dict[str, Any] | None = None,
+        timeout_s: float,
+    ) -> AsyncIterator[StreamEvent]:
+        """SSE-streamed chat completion (spec chat §1.4).
+
+        ``reasoning`` overrides LLM_REASONING_BY_MODEL for this call (chat
+        enables GLM-5.2 thinking; enrichment keeps it disabled). Yields
+        StreamEvents: reasoning/content deltas as they arrive, tool_call
+        events only once a call's argument fragments are complete, one usage
+        event when the provider reports it, then done. Cancellation = the
+        caller cancelling the consuming task; the stream context closes
+        cleanly. Raises LLMError on connect/HTTP/mid-stream provider errors.
+        """
+        raise NotImplementedError  # Stage B
+        yield StreamEvent(kind="done")  # pragma: no cover — marks this as an async generator
 
     async def complete_tools(
         self,

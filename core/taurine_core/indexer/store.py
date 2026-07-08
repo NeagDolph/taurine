@@ -14,6 +14,10 @@ import numpy as np
 
 from taurine_core import config
 from taurine_core.schemas import (
+    ChatActivityStep,
+    ChatMessage,
+    ChatMeta,
+    ChatUsage,
     Enrichment,
     GraphEdge,
     GraphNode,
@@ -552,6 +556,142 @@ class Index:
         ).fetchone()
         return int(row["value"]) if row is not None else 0
 
+    # ── chat persistence (spec 2026-07-08-chat-knowledge-base §1.5) ────
+    def create_chat(self, chat_id: str, *, now: float) -> ChatMeta:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO chats(chat_id, title, created, updated) VALUES (?, '', ?, ?)",
+                (chat_id, now, now),
+            )
+        return ChatMeta(chat_id=chat_id, created=now, updated=now)
+
+    def chat(self, chat_id: str) -> ChatMeta | None:
+        row = self._conn.execute(
+            """
+            SELECT c.chat_id, c.title, c.created, c.updated,
+                   (SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id = c.chat_id) AS message_count
+            FROM chats c WHERE c.chat_id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+        return ChatMeta(**dict(row)) if row is not None else None
+
+    def chats(self) -> list[ChatMeta]:
+        rows = self._conn.execute(
+            """
+            SELECT c.chat_id, c.title, c.created, c.updated,
+                   (SELECT COUNT(*) FROM chat_messages m WHERE m.chat_id = c.chat_id) AS message_count
+            FROM chats c ORDER BY c.updated DESC
+            """
+        ).fetchall()
+        return [ChatMeta(**dict(row)) for row in rows]
+
+    def rename_chat(self, chat_id: str, title: str, *, now: float) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE chats SET title = ?, updated = ? WHERE chat_id = ?",
+                (title, now, chat_id),
+            )
+
+    def delete_chat(self, chat_id: str) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM chat_messages WHERE chat_id = ?", (chat_id,))
+            self._conn.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
+
+    def chat_registry(self, chat_id: str) -> dict:
+        """Per-chat retrieval state: N#/F# registries + seed accumulator."""
+        row = self._conn.execute(
+            "SELECT registry_json FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return json.loads(row["registry_json"]) if row is not None else {}
+
+    def set_chat_registry(self, chat_id: str, registry: dict) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE chats SET registry_json = ? WHERE chat_id = ?",
+                (json.dumps(registry), chat_id),
+            )
+
+    def add_chat_message(self, message: ChatMessage) -> int:
+        """Persist a message; returns its rowid. Assistant rows may start
+        empty (created at ack, finished via finish_chat_message)."""
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO chat_messages(chat_id, role, content, thinking, sources_json,
+                                          facts_json, activity_json, usage_json, cancelled, created)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message.chat_id,
+                    message.role,
+                    message.content,
+                    message.thinking,
+                    json.dumps([item.model_dump(mode="json") for item in message.sources]),
+                    json.dumps([item.model_dump(mode="json") for item in message.facts]),
+                    json.dumps([item.model_dump(mode="json") for item in message.activity]),
+                    message.usage.model_dump_json(),
+                    int(message.cancelled),
+                    message.created,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE chats SET updated = ? WHERE chat_id = ?",
+                (message.created, message.chat_id),
+            )
+            return int(cursor.lastrowid)
+
+    def finish_chat_message(self, message: ChatMessage) -> None:
+        """Overwrite the streamed-into assistant row (matched by message.id)."""
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE chat_messages SET content = ?, thinking = ?, sources_json = ?,
+                    facts_json = ?, activity_json = ?, usage_json = ?, cancelled = ?
+                WHERE id = ?
+                """,
+                (
+                    message.content,
+                    message.thinking,
+                    json.dumps([item.model_dump(mode="json") for item in message.sources]),
+                    json.dumps([item.model_dump(mode="json") for item in message.facts]),
+                    json.dumps([item.model_dump(mode="json") for item in message.activity]),
+                    message.usage.model_dump_json(),
+                    int(message.cancelled),
+                    message.id,
+                ),
+            )
+
+    def chat_messages(self, chat_id: str) -> list[ChatMessage]:
+        rows = self._conn.execute(
+            """
+            SELECT id, chat_id, role, content, thinking, sources_json, facts_json,
+                   activity_json, usage_json, cancelled, created
+            FROM chat_messages WHERE chat_id = ? ORDER BY id
+            """,
+            (chat_id,),
+        ).fetchall()
+        return [
+            ChatMessage(
+                id=int(row["id"]),
+                chat_id=row["chat_id"],
+                role=row["role"],
+                content=row["content"],
+                thinking=row["thinking"],
+                sources=[GroundingItem(**item) for item in json.loads(row["sources_json"])],
+                facts=[GroundedFact(**item) for item in json.loads(row["facts_json"])],
+                activity=[ChatActivityStep(**item) for item in json.loads(row["activity_json"])],
+                usage=ChatUsage(**json.loads(row["usage_json"] or "{}")),
+                cancelled=bool(row["cancelled"]),
+                created=float(row["created"]),
+            )
+            for row in rows
+        ]
+
+    def delete_chat_message(self, message_id: int) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM chat_messages WHERE id = ?", (message_id,))
+
     def term_vectors(self, terms: Sequence[str]) -> dict[str, np.ndarray]:
         """Cached embeddings for term strings (synonym clustering)."""
         found: dict[str, np.ndarray] = {}
@@ -1017,6 +1157,28 @@ class Index:
                     fact TEXT NOT NULL DEFAULT '',
                     judged_at REAL NOT NULL,
                     PRIMARY KEY(src, dst)
+                );
+
+                CREATE TABLE IF NOT EXISTS chats (
+                    chat_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    created REAL NOT NULL,
+                    updated REAL NOT NULL,
+                    registry_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+                    content TEXT NOT NULL,
+                    thinking TEXT NOT NULL DEFAULT '',
+                    sources_json TEXT NOT NULL DEFAULT '[]',
+                    facts_json TEXT NOT NULL DEFAULT '[]',
+                    activity_json TEXT NOT NULL DEFAULT '[]',
+                    usage_json TEXT NOT NULL DEFAULT '{}',
+                    cancelled INTEGER NOT NULL DEFAULT 0,
+                    created REAL NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS metadata (

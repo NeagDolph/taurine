@@ -302,3 +302,117 @@ class ActionableStatusMsg(BaseModel):
     type: Literal["actionable_status"]
     id: str
     status: Literal["confirmed", "dismissed"]
+
+
+# ── chat (knowledge-base Q&A — spec 2026-07-08-chat-knowledge-base) ────
+class ChatMeta(BaseModel):
+    chat_id: str                   # "chat-<8 hex>"
+    title: str = ""
+    created: float
+    updated: float
+    message_count: int = 0
+
+
+class ChatActivityStep(BaseModel):
+    kind: Literal["search", "read", "expand"]
+    label: str                     # e.g. 'Searched "shopify timeline" → 8 notes'
+    status: Literal["running", "done"] = "done"
+    note_ids: list[str] = []
+
+
+class ChatUsage(BaseModel):
+    prompt: int = 0
+    completion: int = 0
+    reasoning: int = 0
+    ttft_ms: float = 0.0
+    total_ms: float = 0.0
+
+
+class ChatMessage(BaseModel):
+    id: int = 0                    # chat_messages rowid
+    chat_id: str
+    role: Literal["user", "assistant"]
+    content: str                   # markdown (assistant) / raw text (user)
+    thinking: str = ""             # full reasoning transcript (assistant)
+    sources: list[GroundingItem] = []
+    facts: list[GroundedFact] = []
+    activity: list[ChatActivityStep] = []
+    usage: ChatUsage = ChatUsage()
+    cancelled: bool = False
+    created: float = 0.0
+
+
+# chat ws events (server → client; all carry chat_id)
+class ChatAckEvent(BaseModel):
+    type: Literal["chat_ack"] = "chat_ack"
+    chat_id: str
+    message_id: int                # assistant row being streamed into
+    user_message_id: int
+    title: str = ""                # set when the chat was just created/titled
+
+
+class ChatRetrievalEvent(BaseModel):
+    type: Literal["chat_retrieval"] = "chat_retrieval"
+    chat_id: str
+    message_id: int
+    sources: list[GroundingItem] = []
+    facts: list[GroundedFact] = []
+
+
+class ChatThinkingEvent(BaseModel):
+    type: Literal["chat_thinking"] = "chat_thinking"
+    chat_id: str
+    message_id: int
+    delta: str
+
+
+class ChatActivityEvent(BaseModel):
+    type: Literal["chat_activity"] = "chat_activity"
+    chat_id: str
+    message_id: int
+    step_index: int                # stable index so running→done updates target the step
+    step: ChatActivityStep
+
+
+class ChatDeltaEvent(BaseModel):
+    type: Literal["chat_delta"] = "chat_delta"
+    chat_id: str
+    message_id: int
+    delta: str
+
+
+class ChatDoneEvent(BaseModel):
+    type: Literal["chat_done"] = "chat_done"
+    chat_id: str
+    message_id: int
+    message: ChatMessage           # the finished assistant message (persisted form)
+
+
+class ChatErrorEvent(BaseModel):
+    type: Literal["chat_error"] = "chat_error"
+    chat_id: str
+    message_id: Optional[int] = None
+    code: Literal["busy", "llm", "timeout"]
+    detail: str = ""
+
+
+class ChatMetaEvent(BaseModel):
+    type: Literal["chat_meta"] = "chat_meta"
+    chat: ChatMeta
+
+
+# chat ws messages (client → server)
+class ChatSendMsg(BaseModel):
+    type: Literal["chat_send"]
+    chat_id: str = ""              # "" → server creates the chat
+    text: str
+
+
+class ChatCancelMsg(BaseModel):
+    type: Literal["chat_cancel"]
+    chat_id: str
+
+
+class ChatRegenerateMsg(BaseModel):
+    type: Literal["chat_regenerate"]
+    chat_id: str

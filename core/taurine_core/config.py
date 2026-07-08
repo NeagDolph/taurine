@@ -143,6 +143,25 @@ ACTIONABLE_QUOTE_MIN_RATIO = 0.85        # rapidfuzz partial ratio vs transcript
 ACTIONABLE_MAX_PER_PASS = 2
 ACTIONABLE_DEDUPE_SIM = 0.90             # title-embedding cosine vs open actionables → update, not new
 
+# ── chat (knowledge-base Q&A — spec 2026-07-08-chat-knowledge-base) ────
+CHAT_MODEL = "z-ai/glm-5.2"
+CHAT_REASONING = {"enabled": True}       # per-call override: thinking ON for chat only
+CHAT_FALLBACK_MODEL = "deepseek/deepseek-v4-pro"
+CHAT_TIMEOUT_S = 120.0                   # whole-stream budget per round trip
+CHAT_MAX_TOOL_CALLS = 6
+CHAT_MAX_CONCURRENT_TURNS = 2
+CHAT_CONTEXT_NOTES = 16                  # Stage-A pack: broad recall posture
+CHAT_CONTEXT_FACTS = 24
+CHAT_SEED_DECAY = 0.7                    # per-turn accumulator decay (chats pivot fast)
+CHAT_SEARCH_TOOL_K = 8                   # default k for the search_notes tool
+CHAT_NOTE_READ_MAX_CHARS = 6000
+CHAT_HISTORY_MAX_TURNS = 12
+CHAT_EMBED_QUERY_PROMPT = (
+    "Instruct: Given a question about the user's personal notes, retrieve "
+    "notes relevant to answering it\nQuery: "
+)
+CHAT_TITLE_MAX_WORDS = 6
+
 # ── grounding / graph traversal (latent retrieval, no LLM) ─────────────
 GROUNDING_TOP_K = 12                     # grounding-set size
 GROUNDING_FACTS_MAX = 20                 # edge facts carried per pass
