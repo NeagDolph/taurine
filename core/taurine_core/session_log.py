@@ -10,6 +10,8 @@ from uuid import uuid4
 
 
 SESSIONS_DIR = Path("sessions")
+KIND_GROUNDING = "grounding"
+KIND_SUMMARY = "summary"
 
 _console = logging.getLogger("taurine.session")
 if not _console.handlers:
@@ -120,6 +122,31 @@ def console_line(kind: str, payload: dict[str, Any]) -> str | None:
             f"presenter {payload.get('model_used')} {round(payload.get('latency_ms') or 0)}ms → "
             f"{picked}"
         )
+    if kind == KIND_GROUNDING:
+        mark = "✓" if payload.get("trigger_decision") else "✗"
+        items = payload.get("items") or []
+        first = ""
+        if items:
+            row = items[0]
+            if isinstance(row, dict):
+                first = f" top={row.get('short_id') or _note_ref(row.get('note_id'))}"
+        return (
+            f"grounding {mark} {payload.get('trigger_reason')} "
+            f"rev={payload.get('revision')}{first} facts={len(payload.get('fact_ids') or [])}"
+        )
+    if kind == KIND_SUMMARY:
+        if payload.get("rejected"):
+            return (
+                f"summary rejected {payload.get('reject_reason')} "
+                f"{round(payload.get('latency_ms') or 0)}ms"
+            )
+        if payload.get("no_update"):
+            return f"summary no_update {round(payload.get('latency_ms') or 0)}ms"
+        accepted = payload.get("accepted_actionable_ids") or []
+        return (
+            f"summary {payload.get('model')} {round(payload.get('latency_ms') or 0)}ms "
+            f"actions={len(accepted)}"
+        )
     if kind == "pin":
         target = payload.get("title") or _note_ref(payload.get("note_id"))
         return (
@@ -139,6 +166,56 @@ class NullSessionLogger:
 
     def close(self) -> None:
         return
+
+
+def log_grounding(
+    logger: Any,
+    update: Any,
+    *,
+    decision: bool,
+    reason: str,
+) -> None:
+    logger.log(
+        KIND_GROUNDING,
+        revision=getattr(update, "revision", 0),
+        items=[
+            {
+                "note_id": getattr(item, "note_id", ""),
+                "short_id": getattr(item, "short_id", ""),
+                "score": getattr(item, "score", 0.0),
+            }
+            for item in getattr(update, "items", [])
+        ],
+        fact_ids=[
+            getattr(fact, "fact_id", "")
+            for fact in getattr(update, "facts", [])
+        ],
+        trigger_decision=decision,
+        trigger_reason=reason,
+    )
+
+
+def log_summary(
+    logger: Any,
+    *,
+    model: str,
+    latency_ms: float,
+    no_update: bool,
+    rejected: bool,
+    reject_reason: str,
+    citation_stats: dict[str, Any],
+    accepted_actionable_ids: list[str],
+) -> None:
+    logger.log(
+        KIND_SUMMARY,
+        model=model,
+        latency_ms=latency_ms,
+        no_update=no_update,
+        rejected=rejected,
+        reject_reason=reject_reason,
+        citation_stats=citation_stats,
+        accepted_actionable_ids=accepted_actionable_ids,
+    )
 
 
 class SessionLogger:

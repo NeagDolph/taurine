@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import json
 
-from taurine_core.session_log import SessionLogger, console_line
+from taurine_core.live.grounding import GroundingUpdate
+from taurine_core.schemas import GroundedFact, GroundingItem
+from taurine_core.session_log import (
+    SessionLogger,
+    console_line,
+    log_grounding,
+    log_summary,
+)
 
 
 def test_session_logger_writes_jsonl_records_and_session_end(tmp_path) -> None:
@@ -59,7 +66,6 @@ def test_session_logger_writes_jsonl_records_and_session_end(tmp_path) -> None:
         "seq": 1,
         "channel": 0,
         "text": "hello",
-        "ts": records[0]["ts"],
         "final": True,
     }
     assert records[1]["trigger_id"] == "abc123"
@@ -102,3 +108,56 @@ def test_c2_console_line_appends_compact_gliner_spans() -> None:
 
     assert line is not None
     assert line.endswith(" spans=[shopify checkout; Ashish]")
+
+
+def test_grounding_and_summary_helpers_write_canonical_payloads(tmp_path) -> None:
+    logger = SessionLogger.create(tmp_path)
+    update = GroundingUpdate(
+        revision=7,
+        items=[
+            GroundingItem(
+                note_id="n1",
+                short_id="N1",
+                title="Timeline",
+                gist="Timeline gist",
+                score=0.91,
+            )
+        ],
+        facts=[GroundedFact(fact_id="F1", src="n1", dst="n2", text="related")],
+    )
+
+    log_grounding(logger, update, decision=True, reason="jaccard")
+    log_summary(
+        logger,
+        model="model-a",
+        latency_ms=12.5,
+        no_update=False,
+        rejected=False,
+        reject_reason="",
+        citation_stats={"total": 2, "valid": 2, "invalid": 0},
+        accepted_actionable_ids=["act-12345678"],
+    )
+    logger.close()
+
+    assert logger.path is not None
+    records = [json.loads(line) for line in logger.path.read_text().splitlines()]
+    assert records[0] | {"ts": records[0]["ts"]} == {
+        "ts": records[0]["ts"],
+        "kind": "grounding",
+        "revision": 7,
+        "items": [{"note_id": "n1", "short_id": "N1", "score": 0.91}],
+        "fact_ids": ["F1"],
+        "trigger_decision": True,
+        "trigger_reason": "jaccard",
+    }
+    assert records[1] | {"ts": records[1]["ts"]} == {
+        "ts": records[1]["ts"],
+        "kind": "summary",
+        "model": "model-a",
+        "latency_ms": 12.5,
+        "no_update": False,
+        "rejected": False,
+        "reject_reason": "",
+        "citation_stats": {"total": 2, "valid": 2, "invalid": 0},
+        "accepted_actionable_ids": ["act-12345678"],
+    }
