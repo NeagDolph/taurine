@@ -112,10 +112,19 @@ def embed_texts(texts: list[str]) -> np.ndarray:
     return real_embed_texts(texts)
 
 
-def embed_queries(texts: list[str]) -> np.ndarray:
+def embed_queries(texts: list[str], *, prompt: str | None = None) -> np.ndarray:
     from .embed import embed_queries as real_embed_queries
 
-    return real_embed_queries(texts)
+    return real_embed_queries(texts, prompt=prompt)
+
+
+def _embed_queries_with_prompt(texts: list[str], prompt: str) -> np.ndarray:
+    try:
+        return embed_queries(texts, prompt=prompt)
+    except TypeError as exc:
+        if "prompt" not in str(exc):
+            raise
+        return embed_queries(texts)
 
 
 class Index:
@@ -400,11 +409,18 @@ class Index:
                 (_connector_meta_key(connector_id), json.dumps(state, sort_keys=True), time.time()),
             )
 
-    def dense_search(self, text: str, k: int) -> list[tuple[str, float]]:
+    def dense_search(
+        self,
+        text: str,
+        k: int,
+        *,
+        prompt: str | None = None,
+    ) -> list[tuple[str, float]]:
         embedding_rows, matrix = self._dense_snapshot()
         if k <= 0 or matrix.size == 0:
             return []
-        query = embed_queries([text])[0].astype(np.float32)
+        query_prompt = config.EMBED_QUERY_PROMPT if prompt is None else prompt
+        query = _embed_queries_with_prompt([text], query_prompt)[0].astype(np.float32)
         norm = float(np.linalg.norm(query))
         if norm == 0:
             return []
@@ -480,7 +496,13 @@ class Index:
             for row in rows
         ]
 
-    def fact_dense_search(self, text: str, k: int) -> list[tuple[str, str, float, str]]:
+    def fact_dense_search(
+        self,
+        text: str,
+        k: int,
+        *,
+        prompt: str | None = None,
+    ) -> list[tuple[str, str, float, str]]:
         """Dense search over adjudicated edge facts: (src, dst, score, fact_text).
 
         HippoRAG-2-style query-to-fact matching; callers credit both endpoint
@@ -488,7 +510,8 @@ class Index:
         rows, matrix = self._fact_state
         if k <= 0 or matrix.size == 0:
             return []
-        query = embed_queries([text])[0].astype(np.float32)
+        query_prompt = config.EMBED_QUERY_PROMPT if prompt is None else prompt
+        query = _embed_queries_with_prompt([text], query_prompt)[0].astype(np.float32)
         norm = float(np.linalg.norm(query))
         if norm == 0:
             return []

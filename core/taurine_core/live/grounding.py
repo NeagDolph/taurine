@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -28,6 +28,7 @@ from ..schemas import GroundedFact, GroundingItem, GroundingWhy, NoteRecord
 SECONDS_PER_DAY = 86_400.0
 SEED_PRUNE_EPSILON = 1e-6
 WHY_HEAD_ORDER = ("dense", "gliner", "bm25", "exact", "fact", "ppr")
+_DEFAULT_HYSTERESIS = object()
 
 
 @dataclass
@@ -41,8 +42,30 @@ class GroundingUpdate:
 
 
 class GroundingEngine:
-    def __init__(self, index: Index) -> None:
+    def __init__(
+        self,
+        index: Index,
+        *,
+        top_k: int | None = None,
+        facts_max: int | None = None,
+        seed_decay: float | None = None,
+        hysteresis: float | None | object = _DEFAULT_HYSTERESIS,
+        query_prompt: str | None = None,
+    ) -> None:
         self.index = index
+        self._top_k = config.GROUNDING_TOP_K if top_k is None else int(top_k)
+        self._facts_max = (
+            config.GROUNDING_FACTS_MAX if facts_max is None else int(facts_max)
+        )
+        self._seed_decay = (
+            config.SEED_ACCUM_DECAY if seed_decay is None else float(seed_decay)
+        )
+        self._hysteresis = (
+            config.GROUNDING_HYSTERESIS
+            if hysteresis is _DEFAULT_HYSTERESIS
+            else hysteresis
+        )
+        self._query_prompt = query_prompt
         self._seeds: dict[str, float] = {}
         self._prev_ppr_raw: np.ndarray | None = None
         self._prev_ppr_matrix_identity: int | None = None
@@ -56,6 +79,74 @@ class GroundingEngine:
         self._revision = 0
         self.last_blend: dict[str, dict[str, float]] = {}
 
+    def export_state(self) -> dict[str, Any]:
+        return {
+            "seeds": {
+                note_id: float(score)
+                for note_id, score in sorted(self._seeds.items())
+            },
+            "note_short_ids": dict(sorted(self._note_short_ids.items())),
+            "fact_short_ids": [
+                {"src": src, "dst": dst, "short_id": short_id}
+                for (src, dst), short_id in sorted(self._fact_short_ids.items())
+            ],
+            "next_note_short_id": self._next_note_short_id,
+            "next_fact_short_id": self._next_fact_short_id,
+            "previous_order": list(self._previous_order),
+            "revision": self._revision,
+        }
+
+    def restore_state(self, state: dict) -> None:
+        raw_seeds = state.get("seeds", {})
+        self._seeds = (
+            {
+                str(note_id): float(score)
+                for note_id, score in raw_seeds.items()
+                if float(score) >= SEED_PRUNE_EPSILON
+            }
+            if isinstance(raw_seeds, dict)
+            else {}
+        )
+
+        raw_note_ids = state.get("note_short_ids", {})
+        self._note_short_ids = (
+            {str(note_id): str(short_id) for note_id, short_id in raw_note_ids.items()}
+            if isinstance(raw_note_ids, dict)
+            else {}
+        )
+
+        self._fact_short_ids = {}
+        raw_fact_ids = state.get("fact_short_ids", [])
+        if isinstance(raw_fact_ids, list):
+            for row in raw_fact_ids:
+                if not isinstance(row, dict):
+                    continue
+                src = row.get("src")
+                dst = row.get("dst")
+                short_id = row.get("short_id")
+                if src is None or dst is None or short_id is None:
+                    continue
+                self._fact_short_ids[_edge_key(str(src), str(dst))] = str(short_id)
+
+        self._next_note_short_id = max(
+            _state_counter(state.get("next_note_short_id"), "N"),
+            _next_counter_from_short_ids(self._note_short_ids.values(), "N"),
+        )
+        self._next_fact_short_id = max(
+            _state_counter(state.get("next_fact_short_id"), "F"),
+            _next_counter_from_short_ids(self._fact_short_ids.values(), "F"),
+        )
+
+        raw_previous_order = state.get("previous_order", [])
+        self._previous_order = (
+            [str(note_id) for note_id in raw_previous_order]
+            if isinstance(raw_previous_order, list)
+            else []
+        )
+        self._revision = _state_counter(state.get("revision"), "")
+        self._prev_ppr_raw = None
+        self._prev_ppr_matrix_identity = None
+
     def on_pass(
         self,
         window_text: str,
@@ -64,6 +155,7 @@ class GroundingEngine:
         now: float,
         *,
         head_hits: dict[str, set[str]] | None = None,
+        decay_seeds: bool = True,
     ) -> GroundingUpdate:
         """Advance the accumulator and produce the current grounding set.
 
@@ -82,7 +174,7 @@ class GroundingEngine:
         """
         fused_rows = _unique_ranked(fused)
         exact_aliases = _exact_aliases(exact_hits)
-        self._advance_seeds(fused_rows, exact_aliases)
+        self._advance_seeds(fused_rows, exact_aliases, decay=decay_seeds)
 
         matrix = self._graph_matrix()
         matrix_identity = id(matrix.matrix)
@@ -97,7 +189,12 @@ class GroundingEngine:
 
         ppr_top = _top_items(ppr_mass, config.SEED_TOP_K)
         ppr_pool = _top_items(ppr_mass, config.GROUNDING_PPR_POOL_K)
-        fact_hits = self.index.fact_dense_search(window_text, config.GROUNDING_FACTS_MAX)
+        fact_hits = _fact_dense_search(
+            self.index,
+            window_text,
+            self._facts_max,
+            self._query_prompt,
+        )
         notes_by_id = {note.note_id: note for note in self.index.notes()}
         active_ids = set(notes_by_id)
 
@@ -214,11 +311,16 @@ class GroundingEngine:
         self,
         fused: list[tuple[str, float]],
         exact_aliases: dict[str, str],
+        *,
+        decay: bool,
     ) -> None:
-        self._seeds = {
-            note_id: score * config.SEED_ACCUM_DECAY
-            for note_id, score in self._seeds.items()
-        }
+        if decay:
+            self._seeds = {
+                note_id: score * self._seed_decay
+                for note_id, score in self._seeds.items()
+            }
+        else:
+            self._seeds = dict(self._seeds)
         for note_id, score in fused[: config.SEED_TOP_K]:
             self._seeds[note_id] = self._seeds.get(note_id, 0.0) + float(score)
 
@@ -249,7 +351,7 @@ class GroundingEngine:
     ) -> list[str]:
         selected: list[str] = []
         used: set[str] = set()
-        limit = config.GROUNDING_TOP_K
+        limit = self._top_k
 
         for slot in range(limit):
             incumbent = (
@@ -271,9 +373,10 @@ class GroundingEngine:
             if incumbent_valid and incumbent is not None:
                 if challenger is None or challenger == incumbent:
                     chosen = incumbent
-                elif (
-                    blend[challenger]["final"]
-                    > blend[incumbent]["final"] * config.GROUNDING_HYSTERESIS
+                elif self._hysteresis is None:
+                    chosen = challenger
+                elif blend[challenger]["final"] > (
+                    blend[incumbent]["final"] * float(self._hysteresis)
                 ):
                     chosen = challenger
                 else:
@@ -339,7 +442,7 @@ class GroundingEngine:
         seen: set[tuple[str, str]] = set()
 
         def append_fact(src: str, dst: str, text: str) -> None:
-            if len(selected) >= config.GROUNDING_FACTS_MAX:
+            if len(selected) >= self._facts_max:
                 return
             key = _edge_key(src, dst)
             if key in seen or key[0] not in active_ids or key[1] not in active_ids:
@@ -457,3 +560,40 @@ def _minmax_norm(
 def _edge_key(src: str, dst: str) -> tuple[str, str]:
     left, right = sorted((src, dst))
     return left, right
+
+
+def _fact_dense_search(
+    index: Index,
+    text: str,
+    k: int,
+    prompt: str | None,
+) -> list[tuple[str, str, float, str]]:
+    if prompt is None:
+        return index.fact_dense_search(text, k)
+    try:
+        return index.fact_dense_search(text, k, prompt=prompt)  # type: ignore[call-arg]
+    except TypeError as exc:
+        if "prompt" not in str(exc):
+            raise
+        return index.fact_dense_search(text, k)
+
+
+def _state_counter(value: Any, prefix: str) -> int:
+    try:
+        counter = int(value)
+    except (TypeError, ValueError):
+        counter = 0 if prefix == "" else 1
+    return max(counter, 0 if prefix == "" else 1)
+
+
+def _next_counter_from_short_ids(short_ids: Any, prefix: str) -> int:
+    highest = 0
+    for short_id in short_ids:
+        text = str(short_id)
+        if not text.startswith(prefix):
+            continue
+        try:
+            highest = max(highest, int(text[len(prefix) :]))
+        except ValueError:
+            continue
+    return highest + 1

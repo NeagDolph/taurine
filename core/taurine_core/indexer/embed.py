@@ -16,8 +16,9 @@ def embed_texts(texts: list[str]) -> np.ndarray:
     return _embed(texts)
 
 
-def embed_queries(texts: list[str]) -> np.ndarray:
-    return _embed(texts, prompt=config.EMBED_QUERY_PROMPT)
+def embed_queries(texts: list[str], *, prompt: str | None = None) -> np.ndarray:
+    query_prompt = config.EMBED_QUERY_PROMPT if prompt is None else prompt
+    return _embed(texts, prompt=query_prompt)
 
 
 def _embed(texts: list[str], *, prompt: str | None = None) -> np.ndarray:

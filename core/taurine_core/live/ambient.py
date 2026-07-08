@@ -27,6 +27,59 @@ class _Candidate:
     score: float
 
 
+@dataclass(frozen=True)
+class HeadFusionResult:
+    fused: list[tuple[str, float]]
+    head_hits: dict[str, set[str]]
+    dense: list[tuple[str, float]]
+    extra_dense: list[tuple[str, float]]
+    bm25: list[tuple[str, float]]
+    exact: list[tuple[str, float]]
+    bm25_query: str
+
+
+def run_head_fusion(
+    index: IndexPort,
+    window_text: str,
+    *,
+    extra_dense_queries: list[str] | None = None,
+    snapped_terms: list[tuple[str, str]] | None = None,
+    exact_hits: list[tuple[str, str]] | None = None,
+    query_prompt: str | None = None,
+) -> HeadFusionResult:
+    """Run the shared dense/BM25/exact heads and RRF fusion."""
+    extra_dense_queries = extra_dense_queries or []
+    snapped_terms = snapped_terms or []
+    exact_hits = exact_hits or []
+
+    dense = _dense_search(index, window_text, config.HEAD_TOP_K, query_prompt)
+    extra_dense = _dense_many(index, extra_dense_queries, query_prompt)
+    bm25_query = _bm25_query(window_text, snapped_terms)
+    bm25 = index.bm25_search(bm25_query, config.HEAD_TOP_K)
+    exact = [(note_id, 1.0) for note_id, _alias in exact_hits]
+    exact_lists = [[row] for row in exact]
+    fused_scores = _rrf_scores(dense, extra_dense, bm25, *exact_lists)
+    fused = [
+        (candidate.note_id, candidate.score)
+        for candidate in _ordered_candidates(fused_scores)
+    ]
+    head_hits = _head_hits(
+        dense=dense,
+        dense_gliner=extra_dense,
+        bm25=bm25,
+        exact=exact,
+    )
+    return HeadFusionResult(
+        fused=fused,
+        head_hits=head_hits,
+        dense=dense,
+        extra_dense=extra_dense,
+        bm25=bm25,
+        exact=exact,
+        bm25_query=bm25_query,
+    )
+
+
 class AmbientRetriever:
     def __init__(
         self,
@@ -80,24 +133,13 @@ class AmbientRetriever:
             span_context_text,
         )
         extracted = [span for span, _score, _label in gliner_spans]
-        dense = self._index.dense_search(window_text, config.HEAD_TOP_K)
-        dense_gliner = self._dense_gliner(gliner_queries)
-        bm25_query = _bm25_query(window_text, snapped)
-        bm25 = self._index.bm25_search(bm25_query, config.HEAD_TOP_K)
         exact_hits = self._exact_hits(window_text, now)
-        exact_ranked = [(note_id, 1.0) for note_id, _alias in exact_hits]
-
-        exact_lists = [[row] for row in exact_ranked]
-        fused_scores = self._rrf_scores(dense, dense_gliner, bm25, *exact_lists)
-        fused = [
-            (candidate.note_id, candidate.score)
-            for candidate in self._ordered_candidates(fused_scores)
-        ]
-        head_hits = _head_hits(
-            dense=dense,
-            dense_gliner=dense_gliner,
-            bm25=bm25,
-            exact=exact_ranked,
+        heads = run_head_fusion(
+            self._index,
+            window_text,
+            extra_dense_queries=gliner_queries,
+            snapped_terms=snapped,
+            exact_hits=exact_hits,
         )
 
         # note ages need wall-clock time: the session clock is monotonic
@@ -105,14 +147,14 @@ class AmbientRetriever:
         # saturate the recency decay to 1.0
         update = self._grounding.on_pass(
             window_text,
-            fused,
+            heads.fused,
             exact_hits,
             self._wall_clock(),
-            head_hits=head_hits,
+            head_hits=heads.head_hits,
         )
         self.last_grounding = update
         self.last_extracted = extracted
-        self.last_fused_ids = {note_id for note_id, _score in fused}
+        self.last_fused_ids = {note_id for note_id, _score in heads.fused}
         self.last_ppr_expansions = [
             (note_id, mass)
             for note_id, mass in update.ppr_top
@@ -124,28 +166,16 @@ class AmbientRetriever:
             gliner_spans=gliner_spans,
             gliner_dropped=gliner_dropped,
             gliner_context_queries=gliner_context_queries,
-            dense=dense,
-            dense_gliner=dense_gliner,
-            bm25=bm25,
-            exact=exact_ranked,
-            bm25_query=bm25_query,
-            fused=fused,
+            dense=heads.dense,
+            dense_gliner=heads.extra_dense,
+            bm25=heads.bm25,
+            exact=heads.exact,
+            bm25_query=heads.bm25_query,
+            fused=heads.fused,
             update=update,
             snapped=snapped,
         )
         return update
-
-    def _rrf_scores(
-        self,
-        *ranked_lists: list[tuple[str, float]],
-    ) -> dict[str, float]:
-        scores: dict[str, float] = {}
-        for rows in ranked_lists:
-            for rank, (note_id, _score) in enumerate(rows, start=1):
-                scores[note_id] = scores.get(note_id, 0.0) + (
-                    1.0 / (config.RRF_K + rank)
-                )
-        return scores
 
     def _extract_spans(self, window_text: str) -> list[tuple[str, float, str]]:
         if self._span_extractor is None:
@@ -200,21 +230,6 @@ class AmbientRetriever:
             return None
         return best[1]
 
-    def _dense_gliner(
-        self,
-        gliner_queries: list[str],
-    ) -> list[tuple[str, float]]:
-        scores: dict[str, float] = {}
-        for query in gliner_queries:
-            for note_id, score in self._index.dense_search(
-                query,
-                config.HEAD_TOP_K,
-            ):
-                scores[note_id] = max(scores.get(note_id, float("-inf")), score)
-        return sorted(scores.items(), key=lambda item: item[1], reverse=True)[
-            : config.HEAD_TOP_K
-        ]
-
     def _exact_hits(self, window_text: str, now: float) -> list[tuple[str, str]]:
         chunk = Chunk(channel=0, text=window_text, ts=now, final=True)
         hits: list[tuple[str, str]] = []
@@ -225,16 +240,6 @@ class AmbientRetriever:
             seen.add(note_id)
             hits.append((note_id, alias))
         return hits
-
-    def _ordered_candidates(self, scores: dict[str, float]) -> list[_Candidate]:
-        first_seen = {note_id: index for index, note_id in enumerate(scores)}
-        return [
-            _Candidate(note_id, score)
-            for note_id, score in sorted(
-                scores.items(),
-                key=lambda item: (-item[1], first_seen[item[0]], item[0]),
-            )
-        ][: config.HEAD_TOP_K]
 
     def _record_debug(
         self,
@@ -304,6 +309,59 @@ def _head_hits(
         for note_id, _score in rows:
             heads.setdefault(note_id, set()).add(label)
     return heads
+
+
+def _dense_search(
+    index: IndexPort,
+    text: str,
+    k: int,
+    prompt: str | None,
+) -> list[tuple[str, float]]:
+    if prompt is None:
+        return index.dense_search(text, k)
+    try:
+        return index.dense_search(text, k, prompt=prompt)  # type: ignore[call-arg]
+    except TypeError as exc:
+        if "prompt" not in str(exc):
+            raise
+        return index.dense_search(text, k)
+
+
+def _dense_many(
+    index: IndexPort,
+    queries: list[str],
+    prompt: str | None,
+) -> list[tuple[str, float]]:
+    scores: dict[str, float] = {}
+    for query in queries:
+        for note_id, score in _dense_search(index, query, config.HEAD_TOP_K, prompt):
+            scores[note_id] = max(scores.get(note_id, float("-inf")), score)
+    return sorted(scores.items(), key=lambda item: item[1], reverse=True)[
+        : config.HEAD_TOP_K
+    ]
+
+
+def _rrf_scores(
+    *ranked_lists: list[tuple[str, float]],
+) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for rows in ranked_lists:
+        for rank, (note_id, _score) in enumerate(rows, start=1):
+            scores[note_id] = scores.get(note_id, 0.0) + (
+                1.0 / (config.RRF_K + rank)
+            )
+    return scores
+
+
+def _ordered_candidates(scores: dict[str, float]) -> list[_Candidate]:
+    first_seen = {note_id: index for index, note_id in enumerate(scores)}
+    return [
+        _Candidate(note_id, score)
+        for note_id, score in sorted(
+            scores.items(),
+            key=lambda item: (-item[1], first_seen[item[0]], item[0]),
+        )
+    ][: config.HEAD_TOP_K]
 
 
 def _rows(rows: list[tuple[Any, ...]]) -> list[list[Any]]:

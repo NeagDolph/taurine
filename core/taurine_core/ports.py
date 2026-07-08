@@ -9,7 +9,13 @@ from .schemas import GraphResponse, NoteRecord
 class IndexPort(Protocol):
     """Implemented by indexer.store.Index (unit 1). Read side used by the live loop."""
 
-    def dense_search(self, text: str, k: int) -> list[tuple[str, float]]:
+    def dense_search(
+        self,
+        text: str,
+        k: int,
+        *,
+        prompt: str | None = None,
+    ) -> list[tuple[str, float]]:
         """Embed text, cosine vs all units, per-note max. -> [(note_id, score)] desc."""
         ...
 
@@ -25,7 +31,13 @@ class IndexPort(Protocol):
         """Note-graph neighbors with facts -> [(note_id, edge_weight, fact)] desc."""
         ...
 
-    def fact_dense_search(self, text: str, k: int) -> list[tuple[str, str, float, str]]:
+    def fact_dense_search(
+        self,
+        text: str,
+        k: int,
+        *,
+        prompt: str | None = None,
+    ) -> list[tuple[str, str, float, str]]:
         """Fact dense search -> [(src, dst, score, fact_text)] desc."""
         ...
 
