@@ -228,7 +228,10 @@ def test_chat_uses_chat_query_prompt_and_store_default_stays_live_prompt(
     store.dense_search("live prompt", 1)
     store.dense_search("chat prompt", 1, prompt=config.CHAT_EMBED_QUERY_PROMPT)
 
-    assert prompts == [config.EMBED_QUERY_PROMPT, config.CHAT_EMBED_QUERY_PROMPT]
+    # the default path passes NO prompt kwarg (None): embed.embed_queries owns
+    # the None -> EMBED_QUERY_PROMPT resolution, so prompt-less fakes keep
+    # working and real TypeErrors are never masked (Stage A review finding)
+    assert prompts == [None, config.CHAT_EMBED_QUERY_PROMPT]
 
 
 def test_exact_hits_are_rank_one_and_fact_hits_credit_endpoints(monkeypatch) -> None:

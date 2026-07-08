@@ -118,13 +118,13 @@ def embed_queries(texts: list[str], *, prompt: str | None = None) -> np.ndarray:
     return real_embed_queries(texts, prompt=prompt)
 
 
-def _embed_queries_with_prompt(texts: list[str], prompt: str) -> np.ndarray:
-    try:
-        return embed_queries(texts, prompt=prompt)
-    except TypeError as exc:
-        if "prompt" not in str(exc):
-            raise
+def _embed_queries_with_prompt(texts: list[str], prompt: str | None) -> np.ndarray:
+    # None → the default spoken-conversation prompt, called WITHOUT the kwarg
+    # so prompt-less test fakes keep working and a real TypeError is never
+    # masked (review finding, Stage A)
+    if prompt is None:
         return embed_queries(texts)
+    return embed_queries(texts, prompt=prompt)
 
 
 class Index:
@@ -419,8 +419,7 @@ class Index:
         embedding_rows, matrix = self._dense_snapshot()
         if k <= 0 or matrix.size == 0:
             return []
-        query_prompt = config.EMBED_QUERY_PROMPT if prompt is None else prompt
-        query = _embed_queries_with_prompt([text], query_prompt)[0].astype(np.float32)
+        query = _embed_queries_with_prompt([text], prompt)[0].astype(np.float32)
         norm = float(np.linalg.norm(query))
         if norm == 0:
             return []
@@ -510,8 +509,7 @@ class Index:
         rows, matrix = self._fact_state
         if k <= 0 or matrix.size == 0:
             return []
-        query_prompt = config.EMBED_QUERY_PROMPT if prompt is None else prompt
-        query = _embed_queries_with_prompt([text], query_prompt)[0].astype(np.float32)
+        query = _embed_queries_with_prompt([text], prompt)[0].astype(np.float32)
         norm = float(np.linalg.norm(query))
         if norm == 0:
             return []
