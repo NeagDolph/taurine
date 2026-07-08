@@ -1,19 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { ActionableRail } from './components/ActionableRail'
 import { AmbientList } from './components/AmbientList'
-import { PinnedStack } from './components/PinnedStack'
 import { SessionControls, type ListeningState } from './components/SessionControls'
 import { StatusBar } from './components/StatusBar'
+import { SummaryPanel } from './components/SummaryPanel'
 import { TriggerInspector } from './components/TriggerInspector'
 import { PcmAudioCapture } from './lib/audio'
 import {
   SidecarClient,
+  type Actionable,
   type AmbientItem,
   type AsrState,
-  type Card,
   type ConnectorInfo,
   type IndexStatus,
   type RetrievalEvent,
   type SidecarConnectionState,
+  type SummaryEvent,
   type TriggerEvent,
   type TranscriptEvent
 } from './lib/sidecar'
@@ -56,8 +58,9 @@ function App(): React.JSX.Element {
   const [triggersBySeq, setTriggersBySeq] = useState<Map<number, TriggerEvent[]>>(new Map())
   const [inspectedTrigger, setInspectedTrigger] = useState<TriggerEvent | null>(null)
   const [ambientItems, setAmbientItems] = useState<AmbientItem[]>([])
-  const [pinnedCards, setPinnedCards] = useState<Card[]>([])
-  const [pinnedNoteIds, setPinnedNoteIds] = useState<string[]>([])
+  const [summary, setSummary] = useState<SummaryEvent | null>(null)
+  const [actionables, setActionables] = useState<Actionable[]>([])
+  const [groundedNoteIds, setGroundedNoteIds] = useState<string[]>([])
   const [lastRetrieval, setLastRetrieval] = useState<RetrievalEvent | null>(null)
 
   useEffect(() => {
@@ -89,19 +92,23 @@ function App(): React.JSX.Element {
       client.onAmbient((event) => {
         setAmbientItems(event.items)
       }),
-      client.onPin((event) => {
-        setPinnedNoteIds((current) =>
-          current.includes(event.card.note_id) ? current : [...current, event.card.note_id]
-        )
-        setPinnedCards((current) => {
-          const withoutDuplicate = current.filter(
-            (card) => card.card_id !== event.card.card_id && card.note_id !== event.card.note_id
-          )
-          return [event.card, ...withoutDuplicate].slice(0, 3)
+      client.onSummary((event) => {
+        setSummary(event)
+        setActionables(event.actionables)
+        setGroundedNoteIds((current) => {
+          const next = new Set(current)
+          event.grounding.forEach((item) => next.add(item.note_id))
+          return next.size === current.length ? current : [...next]
         })
       }),
-      client.onUnpin((event) => {
-        setPinnedCards((current) => current.filter((card) => card.card_id !== event.card_id))
+      client.onActionable((event) => {
+        setActionables((current) => {
+          const withoutItem = current.filter((item) => item.id !== event.item.id)
+          if (event.op === 'dismiss') {
+            return withoutItem
+          }
+          return [...withoutItem, event.item]
+        })
       }),
       client.onRetrieval((event) => {
         setLastRetrieval(event)
@@ -200,9 +207,13 @@ function App(): React.JSX.Element {
     setListeningState('idle')
   }, [])
 
-  const dismissCard = useCallback((cardId: string) => {
-    clientRef.current?.dismiss(cardId)
-    setPinnedCards((current) => current.filter((card) => card.card_id !== cardId))
+  const actionableStatus = useCallback((id: string, status: 'confirmed' | 'dismissed') => {
+    clientRef.current?.actionableStatus(id, status)
+    setActionables((current) =>
+      status === 'dismissed'
+        ? current.filter((item) => item.id !== id)
+        : current.map((item) => (item.id === id ? { ...item, status } : item))
+    )
   }, [])
 
   const openNote = useCallback((noteId: string) => {
@@ -226,27 +237,30 @@ function App(): React.JSX.Element {
     }
   }, [index.reenrich?.running, syncing])
 
-  const reenrichIndex = useCallback(async (source?: string) => {
-    const client = clientRef.current
-    if (!client || reenriching || syncing || index.reenrich?.running) {
-      return
-    }
+  const reenrichIndex = useCallback(
+    async (source?: string) => {
+      const client = clientRef.current
+      if (!client || reenriching || syncing || index.reenrich?.running) {
+        return
+      }
 
-    setReenriching(true)
-    setReenrichTarget(source ?? 'all')
-    setReenrichError('')
-    try {
-      const status = await client.reenrichIndex(source)
-      setIndex((current) => ({
-        ...current,
-        reenrich: status
-      }))
-    } catch (error) {
-      setReenrichError(error instanceof Error ? error.message : 'Re-enrich failed')
-    } finally {
-      setReenriching(false)
-    }
-  }, [index.reenrich?.running, reenriching, syncing])
+      setReenriching(true)
+      setReenrichTarget(source ?? 'all')
+      setReenrichError('')
+      try {
+        const status = await client.reenrichIndex(source)
+        setIndex((current) => ({
+          ...current,
+          reenrich: status
+        }))
+      } catch (error) {
+        setReenrichError(error instanceof Error ? error.message : 'Re-enrich failed')
+      } finally {
+        setReenriching(false)
+      }
+    },
+    [index.reenrich?.running, reenriching, syncing]
+  )
 
   const showDisconnectedBanner = connection !== 'connected'
 
@@ -291,7 +305,16 @@ function App(): React.JSX.Element {
       <div className="workspace-stack" style={viewStackStyle}>
         <div aria-hidden={activeTab !== 'live'} style={viewLayerStyle(activeTab === 'live')}>
           <div className="page live-page">
-            <PinnedStack cards={pinnedCards} onOpenNote={openNote} onDismiss={dismissCard} />
+            <div className="summary-row">
+              <SummaryPanel summary={summary} onOpenNote={openNote} />
+              <ActionableRail
+                actionables={actionables}
+                grounding={summary?.grounding ?? []}
+                facts={summary?.facts ?? []}
+                onStatus={actionableStatus}
+                onOpenNote={openNote}
+              />
+            </div>
             <div className="workspace">
               <main className="main-pane live-main">
                 <FeedView
@@ -302,7 +325,7 @@ function App(): React.JSX.Element {
                 />
               </main>
 
-              <AmbientList items={ambientItems} />
+              <AmbientList items={ambientItems} onOpenNote={openNote} />
             </div>
           </div>
         </div>
@@ -310,7 +333,7 @@ function App(): React.JSX.Element {
         <div aria-hidden={activeTab !== 'data'} style={viewLayerStyle(activeTab === 'data')}>
           <DataView
             latestFinalText={latestFinalText}
-            pinnedNoteIds={pinnedNoteIds}
+            groundedNoteIds={groundedNoteIds}
             profileCard={profileCard}
             refreshKey={graphVersion}
             retrieval={lastRetrieval}
@@ -367,7 +390,9 @@ function appendFinalChunk(
   }
 
   const next =
-    event.seq > 0 ? [...current.filter((item) => item.seq !== event.seq), chunk] : [...current, chunk]
+    event.seq > 0
+      ? [...current.filter((item) => item.seq !== event.seq), chunk]
+      : [...current, chunk]
   return next.sort(compareTranscriptChunks).slice(-MAX_FINAL_CHUNKS)
 }
 
@@ -379,7 +404,10 @@ function compareTranscriptChunks(left: FeedTranscript, right: FeedTranscript): n
   return left.ts - right.ts
 }
 
-function registerTrigger(current: Map<number, TriggerEvent[]>, trigger: TriggerEvent): Map<number, TriggerEvent[]> {
+function registerTrigger(
+  current: Map<number, TriggerEvent[]>,
+  trigger: TriggerEvent
+): Map<number, TriggerEvent[]> {
   const next = new Map(current)
 
   for (const seq of trigger.seqs) {

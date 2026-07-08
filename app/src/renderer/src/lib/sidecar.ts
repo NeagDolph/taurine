@@ -2,10 +2,11 @@ export const SIDECAR_WS_URL = 'ws://127.0.0.1:8930/session'
 export const SIDECAR_REST_URL = restBaseFromWsUrl(SIDECAR_WS_URL)
 
 export type AsrState = 'disconnected' | 'connecting' | 'connected' | 'error'
-export type CardProvenance = 'exact' | 'search' | 'linked'
 export type SidecarConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
-export type TriggerAction = 'pinned' | 'slated' | 'none'
+export type TriggerAction = 'grounded' | 'none'
 export type TriggerKind = 'exact' | 'search'
+export type ActionableStatus = 'open' | 'confirmed' | 'dismissed'
+export type ActionableOp = 'new' | 'update' | 'dismiss'
 export type ReenrichPhase = 'idle' | 'profile' | 'notes' | 'finalizing'
 export type ConnectorKind = 'local' | 'oauth'
 
@@ -18,11 +19,21 @@ export interface TranscriptEvent {
   seq: number
 }
 
+export interface GroundingWhy {
+  heads: string[]
+  ppr_mass: number
+  exact_alias: string
+}
+
 export interface AmbientItem {
   note_id: string
   title: string
   gist: string
   score: number
+  short_id: string
+  source: string
+  age_days: number
+  why: GroundingWhy | null
 }
 
 export interface AmbientEvent {
@@ -30,23 +41,56 @@ export interface AmbientEvent {
   items: AmbientItem[]
 }
 
-export interface Card {
-  card_id: string
+export interface GroundingItem {
   note_id: string
+  short_id: string
   title: string
-  summary: string
-  provenance: CardProvenance
-  heard: string
+  gist: string
+  source: string
+  age_days: number
+  score: number
+  why: GroundingWhy | null
 }
 
-export interface PinEvent {
-  type: 'pin'
-  card: Card
+export interface GroundedFact {
+  fact_id: string
+  src: string
+  dst: string
+  text: string
 }
 
-export interface UnpinEvent {
-  type: 'unpin'
-  card_id: string
+export interface SummaryHighlight {
+  fact_id: string
+  why: string
+}
+
+export interface Actionable {
+  id: string
+  title: string
+  quote: string
+  assignee: string
+  due: string
+  grounding: string[]
+  why_new: string
+  confidence: number
+  status: ActionableStatus
+}
+
+export interface SummaryEvent {
+  type: 'summary'
+  rev: number
+  summary_md: string
+  highlights: SummaryHighlight[]
+  actionables: Actionable[]
+  grounding: GroundingItem[]
+  facts: GroundedFact[]
+  updated_at: number
+}
+
+export interface ActionableEvent {
+  type: 'actionable'
+  op: ActionableOp
+  item: Actionable
 }
 
 export interface Hit {
@@ -60,6 +104,7 @@ export interface Expansion {
   note_id: string
   hop: number
   score: number
+  via: 'graph' | 'ppr'
 }
 
 export interface RetrievalEvent {
@@ -155,8 +200,8 @@ export interface StatusEvent {
 export type SidecarEvent =
   | TranscriptEvent
   | AmbientEvent
-  | PinEvent
-  | UnpinEvent
+  | SummaryEvent
+  | ActionableEvent
   | RetrievalEvent
   | TriggerEvent
   | StatusEvent
@@ -177,7 +222,7 @@ type Unsubscribe = () => void
 type JsonControlMessage =
   | { type: 'start'; channels: Array<{ id: number; label: string }> }
   | { type: 'stop' }
-  | { type: 'dismiss'; card_id: string }
+  | { type: 'actionable_status'; id: string; status: 'confirmed' | 'dismissed' }
   | { type: 'open_note'; note_id: string }
 
 const INITIAL_RECONNECT_MS = 500
@@ -193,8 +238,8 @@ export class SidecarClient {
 
   private readonly transcriptCallbacks = new Set<Callback<TranscriptEvent>>()
   private readonly ambientCallbacks = new Set<Callback<AmbientEvent>>()
-  private readonly pinCallbacks = new Set<Callback<PinEvent>>()
-  private readonly unpinCallbacks = new Set<Callback<UnpinEvent>>()
+  private readonly summaryCallbacks = new Set<Callback<SummaryEvent>>()
+  private readonly actionableCallbacks = new Set<Callback<ActionableEvent>>()
   private readonly retrievalCallbacks = new Set<Callback<RetrievalEvent>>()
   private readonly triggerCallbacks = new Set<Callback<TriggerEvent>>()
   private readonly statusCallbacks = new Set<Callback<StatusEvent>>()
@@ -205,7 +250,10 @@ export class SidecarClient {
   }
 
   connect(): void {
-    if (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) {
+    if (
+      this.socket?.readyState === WebSocket.OPEN ||
+      this.socket?.readyState === WebSocket.CONNECTING
+    ) {
       return
     }
 
@@ -233,8 +281,8 @@ export class SidecarClient {
     this.sendJson({ type: 'stop' })
   }
 
-  dismiss(cardId: string): void {
-    this.sendJson({ type: 'dismiss', card_id: cardId })
+  actionableStatus(id: string, status: 'confirmed' | 'dismissed'): void {
+    this.sendJson({ type: 'actionable_status', id, status })
   }
 
   openNote(noteId: string): void {
@@ -255,16 +303,20 @@ export class SidecarClient {
   }
 
   async reenrichIndex(source?: string): Promise<ReenrichStatus> {
-    const path = source
-      ? `/index/reenrich?source=${encodeURIComponent(source)}`
-      : '/index/reenrich'
-    const payload = await requestSidecarJson(path, { method: 'POST' }, { baseUrl: this.restBaseUrl })
-    return parseReenrichStatus(payload) ?? {
-      running: true,
-      phase: 'profile',
-      done: 0,
-      total: 0
-    }
+    const path = source ? `/index/reenrich?source=${encodeURIComponent(source)}` : '/index/reenrich'
+    const payload = await requestSidecarJson(
+      path,
+      { method: 'POST' },
+      { baseUrl: this.restBaseUrl }
+    )
+    return (
+      parseReenrichStatus(payload) ?? {
+        running: true,
+        phase: 'profile',
+        done: 0,
+        total: 0
+      }
+    )
   }
 
   onTranscript(callback: Callback<TranscriptEvent>): Unsubscribe {
@@ -275,12 +327,12 @@ export class SidecarClient {
     return this.addCallback(this.ambientCallbacks, callback)
   }
 
-  onPin(callback: Callback<PinEvent>): Unsubscribe {
-    return this.addCallback(this.pinCallbacks, callback)
+  onSummary(callback: Callback<SummaryEvent>): Unsubscribe {
+    return this.addCallback(this.summaryCallbacks, callback)
   }
 
-  onUnpin(callback: Callback<UnpinEvent>): Unsubscribe {
-    return this.addCallback(this.unpinCallbacks, callback)
+  onActionable(callback: Callback<ActionableEvent>): Unsubscribe {
+    return this.addCallback(this.actionableCallbacks, callback)
   }
 
   onRetrieval(callback: Callback<RetrievalEvent>): Unsubscribe {
@@ -350,7 +402,10 @@ export class SidecarClient {
     this.clearReconnectTimer()
     this.reconnectAttempt += 1
 
-    const delay = Math.min(MAX_RECONNECT_MS, INITIAL_RECONNECT_MS * 2 ** (this.reconnectAttempt - 1))
+    const delay = Math.min(
+      MAX_RECONNECT_MS,
+      INITIAL_RECONNECT_MS * 2 ** (this.reconnectAttempt - 1)
+    )
     this.emitConnection({ state: 'reconnecting', retryInMs: delay })
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null
@@ -382,11 +437,11 @@ export class SidecarClient {
       case 'ambient':
         this.emit(this.ambientCallbacks, event)
         break
-      case 'pin':
-        this.emit(this.pinCallbacks, event)
+      case 'summary':
+        this.emit(this.summaryCallbacks, event)
         break
-      case 'unpin':
-        this.emit(this.unpinCallbacks, event)
+      case 'actionable':
+        this.emit(this.actionableCallbacks, event)
         break
       case 'retrieval':
         this.emit(this.retrievalCallbacks, event)
@@ -429,7 +484,11 @@ export async function enableConnector(
   connectorId: string,
   options: SidecarRequestOptions = {}
 ): Promise<void> {
-  await requestSidecar(`/connectors/${encodeURIComponent(connectorId)}/enable`, { method: 'POST' }, options)
+  await requestSidecar(
+    `/connectors/${encodeURIComponent(connectorId)}/enable`,
+    { method: 'POST' },
+    options
+  )
 }
 
 export async function disableConnector(
@@ -487,7 +546,11 @@ export async function fetchNotePreview(
   noteId: string,
   options: SidecarRequestOptions = {}
 ): Promise<NotePreview> {
-  const payload = await requestSidecarJson(`/notes/${encodeURIComponent(noteId)}`, { method: 'GET' }, options)
+  const payload = await requestSidecarJson(
+    `/notes/${encodeURIComponent(noteId)}`,
+    { method: 'GET' },
+    options
+  )
   return parseNotePreview(payload)
 }
 
@@ -575,10 +638,10 @@ function parseSidecarEvent(raw: string): SidecarEvent | null {
       return parseTranscript(record)
     case 'ambient':
       return parseAmbient(record)
-    case 'pin':
-      return parsePin(record)
-    case 'unpin':
-      return parseUnpin(record)
+    case 'summary':
+      return parseSummary(record)
+    case 'actionable':
+      return parseActionable(record)
     case 'retrieval':
       return parseRetrieval(record)
     case 'trigger':
@@ -640,53 +703,156 @@ function parseAmbientItem(value: unknown): AmbientItem | null {
     note_id: record.note_id,
     title: record.title,
     gist: record.gist,
-    score: record.score
+    score: record.score,
+    short_id: typeof record.short_id === 'string' ? record.short_id : '',
+    source: typeof record.source === 'string' ? record.source : 'apple_notes',
+    age_days: typeof record.age_days === 'number' ? record.age_days : 0,
+    why: parseGroundingWhy(record.why)
   }
 }
 
-function parsePin(record: Record<string, unknown>): PinEvent | null {
-  const card = parseCard(record.card)
-  if (!card) {
+function parseGroundingWhy(value: unknown): GroundingWhy | null {
+  const record = asRecord(value)
+  if (!record) {
     return null
   }
 
-  return { type: 'pin', card }
+  const heads = Array.isArray(record.heads)
+    ? record.heads.filter((head): head is string => typeof head === 'string')
+    : []
+
+  return {
+    heads,
+    ppr_mass: typeof record.ppr_mass === 'number' ? record.ppr_mass : 0,
+    exact_alias: typeof record.exact_alias === 'string' ? record.exact_alias : ''
+  }
 }
 
-function parseCard(value: unknown): Card | null {
+function parseSummary(record: Record<string, unknown>): SummaryEvent | null {
+  if (typeof record.rev !== 'number' || typeof record.summary_md !== 'string') {
+    return null
+  }
+
+  const highlights = Array.isArray(record.highlights)
+    ? record.highlights.map(parseSummaryHighlight).filter(isNotNull)
+    : []
+  const actionables = Array.isArray(record.actionables)
+    ? record.actionables.map(parseActionableItem).filter(isNotNull)
+    : []
+  const grounding = Array.isArray(record.grounding)
+    ? record.grounding.map(parseGroundingItem).filter(isNotNull)
+    : []
+  const facts = Array.isArray(record.facts)
+    ? record.facts.map(parseGroundedFact).filter(isNotNull)
+    : []
+
+  return {
+    type: 'summary',
+    rev: record.rev,
+    summary_md: record.summary_md,
+    highlights,
+    actionables,
+    grounding,
+    facts,
+    updated_at: typeof record.updated_at === 'number' ? record.updated_at : 0
+  }
+}
+
+function parseSummaryHighlight(value: unknown): SummaryHighlight | null {
+  const record = asRecord(value)
+  if (!record || typeof record.fact_id !== 'string' || typeof record.why !== 'string') {
+    return null
+  }
+
+  return { fact_id: record.fact_id, why: record.why }
+}
+
+function parseGroundingItem(value: unknown): GroundingItem | null {
   const record = asRecord(value)
   if (
     !record ||
-    typeof record.card_id !== 'string' ||
     typeof record.note_id !== 'string' ||
+    typeof record.short_id !== 'string' ||
     typeof record.title !== 'string' ||
-    typeof record.summary !== 'string' ||
-    !isCardProvenance(record.provenance) ||
-    typeof record.heard !== 'string'
+    typeof record.gist !== 'string'
   ) {
     return null
   }
 
   return {
-    card_id: record.card_id,
     note_id: record.note_id,
+    short_id: record.short_id,
     title: record.title,
-    summary: record.summary,
-    provenance: record.provenance,
-    heard: record.heard
+    gist: record.gist,
+    source: typeof record.source === 'string' ? record.source : 'apple_notes',
+    age_days: typeof record.age_days === 'number' ? record.age_days : 0,
+    score: typeof record.score === 'number' ? record.score : 0,
+    why: parseGroundingWhy(record.why)
   }
 }
 
-function parseUnpin(record: Record<string, unknown>): UnpinEvent | null {
-  if (typeof record.card_id !== 'string') {
+function parseGroundedFact(value: unknown): GroundedFact | null {
+  const record = asRecord(value)
+  if (
+    !record ||
+    typeof record.fact_id !== 'string' ||
+    typeof record.src !== 'string' ||
+    typeof record.dst !== 'string' ||
+    typeof record.text !== 'string'
+  ) {
     return null
   }
 
-  return { type: 'unpin', card_id: record.card_id }
+  return { fact_id: record.fact_id, src: record.src, dst: record.dst, text: record.text }
+}
+
+function parseActionable(record: Record<string, unknown>): ActionableEvent | null {
+  const item = parseActionableItem(record.item)
+  if (!item || !isActionableOp(record.op)) {
+    return null
+  }
+
+  return { type: 'actionable', op: record.op, item }
+}
+
+function parseActionableItem(value: unknown): Actionable | null {
+  const record = asRecord(value)
+  if (
+    !record ||
+    typeof record.id !== 'string' ||
+    typeof record.title !== 'string' ||
+    typeof record.quote !== 'string'
+  ) {
+    return null
+  }
+
+  const grounding = Array.isArray(record.grounding)
+    ? record.grounding.filter((id): id is string => typeof id === 'string')
+    : []
+
+  return {
+    id: record.id,
+    title: record.title,
+    quote: record.quote,
+    assignee: typeof record.assignee === 'string' ? record.assignee : '',
+    due: typeof record.due === 'string' ? record.due : '',
+    grounding,
+    why_new: typeof record.why_new === 'string' ? record.why_new : '',
+    confidence: typeof record.confidence === 'number' ? record.confidence : 0,
+    status: isActionableStatus(record.status) ? record.status : 'open'
+  }
+}
+
+function isNotNull<T>(value: T | null): value is T {
+  return value !== null
 }
 
 function parseRetrieval(record: Record<string, unknown>): RetrievalEvent | null {
-  if (typeof record.heard !== 'string' || !Array.isArray(record.hits) || !Array.isArray(record.expansions)) {
+  if (
+    typeof record.heard !== 'string' ||
+    !Array.isArray(record.hits) ||
+    !Array.isArray(record.expansions)
+  ) {
     return null
   }
 
@@ -746,7 +912,8 @@ function parseExpansion(value: unknown): Expansion | null {
     from_note_id: record.from_note_id,
     note_id: record.note_id,
     hop: record.hop,
-    score: record.score
+    score: record.score,
+    via: record.via === 'ppr' ? 'ppr' : 'graph'
   }
 }
 
@@ -959,16 +1126,20 @@ export function parseReenrichStatus(value: unknown): ReenrichStatus | null {
   }
 }
 
-function isCardProvenance(value: unknown): value is CardProvenance {
-  return value === 'exact' || value === 'search' || value === 'linked'
-}
-
 function isTriggerKind(value: unknown): value is TriggerKind {
   return value === 'exact' || value === 'search'
 }
 
 function isTriggerAction(value: unknown): value is TriggerAction {
-  return value === 'pinned' || value === 'slated' || value === 'none'
+  return value === 'grounded' || value === 'none'
+}
+
+function isActionableStatus(value: unknown): value is ActionableStatus {
+  return value === 'open' || value === 'confirmed' || value === 'dismissed'
+}
+
+function isActionableOp(value: unknown): value is ActionableOp {
+  return value === 'new' || value === 'update' || value === 'dismiss'
 }
 
 function isReenrichPhase(value: unknown): value is ReenrichPhase {
@@ -980,7 +1151,9 @@ function isConnectorKind(value: unknown): value is ConnectorKind {
 }
 
 function isAsrState(value: unknown): value is AsrState {
-  return value === 'disconnected' || value === 'connecting' || value === 'connected' || value === 'error'
+  return (
+    value === 'disconnected' || value === 'connecting' || value === 'connected' || value === 'error'
+  )
 }
 
 function parseNumberArray(value: unknown): number[] | null {
@@ -1017,7 +1190,10 @@ export async function fetchProfile(options: SidecarRequestOptions = {}): Promise
   return null
 }
 
-export async function saveProfile(card: string, options: SidecarRequestOptions = {}): Promise<void> {
+export async function saveProfile(
+  card: string,
+  options: SidecarRequestOptions = {}
+): Promise<void> {
   await requestSidecar(
     '/profile',
     {

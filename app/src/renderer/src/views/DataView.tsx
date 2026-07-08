@@ -7,7 +7,7 @@ interface DataViewProps {
   visible: boolean
   latestFinalText: string
   retrieval: RetrievalEvent | null
-  pinnedNoteIds: string[]
+  groundedNoteIds: string[]
   profileCard: string | null | undefined
   refreshKey: number
 }
@@ -28,7 +28,7 @@ export function DataView({
   visible,
   latestFinalText,
   retrieval,
-  pinnedNoteIds,
+  groundedNoteIds,
   profileCard,
   refreshKey
 }: DataViewProps): React.JSX.Element {
@@ -69,7 +69,7 @@ export function DataView({
       <section className="panel-card map-panel" style={{ height: mapHeight }}>
         <MapView
           latestFinalText={latestFinalText}
-          pinnedNoteIds={pinnedNoteIds}
+          groundedNoteIds={groundedNoteIds}
           refreshKey={refreshKey}
           retrieval={retrieval}
           visible={visible}

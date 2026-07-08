@@ -32,7 +32,7 @@ interface MapViewProps {
   refreshKey?: number
   latestFinalText: string
   retrieval: RetrievalEvent | null
-  pinnedNoteIds: string[]
+  groundedNoteIds: string[]
 }
 
 type GraphLinkObject = LinkObject<MapNode, MapLink>
@@ -45,7 +45,7 @@ export function MapView({
   refreshKey = 0,
   latestFinalText,
   retrieval,
-  pinnedNoteIds
+  groundedNoteIds
 }: MapViewProps): React.JSX.Element {
   const graphRef = useRef<ForceGraphMethods<MapNode, MapLink> | undefined>(undefined)
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -64,7 +64,7 @@ export function MapView({
   const [selectedSources, setSelectedSources] = useState<Set<string>>(() => new Set())
 
   const nowLabel = useMemo(() => nowLabelFromText(latestFinalText), [latestFinalText])
-  const pinnedSet = useMemo(() => new Set(pinnedNoteIds), [pinnedNoteIds])
+  const pinnedSet = useMemo(() => new Set(groundedNoteIds), [groundedNoteIds])
   const sourceIds = useMemo(() => sourcesFromMapData(baseGraph), [baseGraph])
 
   const schedulePrune = useCallback(() => {
@@ -315,7 +315,7 @@ export function MapView({
       }
 
       if (isPinned) {
-        // yellow ring for pinned notes
+        // yellow ring for grounding notes
         ctx.beginPath()
         ctx.arc(x, y, radius + 5, 0, Math.PI * 2)
         ctx.strokeStyle = 'rgba(245, 197, 24, 0.95)'
@@ -389,11 +389,7 @@ export function MapView({
           : `${noteCount} notes · ${baseGraph.links.length} links`
 
   return (
-    <section
-      aria-hidden={!visible}
-      aria-label="Map view"
-      className="map-view"
-    >
+    <section aria-hidden={!visible} aria-label="Map view" className="map-view">
       <div className="map-controls">
         <label className="map-search-field">
           <span className="sr-only">Search map titles</span>
@@ -479,7 +475,7 @@ export function MapView({
           </span>
           <span className="map-legend-row">
             <span className="map-legend-ring" aria-hidden="true" />
-            pinned note
+            grounding note
           </span>
           {sourceIds.map((source) => (
             <span className="map-legend-row" key={`legend-${source}`}>
@@ -547,7 +543,9 @@ function linkOpacity(
 
   const sourceId = endpointId(link.source)
   const targetId = endpointId(link.target)
-  const noteIds = [sourceId, targetId].filter((id): id is string => Boolean(id && id !== NOW_NODE_ID))
+  const noteIds = [sourceId, targetId].filter((id): id is string =>
+    Boolean(id && id !== NOW_NODE_ID)
+  )
   return noteIds.some((id) => matchedNodeIds.has(id)) ? baseOpacity : 0.06
 }
 

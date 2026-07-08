@@ -8,14 +8,12 @@ interface TriggerInspectorProps {
 }
 
 const actionLabels: Record<TriggerAction, string> = {
-  pinned: 'Pinned',
-  slated: 'Slated',
+  grounded: 'Grounded',
   none: 'No action'
 }
 
 const exactActionContext: Record<TriggerAction, string> = {
-  pinned: 'pinned instantly',
-  slated: 'added to slate',
+  grounded: 'entered the grounding set',
   none: 'no action'
 }
 
@@ -104,12 +102,14 @@ export function TriggerInspector({
             ) : (
               matches.map((match) => {
                 const viaTitle = match.via_note_id
-                  ? titleByNoteId.get(match.via_note_id) ?? match.via_note_id
+                  ? (titleByNoteId.get(match.via_note_id) ?? match.via_note_id)
                   : ''
 
                 return (
                   <tr
-                    className={isExpandedSearchMatch(trigger, match) ? 'trigger-match-expanded' : ''}
+                    className={
+                      isExpandedSearchMatch(trigger, match) ? 'trigger-match-expanded' : ''
+                    }
                     key={matchKey(match)}
                   >
                     <td>
@@ -120,10 +120,14 @@ export function TriggerInspector({
                         </div>
                       ) : null}
                       {trigger.kind === 'exact' ? (
-                        <div className="trigger-match-context">{exactActionContext[trigger.action]}</div>
+                        <div className="trigger-match-context">
+                          {exactActionContext[trigger.action]}
+                        </div>
                       ) : null}
                     </td>
-                    {isSearch ? <td>{typeof match.rank === 'number' ? `#${match.rank}` : 'linked'}</td> : null}
+                    {isSearch ? (
+                      <td>{typeof match.rank === 'number' ? `#${match.rank}` : 'linked'}</td>
+                    ) : null}
                     <td>{formatScore(match.score)}</td>
                     <td>
                       <button
@@ -176,7 +180,12 @@ function isExpandedSearchMatch(trigger: TriggerEvent, match: TriggerMatch): bool
 }
 
 function matchKey(match: TriggerMatch): string {
-  return [match.note_id, match.rank ?? 'linked', match.via_note_id ?? 'direct', match.hop ?? 0].join('-')
+  return [
+    match.note_id,
+    match.rank ?? 'linked',
+    match.via_note_id ?? 'direct',
+    match.hop ?? 0
+  ].join('-')
 }
 
 function formatScore(score: number): string {
