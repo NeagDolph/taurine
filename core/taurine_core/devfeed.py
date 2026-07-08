@@ -34,6 +34,11 @@ async def run_devfeed(
             if not text:
                 continue
             await session.on_chunk(Chunk(channel=0, text=text, ts=now(), final=True))
+        # an accepted summarizer pass may still be in flight; wait for it so
+        # its events and session-log records land before the logger closes
+        summary_task = getattr(session, "_summary_task", None)
+        if summary_task is not None:
+            await summary_task
     finally:
         logger.close()
 
