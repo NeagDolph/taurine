@@ -59,8 +59,7 @@ def console_line(kind: str, payload: dict[str, Any]) -> str | None:
     """Lean one-line console rendering of a session-log record.
 
     Returns None for records that are noise at console granularity (interim
-    chunks, routine slate adds, debounce/same-revision cadence blocks) — the
-    JSONL file always has everything.
+    chunks) — the JSONL file always has everything.
     """
     if kind == "session_start":
         return f"session started (channels={payload.get('channels')})"
@@ -83,44 +82,13 @@ def console_line(kind: str, payload: dict[str, Any]) -> str | None:
             f"{payload.get('action')} “{_short(target, 40)}”"
         )
     if kind == "c2_pass":
-        ordered = payload.get("ordered") or []
-        expansions = payload.get("expansions") or []
-        adds = payload.get("slate_adds") or []
-        rerank = "rerank ok" if payload.get("rerank_used") else (
-            f"rerank FAILED: {_short(payload.get('rerank_error'), 40)}"
-            if payload.get("rerank_error")
-            else "rerank off"
-        )
-        top = f" top={_note_ref(ordered[0][0])}" if ordered else ""
+        grounding_ids = payload.get("grounding_ids") or []
+        ppr_top = payload.get("ppr_top") or []
+        top = f" top={_note_ref(grounding_ids[0])}" if grounding_ids else ""
         spans = _span_summary(payload.get("gliner_spans"))
         return (
             f"c2 {_seq_range(payload.get('seqs') or [])} “{_short(payload.get('window'), 40)}” → "
-            f"{len(ordered)} ranked, {len(expansions)} via graph, {rerank}, "
-            f"+{len(adds)} slated{top}{spans}"
-        )
-    if kind == "slate":
-        op = payload.get("op")
-        if op in ("add", "renew"):
-            return None  # summarized by the c1/c2 lines
-        return (
-            f"slate {op} {_note_ref(payload.get('note_id'))}"
-            f" ({payload.get('reason') or payload.get('source') or ''}) rev={payload.get('revision')}"
-        )
-    if kind == "cadence":
-        if payload.get("decision"):
-            return f"cadence ✓ rev={payload.get('revision')}"
-        reason = payload.get("reason")
-        if reason in ("debounce", "same_revision"):
-            return None  # constant chatter at chunk rate
-        return f"cadence ✗ {reason} rev={payload.get('revision')}"
-    if kind == "presenter":
-        if payload.get("error"):
-            return f"presenter ERROR: {_short(payload.get('error'), 64)}"
-        picks = payload.get("picks") or []
-        picked = ", ".join(_note_ref(p.get("note_id", "?")) for p in picks) if picks else "empty"
-        return (
-            f"presenter {payload.get('model_used')} {round(payload.get('latency_ms') or 0)}ms → "
-            f"{picked}"
+            f"{len(grounding_ids)} grounded, {len(ppr_top)} ppr{top}{spans}"
         )
     if kind == KIND_GROUNDING:
         mark = "✓" if payload.get("trigger_decision") else "✗"
@@ -147,14 +115,6 @@ def console_line(kind: str, payload: dict[str, Any]) -> str | None:
             f"summary {payload.get('model')} {round(payload.get('latency_ms') or 0)}ms "
             f"actions={len(accepted)}"
         )
-    if kind == "pin":
-        target = payload.get("title") or _note_ref(payload.get("note_id"))
-        return (
-            f"pin [{payload.get('provenance')}] “{_short(target, 40)}” — "
-            f"{_short(payload.get('summary'), 48)}"
-        )
-    if kind == "unpin":
-        return f"unpin ({payload.get('reason')})"
     return f"{kind}: {_short(payload, 80)}"
 
 

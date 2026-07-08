@@ -1,40 +1,41 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from inspect import isawaitable
 from typing import Any, Protocol
 from uuid import uuid4
 
+import numpy as np
+
 from taurine_core import config
+from taurine_core.indexer import store
 from taurine_core.ports import IndexPort
 from taurine_core.schemas import (
+    Actionable,
+    ActionableEvent,
     AmbientEvent,
     AmbientItem,
-    Card,
     Chunk,
     Expansion,
     Hit,
-    PinEvent,
-    Pick,
-    RetrievalResult,
+    MeetingSummary,
     RetrievalEvent,
-    SlateItem,
+    RetrievalResult,
+    SummaryEvent,
     TranscriptEvent,
     TriggerEvent,
     TriggerMatch,
-    UnpinEvent,
 )
-from taurine_core.session_log import NullSessionLogger
+from taurine_core.session_log import NullSessionLogger, log_grounding, log_summary
 
 from .ambient import AmbientRetriever
-from .cadence import Cadence
 from .exact import ExactCollector
 from .grounding import GroundingUpdate
-from .slate import Slate
 
 
-Event = TranscriptEvent | AmbientEvent | PinEvent | UnpinEvent | RetrievalEvent | TriggerEvent
+Event = TranscriptEvent | AmbientEvent | SummaryEvent | ActionableEvent | RetrievalEvent | TriggerEvent
 EventSink = Callable[[Event], Awaitable[None] | None]
 
 
@@ -43,16 +44,27 @@ class Clock(Protocol):
         ...
 
 
-class PresenterLike(Protocol):
-    async def present(
+class TriggerLike(Protocol):
+    def offer(
         self,
-        transcript: list[Chunk],
-        slate: list[SlateItem],
-        via_titles: dict[str, str],
-        *,
-        revision: int | None = None,
-        partials: dict[int, str] | None = None,
-    ) -> list[Pick]:
+        update: GroundingUpdate,
+        window_emb: np.ndarray | None,
+        new_chars: int,
+    ) -> tuple[bool, str]:
+        ...
+
+    def note_summary(self, update: GroundingUpdate, *, no_update: bool) -> None:
+        ...
+
+
+class SummarizerLike(Protocol):
+    async def summarize(
+        self,
+        state: MeetingSummary | None,
+        transcript_delta: str,
+        update: GroundingUpdate,
+        open_actionables: list[Actionable],
+    ) -> Any:
         ...
 
 
@@ -71,30 +83,31 @@ class LiveSession:
         self,
         *,
         index: IndexPort,
-        slate: Slate,
-        cadence: Cadence,
         exact: ExactCollector,
         ambient: AmbientRetriever,
-        presenter: PresenterLike,
+        trigger: TriggerLike,
+        summarizer: SummarizerLike,
         emit: EventSink,
         clock: Clock | None = None,
         logger: LoggerLike | None = None,
     ) -> None:
         self._index = index
-        self._slate = slate
-        self._cadence = cadence
         self._exact = exact
         self._ambient = ambient
-        self._presenter = presenter
+        self._trigger = trigger
+        self._summarizer = summarizer
         self._emit = emit
         self._clock = clock or _SystemClock()
         self._logger = logger or NullSessionLogger()
         self._transcript: list[Chunk] = []
         self._partials: dict[int, str] = {}
         self._c1_segment_seen: dict[int, set[str]] = {}
-        self._pinned: list[Card] = []
         self._next_seq = 1
         self.last_grounding: GroundingUpdate | None = None
+        self._summary: MeetingSummary | None = None
+        self._actionables: list[Actionable] = []
+        self._transcript_delta = ""
+        self._summary_task: asyncio.Task[None] | None = None
 
     async def on_chunk(self, chunk: Chunk) -> None:
         chunk = self._chunk_with_seq(chunk)
@@ -119,34 +132,46 @@ class LiveSession:
             self._partials[chunk.channel] = chunk.text
             await self._run_c1(chunk)
             await self._run_c2()
-            await self._run_presenter()
             return
 
         self._partials.pop(chunk.channel, None)
         self._transcript.append(chunk)
+        self._append_transcript_delta(chunk)
         await self._run_c1(chunk)
         self._c1_segment_seen.pop(chunk.channel, None)
         await self._run_c2()
-        await self._run_presenter()
 
-    async def dismiss(self, card_id: str) -> None:
-        card = next((candidate for candidate in self._pinned if candidate.card_id == card_id), None)
-        if card is None:
+    def current_summary(self) -> MeetingSummary:
+        return self._summary.model_copy(deep=True) if self._summary is not None else MeetingSummary()
+
+    async def set_actionable_status(
+        self,
+        actionable_id: str,
+        status: str,
+    ) -> None:
+        if status not in {"confirmed", "dismissed"}:
+            return
+        actionables = self._summary.actionables if self._summary is not None else self._actionables
+        for index, item in enumerate(actionables):
+            if item.id != actionable_id:
+                continue
+            updated = item.model_copy(update={"status": status})
+            updated_actionables = list(actionables)
+            updated_actionables[index] = updated
+            self._actionables = updated_actionables
+            if self._summary is not None:
+                self._summary = self._summary.model_copy(
+                    update={"actionables": updated_actionables}
+                )
+            await self._emit_event(
+                ActionableEvent(
+                    op="dismiss" if status == "dismissed" else "update",
+                    item=updated,
+                )
+            )
             return
 
-        before_revision = self._slate.revision
-        self._pinned = [candidate for candidate in self._pinned if candidate.card_id != card_id]
-        self._slate.dismiss(card.note_id, now=self._clock.now())
-        self._logger.log("unpin", card_id=card_id, reason="dismissed")
-        await self._emit_event(UnpinEvent(card_id=card_id))
-        await self._emit_ambient_if_changed(before_revision)
-
-    def slate_items(self) -> list[SlateItem]:
-        return self._slate.items()
-
     async def _run_c1(self, chunk: Chunk) -> None:
-        before_revision = self._slate.revision
-        now = self._clock.now()
         segment_seen = self._c1_segment_seen.setdefault(chunk.channel, set())
         seqs = [chunk.seq] if chunk.final else []
         for note_id, alias, is_title in self._exact.on_chunk(chunk):
@@ -156,79 +181,21 @@ class LiveSession:
             note = self._index.note(note_id)
             if note is None:
                 continue
-            if (
-                is_title
-                and note_id not in self._slate.shown
-                and self._cadence.instant_pin_allowed(now=now)
-            ):
-                await self._emit_trigger(
-                    TriggerEvent(
-                        trigger_id=_trigger_id(),
-                        kind="exact",
-                        seqs=seqs,
-                        span=alias,
-                        matches=[
-                            TriggerMatch(
-                                note_id=note_id,
-                                title=note.title,
-                                score=1.0,
-                            )
-                        ],
-                        action="pinned",
-                    )
-                )
-                self._logger.log(
-                    "c1_hit",
-                    seq=chunk.seq,
-                    alias=alias,
-                    note_id=note_id,
-                    title=note.title,
-                    is_title=is_title,
-                    action="pinned",
-                )
-                await self._pin(
-                    Card(
-                        card_id=_card_id(note_id),
+            event = TriggerEvent(
+                trigger_id=_trigger_id(),
+                kind="exact",
+                seqs=seqs,
+                span=alias,
+                matches=[
+                    TriggerMatch(
                         note_id=note_id,
                         title=note.title,
-                        summary=note.gist,
-                        provenance="exact",
-                        heard=chunk.text,
+                        score=1.0,
                     )
-                )
-                continue
-            # rate-capped title hits fall through to a slate add
-
-            add_revision = self._slate.revision
-            self._slate.add(
-                SlateItem(
-                    note_id=note_id,
-                    title=note.title,
-                    gist=note.gist,
-                    score=1.0,
-                    source="exact",
-                    heard=chunk.text,
-                    decay=config.DECAY_EXACT,
-                    added_rev=0,
-                )
+                ],
+                action="grounded",
             )
-            action = "slated" if self._slate.revision != add_revision else "none"
-            await self._emit_trigger(
-                TriggerEvent(
-                    trigger_id=_trigger_id(),
-                    kind="exact",
-                    seqs=seqs,
-                    span=alias,
-                    matches=[
-                        TriggerMatch(
-                            note_id=note_id,
-                            title=note.title,
-                            score=1.0,
-                        )
-                    ],
-                    action=action,
-                )
-            )
+            await self._emit_event(event)
             self._logger.log(
                 "c1_hit",
                 seq=chunk.seq,
@@ -236,9 +203,8 @@ class LiveSession:
                 note_id=note_id,
                 title=note.title,
                 is_title=is_title,
-                action=action,
+                action="grounded",
             )
-        await self._emit_ambient_if_changed(before_revision)
 
     async def _run_c2(self) -> None:
         window_chunks = self._window_chunks()
@@ -250,7 +216,6 @@ class LiveSession:
         ]
         context_text = self._window_text(context_chunks, self._active_partials())
 
-        before_revision = self._slate.revision
         ambient_result = await self._ambient.on_window(window_text, context_text=context_text)
         if ambient_result is None:
             return
@@ -261,35 +226,23 @@ class LiveSession:
             else getattr(self._ambient, "last_grounding", None)
         )
         self.last_grounding = grounding
-        result = (
-            self._retrieval_from_grounding(window_text, grounding)
-            if grounding is not None
-            else ambient_result
-        )
-        slate_adds = (
-            self._slate_items_from_grounding(grounding, window_text)
-            if grounding is not None
-            else list(getattr(self._ambient, "last_slate_adds", []))
-        )
+        if grounding is None:
+            return
 
+        result = self._retrieval_from_grounding(window_text, grounding)
         trigger_id = _trigger_id()
-        for item in slate_adds:
-            self._slate.add(item)
-        slate_ids = {item.note_id for item in self._slate.items()}
-        survived_adds = [item.note_id for item in slate_adds if item.note_id in slate_ids]
         seqs = [chunk.seq for chunk in window_chunks]
-        await self._emit_trigger(
+        await self._emit_event(
             TriggerEvent(
                 trigger_id=trigger_id,
                 kind="search",
                 seqs=seqs,
                 span=result.heard,
                 matches=self._search_trigger_matches(result),
-                action="slated" if survived_adds else "none",
+                action="grounded" if grounding.items else "none",
             )
         )
-        self._log_c2_pass(trigger_id, seqs, result, survived_adds)
-
+        self._log_c2_pass(trigger_id, seqs, result, grounding)
         await self._emit_event(
             RetrievalEvent(
                 heard=result.heard,
@@ -300,110 +253,139 @@ class LiveSession:
                 extracted=result.extracted,
             )
         )
-        await self._emit_ambient_if_changed(before_revision)
+        await self._emit_ambient(grounding)
+        await self._offer_summary(grounding, window_text, ambient_result)
 
-    async def _run_presenter(self) -> None:
-        prompted_items = self._slate.items()
-        if not prompted_items:
+    async def _offer_summary(
+        self,
+        update: GroundingUpdate,
+        window_text: str,
+        ambient_result: Any,
+    ) -> None:
+        window_embedding = self._window_embedding(ambient_result, window_text)
+        fire, reason = self._trigger.offer(
+            update,
+            window_embedding,
+            len(self._transcript_delta),
+        )
+        if fire and self._summary_in_flight():
+            log_grounding(self._logger, update, decision=False, reason="in_flight")
+            return
+        log_grounding(self._logger, update, decision=fire, reason=reason)
+        if not fire:
             return
 
-        now = self._clock.now()
-        attempt_revision = self._slate.revision
-        reason = self._cadence.explain(attempt_revision, now=now)
-        decision = self._cadence.may_present(attempt_revision, now=now)
-        self._logger.log(
-            "cadence",
-            decision=decision,
-            revision=attempt_revision,
-            reason=reason,
-        )
-        if not decision:
-            return
-
-        self._cadence.note_attempt(now=now)
-        picks = await self._presenter.present(
-            self._transcript,
-            prompted_items,
-            self._via_titles(prompted_items),
-            revision=attempt_revision,
-            partials=self._active_partials() or None,
-        )
-
-        self._slate.mark_viewed([item.note_id for item in prompted_items])
-        if not picks:
-            self._cadence.note_empty(attempt_revision, now=now)
-            await self._emit_ambient_if_changed(attempt_revision)
-            return
-
-        item_by_id = {item.note_id: item for item in prompted_items}
-        before_revision = self._slate.revision
-        promoted = 0
-        for pick in picks:
-            item = item_by_id.get(pick.note_id)
-            card = (
-                _card_from_pick(pick, item)
-                if item is not None
-                else self._card_from_index_pick(pick)
-            )
-            if card is None:
-                continue
-            if not await self._pin(card):
-                continue
-            if item is not None:
-                self._slate.kick(item.note_id, "pinned")
-            self._cadence.note_promotion(now=now)
-            promoted += 1
-
-        if promoted == 0:
-            self._cadence.note_empty(attempt_revision, now=now)
-        await self._emit_ambient_if_changed(before_revision)
-
-    def _card_from_index_pick(self, pick: Pick) -> Card | None:
-        note = self._index.note(pick.note_id)
-        if note is None:
-            return None
-        return Card(
-            card_id=_card_id(note.note_id),
-            note_id=note.note_id,
-            title=note.title,
-            summary=pick.why,
-            provenance="linked",
-            heard=self._window_text(self._window_chunks(), self._active_partials()),
-        )
-
-    async def _pin(self, card: Card) -> bool:
-        if card.note_id in self._slate.shown:
-            return False
-        self._slate.mark_shown(card.note_id)
-        self._slate.kick(card.note_id, "pinned")
-        duplicate_ids = [
-            existing.card_id for existing in self._pinned if existing.note_id == card.note_id
+        delta = self._transcript_delta
+        open_actionables = [
+            item for item in self._actionables if item.status != "dismissed"
         ]
-        self._pinned = [existing for existing in self._pinned if existing.note_id != card.note_id]
-        for card_id in duplicate_ids:
-            self._logger.log("unpin", card_id=card_id, reason="superseded")
-            await self._emit_event(UnpinEvent(card_id=card_id))
-
-        self._pinned.insert(0, card)
-        self._logger.log(
-            "pin",
-            card_id=card.card_id,
-            note_id=card.note_id,
-            title=card.title,
-            provenance=card.provenance,
-            summary=card.summary,
+        self._summary_task = asyncio.create_task(
+            self._run_summary(update, delta, open_actionables)
         )
-        await self._emit_event(PinEvent(card=card))
+        self._summary_task.add_done_callback(self._clear_summary_task)
 
-        while len(self._pinned) > config.MAX_PINNED:
-            displaced = self._pinned.pop()
-            self._logger.log("unpin", card_id=displaced.card_id, reason="displaced")
-            await self._emit_event(UnpinEvent(card_id=displaced.card_id))
-        return True
-
-    async def _emit_ambient_if_changed(self, before_revision: int) -> None:
-        if self._slate.revision == before_revision:
+    async def _run_summary(
+        self,
+        update: GroundingUpdate,
+        transcript_delta: str,
+        open_actionables: list[Actionable],
+    ) -> None:
+        try:
+            result = await self._summarizer.summarize(
+                self._summary,
+                transcript_delta,
+                update,
+                open_actionables,
+            )
+        except Exception as exc:
+            log_summary(
+                self._logger,
+                model="",
+                latency_ms=0.0,
+                no_update=False,
+                rejected=True,
+                reject_reason=str(exc),
+                citation_stats={},
+                accepted_actionable_ids=[],
+            )
             return
+
+        if result is None:
+            return
+
+        if result.no_update:
+            self._trigger.note_summary(update, no_update=True)
+            log_summary(
+                self._logger,
+                model=result.model,
+                latency_ms=result.latency_ms,
+                no_update=True,
+                rejected=False,
+                reject_reason="",
+                citation_stats=result.citation_stats,
+                accepted_actionable_ids=[],
+            )
+            return
+
+        if result.summary is None:
+            log_summary(
+                self._logger,
+                model=result.model,
+                latency_ms=result.latency_ms,
+                no_update=False,
+                rejected=bool(result.rejected),
+                reject_reason=result.reject_reason,
+                citation_stats=result.citation_stats,
+                accepted_actionable_ids=[],
+            )
+            return
+
+        self._summary = result.summary
+        self._actionables = list(result.summary.actionables)
+        self._transcript_delta = ""
+        self._trigger.note_summary(update, no_update=False)
+        accepted_actionable_ids = [
+            item.id for item in [*result.new_actionables, *result.updated_actionables]
+        ]
+        log_summary(
+            self._logger,
+            model=result.model,
+            latency_ms=result.latency_ms,
+            no_update=False,
+            rejected=False,
+            reject_reason="",
+            citation_stats=result.citation_stats,
+            accepted_actionable_ids=accepted_actionable_ids,
+        )
+        await self._emit_event(SummaryEvent.from_summary(result.summary))
+        for item in result.new_actionables:
+            await self._emit_event(ActionableEvent(op="new", item=item))
+        for item in result.updated_actionables:
+            await self._emit_event(ActionableEvent(op="update", item=item))
+
+    def _clear_summary_task(self, task: asyncio.Task[None]) -> None:
+        if self._summary_task is task:
+            self._summary_task = None
+
+    def _summary_in_flight(self) -> bool:
+        return self._summary_task is not None and not self._summary_task.done()
+
+    def _window_embedding(
+        self,
+        ambient_result: Any,
+        window_text: str,
+    ) -> np.ndarray | None:
+        embedding = getattr(ambient_result, "window_embedding", None)
+        if embedding is None:
+            embedding = getattr(self._ambient, "last_window_embedding", None)
+        if embedding is not None:
+            return embedding
+        try:
+            return store.embed_queries([window_text])[0]
+        except Exception:
+            return None
+
+    async def _emit_ambient(self, update: GroundingUpdate) -> None:
         await self._emit_event(
             AmbientEvent(
                 items=[
@@ -412,11 +394,26 @@ class LiveSession:
                         title=item.title,
                         gist=item.gist,
                         score=item.score,
+                        short_id=item.short_id,
+                        source=item.source,
+                        age_days=item.age_days,
+                        why=item.why,
                     )
-                    for item in self._slate.items()
+                    for item in update.items
                 ]
             )
         )
+
+    def _append_transcript_delta(self, chunk: Chunk) -> None:
+        text = chunk.text.strip()
+        if not text:
+            return
+        line = f"[ch{chunk.channel}] {text}"
+        self._transcript_delta = (
+            line if not self._transcript_delta else f"{self._transcript_delta}\n{line}"
+        )
+        if len(self._transcript_delta) > config.SUMMARY_DELTA_MAX_CHARS:
+            self._transcript_delta = self._transcript_delta[-config.SUMMARY_DELTA_MAX_CHARS :]
 
     def _window_chunks(self) -> list[Chunk]:
         return self._transcript[-config.C2_WINDOW_CHUNKS :]
@@ -433,22 +430,10 @@ class LiveSession:
             if text.strip()
         }
 
-    def _via_titles(self, items: list[SlateItem]) -> dict[str, str]:
-        titles: dict[str, str] = {}
-        for item in items:
-            if not item.via_note_id or item.via_note_id in titles:
-                continue
-            note = self._index.note(item.via_note_id)
-            titles[item.via_note_id] = note.title if note is not None else item.via_note_id
-        return titles
-
     async def _emit_event(self, event: Event) -> None:
         result = self._emit(event)
         if isawaitable(result):
             await result
-
-    async def _emit_trigger(self, event: TriggerEvent) -> None:
-        await self._emit_event(event)
 
     def _chunk_with_seq(self, chunk: Chunk) -> Chunk:
         if not chunk.final:
@@ -457,7 +442,7 @@ class LiveSession:
         self._next_seq += 1
         return chunk.model_copy(update={"seq": seq})
 
-    def _search_trigger_matches(self, result: Any) -> list[TriggerMatch]:
+    def _search_trigger_matches(self, result: RetrievalResult) -> list[TriggerMatch]:
         matches: list[TriggerMatch] = []
         for hit in result.hits:
             note = self._index.note(hit.note_id)
@@ -511,31 +496,12 @@ class LiveSession:
             extracted=extracted,
         )
 
-    def _slate_items_from_grounding(
-        self,
-        update: GroundingUpdate,
-        heard: str,
-    ) -> list[SlateItem]:
-        return [
-            SlateItem(
-                note_id=item.note_id,
-                title=item.title,
-                gist=item.gist,
-                score=item.score,
-                source="search",
-                heard=heard,
-                decay=config.DECAY_SEARCH,
-                added_rev=0,
-            )
-            for item in update.items
-        ]
-
     def _log_c2_pass(
         self,
         trigger_id: str,
         seqs: list[int],
-        result: Any,
-        survived_adds: list[str],
+        result: RetrievalResult,
+        grounding: GroundingUpdate,
     ) -> None:
         debug = dict(getattr(self._ambient, "last_debug", None) or {})
         if not debug:
@@ -551,33 +517,14 @@ class LiveSession:
                 "fused": [],
                 "ppr_top": [],
                 "blend": [],
-                "grounding_revision": (
-                    self.last_grounding.revision if self.last_grounding is not None else 0
-                ),
-                "slate_adds": [],
+                "grounding_revision": grounding.revision,
             }
         debug.setdefault("gliner_spans", [])
         debug.setdefault("gliner_dropped", [])
         debug.setdefault("gliner_context_queries", [])
         debug.setdefault("dense_gliner", [])
-        debug["slate_adds"] = survived_adds
+        debug["grounding_ids"] = [item.note_id for item in grounding.items]
         self._logger.log("c2_pass", trigger_id=trigger_id, seqs=seqs, **debug)
-
-
-def _card_from_pick(pick: Pick, item: SlateItem) -> Card:
-    provenance = "linked" if item.via_note_id else item.source
-    return Card(
-        card_id=_card_id(item.note_id),
-        note_id=item.note_id,
-        title=item.title,
-        summary=pick.why,
-        provenance=provenance,
-        heard=item.heard,
-    )
-
-
-def _card_id(note_id: str) -> str:
-    return f"{note_id}:{uuid4().hex[:12]}"
 
 
 def _trigger_id() -> str:

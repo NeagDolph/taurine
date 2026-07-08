@@ -1,29 +1,33 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import pytest
 
-from taurine_core import config
-from taurine_core.live.ingest import LiveSession
-from taurine_core.live.slate import Slate
 from taurine_core.live.grounding import GroundingUpdate
+from taurine_core.live.ingest import LiveSession
+from taurine_core.live.summarizer import SummaryResult
 from taurine_core.schemas import (
+    Actionable,
     Chunk,
+    GroundedFact,
     GroundingItem,
     GroundingWhy,
-    Pick,
-    SlateItem,
+    MeetingSummary,
 )
 
 from tests.fakes import FakeClock, FakeIndex, note
 
 
 class NoopAmbient:
-    last_slate_adds: list[SlateItem] = []
     last_debug: dict[str, Any] | None = None
     last_grounding: GroundingUpdate | None = None
+    last_fused_ids: set[str] = set()
+    last_extracted: list[str] = []
+    last_window_embedding: np.ndarray | None = None
 
     async def on_window(self, window_text: str, context_text: str | None = None) -> None:
         del window_text, context_text
@@ -42,17 +46,17 @@ class SequenceExact:
 @dataclass
 class SequenceAmbient:
     results: list[Any | None]
-    slate_add_sequences: list[list[SlateItem]] = field(default_factory=list)
     debug_sequences: list[dict[str, Any] | None] = field(default_factory=list)
     fused_id_sequences: list[set[str]] = field(default_factory=list)
     extracted_sequences: list[list[str]] = field(default_factory=list)
+    embeddings: list[np.ndarray | None] = field(default_factory=list)
     windows: list[str] = field(default_factory=list)
     contexts: list[str | None] = field(default_factory=list)
-    last_slate_adds: list[SlateItem] = field(default_factory=list)
     last_debug: dict[str, Any] | None = None
     last_grounding: GroundingUpdate | None = None
     last_fused_ids: set[str] = field(default_factory=set)
     last_extracted: list[str] = field(default_factory=list)
+    last_window_embedding: np.ndarray | None = None
 
     async def on_window(
         self,
@@ -61,64 +65,55 @@ class SequenceAmbient:
     ) -> Any | None:
         self.windows.append(window_text)
         self.contexts.append(context_text)
-        self.last_slate_adds = (
-            self.slate_add_sequences.pop(0) if self.slate_add_sequences else []
-        )
         self.last_debug = self.debug_sequences.pop(0) if self.debug_sequences else None
         self.last_fused_ids = self.fused_id_sequences.pop(0) if self.fused_id_sequences else set()
         self.last_extracted = self.extracted_sequences.pop(0) if self.extracted_sequences else []
+        self.last_window_embedding = self.embeddings.pop(0) if self.embeddings else None
         result = self.results.pop(0) if self.results else None
         self.last_grounding = result if isinstance(result, GroundingUpdate) else None
         return result
 
 
 @dataclass
-class RecordingCadence:
-    instant_allowed: bool = True
-    may_present_allowed: bool = False
-    attempts: list[float] = field(default_factory=list)
-    promotions: list[float] = field(default_factory=list)
-    empties: list[tuple[int, float]] = field(default_factory=list)
+class RecordingTrigger:
+    decisions: list[tuple[bool, str]]
+    offers: list[tuple[GroundingUpdate, np.ndarray | None, int]] = field(default_factory=list)
+    noted: list[tuple[GroundingUpdate, bool]] = field(default_factory=list)
 
-    def instant_pin_allowed(self, now: float | None = None) -> bool:
-        del now
-        return self.instant_allowed
+    def offer(
+        self,
+        update: GroundingUpdate,
+        window_emb: np.ndarray | None,
+        new_chars: int,
+    ) -> tuple[bool, str]:
+        self.offers.append((update, window_emb, new_chars))
+        return self.decisions.pop(0) if self.decisions else (False, "no_change")
 
-    def may_present(self, revision: int, now: float | None = None) -> bool:
-        del revision, now
-        return self.may_present_allowed
-
-    def explain(self, revision: int, now: float | None = None) -> str:
-        del revision, now
-        return "allowed" if self.may_present_allowed else "same_revision"
-
-    def note_attempt(self, now: float | None = None) -> None:
-        self.attempts.append(float(now or 0.0))
-
-    def note_promotion(self, now: float | None = None) -> None:
-        self.promotions.append(float(now or 0.0))
-
-    def note_empty(self, revision: int, now: float | None = None) -> None:
-        self.empties.append((revision, float(now or 0.0)))
+    def note_summary(self, update: GroundingUpdate, *, no_update: bool) -> None:
+        self.noted.append((update, no_update))
 
 
 @dataclass
-class StaticPresenter:
-    picks: list[Pick]
-    calls: list[tuple[list[Chunk], list[SlateItem], dict[str, str], dict[int, str] | None]] = field(default_factory=list)
+class RecordingSummarizer:
+    results: list[SummaryResult | None]
+    wait_on: asyncio.Event | None = None
+    calls: list[tuple[MeetingSummary | None, str, GroundingUpdate, list[Actionable]]] = field(
+        default_factory=list
+    )
+    started: asyncio.Event = field(default_factory=asyncio.Event)
 
-    async def present(
+    async def summarize(
         self,
-        transcript: list[Chunk],
-        slate: list[SlateItem],
-        via_titles: dict[str, str],
-        *,
-        revision: int | None = None,
-        partials: dict[int, str] | None = None,
-    ) -> list[Pick]:
-        del revision
-        self.calls.append((transcript, slate, via_titles, partials))
-        return self.picks
+        state: MeetingSummary | None,
+        transcript_delta: str,
+        update: GroundingUpdate,
+        open_actionables: list[Actionable],
+    ) -> SummaryResult | None:
+        self.calls.append((state, transcript_delta, update, list(open_actionables)))
+        self.started.set()
+        if self.wait_on is not None:
+            await self.wait_on.wait()
+        return self.results.pop(0) if self.results else None
 
 
 @dataclass
@@ -132,22 +127,48 @@ class RecordingLogger:
         self.records.append(("closed", {}))
 
 
-def chunk(text: str, ts: float = 1000.0) -> Chunk:
-    return Chunk(channel=0, text=text, ts=ts, final=True)
+def chunk(text: str, ts: float = 1000.0, channel: int = 0) -> Chunk:
+    return Chunk(channel=channel, text=text, ts=ts, final=True)
 
 
 def interim(text: str, ts: float = 1000.0, channel: int = 0) -> Chunk:
     return Chunk(channel=channel, text=text, ts=ts, final=False)
 
 
-def grounding_item(note_id: str, title: str, gist: str, score: float) -> GroundingItem:
+def grounding_item(
+    note_id: str,
+    title: str,
+    gist: str,
+    score: float,
+    *,
+    short_id: str = "N1",
+) -> GroundingItem:
     return GroundingItem(
         note_id=note_id,
-        short_id=f"N-{note_id}",
+        short_id=short_id,
         title=title,
         gist=gist,
+        source="obsidian",
+        age_days=12.5,
         score=score,
-        why=GroundingWhy(heads=["dense"]),
+        why=GroundingWhy(heads=["dense", "ppr"], ppr_mass=0.25),
+    )
+
+
+def accepted_result(
+    *,
+    summary: MeetingSummary,
+    new_actionables: list[Actionable] | None = None,
+    updated_actionables: list[Actionable] | None = None,
+) -> SummaryResult:
+    return SummaryResult(
+        summary=summary,
+        no_update=False,
+        new_actionables=new_actionables or [],
+        updated_actionables=updated_actionables or [],
+        latency_ms=12.5,
+        model="model-a",
+        citation_stats={"total": 1.0, "valid": 1.0, "invalid": 0.0},
     )
 
 
@@ -155,116 +176,59 @@ def session_with(
     *,
     index: FakeIndex,
     clock: FakeClock,
-    exact: SequenceExact,
-    cadence: RecordingCadence,
-    slate: Slate | None = None,
+    exact: SequenceExact | None = None,
     ambient: Any | None = None,
-    presenter: StaticPresenter | None = None,
+    trigger: RecordingTrigger | None = None,
+    summarizer: RecordingSummarizer | None = None,
     logger: RecordingLogger | None = None,
-) -> tuple[LiveSession, list[Any]]:
+) -> tuple[LiveSession, list[Any], RecordingTrigger, RecordingSummarizer, RecordingLogger]:
     events: list[Any] = []
+    trigger = trigger or RecordingTrigger([])
+    summarizer = summarizer or RecordingSummarizer([])
+    logger = logger or RecordingLogger()
     session = LiveSession(
         index=index,
-        slate=slate or Slate(clock),
-        cadence=cadence,
-        exact=exact,
+        exact=exact or SequenceExact([]),
         ambient=ambient or NoopAmbient(),
-        presenter=presenter or StaticPresenter([]),
+        trigger=trigger,
+        summarizer=summarizer,
         emit=events.append,
         clock=clock,
-        logger=logger or RecordingLogger(),
+        logger=logger,
     )
-    return session, events
+    return session, events, trigger, summarizer, logger
+
+
+async def drain_summary_task() -> None:
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
-async def test_title_hit_produces_instant_pin_without_starting_cooldown() -> None:
+async def test_c1_exact_hits_emit_grounded_trigger_without_pin_events() -> None:
     clock = FakeClock()
     index = FakeIndex(notes={"roadmap": note("roadmap", "Q3 Roadmap", "Roadmap gist")})
-    cadence = RecordingCadence(instant_allowed=True, may_present_allowed=False)
-    session, events = session_with(
+    session, events, _trigger, _summarizer, logger = session_with(
         index=index,
         clock=clock,
         exact=SequenceExact([[("roadmap", "q3 roadmap", True)]]),
-        cadence=cadence,
     )
 
     await session.on_chunk(chunk("let's open the q3 roadmap"))
 
-    pins = [event for event in events if event.type == "pin"]
-    assert len(pins) == 1
-    assert pins[0].card.note_id == "roadmap"
-    assert pins[0].card.summary == "Roadmap gist"
-    assert pins[0].card.provenance == "exact"
-    assert cadence.promotions == []
-
-
-@pytest.mark.asyncio
-async def test_transcript_seq_and_c1_trigger_events_cover_pin_slate_and_none() -> None:
-    clock = FakeClock()
-    index = FakeIndex(
-        notes={
-            "pinned": note("pinned", "Pinned Title", "Pinned gist"),
-            "slated": note("slated", "Slated Title", "Slated gist"),
-            "suppressed": note("suppressed", "Suppressed Title", "Suppressed gist"),
-        }
-    )
-    preloaded_slate = Slate(clock)
-    preloaded_slate.add(
-        SlateItem(
-            note_id="suppressed",
-            title="Suppressed Title",
-            gist="Suppressed gist",
-            score=1.0,
-            source="exact",
-            heard="old",
-            decay=config.DECAY_EXACT,
-            added_rev=0,
-        )
-    )
-    preloaded_slate.dismiss("suppressed", now=clock.now())
-    session, events = session_with(
-        index=index,
-        clock=clock,
-        slate=preloaded_slate,
-        exact=SequenceExact(
-            [
-                [],
-                [
-                    ("pinned", "pinned title", True),
-                    ("slated", "slated alias", False),
-                    ("suppressed", "suppressed alias", False),
-                ],
-            ]
-        ),
-        cadence=RecordingCadence(instant_allowed=True, may_present_allowed=False),
-    )
-
-    await session.on_chunk(Chunk(channel=0, text="interim words", ts=10.0, final=False))
-    await session.on_chunk(chunk("pinned title plus slated alias and suppressed alias", ts=11.0))
-
-    transcripts = [event for event in events if event.type == "transcript"]
-    assert [event.seq for event in transcripts] == [0, 1]
-
     triggers = [event for event in events if event.type == "trigger"]
-    assert [
-        (event.kind, event.seqs, event.span, event.matches[0].note_id, event.action)
-        for event in triggers
-    ] == [
-        ("exact", [1], "pinned title", "pinned", "pinned"),
-        ("exact", [1], "slated alias", "slated", "slated"),
-        ("exact", [1], "suppressed alias", "suppressed", "none"),
+    assert [(event.kind, event.seqs, event.span, event.matches[0].note_id, event.action) for event in triggers] == [
+        ("exact", [1], "q3 roadmap", "roadmap", "grounded")
     ]
-    assert all(trigger.matches[0].score == 1.0 for trigger in triggers)
-
-    event_types = [event.type for event in events]
-    assert event_types.index("trigger") < event_types.index("pin")
-    assert "slated" in [item.note_id for item in session.slate_items()]
-    assert "suppressed" not in [item.note_id for item in session.slate_items()]
+    assert "pin" not in [event.type for event in events]
+    assert "unpin" not in [event.type for event in events]
+    assert [payload["action"] for kind, payload in logger.records if kind == "c1_hit"] == [
+        "grounded"
+    ]
 
 
 @pytest.mark.asyncio
-async def test_c2_trigger_event_correlates_with_retrieval_event_and_logger() -> None:
+async def test_c2_pass_emits_grounded_ambient_event_and_logs_grounding() -> None:
     clock = FakeClock()
     logger = RecordingLogger()
     index = FakeIndex(
@@ -273,10 +237,9 @@ async def test_c2_trigger_event_correlates_with_retrieval_event_and_logger() -> 
             "expanded": note("expanded", "Expanded Note", "Expanded gist"),
         }
     )
-    result = GroundingUpdate(
-        items=[
-            grounding_item("direct", "Direct Note", "Direct gist", 0.91),
-        ],
+    update = GroundingUpdate(
+        items=[grounding_item("direct", "Direct Note", "Direct gist", 0.91)],
+        facts=[GroundedFact(fact_id="F1", src="direct", dst="expanded", text="related")],
         revision=3,
         ppr_top=[("expanded", 0.31), ("direct", 0.12)],
     )
@@ -291,300 +254,229 @@ async def test_c2_trigger_event_correlates_with_retrieval_event_and_logger() -> 
         "exact": [],
         "fused": [["direct", 0.016]],
         "ppr_top": [["expanded", 0.31], ["direct", 0.12]],
-        "blend": [
-            {
-                "note_id": "direct",
-                "rel": 1.0,
-                "recency": 1.0,
-                "source_rank": 1.0,
-                "quality": 1.0,
-                "final": 0.91,
-            }
-        ],
+        "blend": [{"note_id": "direct", "final": 0.91}],
         "grounding_revision": 3,
     }
+    embedding = np.array([1.0, 0.0], dtype=np.float32)
     ambient = SequenceAmbient(
-        results=[result],
+        results=[update],
         debug_sequences=[debug],
         fused_id_sequences=[{"direct"}],
         extracted_sequences=[["shopify checkout", "Ashish"]],
+        embeddings=[embedding],
     )
-    session, events = session_with(
+    trigger = RecordingTrigger([(False, "no_change")])
+    session, events, trigger, _summarizer, logger = session_with(
         index=index,
         clock=clock,
-        exact=SequenceExact([[]]),
-        cadence=RecordingCadence(may_present_allowed=False),
         ambient=ambient,
+        trigger=trigger,
         logger=logger,
     )
 
     await session.on_chunk(chunk("window text"))
 
-    [trigger] = [event for event in events if event.type == "trigger"]
+    [trigger_event] = [event for event in events if event.type == "trigger"]
     [retrieval] = [event for event in events if event.type == "retrieval"]
-    assert trigger.kind == "search"
-    assert trigger.seqs == [1]
-    assert trigger.span == "window text"
-    assert trigger.action == "slated"
-    assert [(match.note_id, match.rank, match.score, match.via_note_id, match.hop) for match in trigger.matches] == [
+    [ambient_event] = [event for event in events if event.type == "ambient"]
+    assert trigger_event.kind == "search"
+    assert trigger_event.action == "grounded"
+    assert trigger_event.seqs == [1]
+    assert [(match.note_id, match.rank, match.score, match.via_note_id, match.hop) for match in trigger_event.matches] == [
         ("direct", 1, 0.91, None, None),
         ("expanded", None, 0.31, "", 0),
     ]
-    assert retrieval.retrieval_id == trigger.trigger_id
-    assert retrieval.seqs == [1]
+    assert retrieval.retrieval_id == trigger_event.trigger_id
     assert retrieval.extracted == ["shopify checkout", "Ashish"]
-    assert session.last_grounding is result
+    assert ambient_event.items[0].model_dump() == {
+        "note_id": "direct",
+        "title": "Direct Note",
+        "gist": "Direct gist",
+        "score": 0.91,
+        "short_id": "N1",
+        "source": "obsidian",
+        "age_days": 12.5,
+        "why": {"heads": ["dense", "ppr"], "ppr_mass": 0.25, "exact_alias": ""},
+    }
+    assert trigger.offers == [(update, embedding, len("[ch0] window text"))]
+    assert session.last_grounding is update
     assert [kind for kind, _payload in logger.records].count("c2_pass") == 1
     c2_payload = [payload for kind, payload in logger.records if kind == "c2_pass"][0]
-    assert c2_payload["trigger_id"] == trigger.trigger_id
+    assert c2_payload["trigger_id"] == trigger_event.trigger_id
     assert c2_payload["seqs"] == [1]
-    assert c2_payload["slate_adds"] == ["direct"]
+    assert c2_payload["grounding_ids"] == ["direct"]
     assert c2_payload["gliner_spans"] == [["shopify checkout", 0.95], ["Ashish", 0.9]]
     assert c2_payload["dense_gliner"] == [["direct", 0.87]]
     assert c2_payload["ppr_top"] == [["expanded", 0.31], ["direct", 0.12]]
-    assert c2_payload["grounding_revision"] == 3
-    assert "salient" not in c2_payload
+    [grounding_payload] = [payload for kind, payload in logger.records if kind == "grounding"]
+    assert grounding_payload["trigger_decision"] is False
+    assert grounding_payload["trigger_reason"] == "no_change"
+    assert "slate_adds" not in c2_payload
     assert "rerank_used" not in c2_payload
 
 
 @pytest.mark.asyncio
-async def test_c2_trigger_event_action_none_when_no_slate_add_survives() -> None:
+async def test_trigger_fire_summarizer_gets_accumulated_delta_and_accepted_result_emits_events() -> None:
     clock = FakeClock()
-    index = FakeIndex(notes={"direct": note("direct", "Direct Note", "Direct gist")})
-    result = GroundingUpdate(items=[], revision=1)
-    ambient = SequenceAmbient(results=[result])
-    session, events = session_with(
-        index=index,
-        clock=clock,
-        exact=SequenceExact([[]]),
-        cadence=RecordingCadence(may_present_allowed=False),
-        ambient=ambient,
+    action = Actionable(
+        id="act-1",
+        title="Send timeline",
+        quote="I'll send the timeline Friday",
+        grounding=["N1"],
+        confidence=0.93,
     )
-
-    await session.on_chunk(chunk("window text"))
-
-    [trigger] = [event for event in events if event.type == "trigger"]
-    assert trigger.kind == "search"
-    assert trigger.action == "none"
-    assert trigger.seqs == [1]
-
-
-@pytest.mark.asyncio
-async def test_interim_c1_fires_once_per_segment_and_resets_after_final() -> None:
-    clock = FakeClock()
-    logger = RecordingLogger()
-    index = FakeIndex(notes={"roadmap": note("roadmap", "Roadmap Note", "Roadmap gist")})
-    session, events = session_with(
-        index=index,
-        clock=clock,
-        exact=SequenceExact(
-            [
-                [("roadmap", "roadmap", False)],
-                [("roadmap", "roadmap", False)],
-                [("roadmap", "roadmap", False)],
-            ]
-        ),
-        cadence=RecordingCadence(may_present_allowed=False),
-        logger=logger,
-    )
-
-    await session.on_chunk(interim("roadmap is coming together", ts=10.0))
-    await session.on_chunk(chunk("roadmap is coming together", ts=11.0))
-    await session.on_chunk(interim("roadmap follow-up", ts=12.0))
-
-    transcripts = [event for event in events if event.type == "transcript"]
-    assert [(event.final, event.seq) for event in transcripts] == [(False, 0), (True, 1), (False, 0)]
-
-    triggers = [event for event in events if event.type == "trigger"]
-    assert [(event.kind, event.seqs, event.span, event.matches[0].note_id) for event in triggers] == [
-        ("exact", [], "roadmap", "roadmap"),
-        ("exact", [], "roadmap", "roadmap"),
-    ]
-    assert [payload["seq"] for kind, payload in logger.records if kind == "c1_hit"] == [0, 0]
-
-
-@pytest.mark.asyncio
-async def test_c2_window_appends_partials_and_fires_on_interim_with_final_seqs_only() -> None:
-    clock = FakeClock()
-    index = FakeIndex(notes={"direct": note("direct", "Direct Note", "Direct gist")})
-    result = GroundingUpdate(
+    update = GroundingUpdate(
         items=[grounding_item("direct", "Direct Note", "Direct gist", 0.91)],
-        revision=1,
+        revision=3,
     )
-    ambient = SequenceAmbient(
-        results=[None, result],
+    summary = MeetingSummary(
+        rev=1,
+        summary_md="Discussing the timeline [N1]",
+        actionables=[action],
+        grounding=update.items,
+        updated_at=123.0,
     )
-    session, events = session_with(
-        index=index,
+    ambient = SequenceAmbient(results=[update], embeddings=[np.array([1.0, 0.0])])
+    trigger = RecordingTrigger([(True, "jaccard")])
+    summarizer = RecordingSummarizer([accepted_result(summary=summary, new_actionables=[action])])
+    session, events, trigger, summarizer, logger = session_with(
+        index=FakeIndex(notes={"direct": note("direct")}),
         clock=clock,
-        exact=SequenceExact([[], []]),
-        cadence=RecordingCadence(may_present_allowed=False),
         ambient=ambient,
+        trigger=trigger,
+        summarizer=summarizer,
     )
 
-    await session.on_chunk(chunk("final context", ts=10.0))
-    await session.on_chunk(interim("partial insight", ts=11.0))
+    await session.on_chunk(chunk("I'll send the timeline Friday"))
+    await drain_summary_task()
 
-    assert ambient.windows == ["final context", "final context partial insight"]
-    assert ambient.contexts == ["final context", "final context partial insight"]
-    [trigger] = [event for event in events if event.type == "trigger"]
-    [retrieval] = [event for event in events if event.type == "retrieval"]
-    assert trigger.seqs == [1]
-    assert retrieval.seqs == [1]
-    assert trigger.span == "final context partial insight"
+    assert len(summarizer.calls) == 1
+    state, transcript_delta, called_update, open_actionables = summarizer.calls[0]
+    assert state is None
+    assert transcript_delta == "[ch0] I'll send the timeline Friday"
+    assert called_update is update
+    assert open_actionables == []
+    assert trigger.noted == [(update, False)]
+    [summary_event] = [event for event in events if event.type == "summary"]
+    assert summary_event.rev == 1
+    assert summary_event.summary_md == "Discussing the timeline [N1]"
+    assert summary_event.actionables == [action]
+    [actionable_event] = [event for event in events if event.type == "actionable"]
+    assert actionable_event.op == "new"
+    assert actionable_event.item == action
+    assert session.current_summary().rev == 1
+    assert session._transcript_delta == ""
+    [summary_payload] = [payload for kind, payload in logger.records if kind == "summary"]
+    assert summary_payload["accepted_actionable_ids"] == ["act-1"]
 
 
 @pytest.mark.asyncio
-async def test_c2_passes_context_text_with_extra_pre_window_chunks() -> None:
-    clock = FakeClock()
-    index = FakeIndex()
-    ambient = SequenceAmbient(results=[None, None, None, None, None], slate_add_sequences=[])
-    session, _events = session_with(
-        index=index,
-        clock=clock,
+async def test_no_update_records_backoff_without_events_or_delta_reset() -> None:
+    update = GroundingUpdate(items=[grounding_item("direct", "Direct Note", "Direct gist", 0.91)], revision=3)
+    ambient = SequenceAmbient(results=[update])
+    trigger = RecordingTrigger([(True, "jaccard")])
+    summarizer = RecordingSummarizer(
+        [SummaryResult(summary=None, no_update=True, latency_ms=5.0, model="model-a")]
+    )
+    session, events, trigger, _summarizer, logger = session_with(
+        index=FakeIndex(notes={"direct": note("direct")}),
+        clock=FakeClock(),
+        ambient=ambient,
+        trigger=trigger,
+        summarizer=summarizer,
+    )
+
+    await session.on_chunk(chunk("minor chatter that changes nothing"))
+    await drain_summary_task()
+
+    assert trigger.noted == [(update, True)]
+    assert [event.type for event in events].count("summary") == 0
+    assert [event.type for event in events].count("actionable") == 0
+    assert session._transcript_delta == "[ch0] minor chatter that changes nothing"
+    [summary_payload] = [payload for kind, payload in logger.records if kind == "summary"]
+    assert summary_payload["no_update"] is True
+    assert summary_payload["rejected"] is False
+
+
+@pytest.mark.asyncio
+async def test_in_flight_summary_pass_skips_second_fire() -> None:
+    release = asyncio.Event()
+    first = GroundingUpdate(items=[grounding_item("one", "One", "One gist", 0.91)], revision=1)
+    second = GroundingUpdate(items=[grounding_item("two", "Two", "Two gist", 0.92)], revision=2)
+    ambient = SequenceAmbient(results=[first, second])
+    trigger = RecordingTrigger([(True, "jaccard"), (True, "jaccard")])
+    summary = MeetingSummary(rev=1, summary_md="One [N1]", grounding=first.items)
+    summarizer = RecordingSummarizer([accepted_result(summary=summary)], wait_on=release)
+    session, _events, _trigger, summarizer, logger = session_with(
+        index=FakeIndex(notes={"one": note("one"), "two": note("two")}),
+        clock=FakeClock(),
+        ambient=ambient,
+        trigger=trigger,
+        summarizer=summarizer,
+    )
+
+    await session.on_chunk(chunk("first transcript"))
+    await summarizer.started.wait()
+    await session.on_chunk(chunk("second transcript"))
+
+    assert len(summarizer.calls) == 1
+    assert ("grounding", {"trigger_decision": False, "trigger_reason": "in_flight"}) in [
+        (kind, {"trigger_decision": payload.get("trigger_decision"), "trigger_reason": payload.get("trigger_reason")})
+        for kind, payload in logger.records
+        if kind == "grounding"
+    ]
+
+    release.set()
+    await drain_summary_task()
+
+
+@pytest.mark.asyncio
+async def test_actionable_status_updates_session_state_and_emits_actionable_events() -> None:
+    action = Actionable(
+        id="act-1",
+        title="Send timeline",
+        quote="I'll send the timeline Friday",
+        grounding=["N1"],
+        confidence=0.93,
+    )
+    summary = MeetingSummary(rev=1, summary_md="Summary", actionables=[action])
+    summarizer = RecordingSummarizer([accepted_result(summary=summary, new_actionables=[action])])
+    session, events, _trigger, _summarizer, _logger = session_with(
+        index=FakeIndex(notes={"direct": note("direct")}),
+        clock=FakeClock(),
+        ambient=SequenceAmbient(results=[GroundingUpdate(items=[grounding_item("direct", "Direct", "gist", 0.9)], revision=1)]),
+        trigger=RecordingTrigger([(True, "jaccard")]),
+        summarizer=summarizer,
+    )
+    await session.on_chunk(chunk("I'll send the timeline Friday"))
+    await drain_summary_task()
+
+    await session.set_actionable_status("act-1", "confirmed")
+    await session.set_actionable_status("act-1", "dismissed")
+
+    status_events = [event for event in events if event.type == "actionable"][1:]
+    assert [(event.op, event.item.status) for event in status_events] == [
+        ("update", "confirmed"),
+        ("dismiss", "dismissed"),
+    ]
+    assert session.current_summary().actionables[0].status == "dismissed"
+
+
+@pytest.mark.asyncio
+async def test_c2_window_appends_partials_and_passes_context_text() -> None:
+    ambient = SequenceAmbient(results=[None, None, None, None, GroundingUpdate(revision=1)])
+    session, _events, _trigger, _summarizer, _logger = session_with(
+        index=FakeIndex(),
+        clock=FakeClock(),
         exact=SequenceExact([[], [], [], [], []]),
-        cadence=RecordingCadence(may_present_allowed=False),
         ambient=ambient,
     )
 
-    for idx in range(1, config.C2_WINDOW_CHUNKS + config.C2_CONTEXT_CHUNKS + 1):
-        await session.on_chunk(chunk(f"chunk {idx}", ts=float(idx)))
+    await session.on_chunk(chunk("chunk 1", ts=1.0))
+    await session.on_chunk(chunk("chunk 2", ts=2.0))
+    await session.on_chunk(chunk("chunk 3", ts=3.0))
+    await session.on_chunk(chunk("chunk 4", ts=4.0))
+    await session.on_chunk(interim("partial insight", ts=5.0))
 
-    assert ambient.windows[-1] == "chunk 3 chunk 4 chunk 5"
-    assert ambient.contexts[-1] == "chunk 1 chunk 2 chunk 3 chunk 4 chunk 5"
-
-
-@pytest.mark.asyncio
-async def test_presenter_receives_current_partials_on_interim_attempt() -> None:
-    clock = FakeClock()
-    index = FakeIndex(notes={"roadmap": note("roadmap", "Roadmap Note", "Roadmap gist")})
-    slate = Slate(clock)
-    slate.add(
-        SlateItem(
-            note_id="roadmap",
-            title="Roadmap Note",
-            gist="Roadmap gist",
-            score=0.8,
-            source="search",
-            heard="previous",
-            decay=config.DECAY_SEARCH,
-            added_rev=0,
-        )
-    )
-    presenter = StaticPresenter([])
-    session, _events = session_with(
-        index=index,
-        clock=clock,
-        slate=slate,
-        exact=SequenceExact([[]]),
-        cadence=RecordingCadence(may_present_allowed=True),
-        presenter=presenter,
-    )
-
-    await session.on_chunk(interim("still describing the roadmap", ts=10.0))
-
-    assert len(presenter.calls) == 1
-    transcript, prompted, _via_titles, partials = presenter.calls[0]
-    assert transcript == []
-    assert [item.note_id for item in prompted] == ["roadmap"]
-    assert partials == {0: "still describing the roadmap"}
-
-
-@pytest.mark.asyncio
-async def test_presenter_empty_emits_no_pin_and_notes_empty_backoff() -> None:
-    clock = FakeClock()
-    index = FakeIndex(notes={"roadmap": note("roadmap", "Q3 Roadmap")})
-    cadence = RecordingCadence(instant_allowed=False, may_present_allowed=True)
-    presenter = StaticPresenter([])
-    session, events = session_with(
-        index=index,
-        clock=clock,
-        exact=SequenceExact([[("roadmap", "roadmap", False)]]),
-        cadence=cadence,
-        presenter=presenter,
-    )
-
-    await session.on_chunk(chunk("maybe the roadmap note is relevant"))
-
-    assert [event.type for event in events].count("pin") == 0
-    assert len(presenter.calls) == 1
-    assert len(cadence.attempts) == 1
-    assert cadence.promotions == []
-    assert cadence.empties == [(1, clock.now())]
-
-
-@pytest.mark.asyncio
-async def test_presenter_non_slate_pick_pins_index_note_as_linked_card() -> None:
-    clock = FakeClock()
-    index = FakeIndex(
-        notes={
-            "seed": note("seed", "Seed Note", "Seed gist"),
-            "neighbor": note("neighbor", "Neighbor Note", "Neighbor gist"),
-        }
-    )
-    slate = Slate(clock)
-    slate.add(
-        SlateItem(
-            note_id="seed",
-            title="Seed Note",
-            gist="Seed gist",
-            score=0.8,
-            source="search",
-            heard="seed heard",
-            decay=config.DECAY_SEARCH,
-            added_rev=0,
-        )
-    )
-    cadence = RecordingCadence(instant_allowed=False, may_present_allowed=True)
-    presenter = StaticPresenter([Pick(note_id="neighbor", why="Armaan was named")])
-    session, events = session_with(
-        index=index,
-        clock=clock,
-        slate=slate,
-        exact=SequenceExact([[]]),
-        cadence=cadence,
-        presenter=presenter,
-    )
-
-    await session.on_chunk(chunk("Armand came up again"))
-
-    pins = [event for event in events if event.type == "pin"]
-    assert len(pins) == 1
-    assert pins[0].card.note_id == "neighbor"
-    assert pins[0].card.title == "Neighbor Note"
-    assert pins[0].card.summary == "Armaan was named"
-    assert pins[0].card.provenance == "linked"
-    assert cadence.promotions == [clock.now()]
-    assert cadence.empties == []
-
-
-@pytest.mark.asyncio
-async def test_dismiss_unpins_and_shown_note_never_reenters_slate() -> None:
-    clock = FakeClock()
-    index = FakeIndex(notes={"roadmap": note("roadmap", "Q3 Roadmap")})
-    cadence = RecordingCadence(instant_allowed=True, may_present_allowed=False)
-    session, events = session_with(
-        index=index,
-        clock=clock,
-        exact=SequenceExact(
-            [
-                [("roadmap", "q3 roadmap", True)],
-                [("roadmap", "roadmap", False)],
-                [("roadmap", "roadmap", False)],
-            ]
-        ),
-        cadence=cadence,
-    )
-
-    await session.on_chunk(chunk("show q3 roadmap"))
-    card_id = [event.card.card_id for event in events if event.type == "pin"][0]
-    await session.dismiss(card_id)
-    await session.on_chunk(chunk("roadmap should stay suppressed"))
-
-    assert [event.card_id for event in events if event.type == "unpin"] == [card_id]
-    assert session.slate_items() == []
-
-    clock.advance(config.SUPPRESS_S + 0.1)
-    await session.on_chunk(chunk("roadmap can enter the slate later"))
-
-    assert session.slate_items() == []
+    assert ambient.windows[-1] == "chunk 2 chunk 3 chunk 4 partial insight"
+    assert ambient.contexts[-1] == "chunk 1 chunk 2 chunk 3 chunk 4 partial insight"

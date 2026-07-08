@@ -64,7 +64,7 @@ class GraphResponse(BaseModel):
 # ── retrieval ──────────────────────────────────────────────────────────
 class Hit(BaseModel):
     note_id: str
-    rank: int                      # 1-based, post-rerank
+    rank: int                      # 1-based, post-grounding
     score: float
 
 
@@ -81,38 +81,6 @@ class RetrievalResult(BaseModel):
     hits: list[Hit]
     expansions: list[Expansion]
     extracted: list[str] = []      # GLiNER spans that served as query heads
-
-
-# ── slate / cards ──────────────────────────────────────────────────────
-Source = Literal["exact", "search"]
-
-
-class SlateItem(BaseModel):
-    note_id: str
-    title: str
-    gist: str
-    score: float
-    source: Source
-    heard: str
-    views: int = 0
-    decay: int
-    added_rev: int
-    via_note_id: Optional[str] = None   # set when reached via graph expansion
-    hop: Optional[int] = None
-
-
-class Card(BaseModel):
-    card_id: str
-    note_id: str
-    title: str
-    summary: str                   # gist (instant pin) or presenter's why
-    provenance: Literal["exact", "search", "linked"]
-    heard: str
-
-
-class Pick(BaseModel):
-    note_id: str
-    why: str                       # <=WHY_MAX_CHARS, validated
 
 
 # ── grounding / meeting summary (spec 2026-07-08) ──────────────────────
@@ -195,23 +163,31 @@ class AmbientEvent(BaseModel):
 
 class SummaryEvent(BaseModel):
     type: Literal["summary"] = "summary"
-    summary: MeetingSummary        # full replacement on every accepted pass
+    rev: int
+    summary_md: str
+    highlights: list[SummaryHighlight] = []
+    actionables: list[Actionable] = []
+    grounding: list[GroundingItem] = []
+    facts: list[GroundedFact] = []
+    updated_at: float = 0.0
+
+    @classmethod
+    def from_summary(cls, summary: MeetingSummary) -> "SummaryEvent":
+        return cls(
+            rev=summary.rev,
+            summary_md=summary.summary_md,
+            highlights=summary.highlights,
+            actionables=summary.actionables,
+            grounding=summary.grounding,
+            facts=summary.facts,
+            updated_at=summary.updated_at,
+        )
 
 
 class ActionableEvent(BaseModel):
     type: Literal["actionable"] = "actionable"
     op: Literal["new", "update", "dismiss"]
     item: Actionable
-
-
-class PinEvent(BaseModel):
-    type: Literal["pin"] = "pin"
-    card: Card
-
-
-class UnpinEvent(BaseModel):
-    type: Literal["unpin"] = "unpin"
-    card_id: str
 
 
 class RetrievalEvent(BaseModel):
@@ -228,7 +204,7 @@ class RetrievalEvent(BaseModel):
 class TriggerMatch(BaseModel):
     note_id: str
     title: str
-    rank: Optional[int] = None     # post-rerank rank for search triggers
+    rank: Optional[int] = None     # post-grounding rank for search triggers
     score: float = 0.0
     via_note_id: Optional[str] = None
     hop: Optional[int] = None
@@ -241,7 +217,7 @@ class TriggerEvent(BaseModel):
     seqs: list[int]                # transcript chunks involved
     span: str                      # matched alias (exact) / window text (search)
     matches: list[TriggerMatch]    # notes this trigger brought about
-    action: Literal["pinned", "slated", "none"]
+    action: Literal["grounded", "none"]
 
 
 # ── connectors ─────────────────────────────────────────────────────────
@@ -315,11 +291,6 @@ class StartMsg(BaseModel):
 
 class StopMsg(BaseModel):
     type: Literal["stop"]
-
-
-class DismissMsg(BaseModel):
-    type: Literal["dismiss"]
-    card_id: str
 
 
 class OpenNoteMsg(BaseModel):

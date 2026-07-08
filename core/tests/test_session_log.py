@@ -21,32 +21,14 @@ def test_session_logger_writes_jsonl_records_and_session_end(tmp_path) -> None:
         trigger_id="abc123",
         seqs=[1],
         window="hello",
-        salient="hello",
         dense=[["n1", 0.9]],
-        dense_salient=[["n1", 0.8]],
         gliner_spans=[["shopify checkout", 0.95]],
         dense_gliner=[["n2", 0.87]],
         bm25=[],
         fused=[["n1", 0.016]],
-        expansions=[{"from": "n1", "to": "n2", "score": 0.4}],
-        rerank_used=True,
-        rerank_error=None,
-        ordered=[["n1", 0.91]],
-        floor_dropped=[],
-        slate_adds=["n1"],
-    )
-    logger.log("slate", op="add", note_id="n1", source="search", reason="added", revision=1)
-    logger.log("cadence", decision=False, revision=1, reason="debounce")
-    logger.log(
-        "presenter",
-        revision=1,
-        model_used="model-a",
-        transcript_chunks=2,
-        slate_note_ids=["n1"],
-        raw_response={"picks": []},
-        picks=[],
-        latency_ms=12.5,
-        error=None,
+        ppr_top=[["n2", 0.4]],
+        blend=[{"note_id": "n1", "final": 0.91}],
+        grounding_ids=["n1"],
     )
     logger.close()
 
@@ -55,9 +37,6 @@ def test_session_logger_writes_jsonl_records_and_session_end(tmp_path) -> None:
     assert [record["kind"] for record in records] == [
         "chunk",
         "c2_pass",
-        "slate",
-        "cadence",
-        "presenter",
         "session_end",
     ]
     assert records[0] | {"ts": records[0]["ts"]} == {
@@ -69,13 +48,9 @@ def test_session_logger_writes_jsonl_records_and_session_end(tmp_path) -> None:
         "final": True,
     }
     assert records[1]["trigger_id"] == "abc123"
-    assert records[1]["salient"] == "hello"
-    assert records[1]["dense_salient"] == [["n1", 0.8]]
     assert records[1]["gliner_spans"] == [["shopify checkout", 0.95]]
     assert records[1]["dense_gliner"] == [["n2", 0.87]]
-    assert records[2]["op"] == "add"
-    assert records[3]["reason"] == "debounce"
-    assert records[4]["picks"] == []
+    assert records[1]["grounding_ids"] == ["n1"]
     assert records[-1]["kind"] == "session_end"
 
 
@@ -94,10 +69,8 @@ def test_c2_console_line_appends_compact_gliner_spans() -> None:
         {
             "seqs": [1, 2],
             "window": "we should ask ashish about checkout",
-            "ordered": [["n1", 0.9]],
-            "expansions": [],
-            "slate_adds": ["n1"],
-            "rerank_used": True,
+            "grounding_ids": ["n1"],
+            "ppr_top": [],
             "gliner_spans": [
                 ["shopify checkout", 0.95],
                 ["Ashish", 0.9],

@@ -26,20 +26,19 @@ from taurine_core.indexer.reenrich import reenrich_all
 from taurine_core.indexer.store import Index
 from taurine_core.indexer.sync import SyncReport
 from taurine_core.live.ambient import AmbientRetriever
-from taurine_core.live.cadence import Cadence
 from taurine_core.live.exact import ExactCollector
 from taurine_core.live.ingest import Event, EventSink, LiveSession
-from taurine_core.live.presenter import Presenter
-from taurine_core.live.rerank import CohereReranker
-from taurine_core.live.slate import Slate
 from taurine_core.live.spans import Gliner2SpanExtractor
+from taurine_core.live.summarizer import Summarizer
+from taurine_core.live.trigger import SummaryTrigger
 from taurine_core.llm import OpenRouterClient
 from taurine_core.session_log import NullSessionLogger, SessionLogger
 from taurine_core.schemas import (
+    ActionableStatusMsg,
     ConnectorInfo,
-    DismissMsg,
     GraphResponse,
     IndexStatus,
+    MeetingSummary,
     NotePreview,
     OpenNoteMsg,
     ReenrichStatus,
@@ -49,7 +48,7 @@ from taurine_core.schemas import (
 )
 
 
-REQUIRED_SECRET_KEYS = ("TAURINE_ASR_TOKEN", "OPEN_ROUTER_API_KEY", "COHERE_API_KEY")
+REQUIRED_SECRET_KEYS = ("TAURINE_ASR_TOKEN", "OPEN_ROUTER_API_KEY")
 
 
 class ASRClientLike(Protocol):
@@ -67,7 +66,10 @@ class LiveSessionLike(Protocol):
     async def on_chunk(self, chunk: Any) -> None:
         ...
 
-    async def dismiss(self, card_id: str) -> None:
+    async def set_actionable_status(self, actionable_id: str, status: str) -> None:
+        ...
+
+    def current_summary(self) -> MeetingSummary:
         ...
 
 
@@ -116,7 +118,7 @@ class Runtime:
     index: Any
     sync_once: Callable[[], SyncReport]
     open_note: Callable[[str], None]
-    make_live_session: Callable[[EventSink, Any], LiveSessionLike]
+    make_live_session: Callable[[EventSink, Any], LiveSessionLike] | None
     make_asr_client: Callable[
         [ChunkCallback, StatusCallback, IndexStatusProvider],
         ASRClientLike,
@@ -136,6 +138,7 @@ class Runtime:
     status_sinks: set[Callable[[], Awaitable[None]]] = field(default_factory=set)
     updates: UpdateBus = field(default_factory=UpdateBus)
     graph_version: int = 0
+    active_live_session: LiveSessionLike | None = None
 
 
 class _MonotonicClock:
@@ -321,6 +324,16 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         card = getattr(active_runtime.index, "user_card", lambda: None)()
         return {"card": card}
 
+    @app.get("/summary")
+    async def get_summary() -> MeetingSummary:
+        active_runtime: Runtime = app.state.runtime
+        if active_runtime.make_live_session is None:
+            raise HTTPException(status_code=404, detail="live session unavailable")
+        live = active_runtime.active_live_session
+        if live is None:
+            return MeetingSummary()
+        return live.current_summary()
+
     @app.put("/profile")
     async def put_profile(payload: Any = Body(...)) -> dict[str, Any]:
         active_runtime: Runtime = app.state.runtime
@@ -398,7 +411,12 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             )
 
         active_runtime.status_sinks.add(emit_index_status)
+        if active_runtime.make_live_session is None:
+            await websocket.close(code=1011)
+            logger.close()
+            return
         live = active_runtime.make_live_session(emit, logger)
+        active_runtime.active_live_session = live
         asr = active_runtime.make_asr_client(
             live.on_chunk,
             emit,
@@ -434,6 +452,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except WebSocketDisconnect:
             pass
         finally:
+            if active_runtime.active_live_session is live:
+                active_runtime.active_live_session = None
             active_runtime.status_sinks.discard(emit_index_status)
             if not session_started:
                 logger.log("session_start", channels=[])
@@ -450,7 +470,6 @@ def build_runtime() -> Runtime:
     secrets = required_secrets()
     index = Index(Path("taurine.db"))
     llm = OpenRouterClient(secrets["OPEN_ROUTER_API_KEY"])
-    reranker = CohereReranker(secrets["COHERE_API_KEY"])
     span_extractor = Gliner2SpanExtractor()
     connector_registry = ConnectorRegistry()
     connector_registry.reconcile_ledger(index)
@@ -459,19 +478,14 @@ def build_runtime() -> Runtime:
         clock = _MonotonicClock()
         return LiveSession(
             index=index,
-            slate=Slate(
-                clock,
-                on_event=lambda op, payload: logger.log("slate", op=op, **payload),
-            ),
-            cadence=Cadence(clock),
             exact=ExactCollector(index),
             ambient=AmbientRetriever(
                 index,
-                reranker,
                 clock,
                 span_extractor=span_extractor,
             ),
-            presenter=Presenter(llm, index, on_log=lambda payload: logger.log("presenter", **payload)),
+            trigger=SummaryTrigger(clock.now),
+            summarizer=Summarizer(llm, index),
             emit=emit,
             clock=clock,
             logger=logger,
@@ -547,8 +561,8 @@ async def _handle_control(
         await asr.start(channel_ids)
     elif isinstance(message, StopMsg):
         await asr.stop()
-    elif isinstance(message, DismissMsg):
-        await live.dismiss(message.card_id)
+    elif isinstance(message, ActionableStatusMsg):
+        await live.set_actionable_status(message.id, message.status)
     elif isinstance(message, OpenNoteMsg):
         try:
             await asyncio.to_thread(runtime.open_note, message.note_id)
@@ -557,7 +571,7 @@ async def _handle_control(
     return session_started
 
 
-def _parse_control(raw: str) -> StartMsg | StopMsg | DismissMsg | OpenNoteMsg:
+def _parse_control(raw: str) -> StartMsg | StopMsg | ActionableStatusMsg | OpenNoteMsg:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("control message must be a JSON object")
@@ -566,8 +580,8 @@ def _parse_control(raw: str) -> StartMsg | StopMsg | DismissMsg | OpenNoteMsg:
         return StartMsg.model_validate(payload)
     if message_type == "stop":
         return StopMsg.model_validate(payload)
-    if message_type == "dismiss":
-        return DismissMsg.model_validate(payload)
+    if message_type == "actionable_status":
+        return ActionableStatusMsg.model_validate(payload)
     if message_type == "open_note":
         return OpenNoteMsg.model_validate(payload)
     raise ValueError(f"unsupported control type: {message_type}")

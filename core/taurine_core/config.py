@@ -26,22 +26,17 @@ EMBED_QUERY_PROMPT = (
 CHUNK_MAX_TOKENS = 300                   # sentence-boundary chunking
 
 # ── LLM (ALL calls via OpenRouter) ─────────────────────────────────────
-# demo-first: gemini-3.5-flash is pricier but much faster than deepseek
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 ENRICH_MODEL = "z-ai/glm-5.2"            # enrichment is offline: quality over latency
 ENRICH_TIMEOUT_S = 60.0
-PRESENTER_MODEL = "google/gemini-3.5-flash"
-PRESENTER_FALLBACK_MODEL = "deepseek/deepseek-chat"
 LLM_TIMEOUT_S = 15.0
 # chain-of-thought off everywhere: enrichment is bulk offline work (GLM-5.2
-# reasons by default and multiplies latency; it can also return reasoning-only
-# responses with empty content) and the presenter is latency-bound. Values are
-# per-model because providers disagree: GLM accepts enabled=false, Gemini
-# mandates reasoning (minimal → 0 thinking tokens), deepseek-chat rejects the
-# parameter entirely (absent from the map → omitted from the request).
+# reasons by default and multiplies latency; it can also return
+# reasoning-only responses with empty content). Values are per-model because
+# providers disagree: deepseek-chat rejects the parameter entirely (absent
+# from the map → omitted from the request).
 LLM_REASONING_BY_MODEL = {
     "z-ai/glm-5.2": {"enabled": False},
-    "google/gemini-3.5-flash": {"effort": "minimal"},
     "deepseek/deepseek-v4-pro": {"enabled": False},
     "deepseek/deepseek-v4-flash": {"enabled": False},
 }
@@ -75,7 +70,7 @@ CODEX_MEMORY_GLOBS = ("~/.codex/AGENTS.md", "~/.codex/memory/**/*.md", "~/.codex
 OBSIDIAN_APP_JSON = "~/Library/Application Support/obsidian/obsidian.json"
 IMESSAGE_DB = "~/Library/Messages/chat.db"
 CONTACTS_DB_GLOB = "~/Library/Application Support/AddressBook/**/AddressBook-v22.abcddb"
-GIST_MAX_CHARS = 220                     # was 120: mid-word truncation degraded rerank docs
+GIST_MAX_CHARS = 220                     # was 120: mid-word truncation degraded retrieval docs
                                          # and card copy (audit finding #5)
 
 # ── graph term resolution (synonym soft-links, no LLM) ────────────────
@@ -120,24 +115,9 @@ C2_THROTTLE_S = 8.0
 C2_WINDOW_CHUNKS = 3
 C2_WINDOW_MIN_S = 12.0
 RRF_K = 60
-EXPAND_SEEDS = 5
-HOP_DECAY = 0.5
-RERANK_MODEL = "rerank-v3.5"
-RERANK_TIMEOUT_S = 2.0
-RERANK_MAX_CANDIDATES = 20
+HEAD_TOP_K = 20
 C2_TOP_K = 8                             # match the search-lane quota (was 5: entity notes
                                          # repeatedly died at ordered[6] — see 2026-07-06 triage)
-FUSED_PROTECT = 3                        # top-N fused candidates enter the slate even if the
-                                         # reranker demotes them (rerank can't see entity links
-                                         # through ASR spelling drift)
-DENSE_PROTECT = 2                        # top-N dense-window hits likewise protected (RRF
-                                         # buries single-list hits — audit finding #1)
-SALIENT_MIN_DF = 1                       # drop df=0 window terms: they are ASR misspellings,
-                                         # not rare gold (audit finding #2)
-GRAPH_VOTE_TOP = 10                      # fused candidates whose neighbors get vote credit
-GRAPH_VOTE_WEIGHT = 0.5                  # vote strength multiplier (5th RRF list)
-MIN_COSINE = 0.22                        # floor only when no BM25 hit AND no graph path;
-                                         # percentile-matched to Qwen3 (bge 0.35 = p6.8 → 0.219)
 
 # ── fuzzy entity snapping (ASR spelling drift: "Armand" → "Armaan") ────
 FUZZY_SNAP_MIN_LEN = 4                   # only snap spans at least this long
@@ -219,10 +199,6 @@ ALIAS_STOPWORDS = frozenset(
     """.split()
 )
 
-# ── C2 salient-query formulation ───────────────────────────────────────
-SALIENT_TERMS = 6                        # top rare window terms forming the salient query
-SALIENT_MIN_TERM_LEN = 3
-
 # ── C2 GLiNER2 span extraction (schema-based, label descriptions) ─────
 GLINER2_MODEL = "fastino/gliner2-large-v1"
 GLINER2_THRESHOLD = 0.6                  # was the 0.5 default with confidence discarded;
@@ -258,29 +234,3 @@ GLINER2_SCHEMA = {
     "event": "Meetings, deadlines, launches, or scheduled occurrences",
 }
 GLINER_MAX_SPANS = 4
-
-# ── slate ──────────────────────────────────────────────────────────────
-QUOTA_EXACT = 3
-QUOTA_SEARCH = 8
-DECAY_EXACT = 2
-DECAY_SEARCH = 2
-SUPPRESS_S = 300.0                       # dismissed note re-entry suppression
-
-# ── cadence ────────────────────────────────────────────────────────────
-DEBOUNCE_S = 3.0
-COOLDOWN_S = 20.0
-MAX_PROMOS_PER_MIN = 3
-EMPTY_BACKOFF_S = 15.0
-REOFFER_S = 60.0
-
-# ── presenter / cards ──────────────────────────────────────────────────
-# the presenter judges conversation-level relevance, so it sees the WHOLE
-# transcript; the cap is a token-safety backstop (~1-2h of speech), not a
-# window. Retrieval (C2) stays moment-bound by design — whole-meeting
-# embeddings blur the query; only the promoter needs global context.
-PRESENTER_TRANSCRIPT_CHUNKS = 400
-PRESENTER_MAX_PICKS = 2
-PRESENTER_MAX_TOOL_CALLS = 3             # read_note tool-loop budget per pass
-PRESENTER_NEIGHBORS_SHOWN = 3            # neighbor ids listed per slate line
-WHY_MAX_CHARS = 140
-MAX_PINNED = 3

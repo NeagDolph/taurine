@@ -14,15 +14,6 @@ from taurine_core.schemas import GroundingItem, GroundingWhy
 from tests.fakes import FakeClock, FakeIndex, note
 
 
-class UnusedReranker:
-    async def rerank(
-        self,
-        query: str,
-        docs: list[tuple[str, str]],
-    ) -> list[tuple[str, float]]:
-        raise AssertionError("ambient retrieval must not call rerank")
-
-
 class QueryAwareIndex(FakeIndex):
     def __init__(
         self,
@@ -155,7 +146,6 @@ async def test_heads_rrf_exact_injection_and_debug_payload(monkeypatch) -> None:
 
     result = await AmbientRetriever(
         index,
-        UnusedReranker(),
         FakeClock(start=123.0),
         on_debug=lambda _payload: None,
         span_extractor=span_extractor,
@@ -208,7 +198,6 @@ async def test_on_window_records_grounding_retrieval_payload(monkeypatch) -> Non
     )
     retriever = AmbientRetriever(
         index,
-        UnusedReranker(),
         FakeClock(),
         on_debug=debug_records.append,
     )
@@ -247,7 +236,6 @@ async def test_throttled_window_returns_none_and_clears_transient_state(monkeypa
             notes={"alpha": note("alpha", "Alpha")},
             dense_by_query={"first": [("alpha", 0.9)], "second": [("alpha", 0.8)]},
         ),
-        UnusedReranker(),
         clock,
     )
 
@@ -281,7 +269,6 @@ async def test_span_context_query_uses_context_text_and_logs_drops(monkeypatch) 
 
     await AmbientRetriever(
         index,
-        UnusedReranker(),
         FakeClock(),
         on_debug=debug_records.append,
         span_extractor=span_extractor,
@@ -309,7 +296,6 @@ async def test_span_context_query_caps_around_span(monkeypatch) -> None:
 
     await AmbientRetriever(
         index,
-        UnusedReranker(),
         FakeClock(),
         on_debug=debug_records.append,
         span_extractor=span_extractor,
@@ -333,7 +319,6 @@ async def test_empty_span_extractor_keeps_dense_and_bm25_heads_only(monkeypatch)
 
     result = await AmbientRetriever(
         index,
-        UnusedReranker(),
         FakeClock(),
         span_extractor=span_extractor,
     ).on_window("window")

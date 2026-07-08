@@ -8,7 +8,7 @@ from typing import Any, Protocol
 from rapidfuzz.distance import Levenshtein
 
 from taurine_core import config
-from taurine_core.ports import IndexPort, RerankerPort, SpanExtractorPort
+from taurine_core.ports import IndexPort, SpanExtractorPort
 from taurine_core.schemas import Chunk
 
 from .exact import ExactCollector
@@ -30,18 +30,16 @@ class AmbientRetriever:
     def __init__(
         self,
         index: IndexPort,
-        reranker: RerankerPort,
         clock: Clock,
         on_debug: Callable[[dict[str, Any]], None] | None = None,
         span_extractor: SpanExtractorPort | None = None,
     ) -> None:
-        del reranker
-        self.last_slate_adds: list[Any] = []
         self.last_debug: dict[str, Any] | None = None
         self.last_grounding: GroundingUpdate | None = None
         self.last_extracted: list[str] = []
         self.last_fused_ids: set[str] = set()
         self.last_ppr_expansions: list[tuple[str, float]] = []
+        self.last_window_embedding: Any = None
         self._index = index
         self._clock = clock
         self._on_debug = on_debug
@@ -56,12 +54,12 @@ class AmbientRetriever:
         window_text: str,
         context_text: str | None = None,
     ) -> GroundingUpdate | None:
-        self.last_slate_adds = []
         self.last_debug = None
         self.last_grounding = None
         self.last_extracted = []
         self.last_fused_ids = set()
         self.last_ppr_expansions = []
+        self.last_window_embedding = None
 
         span_context_text = context_text if context_text is not None else window_text
         now = self._clock.now()
@@ -79,10 +77,10 @@ class AmbientRetriever:
             span_context_text,
         )
         extracted = [span for span, _score, _label in gliner_spans]
-        dense = self._index.dense_search(window_text, config.RERANK_MAX_CANDIDATES)
+        dense = self._index.dense_search(window_text, config.HEAD_TOP_K)
         dense_gliner = self._dense_gliner(gliner_queries)
         bm25_query = _bm25_query(window_text, snapped)
-        bm25 = self._index.bm25_search(bm25_query, config.RERANK_MAX_CANDIDATES)
+        bm25 = self._index.bm25_search(bm25_query, config.HEAD_TOP_K)
         exact_hits = self._exact_hits(window_text, now)
         exact_ranked = [(note_id, 1.0) for note_id, _alias in exact_hits]
 
@@ -204,11 +202,11 @@ class AmbientRetriever:
         for query in gliner_queries:
             for note_id, score in self._index.dense_search(
                 query,
-                config.RERANK_MAX_CANDIDATES,
+                config.HEAD_TOP_K,
             ):
                 scores[note_id] = max(scores.get(note_id, float("-inf")), score)
         return sorted(scores.items(), key=lambda item: item[1], reverse=True)[
-            : config.RERANK_MAX_CANDIDATES
+            : config.HEAD_TOP_K
         ]
 
     def _exact_hits(self, window_text: str, now: float) -> list[tuple[str, str]]:
@@ -230,7 +228,7 @@ class AmbientRetriever:
                 scores.items(),
                 key=lambda item: (-item[1], first_seen[item[0]], item[0]),
             )
-        ][: config.RERANK_MAX_CANDIDATES]
+        ][: config.HEAD_TOP_K]
 
     def _record_debug(
         self,

@@ -1,4 +1,4 @@
-"""Summary trigger policy (spec §4.6) — replaces the presenter cadence.
+"""Summary trigger policy (spec §4.6).
 
 Fires the summarizer when the *evidence* changes, never on keywords:
 
@@ -11,7 +11,7 @@ Fires the summarizer when the *evidence* changes, never on keywords:
 Topic centroid = EMA (TOPIC_CENTROID_DECAY) of window embeddings; a drift
 firing resets it. A no_update reply applies SUMMARY_EMPTY_BACKOFF_S before
 the same grounding revision may re-fire. Every decision (+ first blocking
-gate) is session-logged, mirroring Cadence.explain.
+gate) is session-logged for debugging.
 """
 from __future__ import annotations
 

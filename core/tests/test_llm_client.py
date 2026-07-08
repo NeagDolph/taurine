@@ -72,7 +72,7 @@ async def test_complete_tools_posts_openrouter_tools_request_and_returns_message
             },
         }
     ]
-    messages = [{"role": "user", "content": "consider the slate"}]
+    messages = [{"role": "user", "content": "consider the evidence"}]
     assistant_message = {
         "role": "assistant",
         "content": None,
@@ -116,11 +116,11 @@ async def test_reasoning_parameter_is_per_model() -> None:
     client = OpenRouterClient("secret-key", transport=httpx.MockTransport(handler))
 
     await client.complete_json("z-ai/glm-5.2", "system", "user")
-    await client.complete_json("google/gemini-3.5-flash", "system", "user")
+    await client.complete_json("deepseek/deepseek-v4-flash", "system", "user")
     await client.complete_json("deepseek/deepseek-chat", "system", "user")
 
     assert bodies[0]["reasoning"] == {"enabled": False}
-    assert bodies[1]["reasoning"] == {"effort": "minimal"}
+    assert bodies[1]["reasoning"] == {"enabled": False}
     assert "reasoning" not in bodies[2]  # deepseek providers reject the parameter
 
 

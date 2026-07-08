@@ -36,7 +36,7 @@ class IndexPort(Protocol):
         ...
 
     def best_chunk(self, note_id: str, query_text: str) -> str:
-        """Chunk of the note most similar to query_text (for rerank docs)."""
+        """Chunk of the note most similar to query_text."""
         ...
 
     def aliases(self) -> list[tuple[str, str, bool]]:
@@ -44,7 +44,7 @@ class IndexPort(Protocol):
         ...
 
     def doc_frequency(self, term: str) -> int:
-        """Number of notes containing the term (for salient-query rarity scoring)."""
+        """Number of notes containing the term."""
         ...
 
     def graph(self) -> GraphResponse:
@@ -85,17 +85,6 @@ class ConnectorPort(Protocol):
 
 
 class ConnectorError(Exception):
-    pass
-
-
-class RerankerPort(Protocol):
-    async def rerank(self, query: str, docs: list[tuple[str, str]]) -> list[tuple[str, float]]:
-        """docs=[(note_id, doc_text)] -> [(note_id, relevance)] desc.
-        Raises RerankError on failure/timeout; caller falls back."""
-        ...
-
-
-class RerankError(Exception):
     pass
 
 

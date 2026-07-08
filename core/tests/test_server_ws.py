@@ -12,16 +12,21 @@ from fastapi.testclient import TestClient
 from taurine_core import session_log
 from taurine_core.indexer.sync import SyncReport
 from taurine_core.schemas import (
+    Actionable,
+    ActionableEvent,
     Chunk,
     ConnectorInfo,
     ConnectorSyncReport,
+    GroundingItem,
     GraphEdge,
     GraphNode,
     GraphResponse,
     IndexStatus,
+    MeetingSummary,
     NeighborRef,
     NotePreview,
     ReenrichStatus,
+    SummaryEvent,
     TranscriptEvent,
 )
 from taurine_core.server import Runtime, create_app, required_secrets, run_sync_once_safely
@@ -73,7 +78,8 @@ class GraphIndex:
 @dataclass
 class EchoLiveSession:
     emit: Any
-    dismisses: list[str] = field(default_factory=list)
+    summary: MeetingSummary = field(default_factory=MeetingSummary)
+    statuses: list[tuple[str, str]] = field(default_factory=list)
 
     async def on_chunk(self, chunk: Chunk) -> None:
         await self.emit(
@@ -85,8 +91,42 @@ class EchoLiveSession:
             )
         )
 
-    async def dismiss(self, card_id: str) -> None:
-        self.dismisses.append(card_id)
+    async def set_actionable_status(self, actionable_id: str, status: str) -> None:
+        self.statuses.append((actionable_id, status))
+
+    def current_summary(self) -> MeetingSummary:
+        return self.summary
+
+
+@dataclass
+class SummaryEchoLiveSession(EchoLiveSession):
+    async def on_chunk(self, chunk: Chunk) -> None:
+        await super().on_chunk(chunk)
+        action = Actionable(
+            id="act-1",
+            title="Send timeline",
+            quote="I'll send the timeline Friday",
+            grounding=["N1"],
+            confidence=0.9,
+        )
+        summary = MeetingSummary(
+            rev=2,
+            summary_md="Discussing timeline [N1]",
+            actionables=[action],
+            grounding=[
+                GroundingItem(
+                    note_id="n1",
+                    short_id="N1",
+                    title="Timeline",
+                    gist="Timeline gist",
+                    score=0.91,
+                )
+            ],
+            updated_at=123.0,
+        )
+        self.summary = summary
+        await self.emit(SummaryEvent.from_summary(summary))
+        await self.emit(ActionableEvent(op="new", item=action))
 
 
 @dataclass
@@ -383,7 +423,7 @@ def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
 
     def make_live_session(emit: Any, logger: Any) -> EchoLiveSession:
         del logger
-        live = EchoLiveSession(emit)
+        live = SummaryEchoLiveSession(emit)
         live_sessions.append(live)
         return live
 
@@ -417,20 +457,131 @@ def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
                 "seq": 0,
             }
 
-            ws.send_json({"type": "dismiss", "card_id": "card-1"})
+            assert ws.receive_json() == {
+                "type": "summary",
+                "rev": 2,
+                "summary_md": "Discussing timeline [N1]",
+                "highlights": [],
+                "actionables": [
+                    {
+                        "id": "act-1",
+                        "title": "Send timeline",
+                        "quote": "I'll send the timeline Friday",
+                        "assignee": "",
+                        "due": "",
+                        "grounding": ["N1"],
+                        "why_new": "",
+                        "confidence": 0.9,
+                        "status": "open",
+                    }
+                ],
+                "grounding": [
+                    {
+                        "note_id": "n1",
+                        "short_id": "N1",
+                        "title": "Timeline",
+                        "gist": "Timeline gist",
+                        "source": "apple_notes",
+                        "age_days": 0.0,
+                        "score": 0.91,
+                        "why": {"heads": [], "ppr_mass": 0.0, "exact_alias": ""},
+                    }
+                ],
+                "facts": [],
+                "updated_at": 123.0,
+            }
+            assert ws.receive_json() == {
+                "type": "actionable",
+                "op": "new",
+                "item": {
+                    "id": "act-1",
+                    "title": "Send timeline",
+                    "quote": "I'll send the timeline Friday",
+                    "assignee": "",
+                    "due": "",
+                    "grounding": ["N1"],
+                    "why_new": "",
+                    "confidence": 0.9,
+                    "status": "open",
+                },
+            }
+
+            ws.send_json(
+                {
+                    "type": "actionable_status",
+                    "id": "act-1",
+                    "status": "confirmed",
+                }
+            )
             ws.send_json({"type": "open_note", "note_id": "n1"})
             ws.send_json({"type": "stop"})
 
     assert asr_clients[0].starts == [[2]]
     assert asr_clients[0].sent == [(2, b"\x01\x00\x02\x00")]
     assert asr_clients[0].stopped
-    assert live_sessions[0].dismisses == ["card-1"]
+    assert live_sessions[0].statuses == [("act-1", "confirmed")]
     assert opened == ["n1"]
     assert asr_clients[0].index_status() == IndexStatus(
         notes=1,
         last_sync=123.0,
         reenrich=ReenrichStatus(running=False),
     )
+
+
+def test_summary_route_returns_empty_or_active_live_summary() -> None:
+    active_live = EchoLiveSession(
+        emit=lambda event: None,
+        summary=MeetingSummary(rev=7, summary_md="Active summary"),
+    )
+    live_sessions: list[EchoLiveSession] = []
+
+    def make_live_session(emit: Any, logger: Any) -> EchoLiveSession:
+        del emit, logger
+        live_sessions.append(active_live)
+        return active_live
+
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=make_live_session,
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.get("/summary").json() == {
+            "rev": 0,
+            "summary_md": "",
+            "highlights": [],
+            "actionables": [],
+            "grounding": [],
+            "facts": [],
+            "updated_at": 0.0,
+        }
+        with client.websocket_connect("/session") as ws:
+            assert ws.receive_json()["type"] == "status"
+            assert client.get("/summary").json()["summary_md"] == "Active summary"
+
+
+def test_summary_route_404s_without_live_session_capability() -> None:
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=None,
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.get("/summary").status_code == 404
 
 
 def test_required_secrets_error_names_missing_key() -> None:
