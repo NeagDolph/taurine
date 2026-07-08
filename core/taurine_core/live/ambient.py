@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -33,6 +34,7 @@ class AmbientRetriever:
         clock: Clock,
         on_debug: Callable[[dict[str, Any]], None] | None = None,
         span_extractor: SpanExtractorPort | None = None,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.last_debug: dict[str, Any] | None = None
         self.last_grounding: GroundingUpdate | None = None
@@ -42,6 +44,7 @@ class AmbientRetriever:
         self.last_window_embedding: Any = None
         self._index = index
         self._clock = clock
+        self._wall_clock = wall_clock
         self._on_debug = on_debug
         self._span_extractor = span_extractor
         self._last_run_at: float | None = None
@@ -97,11 +100,14 @@ class AmbientRetriever:
             exact=exact_ranked,
         )
 
+        # note ages need wall-clock time: the session clock is monotonic
+        # (seconds since boot), which would make every age negative and
+        # saturate the recency decay to 1.0
         update = self._grounding.on_pass(
             window_text,
             fused,
             exact_hits,
-            now,
+            self._wall_clock(),
             head_hits=head_hits,
         )
         self.last_grounding = update

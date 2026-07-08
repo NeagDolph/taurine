@@ -117,6 +117,24 @@ def _patch_grounding(
 
 
 @pytest.mark.asyncio
+async def test_grounding_ages_use_wall_clock_not_session_clock(monkeypatch) -> None:
+    engine = _patch_grounding(monkeypatch)
+    wall_now = 1_700_000_000.0
+    retriever = AmbientRetriever(
+        QueryAwareIndex(notes={"alpha": note("alpha")}, dense_by_query={}),
+        FakeClock(start=123.0),  # monotonic-style session clock
+        span_extractor=FakeSpanExtractor([]),
+        wall_clock=lambda: wall_now,
+    )
+
+    await retriever.on_window("anything about alpha")
+
+    # ages are wall-clock derived; the monotonic session clock would make
+    # every note age negative and disable recency decay
+    assert engine.calls[0]["now"] == wall_now
+
+
+@pytest.mark.asyncio
 async def test_heads_rrf_exact_injection_and_debug_payload(monkeypatch) -> None:
     engine = _patch_grounding(monkeypatch)
     window = "ask armand about exact alpha"

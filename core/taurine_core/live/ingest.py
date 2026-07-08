@@ -360,7 +360,15 @@ class LiveSession:
 
         self._summary = result.summary
         self._actionables = list(result.summary.actionables)
-        self._transcript_delta = ""
+        # consume only the delta this pass actually summarized: chunks that
+        # arrived while the LLM call was in flight stay queued for the next
+        # pass (they were never in the prompt)
+        if self._transcript_delta.startswith(transcript_delta):
+            self._transcript_delta = self._transcript_delta[
+                len(transcript_delta) :
+            ].lstrip("\n")
+        else:
+            self._transcript_delta = ""
         self._trigger.note_summary(update, no_update=False)
         accepted_actionable_ids = [
             item.id for item in [*result.new_actionables, *result.updated_actionables]

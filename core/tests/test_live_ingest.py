@@ -576,6 +576,36 @@ async def test_in_flight_summary_pass_skips_second_fire() -> None:
 
 
 @pytest.mark.asyncio
+async def test_in_flight_chunks_survive_accepted_pass_delta_reset() -> None:
+    release = asyncio.Event()
+    first = GroundingUpdate(items=[grounding_item("one", "One", "One gist", 0.91)], revision=1)
+    second = GroundingUpdate(items=[grounding_item("one", "One", "One gist", 0.91)], revision=1)
+    ambient = SequenceAmbient(results=[first, second])
+    trigger = RecordingTrigger([(True, "jaccard"), (False, "min_interval")])
+    summary = MeetingSummary(rev=1, summary_md="One [N1]", grounding=first.items)
+    summarizer = RecordingSummarizer([accepted_result(summary=summary)], wait_on=release)
+    session, _events, _trigger, summarizer, _logger = session_with(
+        index=FakeIndex(notes={"one": note("one")}),
+        clock=FakeClock(),
+        ambient=ambient,
+        trigger=trigger,
+        summarizer=summarizer,
+    )
+
+    await session.on_chunk(chunk("first transcript"))
+    await summarizer.started.wait()
+    await session.on_chunk(chunk("arrived while llm in flight"))
+
+    release.set()
+    await drain_summary_task()
+
+    # the accepted pass consumed only what it was dispatched with; the
+    # in-flight chunk stays queued for the next pass
+    assert summarizer.calls[0][1] == "[ch0] first transcript"
+    assert session._transcript_delta == "[ch0] arrived while llm in flight"
+
+
+@pytest.mark.asyncio
 async def test_actionable_status_updates_session_state_and_emits_actionable_events() -> None:
     action = Actionable(
         id="act-1",

@@ -294,3 +294,16 @@ def test_rebuild_hook_refreshes_quality_ranks_and_fact_embeddings(store, monkeyp
     assert any(abs(value) > 0 for value in ranks.values())
     assert store.fact_embedding_hashes()
     assert store.fact_dense_search(fact, 1)[0][:2] == ("alpha", "beta")
+
+
+def test_every_connector_has_explicit_source_priors() -> None:
+    # SOURCE_RANK/RECENCY_HALF_LIFE_DAYS keys must match real connector ids;
+    # a typo silently hands the connector the default prior (2026-07-08 bug:
+    # "claude_memories" vs actual "claude_mem")
+    from taurine_core.connectors.catalog import CONNECTORS
+    from taurine_core.indexer import rank
+
+    for connector in CONNECTORS:
+        assert connector.connector_id in config.SOURCE_RANK
+        assert connector.connector_id in config.RECENCY_HALF_LIFE_DAYS
+    assert rank.source_rank("claude_mem") == config.SOURCE_RANK["claude_mem"] == 0.70
