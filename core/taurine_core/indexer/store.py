@@ -122,10 +122,17 @@ class Index:
         raw.row_factory = sqlite3.Row
         self._conn = _ThreadSafeConnection(raw)
         self._conn.execute("PRAGMA foreign_keys = ON")
-        self._embedding_rows: list[tuple[int, str, EmbeddingKind, str]] = []
-        self._matrix = np.empty((0, config.EMBED_DIM), dtype=np.float32)
-        self._fact_rows: list[tuple[str, str, str]] = []       # (src, dst, fact text)
-        self._fact_matrix = np.empty((0, config.EMBED_DIM), dtype=np.float32)
+        # rows+matrix live in ONE tuple assigned atomically: readers on the
+        # live thread must never see rows from one load and the matrix from
+        # another (zip(strict=True) in dense_search would raise)
+        self._dense_state: tuple[list[tuple[int, str, EmbeddingKind, str]], np.ndarray] = (
+            [],
+            np.empty((0, config.EMBED_DIM), dtype=np.float32),
+        )
+        self._fact_state: tuple[list[tuple[str, str, str]], np.ndarray] = (
+            [],
+            np.empty((0, config.EMBED_DIM), dtype=np.float32),
+        )
         self._doc_frequency_cache: dict[str, int] = {}
         self._init_schema()
         self._disabled_sources = self._load_disabled_sources()
@@ -153,13 +160,21 @@ class Index:
                 vector = vector / norm
             vectors.append(vector.astype(np.float32))
             embedding_rows.append((int(row["id"]), row["note_id"], row["kind"], row["text"]))
-        self._embedding_rows = embedding_rows
-        self._matrix = (
+        self._dense_state = (
+            embedding_rows,
             np.vstack(vectors).astype(np.float32)
             if vectors
-            else np.empty((0, config.EMBED_DIM), dtype=np.float32)
+            else np.empty((0, config.EMBED_DIM), dtype=np.float32),
         )
         self.load_facts()
+
+    @property
+    def _embedding_rows(self) -> list[tuple[int, str, EmbeddingKind, str]]:
+        return self._dense_state[0]
+
+    @property
+    def _matrix(self) -> np.ndarray:
+        return self._dense_state[1]
 
     def load_facts(self) -> None:
         """(Re)load the in-memory fact-embedding matrix (active endpoints only)."""
@@ -187,11 +202,11 @@ class Index:
                 vector = vector / norm
             vectors.append(vector.astype(np.float32))
             fact_rows.append((row["src"], row["dst"], row["text"]))
-        self._fact_rows = fact_rows
-        self._fact_matrix = (
+        self._fact_state = (
+            fact_rows,
             np.vstack(vectors).astype(np.float32)
             if vectors
-            else np.empty((0, config.EMBED_DIM), dtype=np.float32)
+            else np.empty((0, config.EMBED_DIM), dtype=np.float32),
         )
 
     def close(self) -> None:
@@ -466,17 +481,14 @@ class Index:
 
         HippoRAG-2-style query-to-fact matching; callers credit both endpoint
         notes (spec 2026-07-08 §1.3/§4.1)."""
-        if k <= 0 or self._fact_matrix.size == 0:
+        rows, matrix = self._fact_state
+        if k <= 0 or matrix.size == 0:
             return []
         query = embed_queries([text])[0].astype(np.float32)
         norm = float(np.linalg.norm(query))
         if norm == 0:
             return []
         query = query / norm
-        rows, matrix = self._fact_rows, self._fact_matrix
-        if len(rows) != matrix.shape[0]:
-            self.load_facts()
-            rows, matrix = self._fact_rows, self._fact_matrix
         scores = matrix @ query
         order = np.argsort(scores)[::-1][:k]
         return [(rows[i][0], rows[i][1], float(scores[i]), rows[i][2]) for i in order]
@@ -691,15 +703,16 @@ class Index:
         synthetic utterances. Utterance winners are labeled as spoken references
         so rerank documents read naturally.
         """
+        embedding_rows, matrix = self._dense_state
         rows = [
             (row_id, kind, text)
-            for row_id, row_note_id, kind, text in self._embedding_rows
+            for row_id, row_note_id, kind, text in embedding_rows
             if row_note_id == note_id
         ]
         if not rows:
             note = self.note(note_id)
             return note.text if note is not None else ""
-        if self._matrix.size == 0:
+        if matrix.size == 0:
             return _rerank_evidence_text(rows[0][1], rows[0][2])
         query = embed_queries([query_text])[0].astype(np.float32)
         norm = float(np.linalg.norm(query))
@@ -710,10 +723,10 @@ class Index:
         best_kind = rows[0][1]
         best_text = rows[0][2]
         best_score = -1.0
-        for index, (row_id, _, _, _) in enumerate(self._embedding_rows):
+        for index, (row_id, _, _, _) in enumerate(embedding_rows):
             if row_id not in row_ids:
                 continue
-            score = float(self._matrix[index] @ query)
+            score = float(matrix[index] @ query)
             if score > best_score:
                 best_score = score
                 best_kind, best_text = row_ids[row_id]
@@ -847,14 +860,7 @@ class Index:
             )
 
     def _dense_snapshot(self) -> tuple[list[tuple[int, str, EmbeddingKind, str]], np.ndarray]:
-        for _attempt in range(3):
-            embedding_rows = self._embedding_rows
-            matrix = self._matrix
-            if len(embedding_rows) == matrix.shape[0]:
-                return embedding_rows, matrix
-            time.sleep(0)
-        self.load()
-        return self._embedding_rows, self._matrix
+        return self._dense_state
 
     def _embedding_rows_raw(
         self, *, stale_only: bool = False
