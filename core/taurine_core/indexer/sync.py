@@ -130,6 +130,25 @@ def sync_source(
     for note_id in rebuilt:
         index.rebuild_for(note_id)
     index.load()
+    if llm is not None:
+        try:
+            from .adjudicate import adjudicate_graph
+
+            adjudication = _run_async(
+                adjudicate_graph(
+                    index,
+                    llm,
+                    lambda done, total: report("adjudicating", done, total),
+                )
+            )
+            _LOG.info(
+                "adjudicate: %d judged, %d admitted, %d vetoed",
+                adjudication.judged,
+                adjudication.admitted,
+                adjudication.vetoed,
+            )
+        except Exception:
+            _LOG.exception("adjudicate failed; continuing sync")
     _LOG.info(
         "sync %s: done — +%d new, ~%d changed, -%d removed, %d enrich failures",
         source_id, added, changed, len(removed_ids), enrich_failures,

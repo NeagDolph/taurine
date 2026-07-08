@@ -133,6 +133,7 @@ export interface NeighborRef {
   title: string
   source: string
   weight: number
+  fact: string
 }
 
 export interface NotePreview {
@@ -929,7 +930,8 @@ function parseNeighborRef(value: unknown): NeighborRef {
     note_id: record.note_id,
     title: record.title,
     source: record.source,
-    weight: record.weight
+    weight: record.weight,
+    fact: typeof record.fact === 'string' ? record.fact : ''
   }
 }
 

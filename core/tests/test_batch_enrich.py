@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 
 import numpy as np
 import pytest
@@ -8,6 +9,8 @@ import pytest
 from tests.conftest import make_note
 from taurine_core import config
 from taurine_core.ports import LLMError
+
+_PAIR_ID_RE = re.compile(r"\bpair-\d+\b")
 
 
 def _payload(gist: str) -> dict:
@@ -58,6 +61,7 @@ class BatchAwareLLM:
         self.fail_per_note_titles = fail_per_note_titles or set()
         self.calls: list[tuple[str, str, str, float | None]] = []
         self.batch_calls = 0
+        self.adjudication_calls = 0
         self.batch_users: list[str] = []
         self.per_note_users: list[str] = []
 
@@ -69,6 +73,17 @@ class BatchAwareLLM:
         self, model: str, system: str, user: str, timeout_s: float | None = None
     ) -> dict:
         self.calls.append((model, system, user, timeout_s))
+        if model == config.ADJUDICATE_MODEL:
+            self.adjudication_calls += 1
+            return {
+                "pairs": {
+                    pair_id: {
+                        "related": True,
+                        "fact": "Batch notes share the same generated enrichment.",
+                    }
+                    for pair_id in dict.fromkeys(_PAIR_ID_RE.findall(user))
+                }
+            }
         if all(note_id in user for note_id in self.note_ids):
             self.batch_calls += 1
             self.batch_users.append(user)
@@ -213,9 +228,11 @@ def test_sync_source_batches_and_caches_successes_only(monkeypatch, store) -> No
 
     assert report.enrich_failures == 1
     assert ("enriching", len(notes), len(notes)) in progress
-    assert progress[-1] == ("finalizing", len(notes), len(notes))
+    assert ("finalizing", len(notes), len(notes)) in progress
+    assert progress[-1][0] == "adjudicating"
     assert llm.batch_calls == 1
     assert llm.per_note_prompt_count == 2
+    assert llm.adjudication_calls == 1
     for note in notes[:-1]:
         assert store.cached_enrichment(note.note_id, note.content_hash) is not None
     assert store.cached_enrichment(failed_note.note_id, failed_note.content_hash) is None

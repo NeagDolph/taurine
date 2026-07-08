@@ -43,7 +43,8 @@ class GraphEdge(BaseModel):
     dst: str                       # src < dst (undirected, canonical order)
     type: EdgeType
     weight: float                  # combined: 1 - prod(1 - w_i)
-    shared: list[str] = []         # topics/entities behind the edge
+    shared: list[str] = []         # canonical topics/entities behind the edge
+    fact: str = ""                 # LLM-written one-sentence relationship (adjudicated edges)
 
 
 class GraphNode(BaseModel):
@@ -204,6 +205,7 @@ class NeighborRef(BaseModel):
     title: str
     source: str = "apple_notes"
     weight: float = 0.0
+    fact: str = ""                 # edge fact when the connection was adjudicated
 
 
 class NotePreview(BaseModel):

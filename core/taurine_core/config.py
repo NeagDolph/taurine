@@ -42,6 +42,7 @@ LLM_TIMEOUT_S = 15.0
 LLM_REASONING_BY_MODEL = {
     "z-ai/glm-5.2": {"enabled": False},
     "google/gemini-3.5-flash": {"effort": "minimal"},
+    "deepseek/deepseek-v4-pro": {"enabled": False},
 }
 
 # ── user information card (full-corpus profile fed to every enrichment) ─
@@ -75,6 +76,36 @@ IMESSAGE_DB = "~/Library/Messages/chat.db"
 CONTACTS_DB_GLOB = "~/Library/Application Support/AddressBook/**/AddressBook-v22.abcddb"
 GIST_MAX_CHARS = 220                     # was 120: mid-word truncation degraded rerank docs
                                          # and card copy (audit finding #5)
+
+# ── graph term resolution (synonym soft-links, no LLM) ────────────────
+# entity/topic strings are embedded (cached in term_vectors) and clustered;
+# canonical forms are what shared-term edges intersect on. Calibrated on the
+# real corpus 2026-07-07: true variants ('Panasonic Avionics Corp'↔'Corp.',
+# 'recommendation-engine'↔'recommendation_engine') sit ≥0.98; distinct
+# entities (ShopLC↔Shopify 0.67) are far below. Terms whose digit sequences
+# differ NEVER merge ('PR #370'≠'#371', 'voice_agent_v3'≠'v4').
+TERM_SYNONYM_MIN_SIM = 0.95
+# merges additionally require lexical compatibility (containment after
+# stripping non-alphanumerics, or normalized Levenshtein ≥ this): embeddings
+# alone merge distinct referents ('Cologne'↔'Düsseldorf' 0.957) while true
+# variants are always string-close too
+TERM_LEXICAL_MIN_RATIO = 0.80
+
+# ── graph adjudication (margin LLM pass + edge facts) ─────────────────
+# deepseek-v4-pro judges only band pairs (never O(n^2)): near-misses that
+# just failed the edge thresholds (may admit) and weak kept edges (may
+# veto), writing a one-sentence fact for every pair it confirms plus each
+# note's strongest edges. Judgments cache by note-content signature; cheap
+# rebuilds apply the cache synchronously.
+ADJUDICATE_MODEL = "deepseek/deepseek-v4-pro"
+ADJUDICATE_TIMEOUT_S = 90.0
+ADJUDICATE_BATCH_PAIRS = 20              # pairs per LLM call
+ADJUDICATE_CONCURRENCY = 4
+MARGIN_SEMANTIC_SIM = 0.50               # near-miss dense floor (< GRAPH_MIN_SIM)
+MARGIN_SHARED_W = 0.15                   # near-miss shared-term floor (< GRAPH_MIN_SHARED_W)
+MARGIN_MAX_PER_NOTE = 5                  # margin pairs sent per note per pass
+VETO_MAX_W = 0.45                        # kept edges below this weight can be vetoed
+FACT_TOP_EDGES_PER_NOTE = 6              # strongest kept edges per note that get facts
 
 # ── note graph ─────────────────────────────────────────────────────────
 GRAPH_KNN = 6

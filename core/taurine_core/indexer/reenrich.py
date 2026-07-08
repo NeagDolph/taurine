@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -11,6 +12,8 @@ from taurine_core.schemas import Enrichment, NoteRecord, ReenrichStatus
 from .batch_enrich import enrich_all_batched
 from .profile import build_user_card
 from .sync import _embedding_units
+
+_LOG = logging.getLogger("taurine.session")
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,30 @@ async def reenrich_all(
     for note_id in changed_note_ids:
         index.rebuild_for(note_id)  # type: ignore[attr-defined]
     index.load()  # type: ignore[attr-defined]
+    if llm is not None:
+        try:
+            from .adjudicate import adjudicate_graph
+
+            adjudication = await adjudicate_graph(
+                index,
+                llm,
+                lambda adjudicated, adjudication_total: progress(
+                    ReenrichStatus(
+                        running=True,
+                        phase="finalizing",
+                        done=adjudicated,
+                        total=adjudication_total,
+                    )
+                ),
+            )
+            _LOG.info(
+                "adjudicate: %d judged, %d admitted, %d vetoed",
+                adjudication.judged,
+                adjudication.admitted,
+                adjudication.vetoed,
+            )
+        except Exception:
+            _LOG.exception("adjudicate failed; continuing reenrich")
     progress(ReenrichStatus(running=False, phase="idle", done=done, total=total))
 
     return ReenrichReport(

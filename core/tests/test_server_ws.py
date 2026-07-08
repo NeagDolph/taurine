@@ -194,6 +194,7 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
                     "type": "topic",
                     "weight": 0.7,
                     "shared": ["roadmap"],
+                    "fact": "",
                 }
             ],
         }
@@ -336,6 +337,7 @@ def test_note_preview_route_handles_url_encoded_note_ids() -> None:
             "title": "Beta",
             "source": "apple_notes",
             "weight": 0.7,
+            "fact": "",
         }
     ]
 

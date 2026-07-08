@@ -1018,6 +1018,10 @@ button:disabled {
 .user-summary {
   max-width: 100%;
   min-width: 0;
+  /* the data page is a flex column with a tall fixed-height map above; without
+     this the card shrinks to the leftover space and its content spills out the
+     bottom. keep the card at its content height and let .page scroll. */
+  flex-shrink: 0;
 }
 
 .user-summary-body {
@@ -1599,6 +1603,16 @@ body.preview-body {
   color: var(--text-3);
   font-size: 11px;
   font-weight: 800;
+}
+
+.preview-neighbor-main .preview-neighbor-fact {
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-style: italic;
+  font-weight: 500;
+  line-height: 1.35;
+  text-transform: none;
+  white-space: normal;
 }
 
 .preview-neighbor .score-track {

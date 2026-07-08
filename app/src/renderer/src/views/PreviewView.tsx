@@ -128,6 +128,9 @@ function PreviewContent({ note }: { note: NotePreview }): React.JSX.Element {
                     <span className="preview-neighbor-main">
                       <strong>{neighbor.title}</strong>
                       <span>{sourceLabel(neighbor.source)}</span>
+                      {neighbor.fact ? (
+                        <span className="preview-neighbor-fact">{neighbor.fact}</span>
+                      ) : null}
                     </span>
                     <span className="preview-neighbor-weight">{formatWeight(neighbor.weight)}</span>
                     <span className="score-track" aria-hidden="true">

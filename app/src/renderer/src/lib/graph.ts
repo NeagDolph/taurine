@@ -20,6 +20,7 @@ export interface GraphEdge {
   type: GraphEdgeType
   weight: number
   shared: string[]
+  fact: string
 }
 
 export interface GraphResponse {
@@ -54,6 +55,7 @@ export interface StaticGraphLink {
   edgeType: GraphEdgeType
   weight: number
   shared: string[]
+  fact: string
 }
 
 export interface LiveRankLink {
@@ -153,7 +155,8 @@ export function graphResponseToMapData(response: GraphResponse, nowLabel: string
       target: edge.dst,
       edgeType: edge.type,
       weight: edge.weight,
-      shared: [...edge.shared]
+      shared: [...edge.shared],
+      fact: edge.fact
     }))
 
   return { nodes, links }
@@ -285,7 +288,8 @@ export function sourcesFromMapData(data: MapGraphData): string[] {
 export function linkTooltip(link: MapLink): string {
   if (link.kind === 'static') {
     const terms = link.shared.length > 0 ? `: ${link.shared.join(', ')}` : ''
-    return `${link.edgeType}${terms}`
+    const base = `${link.edgeType}${terms}`
+    return link.fact ? `${link.fact}\n(${base})` : base
   }
 
   if (link.kind === 'rank') {
@@ -333,7 +337,8 @@ function parseGraphEdge(value: unknown): GraphEdge {
     dst: record.dst,
     type: record.type,
     weight: record.weight,
-    shared: record.shared
+    shared: record.shared,
+    fact: typeof record.fact === 'string' ? record.fact : ''
   }
 }
 

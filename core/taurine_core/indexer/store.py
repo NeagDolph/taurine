@@ -397,6 +397,94 @@ class Index:
             for row in rows
         ]
 
+    def neighbor_edges(self, note_id: str) -> list[tuple[str, float, str]]:
+        """(other_id, weight, fact) for active neighbors — the fact-aware
+        variant of neighbors(), used where edge facts are surfaced."""
+        src_clause, src_params = self._active_sources_clause("n1.source")
+        dst_clause, dst_params = self._active_sources_clause("n2.source")
+        rows = self._conn.execute(
+            f"""
+            SELECT src, dst, weight, fact FROM edges
+            JOIN notes n1 ON n1.note_id = edges.src
+            JOIN notes n2 ON n2.note_id = edges.dst
+            WHERE (src = ? OR dst = ?){src_clause}{dst_clause}
+            ORDER BY weight DESC
+            """,
+            (note_id, note_id, *src_params, *dst_params),
+        ).fetchall()
+        return [
+            (
+                row["dst"] if row["src"] == note_id else row["src"],
+                float(row["weight"]),
+                row["fact"],
+            )
+            for row in rows
+        ]
+
+    def term_vectors(self, terms: Sequence[str]) -> dict[str, np.ndarray]:
+        """Cached embeddings for term strings (synonym clustering)."""
+        found: dict[str, np.ndarray] = {}
+        for term in terms:
+            row = self._conn.execute(
+                "SELECT vec FROM term_vectors WHERE term = ?", (term,)
+            ).fetchone()
+            if row is None:
+                continue
+            vector = np.frombuffer(row["vec"], dtype=np.float32).copy()
+            if vector.shape == (config.EMBED_DIM,):
+                found[term] = vector
+        return found
+
+    def set_term_vectors(self, vectors: dict[str, np.ndarray]) -> None:
+        with self._conn:
+            for term, vector in vectors.items():
+                values = np.asarray(vector, dtype=np.float32)
+                if values.shape != (config.EMBED_DIM,):
+                    raise ValueError(f"term vector must have shape ({config.EMBED_DIM},)")
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO term_vectors(term, vec) VALUES (?, ?)",
+                    (term, values.tobytes()),
+                )
+
+    def edge_judgments(self) -> dict[tuple[str, str], tuple[str, bool, str]]:
+        """(src, dst) -> (sig, related, fact) for every cached adjudication."""
+        rows = self._conn.execute(
+            "SELECT src, dst, sig, related, fact FROM edge_judgments"
+        ).fetchall()
+        return {
+            (row["src"], row["dst"]): (row["sig"], bool(row["related"]), row["fact"])
+            for row in rows
+        }
+
+    def set_edge_judgment(
+        self, src: str, dst: str, sig: str, related: bool, fact: str
+    ) -> None:
+        src, dst = sorted((src, dst))
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO edge_judgments(src, dst, sig, related, fact, judged_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (src, dst, sig, int(related), fact, time.time()),
+            )
+
+    def prune_edge_judgments(self, valid_note_ids: set[str]) -> None:
+        """Drop judgments referencing deleted notes."""
+        rows = self._conn.execute("SELECT src, dst FROM edge_judgments").fetchall()
+        stale = [
+            (row["src"], row["dst"])
+            for row in rows
+            if row["src"] not in valid_note_ids or row["dst"] not in valid_note_ids
+        ]
+        if not stale:
+            return
+        with self._conn:
+            for src, dst in stale:
+                self._conn.execute(
+                    "DELETE FROM edge_judgments WHERE src = ? AND dst = ?", (src, dst)
+                )
+
     def note(self, note_id: str) -> NoteRecord | None:
         row = self._conn.execute(
             """
@@ -451,7 +539,7 @@ class Index:
         if note is None:
             return None
         neighbors: list[NeighborRef] = []
-        for neighbor_id, weight in self.neighbors(note_id):
+        for neighbor_id, weight, fact in self.neighbor_edges(note_id):
             neighbor = self.note(neighbor_id)
             if neighbor is None:
                 continue
@@ -461,6 +549,7 @@ class Index:
                     title=neighbor.title,
                     source=neighbor.source,
                     weight=weight,
+                    fact=fact,
                 )
             )
         neighbors.sort(key=lambda item: item.weight, reverse=True)
@@ -559,7 +648,7 @@ class Index:
         degree: dict[str, int] = defaultdict(int)
         edge_rows = self._conn.execute(
             """
-            SELECT src, dst, type, weight, shared_json
+            SELECT src, dst, type, weight, shared_json, fact
             FROM edges ORDER BY weight DESC, src, dst
             """
         ).fetchall()
@@ -576,6 +665,7 @@ class Index:
                     type=row["type"],
                     weight=float(row["weight"]),
                     shared=json.loads(row["shared_json"]),
+                    fact=row["fact"],
                 )
             )
         nodes = [
@@ -615,8 +705,8 @@ class Index:
                 src, dst = sorted((edge.src, edge.dst))
                 self._conn.execute(
                     """
-                    INSERT OR REPLACE INTO edges(src, dst, type, weight, shared_json)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO edges(src, dst, type, weight, shared_json, fact)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         src,
@@ -624,6 +714,7 @@ class Index:
                         edge.type,
                         float(edge.weight),
                         json.dumps(sorted(set(edge.shared))),
+                        edge.fact,
                     ),
                 )
 
@@ -770,6 +861,21 @@ class Index:
                     PRIMARY KEY(src, dst)
                 );
 
+                CREATE TABLE IF NOT EXISTS term_vectors (
+                    term TEXT PRIMARY KEY,
+                    vec BLOB NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS edge_judgments (
+                    src TEXT NOT NULL,
+                    dst TEXT NOT NULL,
+                    sig TEXT NOT NULL,
+                    related INTEGER NOT NULL,
+                    fact TEXT NOT NULL DEFAULT '',
+                    judged_at REAL NOT NULL,
+                    PRIMARY KEY(src, dst)
+                );
+
                 CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -786,6 +892,7 @@ class Index:
                 """
             )
             self._ensure_notes_source_column()
+            self._ensure_edges_fact_column()
 
     def _ensure_notes_source_column(self) -> None:
         columns = {
@@ -796,6 +903,14 @@ class Index:
         self._conn.execute(
             "ALTER TABLE notes ADD COLUMN source TEXT NOT NULL DEFAULT 'apple_notes'"
         )
+
+    def _ensure_edges_fact_column(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(edges)").fetchall()
+        }
+        if "fact" in columns:
+            return
+        self._conn.execute("ALTER TABLE edges ADD COLUMN fact TEXT NOT NULL DEFAULT ''")
 
     def _insert_embedding(
         self, note_id: str, kind: EmbeddingKind, text: str, vector: np.ndarray
