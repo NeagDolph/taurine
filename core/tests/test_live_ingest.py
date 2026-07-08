@@ -7,9 +7,11 @@ from typing import Any
 import numpy as np
 import pytest
 
+from taurine_core import config
 from taurine_core.live.grounding import GroundingUpdate
 from taurine_core.live.ingest import LiveSession
 from taurine_core.live.summarizer import SummaryResult
+from taurine_core.live.trigger import SummaryTrigger
 from taurine_core.schemas import (
     Actionable,
     Chunk,
@@ -79,6 +81,7 @@ class RecordingTrigger:
     decisions: list[tuple[bool, str]]
     offers: list[tuple[GroundingUpdate, np.ndarray | None, int]] = field(default_factory=list)
     noted: list[tuple[GroundingUpdate, bool]] = field(default_factory=list)
+    rejected_count: int = 0
 
     def offer(
         self,
@@ -91,6 +94,9 @@ class RecordingTrigger:
 
     def note_summary(self, update: GroundingUpdate, *, no_update: bool) -> None:
         self.noted.append((update, no_update))
+
+    def note_rejected(self) -> None:
+        self.rejected_count += 1
 
 
 @dataclass
@@ -396,6 +402,111 @@ async def test_no_update_records_backoff_without_events_or_delta_reset() -> None
     [summary_payload] = [payload for kind, payload in logger.records if kind == "summary"]
     assert summary_payload["no_update"] is True
     assert summary_payload["rejected"] is False
+
+
+@pytest.mark.asyncio
+async def test_rejected_summary_records_pass_without_events_delta_reset_or_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "SUMMARY_MIN_INTERVAL_S", 10.0)
+    monkeypatch.setattr(config, "SUMMARY_MIN_NEW_CHARS", 1)
+    monkeypatch.setattr(config, "SUMMARY_CHANGE_TOP_K", 3)
+    monkeypatch.setattr(config, "SUMMARY_CHANGE_JACCARD", 0.6)
+    monkeypatch.setattr(config, "SUMMARY_EMPTY_BACKOFF_S", 40.0)
+
+    clock = FakeClock()
+    update = GroundingUpdate(
+        items=[grounding_item("direct", "Direct Note", "Direct gist", 0.91)],
+        revision=3,
+    )
+    ambient = SequenceAmbient(
+        results=[update, update, update],
+        embeddings=[
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([1.0, 0.0], dtype=np.float32),
+        ],
+    )
+    summarizer = RecordingSummarizer(
+        [
+            SummaryResult(
+                summary=None,
+                no_update=False,
+                rejected=True,
+                latency_ms=5.0,
+                model="model-a",
+                reject_reason="invalid_citations",
+                citation_stats={"total": 1.0, "valid": 0.0, "invalid": 1.0},
+            ),
+            SummaryResult(
+                summary=None,
+                no_update=False,
+                rejected=True,
+                latency_ms=5.0,
+                model="model-a",
+                reject_reason="invalid_citations",
+                citation_stats={"total": 1.0, "valid": 0.0, "invalid": 1.0},
+            ),
+        ]
+    )
+    previous_summary = MeetingSummary(
+        rev=7,
+        summary_md="Existing summary [N1]",
+        grounding=update.items,
+        updated_at=900.0,
+    )
+    session, events, _trigger, summarizer, logger = session_with(
+        index=FakeIndex(notes={"direct": note("direct")}),
+        clock=clock,
+        ambient=ambient,
+        trigger=SummaryTrigger(clock.now),
+        summarizer=summarizer,
+    )
+    session._summary = previous_summary
+
+    await session.on_chunk(chunk("first rejected update"))
+    await drain_summary_task()
+
+    assert session.current_summary() == previous_summary
+    assert session._transcript_delta == "[ch0] first rejected update"
+    assert [event.type for event in events].count("summary") == 0
+    assert [event.type for event in events].count("actionable") == 0
+    [summary_payload] = [payload for kind, payload in logger.records if kind == "summary"]
+    assert summary_payload["no_update"] is False
+    assert summary_payload["rejected"] is True
+
+    await session.on_chunk(chunk("immediate rejected update"))
+    await drain_summary_task()
+
+    assert len(summarizer.calls) == 1
+    grounding_reasons = [
+        payload["trigger_reason"]
+        for kind, payload in logger.records
+        if kind == "grounding"
+    ]
+    assert grounding_reasons == ["jaccard", "min_interval"]
+
+    clock.advance(10.1)
+    await session.on_chunk(chunk("later rejected update"))
+    await drain_summary_task()
+
+    assert len(summarizer.calls) == 2
+    assert session.current_summary() == previous_summary
+    assert session._transcript_delta == (
+        "[ch0] first rejected update\n"
+        "[ch0] immediate rejected update\n"
+        "[ch0] later rejected update"
+    )
+    assert [event.type for event in events].count("summary") == 0
+    assert [event.type for event in events].count("actionable") == 0
+    grounding_reasons = [
+        payload["trigger_reason"]
+        for kind, payload in logger.records
+        if kind == "grounding"
+    ]
+    assert grounding_reasons == ["jaccard", "min_interval", "jaccard"]
+    summary_payloads = [payload for kind, payload in logger.records if kind == "summary"]
+    assert [payload["rejected"] for payload in summary_payloads] == [True, True]
 
 
 @pytest.mark.asyncio

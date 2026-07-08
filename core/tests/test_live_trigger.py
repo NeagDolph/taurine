@@ -114,6 +114,18 @@ def test_empty_backoff_blocks_same_revision_but_not_new_revision(clock: FakeCloc
     assert trigger.offer(new_revision, None, 5) == (True, "jaccard")
 
 
+def test_rejected_pass_records_min_interval_without_accepting_or_backoff(clock: FakeClock) -> None:
+    trigger = SummaryTrigger(clock.now)
+    update = _update(["a"], revision=1)
+
+    assert trigger.offer(update, None, 5) == (True, "jaccard")
+    trigger.note_rejected()
+
+    assert trigger.offer(update, None, 5) == (False, "min_interval")
+    clock.advance(10.1)
+    assert trigger.offer(update, None, 5) == (True, "jaccard")
+
+
 def _update(note_ids: list[str], *, revision: int) -> GroundingUpdate:
     return GroundingUpdate(
         items=[

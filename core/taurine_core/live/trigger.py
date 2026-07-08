@@ -79,6 +79,10 @@ class SummaryTrigger:
         self._empty_revision = None
         self._empty_backoff_until = -math.inf
 
+    def note_rejected(self) -> None:
+        """Record a rejected summarizer pass without accepting or backing off."""
+        self._last_pass_at = self.clock()
+
     def explain(self) -> str:
         return self._last_decision
 

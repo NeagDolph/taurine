@@ -56,6 +56,9 @@ class TriggerLike(Protocol):
     def note_summary(self, update: GroundingUpdate, *, no_update: bool) -> None:
         ...
 
+    def note_rejected(self) -> None:
+        ...
+
 
 class SummarizerLike(Protocol):
     async def summarize(
@@ -298,6 +301,7 @@ class LiveSession:
                 open_actionables,
             )
         except Exception as exc:
+            self._trigger.note_rejected()
             log_summary(
                 self._logger,
                 model="",
@@ -328,6 +332,7 @@ class LiveSession:
             return
 
         if result.summary is None:
+            self._trigger.note_rejected()
             log_summary(
                 self._logger,
                 model=result.model,
