@@ -7,14 +7,17 @@ browser or view inline on GitHub.
 
 ![Live voice retrieval pipeline](live-voice-retrieval-pipeline.svg)
 
-Mic → Deepgram → transcript chunks feed the two collectors. C1 matches
-word-boundary aliases straight into the slate's exact lane. C2 fans the
-window into four query heads (dense, salient-rarity, GLiNER2 spans +
-sentence context, BM25), fuses them with RRF, traverses graph space
-(graph-vote as a fifth RRF list, 1-hop neighbor expansion), reranks with
-Cohere, then protects the top fused/dense hits past demotion into the
-search lane. The cadence gate and the presenter (whole transcript +
-`read_note` tool) turn the slate into at most three pinned cards.
+**Stale as of 2026-07-08** — the SVG still shows the pin-centric loop. The
+current pipeline (see
+[`../superpowers/specs/2026-07-08-live-summary-graph-retrieval.md`](../superpowers/specs/2026-07-08-live-summary-graph-retrieval.md)):
+mic → Deepgram → C1 exact aliases + C2 heads (dense window, GLiNER2 spans +
+snap + context, BM25) → RRF → meeting seed accumulator → Personalized
+PageRank over the fact-boosted note graph → blend with recency decay,
+source rank, and quality rank → grounding set + edge facts. A change
+trigger (grounding-set Jaccard, topic drift, staleness) fires ONE
+deepseek-v4-flash pass that maintains a rolling, citation-grounded meeting
+summary and conservative quoted-span actionables. No reranker, no
+presenter, no pins.
 
 ## [Enrichment & graph connection pipeline](enrichment-graph-connection-pipeline.svg)
 
