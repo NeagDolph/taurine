@@ -1,11 +1,12 @@
-<svg viewBox="0 0 720 1090" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="d1t d1d">
+<svg viewBox="0 0 720 1460" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="d1t d1d">
 <title id="d1t">Live voice retrieval pipeline</title>
-<desc id="d1d">Mic audio flows through Deepgram into transcript chunks, which feed the C1 exact collector and the C2 retrieval window; C2 fans into four query heads fused by RRF, expanded through graph space, reranked and protected into the slate; the cadence gate and presenter turn the slate into pinned cards.</desc>
+<desc id="d1d">Mic audio flows through Deepgram into final transcript chunks; C1 exact alias hits become max-strength seeds and C2's three local heads are RRF-fused, feed a decayed meeting seed accumulator, and drive Personalized PageRank over the fact-boosted note graph plus a dense search over adjudicated edge facts; relevance, PPR mass, recency decay, source rank, and quality rank blend into a hysteresis-protected grounding set with stable citation IDs; a change trigger fires one deepseek-v4-flash pass that maintains a rolling cited summary and conservative actionables. Everything up to the grounding set is LLM-free.</desc>
 <style>
   text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
   .th{font-size:13px;font-weight:600;fill:#2C2C2A}
   .ts{font-size:11px;font-weight:400;fill:#73726c}
   .arr{stroke:#73726c;stroke-width:1.5;fill:none}
+  .sep{stroke:#73726c;stroke-width:1;stroke-dasharray:4 4;fill:none}
   rect{stroke-width:.5}
   .c-gray rect{fill:#F1EFE8;stroke:#5F5E5A}
   .node.c-gray rect{fill:#D3D1C7}
@@ -31,8 +32,8 @@
     <path d="M2 1L8 5L2 9" fill="none" stroke="#73726c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
   </marker>
 </defs>
-<rect x="1" y="1" width="718" height="1088" rx="16" fill="#FBFAF7" stroke="#E8E6DF"/>
-<text class="ts" x="360" y="16" text-anchor="middle" dominant-baseline="central">blue = retrieval · purple = graph space · amber = LLM · teal = slate state</text>
+<rect x="1" y="1" width="718" height="1458" rx="16" fill="#FBFAF7" stroke="#E8E6DF"/>
+<text class="ts" x="360" y="16" text-anchor="middle" dominant-baseline="central">gray = transcript/control · blue = local retrieval · purple = graph space · teal = grounding · amber = LLM · green = UI</text>
 <g class="node c-gray">
   <rect x="20" y="34" width="160" height="56" rx="8"/>
   <text class="th" x="100" y="52" text-anchor="middle" dominant-baseline="central">Mic capture</text>
@@ -48,116 +49,135 @@
 <g class="node c-gray">
   <rect x="450" y="34" width="230" height="56" rx="8"/>
   <text class="th" x="565" y="52" text-anchor="middle" dominant-baseline="central">Transcript chunks</text>
-  <text class="ts" x="565" y="70" text-anchor="middle" dominant-baseline="central">partials + finals, seq'd</text>
+  <text class="ts" x="565" y="70" text-anchor="middle" dominant-baseline="central">final chunks, seq'd</text>
 </g>
-<path d="M480 90 L480 128 L125 128 L125 164" fill="none" class="arr" marker-end="url(#arrow)"/>
+<path d="M480 90 L480 128 L130 128 L130 164" fill="none" class="arr" marker-end="url(#arrow)"/>
 <path d="M565 90 L565 128 L485 128 L485 164" fill="none" class="arr" marker-end="url(#arrow)"/>
 <g class="node c-blue">
-  <rect x="20" y="168" width="210" height="56" rx="8"/>
-  <text class="th" x="125" y="186" text-anchor="middle" dominant-baseline="central">C1 exact collector</text>
-  <text class="ts" x="125" y="204" text-anchor="middle" dominant-baseline="central">word-boundary alias hits</text>
+  <rect x="20" y="168" width="220" height="74" rx="8"/>
+  <text class="th" x="130" y="188" text-anchor="middle" dominant-baseline="central">C1 exact alias matcher</text>
+  <text class="ts" x="130" y="208" text-anchor="middle" dominant-baseline="central">word-boundary hits · grounded events</text>
+  <text class="ts" x="130" y="224" text-anchor="middle" dominant-baseline="central">max-strength seeds · no instant pins</text>
 </g>
 <g class="node c-blue">
-  <rect x="330" y="168" width="310" height="56" rx="8"/>
-  <text class="th" x="485" y="186" text-anchor="middle" dominant-baseline="central">C2 window</text>
-  <text class="ts" x="485" y="204" text-anchor="middle" dominant-baseline="central">3 chunks + 2-chunk buffer · 8 s throttle</text>
+  <rect x="330" y="168" width="310" height="74" rx="8"/>
+  <text class="th" x="485" y="188" text-anchor="middle" dominant-baseline="central">C2 retrieval pass</text>
+  <text class="ts" x="485" y="208" text-anchor="middle" dominant-baseline="central">rolling window · 8 s throttle</text>
+  <text class="ts" x="485" y="224" text-anchor="middle" dominant-baseline="central">three local heads</text>
 </g>
-<line x1="485" y1="226" x2="295" y2="268" class="arr" marker-end="url(#arrow)"/>
-<line x1="485" y1="226" x2="413" y2="268" class="arr" marker-end="url(#arrow)"/>
-<line x1="485" y1="226" x2="529" y2="268" class="arr" marker-end="url(#arrow)"/>
-<line x1="485" y1="226" x2="645" y2="268" class="arr" marker-end="url(#arrow)"/>
+<line x1="485" y1="242" x2="316" y2="286" class="arr" marker-end="url(#arrow)"/>
+<line x1="485" y1="242" x2="465" y2="286" class="arr" marker-end="url(#arrow)"/>
+<line x1="485" y1="242" x2="604" y2="286" class="arr" marker-end="url(#arrow)"/>
 <g class="node c-blue">
-  <rect x="240" y="272" width="106" height="56" rx="8"/>
-  <text class="th" x="293" y="290" text-anchor="middle" dominant-baseline="central">Dense</text>
-  <text class="ts" x="293" y="308" text-anchor="middle" dominant-baseline="central">window text</text>
-</g>
-<g class="node c-blue">
-  <rect x="358" y="272" width="106" height="56" rx="8"/>
-  <text class="th" x="411" y="290" text-anchor="middle" dominant-baseline="central">Salient</text>
-  <text class="ts" x="411" y="308" text-anchor="middle" dominant-baseline="central">rare terms</text>
+  <rect x="240" y="290" width="136" height="74" rx="8"/>
+  <text class="th" x="308" y="312" text-anchor="middle" dominant-baseline="central">Dense</text>
+  <text class="ts" x="308" y="334" text-anchor="middle" dominant-baseline="central">window text</text>
+  <text class="ts" x="308" y="350" text-anchor="middle" dominant-baseline="central">Qwen3 embedding</text>
 </g>
 <g class="node c-blue">
-  <rect x="476" y="272" width="106" height="56" rx="8"/>
-  <text class="th" x="529" y="290" text-anchor="middle" dominant-baseline="central">GLiNER2</text>
-  <text class="ts" x="529" y="308" text-anchor="middle" dominant-baseline="central">spans + context</text>
+  <rect x="392" y="290" width="136" height="74" rx="8"/>
+  <text class="th" x="460" y="312" text-anchor="middle" dominant-baseline="central">GLiNER2 spans</text>
+  <text class="ts" x="460" y="334" text-anchor="middle" dominant-baseline="central">raw + fuzzy-snapped</text>
+  <text class="ts" x="460" y="350" text-anchor="middle" dominant-baseline="central">sentence context</text>
 </g>
 <g class="node c-blue">
-  <rect x="594" y="272" width="106" height="56" rx="8"/>
-  <text class="th" x="647" y="290" text-anchor="middle" dominant-baseline="central">BM25</text>
-  <text class="ts" x="647" y="308" text-anchor="middle" dominant-baseline="central">+ snapped terms</text>
+  <rect x="544" y="290" width="136" height="74" rx="8"/>
+  <text class="th" x="612" y="312" text-anchor="middle" dominant-baseline="central">BM25</text>
+  <text class="ts" x="612" y="334" text-anchor="middle" dominant-baseline="central">window text</text>
+  <text class="ts" x="612" y="350" text-anchor="middle" dominant-baseline="central">+ snapped terms</text>
 </g>
-<line x1="293" y1="330" x2="380" y2="372" class="arr" marker-end="url(#arrow)"/>
-<line x1="411" y1="330" x2="440" y2="372" class="arr" marker-end="url(#arrow)"/>
-<line x1="529" y1="330" x2="540" y2="372" class="arr" marker-end="url(#arrow)"/>
-<line x1="647" y1="330" x2="605" y2="372" class="arr" marker-end="url(#arrow)"/>
+<line x1="308" y1="364" x2="420" y2="404" class="arr" marker-end="url(#arrow)"/>
+<line x1="460" y1="364" x2="475" y2="404" class="arr" marker-end="url(#arrow)"/>
+<line x1="612" y1="364" x2="550" y2="404" class="arr" marker-end="url(#arrow)"/>
+<path d="M130 242 L130 441 L326 441" fill="none" class="arr" marker-end="url(#arrow)"/>
 <g class="node c-purple">
-  <rect x="330" y="376" width="310" height="56" rx="8"/>
-  <text class="th" x="485" y="394" text-anchor="middle" dominant-baseline="central">RRF fusion</text>
-  <text class="ts" x="485" y="412" text-anchor="middle" dominant-baseline="central">5 ranked lists · k = 60</text>
+  <rect x="330" y="408" width="310" height="64" rx="8"/>
+  <text class="th" x="485" y="428" text-anchor="middle" dominant-baseline="central">RRF fusion · k = 60</text>
+  <text class="ts" x="485" y="450" text-anchor="middle" dominant-baseline="central">exact alias hits injected at rank 1</text>
 </g>
-<line x1="485" y1="434" x2="485" y2="476" class="arr" marker-end="url(#arrow)"/>
+<line x1="485" y1="472" x2="485" y2="508" class="arr" marker-end="url(#arrow)"/>
 <g class="c-purple">
-  <rect x="240" y="480" width="440" height="158" rx="20"/>
-  <text class="th" x="460" y="504" text-anchor="middle" dominant-baseline="central">Graph space</text>
+  <rect x="20" y="512" width="680" height="196" rx="20"/>
+  <text class="th" x="360" y="536" text-anchor="middle" dominant-baseline="central">Graph space — PPR over the note graph</text>
 </g>
 <g class="node c-blue">
-  <rect x="262" y="524" width="190" height="88" rx="8"/>
-  <text class="th" x="357" y="546" text-anchor="middle" dominant-baseline="central">Graph vote</text>
-  <text class="ts" x="357" y="566" text-anchor="middle" dominant-baseline="central">neighbors of top-10</text>
-  <text class="ts" x="357" y="584" text-anchor="middle" dominant-baseline="central">feeds 5th RRF list ↻</text>
+  <rect x="45" y="560" width="200" height="100" rx="8"/>
+  <text class="th" x="145" y="582" text-anchor="middle" dominant-baseline="central">Seed accumulator</text>
+  <text class="ts" x="145" y="604" text-anchor="middle" dominant-baseline="central">decay 0.85 per pass</text>
+  <text class="ts" x="145" y="622" text-anchor="middle" dominant-baseline="central">the whole transcription as a</text>
+  <text class="ts" x="145" y="640" text-anchor="middle" dominant-baseline="central">personalization vector</text>
+</g>
+<line x1="247" y1="610" x2="261" y2="610" class="arr" marker-end="url(#arrow)"/>
+<g class="node c-purple">
+  <rect x="265" y="560" width="205" height="100" rx="8"/>
+  <text class="th" x="367" y="582" text-anchor="middle" dominant-baseline="central">PPR traversal</text>
+  <text class="ts" x="367" y="604" text-anchor="middle" dominant-baseline="central">damping 0.5 · warm-started</text>
+  <text class="ts" x="367" y="622" text-anchor="middle" dominant-baseline="central">fact edges × 1.5</text>
+  <text class="ts" x="367" y="640" text-anchor="middle" dominant-baseline="central">shared-term edges × 1.35</text>
 </g>
 <g class="node c-blue">
-  <rect x="472" y="524" width="186" height="88" rx="8"/>
-  <text class="th" x="565" y="546" text-anchor="middle" dominant-baseline="central">1-hop expansion</text>
-  <text class="ts" x="565" y="566" text-anchor="middle" dominant-baseline="central">top-5 seed neighbors</text>
-  <text class="ts" x="565" y="584" text-anchor="middle" dominant-baseline="central">edge weight × 0.5</text>
+  <rect x="490" y="560" width="185" height="100" rx="8"/>
+  <text class="th" x="582" y="582" text-anchor="middle" dominant-baseline="central">Fact dense search</text>
+  <text class="ts" x="582" y="604" text-anchor="middle" dominant-baseline="central">adjudicated edge facts</text>
+  <text class="ts" x="582" y="622" text-anchor="middle" dominant-baseline="central">hits credit both</text>
+  <text class="ts" x="582" y="640" text-anchor="middle" dominant-baseline="central">endpoint notes</text>
 </g>
-<path d="M460 638 L460 662 L335 662 L335 686" fill="none" class="arr" marker-end="url(#arrow)"/>
-<g class="node c-amber">
-  <rect x="240" y="690" width="190" height="56" rx="8"/>
-  <text class="th" x="335" y="708" text-anchor="middle" dominant-baseline="central">Cohere rerank</text>
-  <text class="ts" x="335" y="726" text-anchor="middle" dominant-baseline="central">rerank-v3.5 · top 20</text>
-</g>
-<line x1="432" y1="718" x2="476" y2="718" class="arr" marker-end="url(#arrow)"/>
+<line x1="265" y1="708" x2="265" y2="748" class="arr" marker-end="url(#arrow)"/>
 <g class="node c-blue">
-  <rect x="480" y="690" width="200" height="56" rx="8"/>
-  <text class="th" x="580" y="708" text-anchor="middle" dominant-baseline="central">Protect + floor</text>
-  <text class="ts" x="580" y="726" text-anchor="middle" dominant-baseline="central">fused 3 · dense 2 · top 8</text>
+  <rect x="45" y="752" width="440" height="92" rx="8"/>
+  <text class="th" x="265" y="774" text-anchor="middle" dominant-baseline="central">Blend</text>
+  <text class="ts" x="265" y="796" text-anchor="middle" dominant-baseline="central">rel = 0.65 · RRF ⊕ 0.35 · PPR</text>
+  <text class="ts" x="265" y="814" text-anchor="middle" dominant-baseline="central">× recency decay — per-source half-life · 48 h grace · 0.15 floor</text>
+  <text class="ts" x="265" y="832" text-anchor="middle" dominant-baseline="central">× source rank × exp(0.2 · quality rank)</text>
 </g>
-<path d="M125 226 L125 836" fill="none" class="arr" marker-end="url(#arrow)"/>
-<path d="M580 748 L580 772 L510 772 L510 836" fill="none" class="arr" marker-end="url(#arrow)"/>
+<g class="c-purple">
+  <rect x="510" y="752" width="170" height="92" rx="8" stroke-dasharray="4 3"/>
+  <text class="th" x="595" y="774" text-anchor="middle" dominant-baseline="central">Quality rank</text>
+  <text class="ts" x="595" y="796" text-anchor="middle" dominant-baseline="central">weighted PageRank</text>
+  <text class="ts" x="595" y="814" text-anchor="middle" dominant-baseline="central">trust + recency teleport</text>
+  <text class="ts" x="595" y="832" text-anchor="middle" dominant-baseline="central">computed at graph rebuild</text>
+</g>
+<line x1="506" y1="798" x2="493" y2="798" class="arr" marker-end="url(#arrow)"/>
+<line x1="265" y1="844" x2="265" y2="880" class="arr" marker-end="url(#arrow)"/>
 <g class="c-teal">
-  <rect x="20" y="798" width="660" height="168" rx="20"/>
-  <text class="th" x="350" y="820" text-anchor="middle" dominant-baseline="central">Slate</text>
+  <rect x="20" y="884" width="680" height="150" rx="20"/>
+  <text class="th" x="360" y="908" text-anchor="middle" dominant-baseline="central">Grounding set</text>
 </g>
 <g class="node c-teal">
-  <rect x="45" y="840" width="290" height="100" rx="8"/>
-  <text class="th" x="190" y="862" text-anchor="middle" dominant-baseline="central">Exact lane</text>
-  <text class="ts" x="190" y="884" text-anchor="middle" dominant-baseline="central">quota 3 · decay 2 revs</text>
-  <text class="ts" x="190" y="902" text-anchor="middle" dominant-baseline="central">never re-show · suppress 300 s</text>
+  <rect x="60" y="930" width="290" height="84" rx="8"/>
+  <text class="th" x="205" y="950" text-anchor="middle" dominant-baseline="central">Top 12 notes</text>
+  <text class="ts" x="205" y="972" text-anchor="middle" dominant-baseline="central">hysteresis: displace only at 1.15×</text>
+  <text class="ts" x="205" y="990" text-anchor="middle" dominant-baseline="central">score bar · source badge · age chip</text>
 </g>
 <g class="node c-teal">
-  <rect x="365" y="840" width="290" height="100" rx="8"/>
-  <text class="th" x="510" y="862" text-anchor="middle" dominant-baseline="central">Search lane</text>
-  <text class="ts" x="510" y="884" text-anchor="middle" dominant-baseline="central">quota 8 · C2 top-8 adds</text>
-  <text class="ts" x="510" y="902" text-anchor="middle" dominant-baseline="central">evict: views ↓ · score ↓ · oldest</text>
+  <rect x="380" y="930" width="290" height="84" rx="8"/>
+  <text class="th" x="525" y="950" text-anchor="middle" dominant-baseline="central">Edge facts ≤ 20</text>
+  <text class="ts" x="525" y="972" text-anchor="middle" dominant-baseline="central">within-set + fact-embedding hits</text>
+  <text class="ts" x="525" y="990" text-anchor="middle" dominant-baseline="central">stable N# / F# citation ids</text>
 </g>
-<line x1="190" y1="966" x2="190" y2="1002" class="arr" marker-end="url(#arrow)"/>
+<line x1="360" y1="1034" x2="360" y2="1096" class="arr" marker-end="url(#arrow)"/>
+<line x1="40" y1="1064" x2="340" y2="1064" class="sep"/>
+<line x1="380" y1="1064" x2="680" y2="1064" class="sep"/>
+<text class="ts" x="180" y="1050" text-anchor="middle" dominant-baseline="central">everything above: LLM-free · local models only · ≈ 250 ms</text>
+<text class="ts" x="540" y="1082" text-anchor="middle" dominant-baseline="central">below: the only live LLM call — the summarizer</text>
 <g class="node c-gray">
-  <rect x="95" y="1006" width="190" height="56" rx="8"/>
-  <text class="th" x="190" y="1024" text-anchor="middle" dominant-baseline="central">Cadence gate</text>
-  <text class="ts" x="190" y="1042" text-anchor="middle" dominant-baseline="central">3 s debounce · ≤3/min</text>
+  <rect x="110" y="1100" width="500" height="88" rx="8"/>
+  <text class="th" x="360" y="1122" text-anchor="middle" dominant-baseline="central">Change trigger</text>
+  <text class="ts" x="360" y="1146" text-anchor="middle" dominant-baseline="central">Jaccard &lt; 0.6 vs last summarized set · topic drift &lt; 0.70 · stale &gt; 240 s</text>
+  <text class="ts" x="360" y="1164" text-anchor="middle" dominant-baseline="central">gates: ≥ 25 s interval · ≥ 200 new chars · no_update backoff 40 s</text>
 </g>
-<line x1="287" y1="1034" x2="326" y2="1034" class="arr" marker-end="url(#arrow)"/>
+<line x1="360" y1="1188" x2="360" y2="1224" class="arr" marker-end="url(#arrow)"/>
 <g class="node c-amber">
-  <rect x="330" y="1006" width="210" height="56" rx="8"/>
-  <text class="th" x="435" y="1024" text-anchor="middle" dominant-baseline="central">Presenter</text>
-  <text class="ts" x="435" y="1042" text-anchor="middle" dominant-baseline="central">whole transcript · read_note</text>
+  <rect x="60" y="1228" width="600" height="106" rx="8"/>
+  <text class="th" x="360" y="1252" text-anchor="middle" dominant-baseline="central">Summarizer — ONE deepseek-v4-flash pass</text>
+  <text class="ts" x="360" y="1276" text-anchor="middle" dominant-baseline="central">prev summary + transcript delta + grounding block</text>
+  <text class="ts" x="360" y="1294" text-anchor="middle" dominant-baseline="central">→ rolling cited summary [N#] [F#] · invalid citations stripped</text>
+  <text class="ts" x="360" y="1312" text-anchor="middle" dominant-baseline="central">→ actionables: verbatim quote ≥ 0.85 fuzzy · confidence ≥ 0.8 · ≤ 2 per pass</text>
 </g>
-<line x1="542" y1="1034" x2="571" y2="1034" class="arr" marker-end="url(#arrow)"/>
+<line x1="360" y1="1334" x2="360" y2="1370" class="arr" marker-end="url(#arrow)"/>
 <g class="node c-green">
-  <rect x="575" y="1006" width="125" height="56" rx="8"/>
-  <text class="th" x="637" y="1024" text-anchor="middle" dominant-baseline="central">Pins + why</text>
-  <text class="ts" x="637" y="1042" text-anchor="middle" dominant-baseline="central">max 3 cards</text>
+  <rect x="130" y="1374" width="460" height="60" rx="8"/>
+  <text class="th" x="360" y="1394" text-anchor="middle" dominant-baseline="central">Summary panel · actionable cards · grounding list</text>
+  <text class="ts" x="360" y="1414" text-anchor="middle" dominant-baseline="central">no pinned cards</text>
 </g>
 </svg>
