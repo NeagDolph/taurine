@@ -358,16 +358,16 @@ function mixHex(start: string, end: string, t: number): string {
 
 const SOURCE_COLORS: Record<string, string> = {
   apple_notes: '#7aa7ff',
-  claude_memories: '#ff8da1',
-  codex_memories: '#6dd6d6',
+  claude_mem: '#ff8da1',
+  codex_mem: '#6dd6d6',
   imessage: '#5fd18d',
   obsidian: '#b98cff'
 }
 
 const SOURCE_LABELS: Record<string, string> = {
   apple_notes: 'Apple Notes',
-  claude_memories: 'Claude',
-  codex_memories: 'Codex',
+  claude_mem: 'Claude',
+  codex_mem: 'Codex',
   imessage: 'iMessage',
   obsidian: 'Obsidian'
 }

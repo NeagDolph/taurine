@@ -6,9 +6,9 @@ export function sourceLabel(source: string): string {
       return 'Obsidian'
     case 'imessage':
       return 'iMessage'
-    case 'claude_memories':
+    case 'claude_mem':
       return 'Claude'
-    case 'codex_memories':
+    case 'codex_mem':
       return 'Codex'
     default:
       return source

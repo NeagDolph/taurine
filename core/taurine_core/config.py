@@ -164,8 +164,8 @@ SOURCE_RANK = {
     "apple_notes": 1.00,                 # written notes: highest
     "obsidian": 1.00,
     "imessage": 0.85,                    # text messages: a bit lower
-    "claude_memories": 0.70,             # agent memories: a bit lower still
-    "codex_memories": 0.70,
+    "claude_mem": 0.70,                  # agent memories: a bit lower still
+    "codex_mem": 0.70,
 }
 SOURCE_RANK_DEFAULT = 0.85               # future connectors until explicitly ranked
 QUALITY_DAMPING = 0.85                   # quality-rank PageRank damping
@@ -176,8 +176,8 @@ QUALITY_LAMBDA = 0.20                    # blend: multiplier = exp(λ·quality_r
 RECENCY_OFFSET_DAYS = 2.0                # grace window before decay starts
 RECENCY_HALF_LIFE_DAYS = {
     "imessage": 30.0,                    # episodic sources decay fast
-    "claude_memories": 60.0,
-    "codex_memories": 60.0,
+    "claude_mem": 60.0,
+    "codex_mem": 60.0,
     "apple_notes": 90.0,
     "obsidian": 120.0,                   # evergreen notes barely decay
 }

@@ -621,8 +621,8 @@ button:disabled {
   color: #58c98d;
 }
 
-.source-claude_memories,
-.source-codex_memories {
+.source-claude_mem,
+.source-codex_mem {
   background: rgba(255, 255, 255, 0.07);
   color: var(--text-2);
 }
