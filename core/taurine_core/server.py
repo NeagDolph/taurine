@@ -153,12 +153,18 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             active_runtime.connector_registry.on_change = lambda: active_runtime.updates.publish(
                 "connectors"
             )
+        # embedding-dimension migration runs in the background so the app can
+        # connect immediately; dense search serves the already-migrated rows
+        # (load() skips wrong-dim vectors) and reloads fully when done
+        reembed_task = asyncio.create_task(_migrate_embeddings(active_runtime))
         periodic_task: asyncio.Task[None] | None = None
         if active_runtime.enable_periodic_sync:
             periodic_task = asyncio.create_task(_periodic_sync(active_runtime))
         try:
             yield
         finally:
+            reembed_task.cancel()
+            await asyncio.gather(reembed_task, return_exceptions=True)
             if periodic_task is not None:
                 periodic_task.cancel()
                 await asyncio.gather(periodic_task, return_exceptions=True)
@@ -448,10 +454,6 @@ def build_runtime() -> Runtime:
     span_extractor = Gliner2SpanExtractor()
     connector_registry = ConnectorRegistry()
     connector_registry.reconcile_ledger(index)
-    from taurine_core.indexer.reembed import needs_reembed, reembed_all
-
-    if needs_reembed(index):
-        reembed_all(index)
 
     def make_live_session(emit: EventSink, logger: SessionLogger) -> LiveSession:
         clock = _MonotonicClock()
@@ -578,6 +580,28 @@ async def _send_events(
     while True:
         event = await events.get()
         await websocket.send_text(event.model_dump_json())
+
+
+async def _migrate_embeddings(runtime: Runtime) -> None:
+    from taurine_core.indexer.reembed import needs_reembed, reembed_all
+
+    if not hasattr(runtime.index, "_embedding_rows_raw"):
+        return  # test doubles without a real embeddings table
+    logger = logging.getLogger("taurine.session")
+    try:
+        if not await asyncio.to_thread(needs_reembed, runtime.index):
+            return
+        logger.info("embedding migration starting (stale rows re-encode in background)")
+        count = await asyncio.to_thread(reembed_all, runtime.index)
+        logger.info("embedding migration done: %d rows", count)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("embedding migration failed")
+        return
+    _bump_graph(runtime)
+    runtime.updates.publish("connectors")
+    await _emit_index_status(runtime)
 
 
 async def _periodic_sync(runtime: Runtime) -> None:

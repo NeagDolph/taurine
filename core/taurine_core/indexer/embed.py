@@ -75,7 +75,9 @@ def chunk_text(text: str) -> list[str]:
 def _get_model() -> Any:
     global _MODEL
     if _MODEL is None:
-        _MODEL = SentenceTransformer(model_ref(config.EMBED_MODEL))
+        ref = model_ref(config.EMBED_MODEL)
+        # a bundled path must load with zero hub traffic (no update pings)
+        _MODEL = SentenceTransformer(ref, local_files_only=ref != config.EMBED_MODEL)
     return _MODEL
 
 

@@ -637,13 +637,19 @@ class Index:
         self.load()
         return self._embedding_rows, self._matrix
 
-    def _embedding_rows_raw(self) -> list[tuple[int, str, EmbeddingKind, str]]:
+    def _embedding_rows_raw(
+        self, *, stale_only: bool = False
+    ) -> list[tuple[int, str, EmbeddingKind, str]]:
+        where = "WHERE length(vec) != ?" if stale_only else ""
+        params = (config.EMBED_DIM * 4,) if stale_only else ()
         rows = self._conn.execute(
-            """
+            f"""
             SELECT id, note_id, kind, text
             FROM embeddings
+            {where}
             ORDER BY id
-            """
+            """,
+            params,
         ).fetchall()
         return [
             (int(row["id"]), row["note_id"], row["kind"], row["text"])

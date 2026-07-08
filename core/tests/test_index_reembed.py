@@ -44,15 +44,16 @@ def test_reembed_all_updates_legacy_vectors_rebuilds_graph_and_reloads(store, mo
 
     count = reembed.reembed_all(store, progress=lambda done, total: progress.append((done, total)))
 
-    assert count == 4
-    assert encoded_texts == [
-        beta_enrich.gist,
-        beta_enrich.gist,
-        beta_enrich.utterances[0],
-        alpha_enrich.gist,
-    ]
+    # stale-only default: current-dim rows are untouched, so an interrupted
+    # migration resumes instead of restarting
+    assert count == 1
+    assert encoded_texts == [alpha_enrich.gist]
     assert _vector_lengths(store) == [config.EMBED_DIM * 4] * 4
     assert reembed.needs_reembed(store) is False
     assert store._matrix.shape == (4, config.EMBED_DIM)
-    assert progress[-1] == (4, 4)
+    assert progress[-1] == (1, 1)
     assert any({edge.src, edge.dst} == {"alpha", "beta"} for edge in store.graph().edges)
+
+    encoded_texts.clear()
+    assert reembed.reembed_all(store, stale_only=False) == 4
+    assert len(encoded_texts) == 4

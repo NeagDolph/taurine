@@ -27,8 +27,16 @@ def needs_reembed(index: Index) -> bool:
     return row is not None and int(row["count"]) > 0
 
 
-def reembed_all(index: Index, progress: Callable[[int, int], None] | None = None) -> int:
-    rows = index._embedding_rows_raw()
+def reembed_all(
+    index: Index,
+    progress: Callable[[int, int], None] | None = None,
+    *,
+    stale_only: bool = True,
+) -> int:
+    """Re-encode embedding rows. With stale_only (the default) only rows whose
+    stored vector has the wrong byte length are touched — every row commits
+    individually, so an interrupted migration resumes where it stopped."""
+    rows = index._embedding_rows_raw(stale_only=stale_only)
     total = len(rows)
     done = 0
     next_log = _LOG_EVERY
@@ -60,8 +68,13 @@ def _batches(rows: Sequence[EmbeddingRow], size: int) -> list[Sequence[Embedding
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Re-embed all Taurine embeddings.")
+    parser = argparse.ArgumentParser(description="Re-embed stale Taurine embeddings.")
     parser.add_argument("--db", type=Path, default=Path("taurine.db"))
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="re-encode every row, not just stale-dimension ones",
+    )
     args = parser.parse_args(argv)
 
     index = Index(args.db)
@@ -72,6 +85,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"reembed: {done}/{total} embeddings",
                 flush=True,
             ),
+            stale_only=not args.all,
         )
     finally:
         index.close()

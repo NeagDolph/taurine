@@ -15,7 +15,8 @@ def test_embed_texts_and_queries_normalize_rows_and_load_model_once(monkeypatch)
     encode_calls: list[tuple[tuple[str, ...], str | None]] = []
 
     class FakeSentenceTransformer:
-        def __init__(self, model_name: str) -> None:
+        def __init__(self, model_name: str, local_files_only: bool = False) -> None:
+            del local_files_only
             calls.append(model_name)
 
         def encode(
