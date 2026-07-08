@@ -201,6 +201,45 @@ async def test_turn_event_order_tool_round_trip_budget_no_tools_and_citation_str
 
 
 @pytest.mark.asyncio
+async def test_pre_tool_narration_is_separated_from_the_answer(
+    store: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        engine_module,
+        "execute_tool",
+        lambda name, arguments, retriever, index, now: (
+            '{"rows":[]}',
+            ChatActivityStep(kind="search", label="Searched", note_ids=[]),
+        ),
+    )
+    llm = FakeLLM(
+        streams=[
+            [
+                StreamEvent(kind="content", text="Let me look that up for full detail."),
+                StreamEvent(kind="tool_call", tool_call={"id": "c1", "name": "search_notes", "arguments": {"query": "x"}}),
+                StreamEvent(kind="done"),
+            ],
+            [
+                StreamEvent(kind="content", text="Here's the answer."),
+                StreamEvent(kind="done"),
+            ],
+        ]
+    )
+    engine = ChatEngine(store, llm, MemoryLogger())
+    events: list[dict[str, Any]] = []
+
+    await engine.send("", "State?", lambda event: _capture(event, events))
+
+    done = next(event for event in events if event["type"] == "chat_done")
+    # the round-1 narration and the round-2 answer must not run together
+    assert done["message"]["content"] == "Let me look that up for full detail.\n\nHere's the answer."
+    # persisted content equals the concatenation of streamed deltas
+    streamed = "".join(event["delta"] for event in events if event["type"] == "chat_delta")
+    assert streamed == done["message"]["content"]
+
+
+@pytest.mark.asyncio
 async def test_tool_call_remnants_are_stripped_from_final_content(store: Any) -> None:
     llm = FakeLLM(
         streams=[

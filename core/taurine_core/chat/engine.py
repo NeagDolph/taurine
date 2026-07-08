@@ -489,6 +489,20 @@ class ChatEngine:
                         }
                     )
                     messages.extend(tool_messages)
+                    # the model often narrates ("Let me pull up…") before a
+                    # tool call; separate it from the next round's answer so
+                    # they don't run together ("…detail.Here's…"). Emit the
+                    # break too, so persisted content matches what streamed.
+                    joined = "".join(content_parts)
+                    if joined and not joined[-1].isspace():
+                        content_parts.append("\n\n")
+                        await emit(
+                            ChatDeltaEvent(
+                                chat_id=chat_id,
+                                message_id=assistant_id,
+                                delta="\n\n",
+                            )
+                        )
                 round_index += 1
         except asyncio.CancelledError:
             if persisted_message is None:
