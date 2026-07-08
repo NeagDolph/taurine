@@ -510,6 +510,40 @@ async def test_rejected_summary_records_pass_without_events_delta_reset_or_backo
 
 
 @pytest.mark.asyncio
+async def test_both_model_failure_throttles_like_rejection() -> None:
+    clock = FakeClock()
+    update = GroundingUpdate(
+        items=[grounding_item("direct", "Direct Note", "Direct gist", 0.91)],
+        revision=3,
+    )
+    ambient = SequenceAmbient(results=[update])
+    trigger = RecordingTrigger([(True, "jaccard")])
+    summarizer = RecordingSummarizer([None])
+    previous_summary = MeetingSummary(rev=7, summary_md="Existing [N1]", grounding=update.items)
+    session, events, trigger, summarizer, logger = session_with(
+        index=FakeIndex(notes={"direct": note("direct")}),
+        clock=clock,
+        ambient=ambient,
+        trigger=trigger,
+        summarizer=summarizer,
+    )
+    session._summary = previous_summary
+
+    await session.on_chunk(chunk("model outage window"))
+    await drain_summary_task()
+
+    assert trigger.rejected_count == 1
+    assert trigger.noted == []
+    assert session.current_summary() == previous_summary
+    assert session._transcript_delta == "[ch0] model outage window"
+    assert [event.type for event in events].count("summary") == 0
+    assert [event.type for event in events].count("actionable") == 0
+    [summary_payload] = [payload for kind, payload in logger.records if kind == "summary"]
+    assert summary_payload["rejected"] is True
+    assert summary_payload["reject_reason"] == "llm_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_in_flight_summary_pass_skips_second_fire() -> None:
     release = asyncio.Event()
     first = GroundingUpdate(items=[grounding_item("one", "One", "One gist", 0.91)], revision=1)

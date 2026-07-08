@@ -315,6 +315,19 @@ class LiveSession:
             return
 
         if result is None:
+            # both models failed: throttle like a rejection so an LLM outage
+            # can't re-fire the summarizer on every C2 pass
+            self._trigger.note_rejected()
+            log_summary(
+                self._logger,
+                model="",
+                latency_ms=0.0,
+                no_update=False,
+                rejected=True,
+                reject_reason="llm_unavailable",
+                citation_stats={},
+                accepted_actionable_ids=[],
+            )
             return
 
         if result.no_update:
