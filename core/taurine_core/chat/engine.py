@@ -31,7 +31,6 @@ from typing import Any, Callable, Coroutine
 from uuid import uuid4
 
 from .. import config
-from ..indexer import store as _store_module
 from ..indexer.store import Index
 from ..llm import OpenRouterClient, StreamEvent
 from ..ports import LLMError
@@ -53,9 +52,6 @@ from ..schemas import (
 )
 from .retrieval import ChatRetriever
 from .tools import TOOL_DEFINITIONS, execute_tool
-
-_store_module.GroundingItem = GroundingItem
-_store_module.GroundedFact = GroundedFact
 
 # async callback the server provides: emits one ws event dict/model to the client
 EmitFn = Callable[[Any], Coroutine[Any, Any, None]]

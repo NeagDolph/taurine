@@ -22,6 +22,8 @@ from taurine_core.schemas import (
     GraphEdge,
     GraphNode,
     GraphResponse,
+    GroundedFact,
+    GroundingItem,
     NeighborRef,
     NotePreview,
     NoteRecord,
