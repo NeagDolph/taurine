@@ -97,11 +97,13 @@ def _record(vault: Path, path: Path) -> NoteRecord:
     parent = path.parent.relative_to(vault)
     folder = "" if parent == Path(".") else parent.as_posix()
     content_hash = hashlib.sha256((title + capped).encode("utf-8")).hexdigest()
+    stat = path.stat()
     return NoteRecord(
         note_id=f"{ObsidianConnector.connector_id}:{relpath}",
         title=title,
         folder=folder,
-        modified=path.stat().st_mtime,
+        modified=stat.st_mtime,
+        created=getattr(stat, "st_birthtime", stat.st_mtime),
         content_hash=content_hash,
         text=capped,
         source=ObsidianConnector.connector_id,

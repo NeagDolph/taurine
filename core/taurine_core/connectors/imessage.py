@@ -203,6 +203,7 @@ def _record_for_chat(
         title=f"iMessage: {title_name}",
         folder="iMessage",
         modified=newest_ts,
+        created=selected[-1].timestamp,
         content_hash=content_hash,
         text=transcript,
         source=IMessageConnector.connector_id,

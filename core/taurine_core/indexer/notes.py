@@ -61,12 +61,14 @@ def _record_from_raw(raw_note: object) -> NoteRecord:
     text = html_to_text(body)
     folder = _folder_name(getattr(raw_note, "folder", ""))
     modified = _timestamp(_value(getattr(raw_note, "modification_date", 0.0)))
+    created = _timestamp(_value(getattr(raw_note, "creation_date", modified))) or modified
     content_hash = hashlib.sha256((title + text).encode("utf-8")).hexdigest()
     return NoteRecord(
         note_id=note_id,
         title=title,
         folder=folder,
         modified=modified,
+        created=created,
         content_hash=content_hash,
         text=text,
     )

@@ -207,12 +207,14 @@ async def test_enrich_batch_falls_back_all_notes_after_batch_retry_fails(monkeyp
 
 def test_sync_source_batches_and_caches_successes_only(monkeypatch, store) -> None:
     from taurine_core.indexer import batch_enrich, enrich, sync
+    from taurine_core.indexer import store as store_module
     from taurine_core.indexer.sync import sync_source
 
     async def no_sleep(_seconds: float) -> None:
         return None
 
     monkeypatch.setattr(sync, "embed_texts", _hash_embeddings)
+    monkeypatch.setattr(store_module, "embed_texts", _hash_embeddings)
     monkeypatch.setattr(batch_enrich.asyncio, "sleep", no_sleep)
     monkeypatch.setattr(enrich.asyncio, "sleep", no_sleep)
     notes = _notes(config.ENRICH_BATCH_MIN_NOTES)

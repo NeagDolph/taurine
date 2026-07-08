@@ -149,6 +149,20 @@ def test_note_source_round_trips_counts_and_graph_nodes(store):
     }
 
 
+def test_note_created_round_trips_and_zero_falls_back_to_modified(store):
+    explicit = make_note("explicit", "Explicit", "Explicit body", modified=200.0).model_copy(
+        update={"created": 100.0}
+    )
+    fallback = make_note("fallback", "Fallback", "Fallback body", modified=300.0)
+    enrich = enrichment("Created gist", topics=["created"])
+
+    store.upsert_note(explicit, enrich, fixture_units(unit_vec(61), enrich))
+    store.upsert_note(fallback, enrich, fixture_units(unit_vec(62), enrich))
+
+    assert store.note("explicit").created == pytest.approx(100.0)
+    assert store.note("fallback").created == pytest.approx(300.0)
+
+
 def test_store_migrates_existing_notes_without_source_column(tmp_path):
     db_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(db_path)
@@ -182,7 +196,11 @@ def test_store_migrates_existing_notes_without_source_column(tmp_path):
         row["name"] for row in index._conn.execute("PRAGMA table_info(notes)").fetchall()
     }
     assert "source" in columns
+    assert "created" in columns
+    assert "quality_rank" in columns
     assert index.note("legacy").source == "apple_notes"
+    assert index.note("legacy").created == pytest.approx(1.0)
+    assert index.note("legacy").quality_rank == pytest.approx(0.0)
     assert index.note_count_by_source() == {"apple_notes": 1}
 
 

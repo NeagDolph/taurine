@@ -45,6 +45,9 @@ def test_claude_memories_extracts_markdown_files_with_caps_and_stable_ids(
     assert len(record.text) == config.CONNECTOR_DOC_MAX_CHARS
     assert len(record.content_hash) == 64
     assert record.modified == pytest.approx(note_path.stat().st_mtime)
+    assert record.created == pytest.approx(
+        getattr(note_path.stat(), "st_birthtime", note_path.stat().st_mtime)
+    )
 
 
 def test_claude_memories_falls_back_to_filename_when_no_heading(tmp_path: Path) -> None:
@@ -83,6 +86,12 @@ def test_codex_memories_extracts_multiple_globs_and_reports_absence(
     assert [record.title for record in records] == ["Agent Rules", "Handoff"]
     assert [record.folder for record in records] == [".codex", "taurine"]
     assert {record.source for record in records} == {"codex_mem"}
+    assert records[0].created == pytest.approx(
+        getattr(agents.stat(), "st_birthtime", agents.stat().st_mtime)
+    )
+    assert records[1].created == pytest.approx(
+        getattr(project_memory.stat(), "st_birthtime", project_memory.stat().st_mtime)
+    )
 
     empty_home = tmp_path / "empty-home"
     empty_home.mkdir()
@@ -111,6 +120,10 @@ def test_obsidian_extracts_vault_markdown_and_skips_hidden_dirs(tmp_path: Path) 
     assert [record.title for record in records] == ["Daily Note", "Plan"]
     assert [record.folder for record in records] == ["", "Projects"]
     assert {record.source for record in records} == {"obsidian"}
+    daily_stat = (vault / "Daily.md").stat()
+    assert records[0].created == pytest.approx(
+        getattr(daily_stat, "st_birthtime", daily_stat.st_mtime)
+    )
 
 
 def test_obsidian_discovers_most_recent_vault_from_app_json(
@@ -175,6 +188,7 @@ def test_imessage_extracts_bounded_chat_transcripts_with_attribution_and_hashes(
     assert record.folder == "iMessage"
     assert record.source == "imessage"
     assert record.modified == pytest.approx(newest.timestamp(), abs=1.0)
+    assert record.created == pytest.approx(inside_window.timestamp(), abs=1.0)
     assert record.text.splitlines() == [
         "[them] inside window",
         "[me] newest reply",

@@ -45,11 +45,13 @@ def _record(path: Path) -> NoteRecord:
     capped = text[: taurine_config.CONNECTOR_DOC_MAX_CHARS]
     title = _title(text, path)
     content_hash = hashlib.sha256((title + capped).encode("utf-8")).hexdigest()
+    stat = path.stat()
     return NoteRecord(
         note_id=f"claude-mem:{_home_relative(path)}",
         title=title,
         folder=_project_folder(path),
-        modified=path.stat().st_mtime,
+        modified=stat.st_mtime,
+        created=getattr(stat, "st_birthtime", stat.st_mtime),
         content_hash=content_hash,
         text=capped,
         source=ClaudeMemoriesConnector.connector_id,

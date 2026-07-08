@@ -21,11 +21,13 @@ def markdown_file_to_note(
     title = first_heading_or_filename(raw_text, file_path)
     relative = _relative_path(file_path, root_path)
     folder = "" if relative.parent == Path(".") else relative.parent.as_posix()
+    stat = file_path.stat()
     return NoteRecord(
         note_id=namespaced_file_id(connector_id, relative),
         title=title,
         folder=folder,
-        modified=file_path.stat().st_mtime,
+        modified=stat.st_mtime,
+        created=getattr(stat, "st_birthtime", stat.st_mtime),
         content_hash=content_hash(title, text),
         text=text,
         source=connector_id,

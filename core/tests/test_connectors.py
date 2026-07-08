@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import importlib
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -89,6 +88,9 @@ def test_markdown_file_to_record_caps_body_namespaces_id_and_uses_first_heading(
     assert note.source == "obsidian"
     assert len(note.text) == config.CONNECTOR_DOC_MAX_CHARS
     assert note.content_hash == hashlib.sha256((note.title + note.text).encode("utf-8")).hexdigest()
+    assert note.created == pytest.approx(
+        getattr(path.stat(), "st_birthtime", path.stat().st_mtime)
+    )
 
 
 def test_markdown_file_to_record_uses_filename_when_heading_missing(tmp_path):
@@ -126,6 +128,27 @@ def test_apple_notes_connector_tags_records_and_wraps_access_errors(monkeypatch)
     )
     with pytest.raises(ConnectorError, match="denied"):
         failing.extract({})
+
+
+def test_apple_notes_raw_record_uses_creation_date_with_modified_fallback():
+    from taurine_core.indexer.notes import _record_from_raw
+
+    class RawNote:
+        name = "Apple"
+        id = "x-coredata://note"
+        body = "<div>Apple body</div>"
+        folder = "Notes"
+        modification_date = 200.0
+        creation_date = 100.0
+
+    note = _record_from_raw(RawNote())
+
+    assert note.modified == 200.0
+    assert note.created == 100.0
+
+    del RawNote.creation_date
+    fallback = _record_from_raw(RawNote())
+    assert fallback.created == 200.0
 
 
 def test_apple_notes_available_uses_cheap_account_probe_without_extraction():

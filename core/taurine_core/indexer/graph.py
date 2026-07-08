@@ -66,6 +66,10 @@ def rebuild_all(index: object) -> None:
     kept, margin = _candidates(index)
     edges = _cap_edges(_apply_judgments(kept, margin, _valid_judgments(index)))
     index.replace_edges(edges)  # type: ignore[attr-defined]
+    from .rank import compute_quality_ranks, refresh_fact_embeddings
+
+    compute_quality_ranks(index)  # type: ignore[arg-type]
+    refresh_fact_embeddings(index)  # type: ignore[arg-type]
 
 
 def rebuild_for(index: object, note_id: str) -> None:
@@ -98,6 +102,10 @@ def rebuild_for(index: object, note_id: str) -> None:
         other_degree[other] = other_degree.get(other, 0) + 1
 
     index.replace_edges(selected, incident_note_id=note_id)  # type: ignore[attr-defined]
+    from .rank import compute_quality_ranks, refresh_fact_embeddings
+
+    compute_quality_ranks(index)  # type: ignore[arg-type]
+    refresh_fact_embeddings(index)  # type: ignore[arg-type]
 
 
 def _candidate_edges(index: object) -> list[GraphEdge]:

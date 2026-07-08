@@ -115,11 +115,14 @@ class ScriptedAdjudicationLLM:
 
 @pytest.fixture(autouse=True)
 def deterministic_term_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from taurine_core.indexer import store as store_module
+
     def fake_embed_texts(texts: list[str]) -> np.ndarray:
         rows = [_basis(900 + index) for index, _text in enumerate(texts)]
         return np.vstack(rows) if rows else np.empty((0, config.EMBED_DIM), dtype=np.float32)
 
     monkeypatch.setattr(graph, "embed_texts", fake_embed_texts, raising=False)
+    monkeypatch.setattr(store_module, "embed_texts", fake_embed_texts, raising=False)
 
 
 @pytest.mark.asyncio
