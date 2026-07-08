@@ -83,6 +83,34 @@ def test_c2_console_line_appends_compact_gliner_spans() -> None:
     assert line.endswith(" spans=[shopify checkout; Ashish]")
 
 
+def test_chat_console_lines_are_compact() -> None:
+    retrieval = console_line(
+        "chat_retrieval",
+        {
+            "chat_id": "chat-1234abcd",
+            "query": "what changed in roadmap?",
+            "top": [{"id": "N1", "score": 0.9}, {"id": "N2", "score": 0.7}],
+            "facts": ["F1"],
+        },
+    )
+    turn = console_line(
+        "chat_turn",
+        {
+            "chat_id": "chat-1234abcd",
+            "message_id": 7,
+            "model": "z-ai/glm-5.2",
+            "tools": [{"name": "search_notes"}],
+            "usage": {"prompt": 10, "completion": 20, "reasoning": 5},
+            "total_ms": 1234.5,
+            "cancelled": False,
+            "stripped_citations": 2,
+        },
+    )
+
+    assert retrieval == "chat chat-1234abcd retrieval “what changed in roadmap?” → 2 notes, 1 facts top=N1"
+    assert turn == "chat chat-1234abcd msg=7 z-ai/glm-5.2 1234ms tools=1 usage=10/20+5 stripped=2"
+
+
 def test_grounding_and_summary_helpers_write_canonical_payloads(tmp_path) -> None:
     logger = SessionLogger.create(tmp_path)
     update = GroundingUpdate(

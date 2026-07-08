@@ -115,6 +115,27 @@ def console_line(kind: str, payload: dict[str, Any]) -> str | None:
             f"summary {payload.get('model')} {round(payload.get('latency_ms') or 0)}ms "
             f"actions={len(accepted)}"
         )
+    if kind == "chat_retrieval":
+        top = payload.get("top") or []
+        top_ref = ""
+        if top and isinstance(top[0], dict):
+            top_ref = f" top={top[0].get('id')}"
+        facts = payload.get("facts") or []
+        return (
+            f"chat {payload.get('chat_id')} retrieval “{_short(payload.get('query'), 40)}” → "
+            f"{len(top)} notes, {len(facts)} facts{top_ref}"
+        )
+    if kind == "chat_turn":
+        usage = payload.get("usage") or {}
+        tools = payload.get("tools") or []
+        cancelled = " cancelled" if payload.get("cancelled") else ""
+        stripped = payload.get("stripped_citations") or 0
+        return (
+            f"chat {payload.get('chat_id')} msg={payload.get('message_id')} {payload.get('model')} "
+            f"{round(payload.get('total_ms') or 0)}ms tools={len(tools)} "
+            f"usage={usage.get('prompt', 0)}/{usage.get('completion', 0)}+{usage.get('reasoning', 0)} "
+            f"stripped={stripped}{cancelled}"
+        )
     return f"{kind}: {_short(payload, 80)}"
 
 

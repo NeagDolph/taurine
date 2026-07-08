@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -20,6 +21,7 @@ from pydantic import ValidationError
 from taurine_core import config
 from taurine_core import session_log
 from taurine_core.asr import ASRClient, ChunkCallback, IndexStatusProvider, StatusCallback
+from taurine_core.chat.engine import ChatEngine
 from taurine_core.connectors.registry import ConnectorRegistry
 from taurine_core.indexer.notes import open_note
 from taurine_core.indexer.reenrich import reenrich_all
@@ -35,6 +37,10 @@ from taurine_core.llm import OpenRouterClient
 from taurine_core.session_log import NullSessionLogger, SessionLogger
 from taurine_core.schemas import (
     ActionableStatusMsg,
+    ChatCancelMsg,
+    ChatMetaEvent,
+    ChatRegenerateMsg,
+    ChatSendMsg,
     ConnectorInfo,
     GraphResponse,
     IndexStatus,
@@ -81,7 +87,7 @@ class UpdateBus:
     payloads when it drains its queue, so bursts coalesce naturally.
     """
 
-    KINDS = ("connectors", "reenrich", "graph", "profile")
+    KINDS = ("connectors", "reenrich", "graph", "profile", "chats")
 
     def __init__(self) -> None:
         self._subscribers: set[asyncio.Queue[str]] = set()
@@ -139,6 +145,8 @@ class Runtime:
     updates: UpdateBus = field(default_factory=UpdateBus)
     graph_version: int = 0
     active_live_session: LiveSessionLike | None = None
+    make_chat_engine: Callable[[], Any] | None = None
+    chat_engine: Any = None
 
 
 class _MonotonicClock:
@@ -152,6 +160,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         active_runtime = runtime or build_runtime()
         app.state.runtime = active_runtime
         active_runtime.updates.bind_loop(asyncio.get_running_loop())
+        if active_runtime.chat_engine is None and active_runtime.make_chat_engine is not None:
+            active_runtime.chat_engine = active_runtime.make_chat_engine()
         if active_runtime.connector_registry is not None:
             active_runtime.connector_registry.on_change = lambda: active_runtime.updates.publish(
                 "connectors"
@@ -181,6 +191,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                     *active_runtime.connector_sync_tasks.values(),
                     return_exceptions=True,
                 )
+            chat_logger = getattr(getattr(active_runtime, "chat_engine", None), "logger", None)
+            close = getattr(chat_logger, "close", None)
+            if callable(close):
+                close()
 
     app = FastAPI(lifespan=lifespan)
     # localhost-bound service consumed by the Electron renderer (vite origin
@@ -188,7 +202,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_methods=["GET", "POST", "PUT"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["*"],
     )
 
@@ -334,6 +348,46 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             return MeetingSummary()
         return live.current_summary()
 
+    @app.get("/chats")
+    async def chats() -> list[Any]:
+        active_runtime: Runtime = app.state.runtime
+        return active_runtime.index.chats()
+
+    @app.post("/chats")
+    async def create_chat() -> Any:
+        active_runtime: Runtime = app.state.runtime
+        chat = active_runtime.index.create_chat(_new_chat_id(active_runtime.index), now=time.time())
+        active_runtime.updates.publish("chats")
+        return chat
+
+    @app.get("/chats/{chat_id}")
+    async def chat_detail(chat_id: str) -> dict[str, Any]:
+        active_runtime: Runtime = app.state.runtime
+        chat = active_runtime.index.chat(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="chat not found")
+        return {"chat": chat, "messages": active_runtime.index.chat_messages(chat_id)}
+
+    @app.patch("/chats/{chat_id}")
+    async def rename_chat(chat_id: str, payload: Any = Body(...)) -> Any:
+        active_runtime: Runtime = app.state.runtime
+        if active_runtime.index.chat(chat_id) is None:
+            raise HTTPException(status_code=404, detail="chat not found")
+        if not isinstance(payload, dict) or not isinstance(payload.get("title"), str):
+            raise HTTPException(status_code=422, detail="title must be a string")
+        active_runtime.index.rename_chat(chat_id, payload["title"].strip()[:120], now=time.time())
+        active_runtime.updates.publish("chats")
+        return active_runtime.index.chat(chat_id)
+
+    @app.delete("/chats/{chat_id}")
+    async def delete_chat(chat_id: str) -> dict[str, bool]:
+        active_runtime: Runtime = app.state.runtime
+        if active_runtime.index.chat(chat_id) is None:
+            raise HTTPException(status_code=404, detail="chat not found")
+        active_runtime.index.delete_chat(chat_id)
+        active_runtime.updates.publish("chats")
+        return {"ok": True}
+
     @app.put("/profile")
     async def put_profile(payload: Any = Body(...)) -> dict[str, Any]:
         active_runtime: Runtime = app.state.runtime
@@ -462,6 +516,59 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             await asyncio.gather(sender, return_exceptions=True)
             logger.close()
 
+    @app.websocket("/chat")
+    async def chat(websocket: WebSocket) -> None:
+        await websocket.accept()
+        active_runtime: Runtime = app.state.runtime
+        engine = _chat_engine(active_runtime)
+        send_lock = asyncio.Lock()
+        tasks: set[asyncio.Task[Any]] = set()
+
+        async def emit(event: Any) -> None:
+            if isinstance(event, ChatMetaEvent):
+                active_runtime.updates.publish("chats")
+            text = event.model_dump_json() if isinstance(event, BaseModel) else json.dumps(event)
+            async with send_lock:
+                await websocket.send_text(text)
+
+        def track(task: asyncio.Task[Any]) -> None:
+            tasks.add(task)
+
+            def done(finished: asyncio.Task[Any]) -> None:
+                tasks.discard(finished)
+                try:
+                    finished.exception()
+                except (asyncio.CancelledError, Exception):
+                    return
+
+            task.add_done_callback(done)
+
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                raw = message.get("text")
+                if raw is None:
+                    continue
+                try:
+                    control = _parse_chat_control(raw)
+                except (json.JSONDecodeError, ValidationError, ValueError):
+                    continue
+                if isinstance(control, ChatSendMsg):
+                    track(asyncio.create_task(engine.send(control.chat_id, control.text, emit)))
+                elif isinstance(control, ChatCancelMsg):
+                    await engine.cancel(control.chat_id)
+                elif isinstance(control, ChatRegenerateMsg):
+                    track(asyncio.create_task(engine.regenerate(control.chat_id, emit)))
+        except WebSocketDisconnect:
+            pass
+        finally:
+            for task in tuple(tasks):
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
     return app
 
 
@@ -515,6 +622,11 @@ def build_runtime() -> Runtime:
         connector_registry=connector_registry,
         connector_llm=llm,
         reenrich_all=lambda progress, source=None: reenrich_all(index, llm, progress, source=source),
+        make_chat_engine=lambda: ChatEngine(
+            index,
+            llm,
+            SessionLogger.create(session_log.SESSIONS_DIR),
+        ),
     )
 
 
@@ -585,6 +697,20 @@ def _parse_control(raw: str) -> StartMsg | StopMsg | ActionableStatusMsg | OpenN
     if message_type == "open_note":
         return OpenNoteMsg.model_validate(payload)
     raise ValueError(f"unsupported control type: {message_type}")
+
+
+def _parse_chat_control(raw: str) -> ChatSendMsg | ChatCancelMsg | ChatRegenerateMsg:
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("chat control message must be a JSON object")
+    message_type = payload.get("type")
+    if message_type == "chat_send":
+        return ChatSendMsg.model_validate(payload)
+    if message_type == "chat_cancel":
+        return ChatCancelMsg.model_validate(payload)
+    if message_type == "chat_regenerate":
+        return ChatRegenerateMsg.model_validate(payload)
+    raise ValueError(f"unsupported chat control type: {message_type}")
 
 
 async def _send_events(
@@ -752,6 +878,19 @@ async def _send_updates(
     if "profile" in kinds:
         card = getattr(runtime.index, "user_card", lambda: None)()
         await websocket.send_text(json.dumps({"type": "profile", "card": card}))
+    if "chats" in kinds:
+        chats = getattr(runtime.index, "chats", lambda: [])()
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "chats",
+                    "chats": [
+                        chat.model_dump(mode="json") if isinstance(chat, BaseModel) else chat
+                        for chat in chats
+                    ],
+                }
+            )
+        )
 
 
 async def _emit_index_status(runtime: Runtime) -> None:
@@ -788,6 +927,21 @@ def _connector_info(runtime: Runtime, connector_id: str) -> ConnectorInfo:
         if info.connector_id == connector_id:
             return info
     raise HTTPException(status_code=404, detail="connector not found")
+
+
+def _chat_engine(runtime: Runtime) -> Any:
+    if runtime.chat_engine is None:
+        if runtime.make_chat_engine is None:
+            raise HTTPException(status_code=503, detail="chat unavailable")
+        runtime.chat_engine = runtime.make_chat_engine()
+    return runtime.chat_engine
+
+
+def _new_chat_id(index: Any) -> str:
+    while True:
+        chat_id = f"chat-{uuid4().hex[:8]}"
+        if index.chat(chat_id) is None:
+            return chat_id
 
 
 def _flat_config(payload: Any) -> dict[str, Any]:

@@ -700,14 +700,15 @@ def test_updates_websocket_sends_snapshot_and_change_events() -> None:
     with TestClient(create_app(runtime)) as client:
         with client.websocket_connect("/updates") as websocket:
             snapshot = {}
-            for _ in range(4):
+            for _ in range(5):
                 message = websocket.receive_json()
                 snapshot[message["type"]] = message
-            assert set(snapshot) == {"connectors", "reenrich", "graph", "profile"}
+            assert set(snapshot) == {"connectors", "reenrich", "graph", "profile", "chats"}
             assert snapshot["connectors"]["connectors"][0]["connector_id"] == "fake"
             assert snapshot["reenrich"]["status"]["running"] is False
             assert snapshot["graph"]["version"] == 0
             assert snapshot["profile"]["card"] is None
+            assert snapshot["chats"]["chats"] == []
 
             # a state change publishes fresh events over the socket
             assert client.post("/connectors/fake/disable").status_code == 200
