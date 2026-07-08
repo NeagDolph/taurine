@@ -8,7 +8,14 @@ import pytest
 from taurine_core import config
 from taurine_core.live.ingest import LiveSession
 from taurine_core.live.slate import Slate
-from taurine_core.schemas import Chunk, Expansion, Hit, Pick, RetrievalResult, SlateItem
+from taurine_core.live.grounding import GroundingUpdate
+from taurine_core.schemas import (
+    Chunk,
+    GroundingItem,
+    GroundingWhy,
+    Pick,
+    SlateItem,
+)
 
 from tests.fakes import FakeClock, FakeIndex, note
 
@@ -16,6 +23,7 @@ from tests.fakes import FakeClock, FakeIndex, note
 class NoopAmbient:
     last_slate_adds: list[SlateItem] = []
     last_debug: dict[str, Any] | None = None
+    last_grounding: GroundingUpdate | None = None
 
     async def on_window(self, window_text: str, context_text: str | None = None) -> None:
         del window_text, context_text
@@ -33,26 +41,35 @@ class SequenceExact:
 
 @dataclass
 class SequenceAmbient:
-    results: list[RetrievalResult | None]
-    slate_add_sequences: list[list[SlateItem]]
+    results: list[Any | None]
+    slate_add_sequences: list[list[SlateItem]] = field(default_factory=list)
     debug_sequences: list[dict[str, Any] | None] = field(default_factory=list)
+    fused_id_sequences: list[set[str]] = field(default_factory=list)
+    extracted_sequences: list[list[str]] = field(default_factory=list)
     windows: list[str] = field(default_factory=list)
     contexts: list[str | None] = field(default_factory=list)
     last_slate_adds: list[SlateItem] = field(default_factory=list)
     last_debug: dict[str, Any] | None = None
+    last_grounding: GroundingUpdate | None = None
+    last_fused_ids: set[str] = field(default_factory=set)
+    last_extracted: list[str] = field(default_factory=list)
 
     async def on_window(
         self,
         window_text: str,
         context_text: str | None = None,
-    ) -> RetrievalResult | None:
+    ) -> Any | None:
         self.windows.append(window_text)
         self.contexts.append(context_text)
         self.last_slate_adds = (
             self.slate_add_sequences.pop(0) if self.slate_add_sequences else []
         )
         self.last_debug = self.debug_sequences.pop(0) if self.debug_sequences else None
-        return self.results.pop(0) if self.results else None
+        self.last_fused_ids = self.fused_id_sequences.pop(0) if self.fused_id_sequences else set()
+        self.last_extracted = self.extracted_sequences.pop(0) if self.extracted_sequences else []
+        result = self.results.pop(0) if self.results else None
+        self.last_grounding = result if isinstance(result, GroundingUpdate) else None
+        return result
 
 
 @dataclass
@@ -121,6 +138,17 @@ def chunk(text: str, ts: float = 1000.0) -> Chunk:
 
 def interim(text: str, ts: float = 1000.0, channel: int = 0) -> Chunk:
     return Chunk(channel=channel, text=text, ts=ts, final=False)
+
+
+def grounding_item(note_id: str, title: str, gist: str, score: float) -> GroundingItem:
+    return GroundingItem(
+        note_id=note_id,
+        short_id=f"N-{note_id}",
+        title=title,
+        gist=gist,
+        score=score,
+        why=GroundingWhy(heads=["dense"]),
+    )
 
 
 def session_with(
@@ -245,52 +273,41 @@ async def test_c2_trigger_event_correlates_with_retrieval_event_and_logger() -> 
             "expanded": note("expanded", "Expanded Note", "Expanded gist"),
         }
     )
-    result = RetrievalResult(
-        heard="window text",
-        hits=[Hit(note_id="direct", rank=1, score=0.91)],
-        expansions=[
-            Expansion(
-                from_note_id="direct",
-                note_id="expanded",
-                hop=1,
-                score=0.31,
-            )
+    result = GroundingUpdate(
+        items=[
+            grounding_item("direct", "Direct Note", "Direct gist", 0.91),
         ],
-        extracted=["shopify checkout", "Ashish"],
+        revision=3,
+        ppr_top=[("expanded", 0.31), ("direct", 0.12)],
     )
     debug = {
         "window": "window text",
-        "salient": "window text",
         "dense": [["direct", 0.9]],
-        "dense_salient": [["direct", 0.8]],
         "gliner_spans": [["shopify checkout", 0.95], ["Ashish", 0.9]],
+        "gliner_dropped": [],
+        "gliner_context_queries": [],
         "dense_gliner": [["direct", 0.87]],
         "bm25": [],
+        "exact": [],
         "fused": [["direct", 0.016]],
-        "expansions": [{"from": "direct", "to": "expanded", "score": 0.31}],
-        "rerank_used": True,
-        "rerank_error": None,
-        "ordered": [["direct", 0.91]],
-        "floor_dropped": [],
-        "slate_adds": ["direct"],
+        "ppr_top": [["expanded", 0.31], ["direct", 0.12]],
+        "blend": [
+            {
+                "note_id": "direct",
+                "rel": 1.0,
+                "recency": 1.0,
+                "source_rank": 1.0,
+                "quality": 1.0,
+                "final": 0.91,
+            }
+        ],
+        "grounding_revision": 3,
     }
     ambient = SequenceAmbient(
         results=[result],
-        slate_add_sequences=[
-            [
-                SlateItem(
-                    note_id="direct",
-                    title="Direct Note",
-                    gist="Direct gist",
-                    score=0.91,
-                    source="search",
-                    heard="window text",
-                    decay=config.DECAY_SEARCH,
-                    added_rev=0,
-                )
-            ]
-        ],
         debug_sequences=[debug],
+        fused_id_sequences=[{"direct"}],
+        extracted_sequences=[["shopify checkout", "Ashish"]],
     )
     session, events = session_with(
         index=index,
@@ -311,11 +328,12 @@ async def test_c2_trigger_event_correlates_with_retrieval_event_and_logger() -> 
     assert trigger.action == "slated"
     assert [(match.note_id, match.rank, match.score, match.via_note_id, match.hop) for match in trigger.matches] == [
         ("direct", 1, 0.91, None, None),
-        ("expanded", None, 0.31, "direct", 1),
+        ("expanded", None, 0.31, "", 0),
     ]
     assert retrieval.retrieval_id == trigger.trigger_id
     assert retrieval.seqs == [1]
     assert retrieval.extracted == ["shopify checkout", "Ashish"]
+    assert session.last_grounding is result
     assert [kind for kind, _payload in logger.records].count("c2_pass") == 1
     c2_payload = [payload for kind, payload in logger.records if kind == "c2_pass"][0]
     assert c2_payload["trigger_id"] == trigger.trigger_id
@@ -323,18 +341,18 @@ async def test_c2_trigger_event_correlates_with_retrieval_event_and_logger() -> 
     assert c2_payload["slate_adds"] == ["direct"]
     assert c2_payload["gliner_spans"] == [["shopify checkout", 0.95], ["Ashish", 0.9]]
     assert c2_payload["dense_gliner"] == [["direct", 0.87]]
+    assert c2_payload["ppr_top"] == [["expanded", 0.31], ["direct", 0.12]]
+    assert c2_payload["grounding_revision"] == 3
+    assert "salient" not in c2_payload
+    assert "rerank_used" not in c2_payload
 
 
 @pytest.mark.asyncio
 async def test_c2_trigger_event_action_none_when_no_slate_add_survives() -> None:
     clock = FakeClock()
     index = FakeIndex(notes={"direct": note("direct", "Direct Note", "Direct gist")})
-    result = RetrievalResult(
-        heard="window text",
-        hits=[Hit(note_id="direct", rank=1, score=0.91)],
-        expansions=[],
-    )
-    ambient = SequenceAmbient(results=[result], slate_add_sequences=[[]])
+    result = GroundingUpdate(items=[], revision=1)
+    ambient = SequenceAmbient(results=[result])
     session, events = session_with(
         index=index,
         clock=clock,
@@ -389,28 +407,12 @@ async def test_interim_c1_fires_once_per_segment_and_resets_after_final() -> Non
 async def test_c2_window_appends_partials_and_fires_on_interim_with_final_seqs_only() -> None:
     clock = FakeClock()
     index = FakeIndex(notes={"direct": note("direct", "Direct Note", "Direct gist")})
-    result = RetrievalResult(
-        heard="final context partial insight",
-        hits=[Hit(note_id="direct", rank=1, score=0.91)],
-        expansions=[],
+    result = GroundingUpdate(
+        items=[grounding_item("direct", "Direct Note", "Direct gist", 0.91)],
+        revision=1,
     )
     ambient = SequenceAmbient(
         results=[None, result],
-        slate_add_sequences=[
-            [],
-            [
-                SlateItem(
-                    note_id="direct",
-                    title="Direct Note",
-                    gist="Direct gist",
-                    score=0.91,
-                    source="search",
-                    heard="final context partial insight",
-                    decay=config.DECAY_SEARCH,
-                    added_rev=0,
-                )
-            ],
-        ],
     )
     session, events = session_with(
         index=index,

@@ -21,7 +21,18 @@ class IndexPort(Protocol):
         """Note-graph neighbors -> [(note_id, edge_weight)] desc."""
         ...
 
+    def neighbor_edges(self, note_id: str) -> list[tuple[str, float, str]]:
+        """Note-graph neighbors with facts -> [(note_id, edge_weight, fact)] desc."""
+        ...
+
+    def fact_dense_search(self, text: str, k: int) -> list[tuple[str, str, float, str]]:
+        """Fact dense search -> [(src, dst, score, fact_text)] desc."""
+        ...
+
     def note(self, note_id: str) -> NoteRecord | None:
+        ...
+
+    def notes(self, source: str | None = None) -> list[NoteRecord]:
         ...
 
     def best_chunk(self, note_id: str, query_text: str) -> str:
@@ -37,6 +48,9 @@ class IndexPort(Protocol):
         ...
 
     def graph(self) -> GraphResponse:
+        ...
+
+    def graph_version(self) -> int:
         ...
 
     def status(self) -> tuple[int, float | None]:

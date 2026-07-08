@@ -13,8 +13,11 @@ from taurine_core.schemas import (
     AmbientItem,
     Card,
     Chunk,
+    Expansion,
+    Hit,
     PinEvent,
     Pick,
+    RetrievalResult,
     RetrievalEvent,
     SlateItem,
     TranscriptEvent,
@@ -27,6 +30,7 @@ from taurine_core.session_log import NullSessionLogger
 from .ambient import AmbientRetriever
 from .cadence import Cadence
 from .exact import ExactCollector
+from .grounding import GroundingUpdate
 from .slate import Slate
 
 
@@ -90,6 +94,7 @@ class LiveSession:
         self._c1_segment_seen: dict[int, set[str]] = {}
         self._pinned: list[Card] = []
         self._next_seq = 1
+        self.last_grounding: GroundingUpdate | None = None
 
     async def on_chunk(self, chunk: Chunk) -> None:
         chunk = self._chunk_with_seq(chunk)
@@ -246,17 +251,32 @@ class LiveSession:
         context_text = self._window_text(context_chunks, self._active_partials())
 
         before_revision = self._slate.revision
-        result = await self._ambient.on_window(window_text, context_text=context_text)
-        if result is None:
+        ambient_result = await self._ambient.on_window(window_text, context_text=context_text)
+        if ambient_result is None:
             return
 
+        grounding = (
+            ambient_result
+            if isinstance(ambient_result, GroundingUpdate)
+            else getattr(self._ambient, "last_grounding", None)
+        )
+        self.last_grounding = grounding
+        result = (
+            self._retrieval_from_grounding(window_text, grounding)
+            if grounding is not None
+            else ambient_result
+        )
+        slate_adds = (
+            self._slate_items_from_grounding(grounding, window_text)
+            if grounding is not None
+            else list(getattr(self._ambient, "last_slate_adds", []))
+        )
+
         trigger_id = _trigger_id()
-        for item in self._ambient.last_slate_adds:
+        for item in slate_adds:
             self._slate.add(item)
         slate_ids = {item.note_id for item in self._slate.items()}
-        survived_adds = [
-            item.note_id for item in self._ambient.last_slate_adds if item.note_id in slate_ids
-        ]
+        survived_adds = [item.note_id for item in slate_adds if item.note_id in slate_ids]
         seqs = [chunk.seq for chunk in window_chunks]
         await self._emit_trigger(
             TriggerEvent(
@@ -462,6 +482,54 @@ class LiveSession:
             )
         return matches
 
+    def _retrieval_from_grounding(
+        self,
+        heard: str,
+        update: GroundingUpdate,
+    ) -> RetrievalResult:
+        fused_ids = set(getattr(self._ambient, "last_fused_ids", set()))
+        extracted = list(getattr(self._ambient, "last_extracted", []))
+        hits = [
+            Hit(note_id=item.note_id, rank=rank, score=item.score)
+            for rank, item in enumerate(update.items, start=1)
+        ]
+        expansions = [
+            Expansion(
+                from_note_id="",
+                note_id=note_id,
+                hop=0,
+                score=mass,
+                via="ppr",
+            )
+            for note_id, mass in update.ppr_top
+            if note_id not in fused_ids
+        ]
+        return RetrievalResult(
+            heard=heard,
+            hits=hits,
+            expansions=expansions,
+            extracted=extracted,
+        )
+
+    def _slate_items_from_grounding(
+        self,
+        update: GroundingUpdate,
+        heard: str,
+    ) -> list[SlateItem]:
+        return [
+            SlateItem(
+                note_id=item.note_id,
+                title=item.title,
+                gist=item.gist,
+                score=item.score,
+                source="search",
+                heard=heard,
+                decay=config.DECAY_SEARCH,
+                added_rev=0,
+            )
+            for item in update.items
+        ]
+
     def _log_c2_pass(
         self,
         trigger_id: str,
@@ -473,27 +541,19 @@ class LiveSession:
         if not debug:
             debug = {
                 "window": result.heard,
-                "salient": None,
                 "gliner_spans": [],
                 "gliner_dropped": [],
                 "gliner_context_queries": [],
                 "dense": [],
-                "dense_salient": [],
                 "dense_gliner": [],
                 "bm25": [],
+                "exact": [],
                 "fused": [],
-                "expansions": [
-                    {
-                        "from": expansion.from_note_id,
-                        "to": expansion.note_id,
-                        "score": expansion.score,
-                    }
-                    for expansion in result.expansions
-                ],
-                "rerank_used": False,
-                "rerank_error": None,
-                "ordered": [[hit.note_id, hit.score] for hit in result.hits],
-                "floor_dropped": [],
+                "ppr_top": [],
+                "blend": [],
+                "grounding_revision": (
+                    self.last_grounding.revision if self.last_grounding is not None else 0
+                ),
                 "slate_adds": [],
             }
         debug.setdefault("gliner_spans", [])
