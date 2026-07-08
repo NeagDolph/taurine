@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from taurine_core.indexer.sync import SyncReport
@@ -53,6 +55,18 @@ class StubChatEngine:
         await emit(ChatAckEvent(chat_id=chat_id, message_id=4, user_message_id=3))
 
 
+class FailingChatEngine:
+    async def send(self, chat_id: str, text: str, emit: Any) -> None:
+        del chat_id, text, emit
+        raise RuntimeError("chat task exploded")
+
+    async def cancel(self, chat_id: str) -> None:
+        del chat_id
+
+    async def regenerate(self, chat_id: str, emit: Any) -> None:
+        del chat_id, emit
+
+
 def test_chat_websocket_relays_stubbed_engine_events_and_ignores_bad_controls() -> None:
     engine = StubChatEngine()
     runtime = Runtime(
@@ -78,6 +92,29 @@ def test_chat_websocket_relays_stubbed_engine_events_and_ignores_bad_controls() 
     assert engine.sent == [("", "hello")]
     assert engine.cancelled == ["chat-stub"]
     assert engine.regenerated == ["chat-stub"]
+
+
+def test_chat_websocket_logs_unexpected_task_exception(caplog: pytest.LogCaptureFixture) -> None:
+    runtime = Runtime(
+        index=MinimalIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=None,
+        make_asr_client=lambda on_chunk, on_status, index_status: None,
+        make_chat_engine=lambda: FailingChatEngine(),
+    )
+    caplog.set_level(logging.ERROR, logger="taurine.chat")
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/chat") as ws:
+            ws.send_json({"type": "chat_send", "chat_id": "", "text": "hello"})
+
+    assert any(
+        "chat websocket task failed" in record.getMessage()
+        and record.exc_info is not None
+        and isinstance(record.exc_info[1], RuntimeError)
+        for record in caplog.records
+    )
 
 
 def test_chat_rest_crud_and_update_bus_publish(store: Any) -> None:

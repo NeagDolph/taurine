@@ -96,6 +96,12 @@ class GroundingEngine:
             "revision": self._revision,
         }
 
+    def note_short_ids(self) -> dict[str, str]:
+        return dict(self._note_short_ids)
+
+    def fact_short_ids(self) -> dict[tuple[str, str], str]:
+        return dict(self._fact_short_ids)
+
     def restore_state(self, state: dict) -> None:
         raw_seeds = state.get("seeds", {})
         self._seeds = (

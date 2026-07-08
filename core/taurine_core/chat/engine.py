@@ -57,6 +57,7 @@ from .tools import TOOL_DEFINITIONS, execute_tool
 EmitFn = Callable[[Any], Coroutine[Any, Any, None]]
 
 _CITATION_RE = re.compile(r"\[(N|F)\d+\]")
+_SPACE_RUN_RE = re.compile(r" {2,}")
 
 
 @dataclass
@@ -214,14 +215,30 @@ class ChatEngine:
         tool_summaries: list[dict[str, Any]] = []
         stripped_citations = 0
         model = config.CHAT_MODEL
+        persisted_message: ChatMessage | None = None
+        success_finish_task: asyncio.Task[None] | None = None
 
         def _set_ttft(value: float) -> None:
             nonlocal ttft_ms
             if ttft_ms is None:
                 ttft_ms = value
 
-        async def finish(*, cancelled: bool) -> None:
-            nonlocal stripped_citations
+        def log_turn_error(exc: BaseException) -> None:
+            try:
+                self.logger.log(
+                    "chat_error",
+                    chat_id=chat_id,
+                    message_id=assistant_id,
+                    code="llm",
+                    detail=str(exc),
+                )
+            except Exception:
+                pass
+
+        def persist_turn(*, cancelled: bool) -> ChatMessage:
+            nonlocal stripped_citations, persisted_message
+            if persisted_message is not None:
+                return persisted_message
             final_content, sources, facts, stripped_citations = _finalize_grounding(
                 "".join(content_parts),
                 context_items,
@@ -264,9 +281,30 @@ class ChatEngine:
                 stripped_citations=stripped_citations,
                 cancelled=cancelled,
             )
+            persisted_message = message
+            return message
+
+        async def finish_done(*, cancelled: bool) -> None:
+            message = persist_turn(cancelled=cancelled)
             await emit(ChatDoneEvent(chat_id=chat_id, message_id=assistant_id, message=message))
             if not cancelled:
                 await self._maybe_title(chat_id, text, emit)
+
+        async def finish_success() -> None:
+            nonlocal success_finish_task
+            success_finish_task = asyncio.create_task(finish_done(cancelled=False))
+            try:
+                await asyncio.shield(success_finish_task)
+            except asyncio.CancelledError:
+                await asyncio.shield(success_finish_task)
+                raise
+
+        async def finish_error(event: ChatErrorEvent) -> None:
+            try:
+                persist_turn(cancelled=False)
+            except Exception as exc:
+                log_turn_error(exc)
+            await emit(event)
 
         try:
             context_items, context_facts = retriever.context_pack(text, now=wall_now)
@@ -315,7 +353,7 @@ class ChatEngine:
                     if round_index == 0 and not exc.opened and model != config.CHAT_FALLBACK_MODEL:
                         model = config.CHAT_FALLBACK_MODEL
                         continue
-                    await emit(
+                    await finish_error(
                         ChatErrorEvent(
                             chat_id=chat_id,
                             message_id=assistant_id,
@@ -323,10 +361,9 @@ class ChatEngine:
                             detail=str(exc.error),
                         )
                     )
-                    await finish(cancelled=False)
                     return
                 except TimeoutError as exc:
-                    await emit(
+                    await finish_error(
                         ChatErrorEvent(
                             chat_id=chat_id,
                             message_id=assistant_id,
@@ -334,12 +371,11 @@ class ChatEngine:
                             detail=str(exc),
                         )
                     )
-                    await finish(cancelled=False)
                     return
 
                 tool_calls = outcome.tool_calls
                 if not tool_calls or tools is None:
-                    await finish(cancelled=False)
+                    await finish_success()
                     return
                 tool_messages: list[dict[str, Any]] = []
                 assistant_tool_calls: list[dict[str, Any]] = []
@@ -419,7 +455,22 @@ class ChatEngine:
                     messages.extend(tool_messages)
                 round_index += 1
         except asyncio.CancelledError:
-            await finish(cancelled=True)
+            if persisted_message is None:
+                if success_finish_task is not None:
+                    await asyncio.shield(success_finish_task)
+                else:
+                    await finish_done(cancelled=True)
+            raise
+        except Exception as exc:
+            log_turn_error(exc)
+            await finish_error(
+                ChatErrorEvent(
+                    chat_id=chat_id,
+                    message_id=assistant_id,
+                    code="llm",
+                    detail=str(exc),
+                )
+            )
             return
 
     async def _stream_round(
@@ -620,10 +671,26 @@ def _finalize_grounding(
     tool_sources: dict[str, GroundingItem],
     retriever: Any,
 ) -> tuple[str, list[GroundingItem], list[GroundedFact], int]:
-    valid_ids = {item.short_id for item in context_items}
-    valid_ids |= {fact.fact_id for fact in context_facts}
-    valid_ids |= set(tool_sources)
-    valid_ids |= _registry_ids(retriever)
+    item_by_id = {item.short_id: item for item in context_items}
+    item_by_id.update(tool_sources)
+    fact_by_id = {fact.fact_id: fact for fact in context_facts}
+    note_registry, fact_registry = _registry_maps(retriever)
+    cited_refs = [match.group(0)[1:-1] for match in _CITATION_RE.finditer(content)]
+
+    for ref in cited_refs:
+        if ref.startswith("N") and ref not in item_by_id and ref in note_registry:
+            item = _materialize_registry_note(ref, retriever)
+            if item is not None:
+                item_by_id[ref] = item
+        elif ref.startswith("F") and ref not in fact_by_id:
+            key = fact_registry.get(ref)
+            if key is None:
+                continue
+            fact = _materialize_registry_fact(ref, key, retriever)
+            if fact is not None:
+                fact_by_id[ref] = fact
+
+    valid_ids = set(item_by_id) | set(fact_by_id)
     cited: list[str] = []
     stripped = 0
 
@@ -637,9 +704,8 @@ def _finalize_grounding(
         return ""
 
     stripped_content = _CITATION_RE.sub(replace, content)
-    item_by_id = {item.short_id: item for item in context_items}
-    item_by_id.update(tool_sources)
-    fact_by_id = {fact.fact_id: fact for fact in context_facts}
+    if stripped:
+        stripped_content = _SPACE_RUN_RE.sub(" ", stripped_content)
     source_ids = [ref for ref in cited if ref.startswith("N") and ref in item_by_id]
     source_ids.extend(item.short_id for item in context_items if item.short_id not in source_ids)
     fact_ids = [ref for ref in cited if ref.startswith("F") and ref in fact_by_id]
@@ -649,16 +715,68 @@ def _finalize_grounding(
     return stripped_content, sources, facts, stripped
 
 
-def _registry_ids(retriever: Any) -> set[str]:
+def _registry_maps(retriever: Any) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
     grounding = getattr(retriever, "_grounding", None)
-    ids: set[str] = set()
-    note_ids = getattr(grounding, "_note_short_ids", {})
+    note_by_short: dict[str, str] = {}
+    fact_by_short: dict[str, tuple[str, str]] = {}
+    note_ids_fn = getattr(grounding, "note_short_ids", None)
+    note_ids = note_ids_fn() if callable(note_ids_fn) else {}
     if isinstance(note_ids, dict):
-        ids |= {str(value) for value in note_ids.values()}
-    fact_ids = getattr(grounding, "_fact_short_ids", {})
+        note_by_short = {str(short_id): str(note_id) for note_id, short_id in note_ids.items()}
+    fact_ids_fn = getattr(grounding, "fact_short_ids", None)
+    fact_ids = fact_ids_fn() if callable(fact_ids_fn) else {}
     if isinstance(fact_ids, dict):
-        ids |= {str(value) for value in fact_ids.values()}
-    return ids
+        for key, short_id in fact_ids.items():
+            if not isinstance(key, tuple) or len(key) != 2:
+                continue
+            fact_by_short[str(short_id)] = (str(key[0]), str(key[1]))
+    return note_by_short, fact_by_short
+
+
+def _materialize_registry_note(ref: str, retriever: Any) -> GroundingItem | None:
+    resolve = getattr(retriever, "resolve", None)
+    if not callable(resolve):
+        return None
+    note_id = resolve(ref)
+    if note_id is None:
+        return None
+    index = getattr(retriever, "index", None)
+    note_fn = getattr(index, "note", None)
+    if not callable(note_fn):
+        return None
+    note = note_fn(note_id)
+    if note is None:
+        return None
+    age_days = (time.time() - float(getattr(note, "modified", time.time()))) / 86_400.0
+    return GroundingItem(
+        note_id=str(getattr(note, "note_id", note_id)),
+        short_id=ref,
+        title=str(getattr(note, "title", "")),
+        gist=str(getattr(note, "gist", "")),
+        source=str(getattr(note, "source", "apple_notes")),
+        age_days=age_days,
+        score=0.0,
+    )
+
+
+def _materialize_registry_fact(
+    ref: str,
+    key: tuple[str, str],
+    retriever: Any,
+) -> GroundedFact | None:
+    index = getattr(retriever, "index", None)
+    neighbor_edges = getattr(index, "neighbor_edges", None)
+    if not callable(neighbor_edges):
+        return None
+    src, dst = key
+    for other_id, _weight, fact in neighbor_edges(src):
+        if tuple(sorted((src, str(other_id)))) != tuple(sorted(key)):
+            continue
+        fact_text = str(fact or "").strip()
+        if not fact_text:
+            return None
+        return GroundedFact(fact_id=ref, src=src, dst=dst, text=fact_text)
+    return None
 
 
 def _unique(values: list[str]) -> list[str]:

@@ -537,9 +537,23 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             def done(finished: asyncio.Task[Any]) -> None:
                 tasks.discard(finished)
                 try:
-                    finished.exception()
-                except (asyncio.CancelledError, Exception):
+                    exc = finished.exception()
+                except asyncio.CancelledError:
                     return
+                if exc is None:
+                    return
+                task_logger = getattr(engine, "logger", None)
+                log = getattr(task_logger, "log", None)
+                if callable(log):
+                    try:
+                        log("chat_task_error", detail=str(exc))
+                        return
+                    except Exception:
+                        pass
+                logging.getLogger("taurine.chat").exception(
+                    "chat websocket task failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
 
             task.add_done_callback(done)
 

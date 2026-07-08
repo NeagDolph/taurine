@@ -355,6 +355,14 @@ def test_grounding_engine_parameters_and_state_round_trip(monkeypatch) -> None:
     )
 
     first = engine.on_pass("window", [("alpha", 1.0), ("beta", 1.0)], [], 1_000.0)
+    note_short_ids = engine.note_short_ids()
+    fact_short_ids = engine.fact_short_ids()
+    assert note_short_ids == {"alpha": "N1"}
+    assert fact_short_ids == {("alpha", "beta"): "F1"}
+    note_short_ids["beta"] = "N404"
+    fact_short_ids[("beta", "gamma")] = "F404"
+    assert engine.note_short_ids() == {"alpha": "N1"}
+    assert engine.fact_short_ids() == {("alpha", "beta"): "F1"}
     state = engine.export_state()
     restored = GroundingEngine(
         index,  # type: ignore[arg-type]

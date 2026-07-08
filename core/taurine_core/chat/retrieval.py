@@ -68,7 +68,7 @@ class ChatRetriever:
 
     def resolve(self, ref: str) -> str | None:
         """short_id ("N3") or raw note_id → note_id, if known to this chat."""
-        for note_id, short_id in self._grounding._note_short_ids.items():
+        for note_id, short_id in self._grounding.note_short_ids().items():
             if short_id == ref:
                 return note_id
         if self.index.note(ref) is not None:
