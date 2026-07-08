@@ -61,9 +61,11 @@ by node type**, and a **note preview window** (separate Electron window).
   temp file first** (the live db is locked/WAL) and open read-only. One
   document per conversation (chat), titled "iMessage: <display name or
   handle>". Content = transcript lines `[me]|[them] <text>` newest-last,
-  taking messages from newest backwards bounded by
-  `IMESSAGE_WINDOW_DAYS=14` **or** `IMESSAGE_MAX_CHARS=5000`, whichever
-  bound hits first — the raw db bulk is never stored. Apple epoch
+  taking messages from newest backwards bounded by the smaller of
+  `IMESSAGE_WINDOW_DAYS=183` (~6 months) **or** the last
+  `IMESSAGE_MAX_MESSAGES=150` messages; conversations whose most recent
+  message predates the window are skipped entirely, and the raw db bulk is
+  never stored. Apple epoch
   (2001-01-01, ns) date conversion; `message.text` with `attributedBody`
   fallback decoding for newer macOS rows. Requires Full Disk Access →
   `available()` returns false with a remediation detail when unreadable.

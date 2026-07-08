@@ -63,8 +63,11 @@ ENRICH_BATCH_MIN_NOTES = 3               # below this, per-note calls (batch ove
 # ── notes sync / connectors ────────────────────────────────────────────
 SYNC_INTERVAL_S = 300.0
 CONNECTOR_DOC_MAX_CHARS = 12000          # per-document body cap at extraction
-IMESSAGE_WINDOW_DAYS = 14
-IMESSAGE_MAX_CHARS = 5000                # per-conversation transcript cap
+# each conversation contributes the smaller of its last IMESSAGE_WINDOW_DAYS
+# of messages or its last IMESSAGE_MAX_MESSAGES; conversations whose most
+# recent message predates the window are skipped entirely
+IMESSAGE_WINDOW_DAYS = 183               # ~6 months
+IMESSAGE_MAX_MESSAGES = 150              # most-recent-N cap per conversation
 CLAUDE_MEMORY_GLOB = "~/.claude/projects/*/memory/*.md"
 CODEX_MEMORY_GLOBS = ("~/.codex/AGENTS.md", "~/.codex/memory/**/*.md", "~/.codex/memories/**/*.md")
 OBSIDIAN_APP_JSON = "~/Library/Application Support/obsidian/obsidian.json"

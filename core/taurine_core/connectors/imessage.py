@@ -156,37 +156,37 @@ def _record_for_chat(
     if not messages:
         return None
 
+    # rows arrive newest-first; drop the whole conversation if it has gone
+    # quiet for longer than the window
+    newest_ts = messages[0].timestamp
     cutoff = time.time() - taurine_config.IMESSAGE_WINDOW_DAYS * 24 * 60 * 60
-    lines_desc: list[str] = []
-    accumulated = 0
-    newest_ts: float | None = None
+    if newest_ts < cutoff:
+        return None
+
+    # keep the most recent messages within the window, capped at the message
+    # limit — the smaller of "last N days" and "last N messages" wins
+    selected: list[_Message] = []
+    for message in messages:
+        if message.timestamp < cutoff:
+            break
+        selected.append(message)
+        if len(selected) >= taurine_config.IMESSAGE_MAX_MESSAGES:
+            break
+
     handle_ids: list[str] = []
     seen_handles: set[str] = set()
-    for message in messages:
+    for message in selected:
         if message.handle_id and message.handle_id not in seen_handles:
             handle_ids.append(message.handle_id)
             seen_handles.add(message.handle_id)
-        if message.timestamp < cutoff:
-            break
-        if newest_ts is None:
-            newest_ts = message.timestamp
+
+    lines_desc: list[str] = []
+    for message in selected:
         if message.is_from_me:
             speaker = "me"
         else:
             speaker = _resolve_handle(message.handle_id, contacts) or "them"
-        line = f"[{speaker}] {message.text}"
-        line_length = len(line) + (1 if lines_desc else 0)
-        if accumulated + line_length > taurine_config.IMESSAGE_MAX_CHARS:
-            if not lines_desc:
-                line = line[: taurine_config.IMESSAGE_MAX_CHARS]
-                line_length = len(line)
-            else:
-                break
-        lines_desc.append(line)
-        accumulated += line_length
-
-    if not lines_desc or newest_ts is None:
-        return None
+        lines_desc.append(f"[{speaker}] {message.text}")
 
     transcript = "\n".join(reversed(lines_desc))
     content_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()

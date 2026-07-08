@@ -151,8 +151,8 @@ def test_imessage_extracts_bounded_chat_transcripts_with_attribution_and_hashes(
     _create_imessage_db(db_path)
     now = datetime.now(tz=UTC)
     newest = now - timedelta(days=1)
-    inside_window = now - timedelta(days=13)
-    outside_window = now - timedelta(days=15)
+    inside_window = now - timedelta(days=100)
+    outside_window = now - timedelta(days=config.IMESSAGE_WINDOW_DAYS + 20)
     _insert_handle(db_path, 1, "+15551234567")
     _insert_chat(db_path, 1, "iMessage;-;+15551234567", "Alice")
     _insert_message(db_path, 1, 1, 1, "outside window", outside_window, from_me=False)
@@ -183,34 +183,59 @@ def test_imessage_extracts_bounded_chat_transcripts_with_attribution_and_hashes(
     assert first[0].content_hash == second[0].content_hash
 
 
-def test_imessage_stops_at_max_chars_before_older_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_imessage_caps_at_max_messages_keeping_the_newest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     db_path = home / "Library" / "Messages" / "chat.db"
     _create_imessage_db(db_path)
     now = datetime.now(tz=UTC)
     _insert_handle(db_path, 1, "+15550000000")
     _insert_chat(db_path, 1, "chat-guid", None)
-    for idx in range(10):
-        text = f"message-{idx} " + ("x" * 900)
+    total = config.IMESSAGE_MAX_MESSAGES + 40  # all recent (within window)
+    for idx in range(total):
         _insert_message(
             db_path,
             1,
             idx + 1,
             1,
-            text,
-            now - timedelta(minutes=10 - idx),
+            f"message-{idx}",
+            now - timedelta(minutes=total - idx),  # idx grows => newer
             from_me=False,
         )
     monkeypatch.setenv("HOME", str(home))
 
     record = IMessageConnector().extract({})[0]
+    lines = record.text.splitlines()
 
-    assert len(record.text) <= config.IMESSAGE_MAX_CHARS
-    assert "message-9" in record.text
-    assert "message-8" in record.text
-    assert "message-0" not in record.text
-    assert record.text.splitlines()[0].startswith("[them] message-5")
+    # only the most-recent N kept, in chronological order (oldest kept first)
+    assert len(lines) == config.IMESSAGE_MAX_MESSAGES
+    assert lines[0] == f"[them] message-{total - config.IMESSAGE_MAX_MESSAGES}"
+    assert lines[-1] == f"[them] message-{total - 1}"
+    assert f"[them] message-{total - config.IMESSAGE_MAX_MESSAGES - 1}" not in lines
     assert record.title == "iMessage: +15550000000"
+
+
+def test_imessage_excludes_conversations_older_than_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    db_path = home / "Library" / "Messages" / "chat.db"
+    _create_imessage_db(db_path)
+    now = datetime.now(tz=UTC)
+    stale = now - timedelta(days=config.IMESSAGE_WINDOW_DAYS + 10)
+    _insert_handle(db_path, 1, "+15559999999")
+    _insert_chat(db_path, 1, "stale-guid", "Old Friend")
+    _insert_message(db_path, 1, 1, 1, "haven't talked in ages", stale, from_me=False)
+    # an active chat proves only the stale conversation is dropped
+    _insert_handle(db_path, 2, "+15551112222")
+    _insert_chat(db_path, 2, "active-guid", "Recent Friend")
+    _insert_message(db_path, 2, 2, 2, "still chatting", now - timedelta(days=1), from_me=False)
+    monkeypatch.setenv("HOME", str(home))
+
+    records = IMessageConnector().extract({})
+
+    assert {record.title for record in records} == {"iMessage: Recent Friend"}
 
 
 def test_imessage_handles_old_second_precision_apple_dates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
