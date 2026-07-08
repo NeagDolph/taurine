@@ -28,11 +28,13 @@ class NoteRecord(BaseModel):
     note_id: str
     title: str
     folder: str = ""
-    modified: float
+    modified: float                # recency anchor for age decay
+    created: float = 0.0           # creation ts (0 → store falls back to modified)
     content_hash: str
     text: str                      # plain text body
     gist: str = ""                 # filled after enrichment (fallback: first line)
     source: str = "apple_notes"    # connector_id that produced this document
+    quality_rank: float = 0.0      # log(pagerank/median), clipped ±QUALITY_CLIP; set at rebuild
 
 
 EdgeType = Literal["semantic", "topic", "entity", "mixed"]
@@ -67,10 +69,11 @@ class Hit(BaseModel):
 
 
 class Expansion(BaseModel):
-    from_note_id: str              # the seed it was reached from
+    from_note_id: str              # the seed it was reached from ("" for PPR arrivals)
     note_id: str
-    hop: int                       # 1 at MVP
+    hop: int                       # 1 for 1-hop expansion; 0 for PPR arrivals
     score: float
+    via: Literal["graph", "ppr"] = "graph"
 
 
 class RetrievalResult(BaseModel):
@@ -112,6 +115,58 @@ class Pick(BaseModel):
     why: str                       # <=WHY_MAX_CHARS, validated
 
 
+# ── grounding / meeting summary (spec 2026-07-08) ──────────────────────
+class GroundingWhy(BaseModel):
+    heads: list[str] = []          # heads that surfaced the note: dense|gliner|bm25|exact|fact
+    ppr_mass: float = 0.0          # PPR probability mass this pass
+    exact_alias: str = ""          # alias text when C1 matched
+
+
+class GroundingItem(BaseModel):
+    note_id: str
+    short_id: str                  # stable per-session citation id ("N3"), never reused
+    title: str
+    gist: str
+    source: str = "apple_notes"
+    age_days: float = 0.0          # now - modified, in days
+    score: float = 0.0             # final blended score (rel × recency × source × quality)
+    why: GroundingWhy = GroundingWhy()
+
+
+class GroundedFact(BaseModel):
+    fact_id: str                   # stable per-session citation id ("F7"), never reused
+    src: str                       # edge endpoints (src < dst)
+    dst: str
+    text: str                      # the adjudicated one-sentence edge fact
+
+
+class SummaryHighlight(BaseModel):
+    fact_id: str
+    why: str
+
+
+class Actionable(BaseModel):
+    id: str
+    title: str
+    quote: str                     # verbatim transcript span (fuzzy-validated ≥ ACTIONABLE_QUOTE_MIN_RATIO)
+    assignee: str = ""
+    due: str = ""
+    grounding: list[str] = []      # GroundingItem.short_id / GroundedFact.fact_id references
+    why_new: str = ""              # model's rationale for surfacing this as new
+    confidence: float = 0.0
+    status: Literal["open", "confirmed", "dismissed"] = "open"
+
+
+class MeetingSummary(BaseModel):
+    rev: int = 0
+    summary_md: str = ""           # markdown with [N#]/[F#] citation chips
+    highlights: list[SummaryHighlight] = []
+    actionables: list[Actionable] = []
+    grounding: list[GroundingItem] = []
+    facts: list[GroundedFact] = []
+    updated_at: float = 0.0
+
+
 # ── ws events (server → client) ────────────────────────────────────────
 class TranscriptEvent(BaseModel):
     type: Literal["transcript"] = "transcript"
@@ -127,11 +182,26 @@ class AmbientItem(BaseModel):
     title: str
     gist: str
     score: float
+    short_id: str = ""             # grounding citation id when in the grounding set
+    source: str = "apple_notes"
+    age_days: float = 0.0
+    why: Optional[GroundingWhy] = None
 
 
 class AmbientEvent(BaseModel):
     type: Literal["ambient"] = "ambient"
     items: list[AmbientItem]
+
+
+class SummaryEvent(BaseModel):
+    type: Literal["summary"] = "summary"
+    summary: MeetingSummary        # full replacement on every accepted pass
+
+
+class ActionableEvent(BaseModel):
+    type: Literal["actionable"] = "actionable"
+    op: Literal["new", "update", "dismiss"]
+    item: Actionable
 
 
 class PinEvent(BaseModel):
@@ -255,3 +325,9 @@ class DismissMsg(BaseModel):
 class OpenNoteMsg(BaseModel):
     type: Literal["open_note"]
     note_id: str
+
+
+class ActionableStatusMsg(BaseModel):
+    type: Literal["actionable_status"]
+    id: str
+    status: Literal["confirmed", "dismissed"]

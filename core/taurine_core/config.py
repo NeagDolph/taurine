@@ -43,6 +43,7 @@ LLM_REASONING_BY_MODEL = {
     "z-ai/glm-5.2": {"enabled": False},
     "google/gemini-3.5-flash": {"effort": "minimal"},
     "deepseek/deepseek-v4-pro": {"enabled": False},
+    "deepseek/deepseek-v4-flash": {"enabled": False},
 }
 
 # ── user information card (full-corpus profile fed to every enrichment) ─
@@ -142,6 +143,64 @@ MIN_COSINE = 0.22                        # floor only when no BM25 hit AND no gr
 FUZZY_SNAP_MIN_LEN = 4                   # only snap spans at least this long
 FUZZY_SNAP_MAX_DIST = 2                  # max Levenshtein distance to an alias/title term
 FUZZY_SNAP_LABELS = ("person", "organization", "project")  # spans eligible for snapping
+
+# ── summarizer (spec 2026-07-08: one pass, change-triggered) ───────────
+SUMMARY_MODEL = "deepseek/deepseek-v4-flash"
+SUMMARY_FALLBACK_MODEL = "deepseek/deepseek-chat"
+SUMMARY_TIMEOUT_S = 20.0
+SUMMARY_MIN_INTERVAL_S = 25.0            # hard floor between summarizer passes
+SUMMARY_MAX_STALENESS_S = 240.0          # force a pass if new speech and this much elapsed
+SUMMARY_MIN_NEW_CHARS = 200              # don't resummarize silence
+SUMMARY_CHANGE_JACCARD = 0.6             # top-8 grounding overlap below this → trigger
+SUMMARY_CHANGE_TOP_K = 8                 # grounding prefix compared by Jaccard
+SUMMARY_DRIFT_COSINE = 0.70              # window-vs-topic-centroid cosine below this → trigger
+TOPIC_CENTROID_DECAY = 0.8               # EMA factor for the topic centroid
+SUMMARY_EMPTY_BACKOFF_S = 40.0           # after a no_update reply, same set can't re-fire sooner
+SUMMARY_DELTA_MAX_CHARS = 6000           # transcript delta cap per pass
+SUMMARY_INVALID_CITATION_MAX = 0.30      # reject summary if > this fraction of citations unknown
+ACTIONABLE_MIN_CONF = 0.8
+ACTIONABLE_QUOTE_MIN_RATIO = 0.85        # rapidfuzz partial ratio vs transcript delta (0-1)
+ACTIONABLE_MAX_PER_PASS = 2
+ACTIONABLE_DEDUPE_SIM = 0.90             # title-embedding cosine vs open actionables → update, not new
+
+# ── grounding / graph traversal (latent retrieval, no LLM) ─────────────
+GROUNDING_TOP_K = 12                     # grounding-set size
+GROUNDING_FACTS_MAX = 20                 # edge facts carried per pass
+GROUNDING_HYSTERESIS = 1.15              # challenger must beat incumbent by this factor
+SEED_TOP_K = 10                          # fused candidates entering the seed accumulator per pass
+SEED_ACCUM_DECAY = 0.85                  # per-pass decay of the meeting seed accumulator
+PPR_DAMPING = 0.5                        # HippoRAG value: mass stays within ~2 hops of seeds
+PPR_TOL = 1e-8                           # L1 convergence tolerance
+PPR_MAX_ITERS = 50
+PPR_BLEND = 0.35                         # rel = (1-β)·norm(fused RRF) + β·norm(PPR mass)
+FACT_EDGE_BOOST = 1.5                    # traversal weight multiplier for adjudicated fact edges
+SHARED_EDGE_BOOST = 1.35                 # entity/topic/mixed edges (audit F3.1 correction)
+DUP_EDGE_SIM = 0.95                      # same-source gist cosine ≥ this → edge excluded from quality rank
+
+# ── static priors (source rank, quality rank, recency decay) ───────────
+SOURCE_RANK = {
+    "apple_notes": 1.00,                 # written notes: highest
+    "obsidian": 1.00,
+    "imessage": 0.85,                    # text messages: a bit lower
+    "claude_memories": 0.70,             # agent memories: a bit lower still
+    "codex_memories": 0.70,
+}
+SOURCE_RANK_DEFAULT = 0.85               # future connectors until explicitly ranked
+QUALITY_DAMPING = 0.85                   # quality-rank PageRank damping
+QUALITY_TOL = 1e-6                       # L1 convergence tolerance
+QUALITY_MAX_ITERS = 100
+QUALITY_CLIP = 2.0                       # quality_rank = clip(log(r/median), ±this)
+QUALITY_LAMBDA = 0.20                    # blend: multiplier = exp(λ·quality_rank) ∈ [0.67, 1.49]
+RECENCY_OFFSET_DAYS = 2.0                # grace window before decay starts
+RECENCY_HALF_LIFE_DAYS = {
+    "imessage": 30.0,                    # episodic sources decay fast
+    "claude_memories": 60.0,
+    "codex_memories": 60.0,
+    "apple_notes": 90.0,
+    "obsidian": 120.0,                   # evergreen notes barely decay
+}
+RECENCY_HALF_LIFE_DEFAULT_DAYS = 90.0
+RECENCY_FLOOR = 0.15                     # decay is a downweight, never an exclusion
 
 # ── C1 exact collector ─────────────────────────────────────────────────
 # ALL aliases require word-boundary matches: substring matching fired 'comp'

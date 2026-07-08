@@ -124,6 +124,8 @@ class Index:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._embedding_rows: list[tuple[int, str, EmbeddingKind, str]] = []
         self._matrix = np.empty((0, config.EMBED_DIM), dtype=np.float32)
+        self._fact_rows: list[tuple[str, str, str]] = []       # (src, dst, fact text)
+        self._fact_matrix = np.empty((0, config.EMBED_DIM), dtype=np.float32)
         self._doc_frequency_cache: dict[str, int] = {}
         self._init_schema()
         self._disabled_sources = self._load_disabled_sources()
@@ -157,6 +159,40 @@ class Index:
             if vectors
             else np.empty((0, config.EMBED_DIM), dtype=np.float32)
         )
+        self.load_facts()
+
+    def load_facts(self) -> None:
+        """(Re)load the in-memory fact-embedding matrix (active endpoints only)."""
+        src_clause, src_params = self._active_sources_clause("n1.source")
+        dst_clause, dst_params = self._active_sources_clause("n2.source")
+        rows = self._conn.execute(
+            f"""
+            SELECT f.src, f.dst, f.text, f.vec
+            FROM fact_embeddings f
+            JOIN notes n1 ON n1.note_id = f.src
+            JOIN notes n2 ON n2.note_id = f.dst
+            WHERE 1=1{src_clause}{dst_clause}
+            ORDER BY f.src, f.dst
+            """,
+            (*src_params, *dst_params),
+        ).fetchall()
+        vectors: list[np.ndarray] = []
+        fact_rows: list[tuple[str, str, str]] = []
+        for row in rows:
+            vector = np.frombuffer(row["vec"], dtype=np.float32).copy()
+            if vector.shape != (config.EMBED_DIM,):
+                continue
+            norm = float(np.linalg.norm(vector))
+            if norm > 0:
+                vector = vector / norm
+            vectors.append(vector.astype(np.float32))
+            fact_rows.append((row["src"], row["dst"], row["text"]))
+        self._fact_rows = fact_rows
+        self._fact_matrix = (
+            np.vstack(vectors).astype(np.float32)
+            if vectors
+            else np.empty((0, config.EMBED_DIM), dtype=np.float32)
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -169,14 +205,17 @@ class Index:
     ) -> None:
         stored = note.model_copy(update={"gist": enrichment.gist})
         with self._conn:
+            # quality_rank is deliberately absent: it is owned by the rank pass
+            # (set_quality_ranks) and must survive note upserts untouched.
             self._conn.execute(
                 """
-                INSERT INTO notes(note_id, title, folder, modified, content_hash, text, gist, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO notes(note_id, title, folder, modified, created, content_hash, text, gist, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(note_id) DO UPDATE SET
                     title=excluded.title,
                     folder=excluded.folder,
                     modified=excluded.modified,
+                    created=excluded.created,
                     content_hash=excluded.content_hash,
                     text=excluded.text,
                     gist=excluded.gist,
@@ -187,6 +226,7 @@ class Index:
                     stored.title,
                     stored.folder,
                     stored.modified,
+                    stored.created or stored.modified,
                     stored.content_hash,
                     stored.text,
                     stored.gist,
@@ -421,6 +461,85 @@ class Index:
             for row in rows
         ]
 
+    def fact_dense_search(self, text: str, k: int) -> list[tuple[str, str, float, str]]:
+        """Dense search over adjudicated edge facts: (src, dst, score, fact_text).
+
+        HippoRAG-2-style query-to-fact matching; callers credit both endpoint
+        notes (spec 2026-07-08 §1.3/§4.1)."""
+        if k <= 0 or self._fact_matrix.size == 0:
+            return []
+        query = embed_queries([text])[0].astype(np.float32)
+        norm = float(np.linalg.norm(query))
+        if norm == 0:
+            return []
+        query = query / norm
+        rows, matrix = self._fact_rows, self._fact_matrix
+        if len(rows) != matrix.shape[0]:
+            self.load_facts()
+            rows, matrix = self._fact_rows, self._fact_matrix
+        scores = matrix @ query
+        order = np.argsort(scores)[::-1][:k]
+        return [(rows[i][0], rows[i][1], float(scores[i]), rows[i][2]) for i in order]
+
+    def fact_embedding_hashes(self) -> dict[tuple[str, str], str]:
+        """(src, dst) → fact_hash for every stored fact embedding (content-addressed refresh)."""
+        rows = self._conn.execute(
+            "SELECT src, dst, fact_hash FROM fact_embeddings"
+        ).fetchall()
+        return {(row["src"], row["dst"]): row["fact_hash"] for row in rows}
+
+    def upsert_fact_embedding(
+        self, src: str, dst: str, fact_hash: str, text: str, vector: np.ndarray
+    ) -> None:
+        """Store one fact embedding (src < dst). Caller batches, then load_facts()."""
+        values = np.asarray(vector, dtype=np.float32)
+        if values.shape != (config.EMBED_DIM,):
+            raise ValueError(f"fact embedding must have shape ({config.EMBED_DIM},)")
+        norm = float(np.linalg.norm(values))
+        if norm > 0:
+            values = values / norm
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO fact_embeddings(src, dst, fact_hash, text, vec)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (src, dst, fact_hash, text, values.astype(np.float32).tobytes()),
+            )
+
+    def prune_fact_embeddings(self, valid_keys: set[tuple[str, str]]) -> None:
+        """Drop fact embeddings whose (src, dst) is no longer a fact-carrying edge."""
+        stored = self.fact_embedding_hashes()
+        stale = [key for key in stored if key not in valid_keys]
+        if not stale:
+            return
+        with self._conn:
+            for src, dst in stale:
+                self._conn.execute(
+                    "DELETE FROM fact_embeddings WHERE src = ? AND dst = ?", (src, dst)
+                )
+
+    def set_quality_ranks(self, ranks: dict[str, float]) -> None:
+        """Write the rebuild-time quality ranks (log-median transformed, clipped)."""
+        with self._conn:
+            self._conn.execute("UPDATE notes SET quality_rank = 0.0")
+            self._conn.executemany(
+                "UPDATE notes SET quality_rank = ? WHERE note_id = ?",
+                [(float(rank), note_id) for note_id, rank in ranks.items()],
+            )
+
+    def quality_ranks(self) -> dict[str, float]:
+        rows = self._conn.execute("SELECT note_id, quality_rank FROM notes").fetchall()
+        return {row["note_id"]: float(row["quality_rank"]) for row in rows}
+
+    def graph_version(self) -> int:
+        """Monotonic counter bumped by replace_edges — lets live consumers know
+        when to rebuild cached traversal matrices."""
+        row = self._conn.execute(
+            "SELECT value FROM metadata WHERE key = 'graph_version'"
+        ).fetchone()
+        return int(row["value"]) if row is not None else 0
+
     def term_vectors(self, terms: Sequence[str]) -> dict[str, np.ndarray]:
         """Cached embeddings for term strings (synonym clustering)."""
         found: dict[str, np.ndarray] = {}
@@ -488,7 +607,8 @@ class Index:
     def note(self, note_id: str) -> NoteRecord | None:
         row = self._conn.execute(
             """
-            SELECT note_id, title, folder, modified, content_hash, text, gist, source
+            SELECT note_id, title, folder, modified, created, content_hash, text, gist,
+                   source, quality_rank
             FROM notes WHERE note_id = ?
             """,
             (note_id,),
@@ -501,7 +621,8 @@ class Index:
         if source is not None:
             rows = self._conn.execute(
                 """
-                SELECT note_id, title, folder, modified, content_hash, text, gist, source
+                SELECT note_id, title, folder, modified, created, content_hash, text, gist,
+                       source, quality_rank
                 FROM notes WHERE source = ? ORDER BY note_id
                 """,
                 (source,),
@@ -509,7 +630,8 @@ class Index:
             return [NoteRecord(**dict(row)) for row in rows]
         rows = self._conn.execute(
             """
-            SELECT note_id, title, folder, modified, content_hash, text, gist, source
+            SELECT note_id, title, folder, modified, created, content_hash, text, gist,
+                   source, quality_rank
             FROM notes ORDER BY note_id
             """
         ).fetchall()
@@ -717,6 +839,12 @@ class Index:
                         edge.fact,
                     ),
                 )
+            self._conn.execute(
+                """
+                INSERT INTO metadata(key, value) VALUES ('graph_version', '1')
+                ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+                """
+            )
 
     def _dense_snapshot(self) -> tuple[list[tuple[int, str, EmbeddingKind, str]], np.ndarray]:
         for _attempt in range(3):
@@ -866,6 +994,15 @@ class Index:
                     vec BLOB NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS fact_embeddings (
+                    src TEXT NOT NULL,
+                    dst TEXT NOT NULL,
+                    fact_hash TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    vec BLOB NOT NULL,
+                    PRIMARY KEY(src, dst)
+                );
+
                 CREATE TABLE IF NOT EXISTS edge_judgments (
                     src TEXT NOT NULL,
                     dst TEXT NOT NULL,
@@ -893,6 +1030,27 @@ class Index:
             )
             self._ensure_notes_source_column()
             self._ensure_edges_fact_column()
+            self._ensure_notes_created_column()
+            self._ensure_notes_quality_rank_column()
+
+    def _ensure_notes_created_column(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(notes)").fetchall()
+        }
+        if "created" in columns:
+            return
+        self._conn.execute("ALTER TABLE notes ADD COLUMN created REAL NOT NULL DEFAULT 0")
+        self._conn.execute("UPDATE notes SET created = modified WHERE created = 0")
+
+    def _ensure_notes_quality_rank_column(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(notes)").fetchall()
+        }
+        if "quality_rank" in columns:
+            return
+        self._conn.execute(
+            "ALTER TABLE notes ADD COLUMN quality_rank REAL NOT NULL DEFAULT 0.0"
+        )
 
     def _ensure_notes_source_column(self) -> None:
         columns = {
