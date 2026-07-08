@@ -61,6 +61,13 @@ _CITATION_RE = re.compile(r"\[(N|F)\d+\]")
 # double spaces — a global space-collapse would mangle code indentation and
 # markdown hard breaks (re-review finding)
 _CITATION_STRIP_RE = re.compile(r" ?\[(N|F)\d+\]")
+# GLM-5.2 leaks its native tool-call markup as plain text when it wants a
+# tool on the forced no-tools round (live smoke 2026-07-08) — never render it
+_TOOL_CALL_REMNANT_RE = re.compile(r"<tool_call>.*?(?:</tool_call>|\Z)", re.DOTALL)
+
+
+def _strip_tool_call_remnants(content: str) -> str:
+    return _TOOL_CALL_REMNANT_RE.sub("", content).rstrip()
 
 
 @dataclass
@@ -243,7 +250,7 @@ class ChatEngine:
             if persisted_message is not None:
                 return persisted_message
             final_content, sources, facts, stripped_citations = _finalize_grounding(
-                "".join(content_parts),
+                _strip_tool_call_remnants("".join(content_parts)),
                 context_items,
                 context_facts,
                 tool_sources,
@@ -347,8 +354,23 @@ class ChatEngine:
             )
             round_index = 0
             tool_count = 0
+            budget_notice_sent = False
             while True:
                 tools = TOOL_DEFINITIONS if tool_count < config.CHAT_MAX_TOOL_CALLS else None
+                if tools is None and not budget_notice_sent:
+                    # GLM keeps trying to call tools in plain text when they
+                    # vanish silently (live smoke 2026-07-08) — tell it why
+                    budget_notice_sent = True
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "(Tool budget exhausted — tools are no longer "
+                                "available. Answer now using only the "
+                                "information you already have.)"
+                            ),
+                        }
+                    )
                 try:
                     outcome = await self._stream_round(
                         model,

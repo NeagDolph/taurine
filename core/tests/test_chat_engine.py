@@ -188,11 +188,43 @@ async def test_turn_event_order_tool_round_trip_budget_no_tools_and_citation_str
     assert [call["model"] for call in llm.calls] == [config.CHAT_MODEL, config.CHAT_MODEL]
     assert llm.calls[0]["tools"] is not None
     assert llm.calls[1]["tools"] is None
-    assert llm.calls[1]["messages"][-2]["tool_calls"][0]["id"] == "call-1"
-    assert llm.calls[1]["messages"][-1]["role"] == "tool"
+    assert llm.calls[1]["messages"][-3]["tool_calls"][0]["id"] == "call-1"
+    assert llm.calls[1]["messages"][-2]["role"] == "tool"
+    # the forced no-tools round tells the model why tools vanished (GLM
+    # otherwise emits its native tool markup as plain text)
+    budget_notice = llm.calls[1]["messages"][-1]
+    assert budget_notice["role"] == "user"
+    assert budget_notice["content"] != "What changed?"
     assert store.chat_messages(done["chat_id"])[1].content == "Answer [N1] [F1]"
     assert ("chat_retrieval", {"chat_id": done["chat_id"], "query": "What changed?", "top": [{"id": "N1", "score": 0.9}], "facts": ["F1"]}) in logger.records
     assert any(kind == "chat_turn" and payload["usage"]["prompt"] == 7 for kind, payload in logger.records)
+
+
+@pytest.mark.asyncio
+async def test_tool_call_remnants_are_stripped_from_final_content(store: Any) -> None:
+    llm = FakeLLM(
+        streams=[
+            [
+                StreamEvent(
+                    kind="content",
+                    text=(
+                        "Here is the state [N1].<tool_call>read_note"
+                        "<arg_key>note</arg_key><arg_value>N16</arg_value></tool_call>"
+                    ),
+                ),
+                StreamEvent(kind="content", text="\n<tool_call>unterminated leak"),
+                StreamEvent(kind="done"),
+            ],
+        ]
+    )
+    engine = ChatEngine(store, llm, MemoryLogger())
+    events: list[dict[str, Any]] = []
+
+    await engine.send("", "State of things?", lambda event: _capture(event, events))
+
+    done = next(event for event in events if event["type"] == "chat_done")
+    assert done["message"]["content"] == "Here is the state [N1]."
+    assert _terminal_types(events) == ["chat_done"]
 
 
 @pytest.mark.asyncio
