@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
 import { saveProfile } from '../lib/sidecar'
 
 interface UserSummaryProps {
@@ -129,7 +130,9 @@ export function UserSummary({ card }: UserSummaryProps): React.JSX.Element {
               .
             </p>
           ) : (
-            <pre className="user-summary-text">{shownCard}</pre>
+            <div className="user-summary-text markdown-body">
+              <ReactMarkdown>{shownCard}</ReactMarkdown>
+            </div>
           )}
         </div>
       )}
