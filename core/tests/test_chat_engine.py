@@ -179,7 +179,7 @@ async def test_turn_event_order_tool_round_trip_budget_no_tools_and_citation_str
     assert events[-1]["type"] == "chat_meta"
     done = events[-2]["message"]
     assert _terminal_types(events) == ["chat_done"]
-    assert done["content"] == "Answer [N1] [F1] "
+    assert done["content"] == "Answer [N1] [F1]"
     assert done["usage"]["prompt"] == 7
     assert done["usage"]["completion"] == 10
     assert done["usage"]["reasoning"] == 15
@@ -190,7 +190,7 @@ async def test_turn_event_order_tool_round_trip_budget_no_tools_and_citation_str
     assert llm.calls[1]["tools"] is None
     assert llm.calls[1]["messages"][-2]["tool_calls"][0]["id"] == "call-1"
     assert llm.calls[1]["messages"][-1]["role"] == "tool"
-    assert store.chat_messages(done["chat_id"])[1].content == "Answer [N1] [F1] "
+    assert store.chat_messages(done["chat_id"])[1].content == "Answer [N1] [F1]"
     assert ("chat_retrieval", {"chat_id": done["chat_id"], "query": "What changed?", "top": [{"id": "N1", "score": 0.9}], "facts": ["F1"]}) in logger.records
     assert any(kind == "chat_turn" and payload["usage"]["prompt"] == 7 for kind, payload in logger.records)
 

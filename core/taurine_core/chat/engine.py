@@ -57,7 +57,10 @@ from .tools import TOOL_DEFINITIONS, execute_tool
 EmitFn = Callable[[Any], Coroutine[Any, Any, None]]
 
 _CITATION_RE = re.compile(r"\[(N|F)\d+\]")
-_SPACE_RUN_RE = re.compile(r" {2,}")
+# strip variant consumes one adjacent leading space so removals don't leave
+# double spaces — a global space-collapse would mangle code indentation and
+# markdown hard breaks (re-review finding)
+_CITATION_STRIP_RE = re.compile(r" ?\[(N|F)\d+\]")
 
 
 @dataclass
@@ -288,7 +291,18 @@ class ChatEngine:
             message = persist_turn(cancelled=cancelled)
             await emit(ChatDoneEvent(chat_id=chat_id, message_id=assistant_id, message=message))
             if not cancelled:
-                await self._maybe_title(chat_id, text, emit)
+                # post-done tail: chat_done is already out, so nothing here may
+                # escape to the catch-all (chat_error after chat_done would
+                # break §2.1 terminal exclusivity)
+                try:
+                    await self._maybe_title(chat_id, text, emit)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    try:
+                        self.logger.log("chat_turn", chat_id=chat_id, title_error=str(exc))
+                    except Exception:
+                        pass
 
         async def finish_success() -> None:
             nonlocal success_finish_task
@@ -696,16 +710,14 @@ def _finalize_grounding(
 
     def replace(match: re.Match[str]) -> str:
         nonlocal stripped
-        ref = match.group(0)[1:-1]
+        ref = match.group(0).lstrip()[1:-1]
         if ref in valid_ids:
             cited.append(ref)
             return match.group(0)
         stripped += 1
         return ""
 
-    stripped_content = _CITATION_RE.sub(replace, content)
-    if stripped:
-        stripped_content = _SPACE_RUN_RE.sub(" ", stripped_content)
+    stripped_content = _CITATION_STRIP_RE.sub(replace, content)
     source_ids = [ref for ref in cited if ref.startswith("N") and ref in item_by_id]
     source_ids.extend(item.short_id for item in context_items if item.short_id not in source_ids)
     fact_ids = [ref for ref in cited if ref.startswith("F") and ref in fact_by_id]
