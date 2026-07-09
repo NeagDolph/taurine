@@ -1,0 +1,3 @@
+{"example_id":"live-train-001","split":"train","source_note_ids":["eval-live-note-001"],"kind":"retrieval_live","input":{"window":"Who owns the launch checklist?"},"labels":{"passage_ids":["eval-live-passage-001"],"fact_ids":["eval-live-fact-001"],"answerable":true}}
+{"example_id":"live-cal-null-001","split":"calibration","source_note_ids":["eval-live-null-001"],"kind":"retrieval_live","input":{"window":"the the um okay yeah right"},"labels":{"passage_ids":[],"fact_ids":[],"answerable":false}}
+{"example_id":"live-held-null-001","split":"held_out","source_note_ids":["eval-live-null-002"],"kind":"retrieval_live","input":{"window":"completely unrelated zephyr quasar nonsense token"},"labels":{"passage_ids":[],"fact_ids":[],"answerable":false}}

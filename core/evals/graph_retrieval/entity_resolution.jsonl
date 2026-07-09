@@ -1,0 +1,3 @@
+{"example_id":"entity-train-001","split":"train","source_note_ids":["eval-entity-note-001"],"kind":"entity_resolution","input":{"surface":"wink","etype":"organization","context":"work at wink"},"labels":{"canonical":"Wink","status":"resolved","merge":true}}
+{"example_id":"entity-cal-001","split":"calibration","source_note_ids":["eval-entity-note-002"],"kind":"entity_resolution","input":{"surface":"AC","etype":"organization","context":""},"labels":{"status":"ambiguous","merge":false}}
+{"example_id":"entity-held-001","split":"held_out","source_note_ids":["eval-entity-note-003"],"kind":"entity_resolution","input":{"left":"Project 12","right":"Project 13","etype":"project"},"labels":{"status":"distinct","merge":false}}
