@@ -48,6 +48,12 @@ class Gliner2SpanExtractor:
         return kept
 
 
+def shared_model() -> Any | None:
+    """The lazily-loaded, process-cached GLiNER2 instance (also used by
+    pii.redact_pii — one model in memory, two schemas)."""
+    return _get_model()
+
+
 def _get_model() -> Any | None:
     global _MODEL, _MODEL_LOAD_FAILED
     if _MODEL is not None:
