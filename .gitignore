@@ -9,3 +9,5 @@ __pycache__/
 sessions/
 models/
 .scratch-sidecar/
+.worktrees/
+.superpowers/brainstorm/
