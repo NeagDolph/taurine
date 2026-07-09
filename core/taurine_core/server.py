@@ -640,6 +640,7 @@ def build_runtime() -> Runtime:
             index,
             llm,
             SessionLogger.create(session_log.SESSIONS_DIR),
+            span_extractor=span_extractor,
         ),
     )
 
