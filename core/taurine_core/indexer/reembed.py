@@ -60,6 +60,10 @@ def reembed_all(
 
     index.rebuild_graph()
     index.load()
+    from . import rank
+
+    rank.compute_quality_ranks(index)
+    rank.refresh_fact_embeddings(index)
     return total
 
 

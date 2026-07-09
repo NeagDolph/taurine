@@ -245,3 +245,80 @@ Other touched task-adjacent files:
 
 - The raw requested grep command is noisy because it matches `registry`. The meaningful word-boundary audit is clean for old LLM gist semantics.
 - The DB schema still permits legacy `gist` embedding rows so old databases can be read/re-embedded; new sync no longer writes them.
+
+---
+
+## Review Fix Report - 2026-07-09
+
+Commit target: `fix: reembed rank refresh, narrow entity-surface lookup, append-only slim phase, restore html test`
+
+### 1. Reembed rank/fact refresh
+
+Changed:
+- `core/taurine_core/indexer/reembed.py` now imports `rank` after `index.rebuild_graph()`/`index.load()` and calls `rank.compute_quality_ranks(index)` plus `rank.refresh_fact_embeddings(index)`.
+- `core/tests/test_index_reembed.py` spies on both rank refresh functions and verifies quality ranks are persisted by `reembed_all`.
+
+RED evidence:
+- `cd core && uv run pytest -q tests/test_index_reembed.py::test_reembed_all_updates_legacy_vectors_rebuilds_graph_and_reloads ...`
+- Failed as expected: `rank_calls == []` instead of `["quality", "facts"]`.
+
+GREEN evidence:
+- Same focused selector passed in the combined GREEN run: `4 passed, 2 warnings`.
+- Focused touched-area files passed: `45 passed, 2 warnings`.
+
+### 2. Narrow entity-surface lookup for grounding suffixes
+
+Changed:
+- `core/taurine_core/indexer/store.py` adds `Index.entity_surfaces_for(note_id: str, limit: int = 3) -> list[str]` using the requested single join query ordered by `ne.conf DESC, e.entity_id ASC`.
+- `core/taurine_core/live/grounding.py` and `core/taurine_core/chat/engine.py` use `entity_surfaces_for(..., limit=3)` when available, with the old enrichment fallback retained for test doubles/non-store indexes.
+- `core/tests/test_store_entities.py` covers confidence ordering, deterministic entity-id tie break, default limit, explicit limit, and missing-note behavior.
+
+RED evidence:
+- `cd core && uv run pytest -q tests/test_store_entities.py::test_entity_surfaces_for_orders_by_confidence_then_entity_id_and_limits ...`
+- Failed as expected with `AttributeError: 'Index' object has no attribute 'entity_surfaces_for'`.
+
+GREEN evidence:
+- Same focused selector passed in the combined GREEN run: `4 passed, 2 warnings`.
+- Focused touched-area files passed: `45 passed, 2 warnings`.
+
+### 3. Append-only slim enrichment
+
+Changed:
+- `core/taurine_core/indexer/sync.py` now embeds only slim utterance texts in `_utterance_embedding_units` and calls `index.apply_slim_enrichment(...)` instead of re-upserting the full note.
+- `core/taurine_core/indexer/store.py` adds `Index.apply_slim_enrichment(...)`, replacing alias rows, deleting/reinserting only `kind='utterance'` embeddings, refreshing extraction cache JSON, and leaving chunk rows untouched.
+- `core/tests/test_index_sync.py` records `embed_texts` batches and asserts each gated note chunk text is embedded exactly once per sync while slim utterance text is still embedded.
+
+RED evidence:
+- `cd core && uv run pytest -q tests/test_index_sync.py::test_slim_enrichment_embeds_gated_note_chunks_once_per_sync ...`
+- Failed as expected with chunk count `2` instead of `1`.
+
+GREEN evidence:
+- Same focused selector passed in the combined GREEN run: `4 passed, 2 warnings`.
+- Focused touched-area files passed: `45 passed, 2 warnings`.
+
+### 4. Restored Apple Notes HTML coverage
+
+Changed:
+- `core/tests/test_connectors.py` restores `test_extract_notes_converts_html_and_hashes_content`, covering `<div>Hello <b>world</b><br>Next line&nbsp;here</div>` to `Hello world\nNext line here` plus exact SHA-256 content hash and length.
+- No production code changed for this item.
+
+Evidence:
+- Included in the RED/GREEN selector command and passed throughout: `tests/test_connectors.py::test_extract_notes_converts_html_and_hashes_content`.
+
+### Test Runs
+
+RED:
+- `cd /Users/neil/taurine/core && uv run pytest -q tests/test_index_reembed.py::test_reembed_all_updates_legacy_vectors_rebuilds_graph_and_reloads tests/test_store_entities.py::test_entity_surfaces_for_orders_by_confidence_then_entity_id_and_limits tests/test_index_sync.py::test_slim_enrichment_embeds_gated_note_chunks_once_per_sync tests/test_connectors.py::test_extract_notes_converts_html_and_hashes_content`
+- Output summary: `3 failed, 1 passed, 2 warnings`.
+
+GREEN focused selectors:
+- Same command after fixes.
+- Output summary: `4 passed, 2 warnings`.
+
+Focused touched-area files:
+- `cd /Users/neil/taurine/core && uv run pytest -q tests/test_index_reembed.py tests/test_store_entities.py tests/test_index_sync.py tests/test_connectors.py tests/test_live_grounding.py tests/test_chat_engine.py`
+- Output summary: `45 passed, 2 warnings`.
+
+Full suite:
+- `cd /Users/neil/taurine/core && uv run pytest -q`
+- Output summary: `287 passed, 2 skipped, 3 warnings in 11.26s`.

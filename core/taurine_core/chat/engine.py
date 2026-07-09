@@ -832,6 +832,16 @@ def _materialize_registry_fact(
 
 
 def _display_line_with_entities(index: Any, note_id: str, display_line: str) -> str:
+    entity_surfaces_for = getattr(index, "entity_surfaces_for", None)
+    if callable(entity_surfaces_for):
+        surfaces = [
+            str(surface).strip()
+            for surface in entity_surfaces_for(note_id, limit=3)
+            if str(surface).strip()
+        ]
+        if surfaces:
+            return f"{display_line} [{', '.join(surfaces)}]"
+        return display_line
     enrichment_for = getattr(index, "enrichment_for", None)
     if not callable(enrichment_for):
         return display_line

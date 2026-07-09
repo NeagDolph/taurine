@@ -208,6 +208,17 @@ def _embedding_units(note: NoteRecord, enrichment: Enrichment) -> list[Embedding
     return units
 
 
+def _utterance_embedding_units(enrichment: Enrichment) -> list[EmbeddingInput]:
+    texts = [utterance for utterance in enrichment.utterances if utterance.strip()]
+    if not texts:
+        return []
+    vectors = embed_texts(texts)
+    units: list[EmbeddingInput] = []
+    for text, vector in zip(texts, vectors, strict=True):
+        units.append(("utterance", text, np.asarray(vector, dtype=np.float32)))
+    return units
+
+
 async def _apply_slim_enrichment(
     index: Index,
     changed: list[NoteRecord],
@@ -235,7 +246,11 @@ async def _apply_slim_enrichment(
             }
         )
         enrichments[note.note_id] = merged
-        index.upsert_note(note, merged, _embedding_units(note, merged))
+        index.apply_slim_enrichment(
+            note.note_id,
+            merged,
+            _utterance_embedding_units(merged),
+        )
 
 
 def _enrichment_from_extraction(note: NoteRecord, extraction: Extraction) -> Enrichment:

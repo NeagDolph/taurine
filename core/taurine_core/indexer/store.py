@@ -309,6 +309,54 @@ class Index:
         self._doc_frequency_cache.clear()
         self.load()
 
+    def apply_slim_enrichment(
+        self,
+        note_id: str,
+        enrichment: Enrichment,
+        utterance_units: Sequence[EmbeddingInput],
+    ) -> None:
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT title, content_hash FROM notes WHERE note_id = ?",
+                (note_id,),
+            ).fetchone()
+            if row is None:
+                return
+            self._conn.execute("DELETE FROM aliases WHERE note_id = ?", (note_id,))
+            for alias, is_title in self._aliases_for(row["title"], enrichment):
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO aliases(alias_lowercase, note_id, is_title)
+                    VALUES (?, ?, ?)
+                    """,
+                    (alias, note_id, int(is_title)),
+                )
+            self._conn.execute(
+                "DELETE FROM embeddings WHERE note_id = ? AND kind = 'utterance'",
+                (note_id,),
+            )
+            for kind, text, vector in utterance_units:
+                if kind != "utterance":
+                    raise ValueError(f"slim enrichment only accepts utterance units: {kind}")
+                self._insert_embedding(note_id, kind, text, vector)
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO enrich_cache(note_id, content_hash, enrichment_json)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    note_id,
+                    row["content_hash"],
+                    Extraction(
+                        entities=enrichment.entities,
+                        relations=enrichment.relations,
+                        failed=enrichment.extraction_failed,
+                    ).model_dump_json(),
+                ),
+            )
+            self._set_last_sync(time.time())
+        self.load()
+
     def delete_note(self, note_id: str) -> None:
         with self._conn:
             touched_entity_ids = self._entity_ids_touched_by_note(note_id)
@@ -1246,6 +1294,20 @@ class Index:
                 vector = vector / norm
             vectors.append(vector.astype(np.float32))
         return vectors
+
+    def entity_surfaces_for(self, note_id: str, limit: int = 3) -> list[str]:
+        rows = self._conn.execute(
+            """
+            SELECT e.canonical
+            FROM note_entities ne
+            JOIN entities e ON e.entity_id = ne.entity_id
+            WHERE ne.note_id = ?
+            ORDER BY ne.conf DESC, e.entity_id ASC
+            LIMIT ?
+            """,
+            (note_id, max(0, int(limit))),
+        ).fetchall()
+        return [row["canonical"] for row in rows]
 
     def enrichment_for(self, note_id: str) -> Enrichment | None:
         note = self.note(note_id)

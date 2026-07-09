@@ -4,7 +4,8 @@ import sqlite3
 
 import pytest
 
-from tests.conftest import enrichment, fixture_units, make_note, unit_vec
+from tests.conftest import entity, enrichment, fixture_units, make_note, unit_vec
+from taurine_core.schemas import Enrichment
 
 
 def _entities_by_key(store) -> dict[tuple[str, str], tuple[int, int]]:
@@ -97,6 +98,27 @@ def test_relations_between_returns_max_conf_in_both_note_orientations(store) -> 
     assert store.relations_between("beta", "alpha") == [
         ("Jane Doe", "works_at", "Acme", pytest.approx(0.88))
     ]
+
+
+def test_entity_surfaces_for_orders_by_confidence_then_entity_id_and_limits(store) -> None:
+    enrich = Enrichment(
+        gist="Entity gist",
+        entities=[
+            entity("Beta", "concept", conf=0.80),
+            entity("Alpha", "concept", conf=0.95),
+            entity("Gamma", "concept", conf=0.95),
+            entity("Delta", "concept", conf=0.70),
+        ],
+    )
+    store.upsert_note(
+        make_note("entity-note", "Entity Note", "Entity body"),
+        enrich,
+        fixture_units(unit_vec(12), enrich),
+    )
+
+    assert store.entity_surfaces_for("entity-note", limit=2) == ["Alpha", "Gamma"]
+    assert store.entity_surfaces_for("entity-note") == ["Alpha", "Gamma", "Beta"]
+    assert store.entity_surfaces_for("missing") == []
 
 
 def test_ingest_salience_and_value_scores_round_trip(store) -> None:

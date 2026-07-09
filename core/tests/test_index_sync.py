@@ -95,18 +95,19 @@ def fake_extractor(monkeypatch) -> FakeExtractorModel:
 def deterministic_sync_embeddings(monkeypatch):
     from taurine_core.indexer import sync
 
-    def fake_embed_texts(texts: list[str]) -> np.ndarray:
-        rows = []
-        for text in texts:
-            digest = hashlib.sha256(text.encode("utf-8")).digest()
-            seed = int.from_bytes(digest[:8], "little")
-            rng = np.random.default_rng(seed)
-            row = rng.normal(size=config.EMBED_DIM).astype(np.float32)
-            row /= np.linalg.norm(row)
-            rows.append(row)
-        return np.vstack(rows) if rows else np.empty((0, config.EMBED_DIM), dtype=np.float32)
+    monkeypatch.setattr(sync, "embed_texts", _deterministic_vectors)
 
-    monkeypatch.setattr(sync, "embed_texts", fake_embed_texts)
+
+def _deterministic_vectors(texts: list[str]) -> np.ndarray:
+    rows = []
+    for text in texts:
+        digest = hashlib.sha256(text.encode("utf-8")).digest()
+        seed = int.from_bytes(digest[:8], "little")
+        rng = np.random.default_rng(seed)
+        row = rng.normal(size=config.EMBED_DIM).astype(np.float32)
+        row /= np.linalg.norm(row)
+        rows.append(row)
+    return np.vstack(rows) if rows else np.empty((0, config.EMBED_DIM), dtype=np.float32)
 
 
 def _raw_extraction_for(text: str) -> dict:
@@ -221,6 +222,30 @@ def test_sync_adds_display_line_heuristic_aliases_and_slim_utterances(
     assert "gist" not in kinds
     assert "chunk" in kinds
     assert "utterance" in kinds
+
+
+def test_slim_enrichment_embeds_gated_note_chunks_once_per_sync(
+    store, fake_extractor, monkeypatch
+):
+    from taurine_core.indexer import sync
+    from taurine_core.indexer.sync import sync_once
+
+    embed_calls: list[list[str]] = []
+
+    def tracking_embed_texts(texts: list[str]) -> np.ndarray:
+        embed_calls.append(list(texts))
+        return _deterministic_vectors(texts)
+
+    monkeypatch.setattr(sync, "embed_texts", tracking_embed_texts)
+
+    sync_once(store, source_with(NOTE_A), SlimLLM())
+
+    chunk_texts = sync.chunk_text(NOTE_A.text) or [NOTE_A.text or NOTE_A.title]
+    chunk_counts = {
+        chunk: sum(batch.count(chunk) for batch in embed_calls) for chunk in chunk_texts
+    }
+    assert chunk_counts == {chunk: 1 for chunk in chunk_texts}
+    assert any("Can we talk through the billing launch?" in batch for batch in embed_calls)
 
 
 def test_removed_note_is_deleted(store, fake_extractor):

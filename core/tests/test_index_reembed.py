@@ -12,7 +12,7 @@ def _vector_lengths(index: object) -> list[int]:
 
 
 def test_reembed_all_updates_legacy_vectors_rebuilds_graph_and_reloads(store, monkeypatch):
-    from taurine_core.indexer import reembed
+    from taurine_core.indexer import rank, reembed
 
     alpha = make_note("alpha", "Alpha", "Alpha legacy text")
     beta = make_note("beta", "Beta", "Beta current text")
@@ -42,6 +42,20 @@ def test_reembed_all_updates_legacy_vectors_rebuilds_graph_and_reloads(store, mo
     progress: list[tuple[int, int]] = []
     monkeypatch.setattr(reembed, "embed_texts", fake_embed_texts)
 
+    rank_calls: list[str] = []
+
+    def fake_compute_quality_ranks(index):
+        rank_calls.append("quality")
+        index.set_quality_ranks({"alpha": 1.25, "beta": -0.25})
+        return {"alpha": 1.25, "beta": -0.25}
+
+    def fake_refresh_fact_embeddings(index):
+        del index
+        rank_calls.append("facts")
+
+    monkeypatch.setattr(rank, "compute_quality_ranks", fake_compute_quality_ranks)
+    monkeypatch.setattr(rank, "refresh_fact_embeddings", fake_refresh_fact_embeddings)
+
     count = reembed.reembed_all(store, progress=lambda done, total: progress.append((done, total)))
 
     # stale-only default: current-dim rows are untouched, so an interrupted
@@ -53,6 +67,8 @@ def test_reembed_all_updates_legacy_vectors_rebuilds_graph_and_reloads(store, mo
     assert store._matrix.shape == (3, config.EMBED_DIM)
     assert progress[-1] == (1, 1)
     assert any({edge.src, edge.dst} == {"alpha", "beta"} for edge in store.graph().edges)
+    assert rank_calls == ["quality", "facts"]
+    assert store.quality_ranks() == {"alpha": 1.25, "beta": -0.25}
 
     encoded_texts.clear()
     assert reembed.reembed_all(store, stale_only=False) == 3

@@ -130,6 +130,26 @@ def test_apple_notes_connector_tags_records_and_wraps_access_errors(monkeypatch)
         failing.extract({})
 
 
+def test_extract_notes_converts_html_and_hashes_content():
+    from taurine_core.indexer.notes import _record_from_raw
+
+    class RawNote:
+        name = "HTML Note"
+        id = "x-coredata://html"
+        body = "<div>Hello <b>world</b><br>Next line&nbsp;here</div>"
+        folder = "Notes"
+        modification_date = 200.0
+        creation_date = 100.0
+
+    note = _record_from_raw(RawNote())
+
+    assert note.text == "Hello world\nNext line here"
+    assert note.content_hash == hashlib.sha256(
+        ("HTML Note" + "Hello world\nNext line here").encode("utf-8")
+    ).hexdigest()
+    assert len(note.content_hash) == 64
+
+
 def test_apple_notes_raw_record_uses_creation_date_with_modified_fallback():
     from taurine_core.indexer.notes import _record_from_raw
 
