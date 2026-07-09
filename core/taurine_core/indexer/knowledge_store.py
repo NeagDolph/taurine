@@ -7,13 +7,14 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 from urllib.parse import quote
 
 import numpy as np
 
 from taurine_core.indexer.embed import PassageEmbedding
 from taurine_core.indexer.passages import PassageDraft
+from taurine_core.indexer.projection import ProjectionEdge
 from taurine_core.schemas import NoteRecord
 
 
@@ -157,6 +158,40 @@ class KnowledgeStore:
             calibration_hash=row["calibration_hash"],
             graph_hash=row["graph_hash"],
         )
+
+    def complete_build(
+        self,
+        build_id: str,
+        *,
+        completed_at: float,
+        health: Literal["healthy", "degraded"],
+        graph_hash: str,
+        base_edge_count: int,
+        projection_count: int,
+    ) -> None:
+        self._writable()
+        counts = self.counts()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE index_builds SET
+                    completed_at = ?, status = 'complete', health = ?,
+                    passage_count = ?, entity_count = ?, fact_count = ?,
+                    base_edge_count = ?, projection_count = ?, graph_hash = ?, error = ''
+                WHERE build_id = ?
+                """,
+                (
+                    float(completed_at),
+                    health,
+                    counts["passages"],
+                    counts["entities"],
+                    counts["facts"],
+                    int(base_edge_count),
+                    int(projection_count),
+                    graph_hash,
+                    build_id,
+                ),
+            )
 
     def write_note(
         self,
@@ -307,6 +342,53 @@ class KnowledgeStore:
             )
             for row in rows
         )
+
+    def write_semantic_edges(
+        self,
+        rows: Sequence[tuple[str, str, float, float]],
+        *,
+        build_id: str,
+    ) -> None:
+        self._writable()
+        with self._conn:
+            for src, dst, cosine, weight in rows:
+                left, right = sorted((src, dst))
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO passage_semantic_edges(
+                        src_passage_id, dst_passage_id, cosine, weight, build_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (left, right, float(cosine), float(weight), build_id),
+                )
+
+    def write_projection(
+        self,
+        rows: Sequence[ProjectionEdge],
+        *,
+        build_id: str,
+    ) -> None:
+        self._writable()
+        with self._conn:
+            for row in rows:
+                self._conn.execute(
+                    """
+                    INSERT INTO note_projection_edges(
+                        src_note_id, dst_note_id, edge_type, weight,
+                        shared, fact_ids, mechanisms, build_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row.src_note_id,
+                        row.dst_note_id,
+                        row.edge_type,
+                        row.weight,
+                        json.dumps(row.shared),
+                        json.dumps(row.fact_ids),
+                        json.dumps(row.mechanisms, sort_keys=True),
+                        build_id,
+                    ),
+                )
 
     def search_passages_bm25(self, query: str, k: int) -> tuple[BM25PassageHit, ...]:
         if not query.strip() or k <= 0:
