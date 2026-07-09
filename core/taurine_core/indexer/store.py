@@ -293,14 +293,18 @@ class Index:
 
     def delete_note(self, note_id: str) -> None:
         with self._conn:
+            touched_entity_ids = self._entity_ids_touched_by_note(note_id)
             self._conn.execute("DELETE FROM notes WHERE note_id = ?", (note_id,))
             self._conn.execute("DELETE FROM notes_fts WHERE note_id = ?", (note_id,))
             self._conn.execute("DELETE FROM aliases WHERE note_id = ?", (note_id,))
             self._conn.execute("DELETE FROM embeddings WHERE note_id = ?", (note_id,))
+            self._conn.execute("DELETE FROM note_entities WHERE note_id = ?", (note_id,))
+            self._conn.execute("DELETE FROM entity_relations WHERE note_id = ?", (note_id,))
             self._conn.execute(
                 "DELETE FROM edges WHERE src = ? OR dst = ?",
                 (note_id, note_id),
             )
+            self._recompute_entity_df(touched_entity_ids)
             self._set_last_sync(time.time())
         self._doc_frequency_cache.clear()
         self.load()
@@ -570,6 +574,157 @@ class Index:
     def quality_ranks(self) -> dict[str, float]:
         rows = self._conn.execute("SELECT note_id, quality_rank FROM notes").fetchall()
         return {row["note_id"]: float(row["quality_rank"]) for row in rows}
+
+    def replace_note_extraction(
+        self,
+        note_id: str,
+        entities: list[tuple[str, str, float, int]],
+        relations: list[tuple[str, str, str, float]],
+    ) -> None:
+        """Replace GLiNER extraction rows for one note and refresh entity df."""
+        with self._conn:
+            touched_entity_ids = self._entity_ids_touched_by_note(note_id)
+            self._conn.execute("DELETE FROM note_entities WHERE note_id = ?", (note_id,))
+            self._conn.execute("DELETE FROM entity_relations WHERE note_id = ?", (note_id,))
+
+            canonical_entity_ids: dict[str, set[int]] = defaultdict(set)
+            for canonical, etype, conf, count in entities:
+                entity_id = self._upsert_entity(canonical, etype)
+                touched_entity_ids.add(entity_id)
+                canonical_entity_ids[canonical].add(entity_id)
+                self._conn.execute(
+                    """
+                    INSERT INTO note_entities(note_id, entity_id, conf, count)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(note_id, entity_id) DO UPDATE SET
+                        conf = excluded.conf,
+                        count = excluded.count
+                    """,
+                    (note_id, entity_id, float(conf), int(count)),
+                )
+
+            for src_canonical, rel_type, dst_canonical, conf in relations:
+                src_entity = self._resolve_entity_id(src_canonical, canonical_entity_ids)
+                dst_entity = self._resolve_entity_id(dst_canonical, canonical_entity_ids)
+                if src_entity is None or dst_entity is None:
+                    continue
+                touched_entity_ids.update((src_entity, dst_entity))
+                self._conn.execute(
+                    """
+                    INSERT INTO entity_relations(note_id, src_entity, rel_type, dst_entity, conf)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(note_id, src_entity, rel_type, dst_entity) DO UPDATE SET
+                        conf = MAX(entity_relations.conf, excluded.conf)
+                    """,
+                    (note_id, src_entity, rel_type, dst_entity, float(conf)),
+                )
+
+            self._recompute_entity_df(touched_entity_ids)
+
+    def entity_rows(self) -> list[tuple[int, str, str, int]]:
+        rows = self._conn.execute(
+            "SELECT entity_id, canonical, etype, df FROM entities ORDER BY entity_id"
+        ).fetchall()
+        return [
+            (int(row["entity_id"]), row["canonical"], row["etype"], int(row["df"]))
+            for row in rows
+        ]
+
+    def note_entity_rows(self) -> list[tuple[str, int, float, int]]:
+        rows = self._conn.execute(
+            """
+            SELECT note_id, entity_id, conf, count
+            FROM note_entities ORDER BY note_id, entity_id
+            """
+        ).fetchall()
+        return [
+            (row["note_id"], int(row["entity_id"]), float(row["conf"]), int(row["count"]))
+            for row in rows
+        ]
+
+    def relation_rows(self) -> list[tuple[str, int, str, int, float]]:
+        rows = self._conn.execute(
+            """
+            SELECT note_id, src_entity, rel_type, dst_entity, conf
+            FROM entity_relations ORDER BY note_id, src_entity, rel_type, dst_entity
+            """
+        ).fetchall()
+        return [
+            (
+                row["note_id"],
+                int(row["src_entity"]),
+                row["rel_type"],
+                int(row["dst_entity"]),
+                float(row["conf"]),
+            )
+            for row in rows
+        ]
+
+    def relations_between(
+        self, src_note: str, dst_note: str
+    ) -> list[tuple[str, str, str, float]]:
+        rows = self._conn.execute(
+            """
+            SELECT src.canonical AS head_canonical,
+                   er.rel_type AS rel_type,
+                   dst.canonical AS tail_canonical,
+                   MAX(er.conf) AS conf
+            FROM entity_relations er
+            JOIN entities src ON src.entity_id = er.src_entity
+            JOIN entities dst ON dst.entity_id = er.dst_entity
+            WHERE (
+                EXISTS (
+                    SELECT 1 FROM note_entities ne
+                    WHERE ne.note_id = ? AND ne.entity_id = er.src_entity
+                )
+                AND EXISTS (
+                    SELECT 1 FROM note_entities ne
+                    WHERE ne.note_id = ? AND ne.entity_id = er.dst_entity
+                )
+            ) OR (
+                EXISTS (
+                    SELECT 1 FROM note_entities ne
+                    WHERE ne.note_id = ? AND ne.entity_id = er.src_entity
+                )
+                AND EXISTS (
+                    SELECT 1 FROM note_entities ne
+                    WHERE ne.note_id = ? AND ne.entity_id = er.dst_entity
+                )
+            )
+            GROUP BY er.src_entity, er.rel_type, er.dst_entity
+            ORDER BY head_canonical, rel_type, tail_canonical
+            """,
+            (src_note, dst_note, dst_note, src_note),
+        ).fetchall()
+        return [
+            (
+                row["head_canonical"],
+                row["rel_type"],
+                row["tail_canonical"],
+                float(row["conf"]),
+            )
+            for row in rows
+        ]
+
+    def set_ingest_salience(self, scores: dict[str, float]) -> None:
+        with self._conn:
+            self._conn.execute("UPDATE notes SET ingest_salience = 1.0")
+            self._conn.executemany(
+                "UPDATE notes SET ingest_salience = ? WHERE note_id = ?",
+                [(float(score), note_id) for note_id, score in scores.items()],
+            )
+
+    def set_value_scores(self, scores: dict[str, float]) -> None:
+        with self._conn:
+            self._conn.execute("UPDATE notes SET value_score = 0.0")
+            self._conn.executemany(
+                "UPDATE notes SET value_score = ? WHERE note_id = ?",
+                [(float(score), note_id) for note_id, score in scores.items()],
+            )
+
+    def value_scores(self) -> dict[str, float]:
+        rows = self._conn.execute("SELECT note_id, value_score FROM notes").fetchall()
+        return {row["note_id"]: float(row["value_score"]) for row in rows}
 
     def graph_version(self) -> int:
         """Monotonic counter bumped by replace_edges — lets live consumers know
@@ -1142,6 +1297,31 @@ class Index:
                     PRIMARY KEY(note_id, content_hash)
                 );
 
+                CREATE TABLE IF NOT EXISTS entities(
+                    entity_id INTEGER PRIMARY KEY,
+                    canonical TEXT NOT NULL,
+                    etype TEXT NOT NULL,
+                    df INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(canonical, etype)
+                );
+
+                CREATE TABLE IF NOT EXISTS note_entities(
+                    note_id TEXT NOT NULL,
+                    entity_id INTEGER NOT NULL,
+                    conf REAL NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY(note_id, entity_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS entity_relations(
+                    note_id TEXT NOT NULL,
+                    src_entity INTEGER NOT NULL,
+                    rel_type TEXT NOT NULL,
+                    dst_entity INTEGER NOT NULL,
+                    conf REAL NOT NULL,
+                    PRIMARY KEY(note_id, src_entity, rel_type, dst_entity)
+                );
+
                 CREATE TABLE IF NOT EXISTS embeddings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     note_id TEXT NOT NULL REFERENCES notes(note_id) ON DELETE CASCADE,
@@ -1224,6 +1404,7 @@ class Index:
             self._ensure_edges_fact_column()
             self._ensure_notes_created_column()
             self._ensure_notes_quality_rank_column()
+            self._ensure_notes_value_columns()
 
     def _ensure_notes_created_column(self) -> None:
         columns = {
@@ -1244,6 +1425,15 @@ class Index:
             "ALTER TABLE notes ADD COLUMN quality_rank REAL NOT NULL DEFAULT 0.0"
         )
 
+    def _ensure_notes_value_columns(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(notes)").fetchall()
+        }
+        if "ingest_salience" not in columns:
+            self._conn.execute("ALTER TABLE notes ADD COLUMN ingest_salience REAL DEFAULT 1.0")
+        if "value_score" not in columns:
+            self._conn.execute("ALTER TABLE notes ADD COLUMN value_score REAL DEFAULT 0.0")
+
     def _ensure_notes_source_column(self) -> None:
         columns = {
             row["name"] for row in self._conn.execute("PRAGMA table_info(notes)").fetchall()
@@ -1261,6 +1451,61 @@ class Index:
         if "fact" in columns:
             return
         self._conn.execute("ALTER TABLE edges ADD COLUMN fact TEXT NOT NULL DEFAULT ''")
+
+    def _upsert_entity(self, canonical: str, etype: str) -> int:
+        self._conn.execute(
+            "INSERT OR IGNORE INTO entities(canonical, etype) VALUES (?, ?)",
+            (canonical, etype),
+        )
+        row = self._conn.execute(
+            "SELECT entity_id FROM entities WHERE canonical = ? AND etype = ?",
+            (canonical, etype),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("failed to upsert entity")
+        return int(row["entity_id"])
+
+    def _resolve_entity_id(
+        self, canonical: str, preferred_ids: dict[str, set[int]]
+    ) -> int | None:
+        ids = preferred_ids.get(canonical, set())
+        if len(ids) == 1:
+            return next(iter(ids))
+        rows = self._conn.execute(
+            "SELECT entity_id FROM entities WHERE canonical = ? ORDER BY entity_id",
+            (canonical,),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        return int(rows[0]["entity_id"])
+
+    def _entity_ids_touched_by_note(self, note_id: str) -> set[int]:
+        rows = self._conn.execute(
+            """
+            SELECT entity_id FROM note_entities WHERE note_id = ?
+            UNION
+            SELECT src_entity AS entity_id FROM entity_relations WHERE note_id = ?
+            UNION
+            SELECT dst_entity AS entity_id FROM entity_relations WHERE note_id = ?
+            """,
+            (note_id, note_id, note_id),
+        ).fetchall()
+        return {int(row["entity_id"]) for row in rows}
+
+    def _recompute_entity_df(self, entity_ids: set[int]) -> None:
+        for entity_id in sorted(entity_ids):
+            self._conn.execute(
+                """
+                UPDATE entities
+                SET df = (
+                    SELECT COUNT(DISTINCT note_id)
+                    FROM note_entities
+                    WHERE entity_id = ?
+                )
+                WHERE entity_id = ?
+                """,
+                (entity_id, entity_id),
+            )
 
     def _insert_embedding(
         self, note_id: str, kind: EmbeddingKind, text: str, vector: np.ndarray
