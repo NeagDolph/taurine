@@ -24,6 +24,26 @@ class Enrichment(BaseModel):
     entities: list[str]
 
 
+class EntityMention(BaseModel):
+    surface: str
+    etype: str                     # key of config.INGEST_ENTITY_TYPES
+    conf: float
+    mentions: int = 1              # deduped count for this surface/type in the note
+
+
+class RelationTriple(BaseModel):
+    head: str                      # entity surface
+    rel_type: str                  # key of config.INGEST_RELATION_TYPES
+    tail: str
+    conf: float
+
+
+class Extraction(BaseModel):
+    entities: list[EntityMention] = []
+    relations: list[RelationTriple] = []
+    failed: bool = False           # GLiNER inference error → retry next sync
+
+
 class NoteRecord(BaseModel):
     note_id: str
     title: str
