@@ -219,11 +219,6 @@ class ProfileGenerator:
                 messages.extend(tool_messages)
 
 
-async def build_user_card(index: object, llm: Any) -> str:
-    """Compatibility bridge until profile generation is removed from re-enrich."""
-    return await ProfileGenerator(index, llm).generate(lambda _progress: None)  # type: ignore[arg-type]
-
-
 def _phase_for_tool(
     name: str,
     arguments: dict[str, Any],

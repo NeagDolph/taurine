@@ -335,7 +335,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             active_runtime,
             ReenrichStatus(
                 running=True,
-                phase="notes" if source else "profile",
+                phase="notes",
                 done=0,
                 total=0,
             ),
@@ -872,9 +872,8 @@ async def _run_reenrich(runtime: Runtime, source: str | None = None) -> None:
             )
         else:
             await _emit_index_status(runtime)
-        # re-enrichment refreshes extraction/display lines/edges and, on full runs, the user card
+        # re-enrichment refreshes extraction/display lines/edges only
         _bump_graph(runtime)
-        runtime.updates.publish("profile")
         runtime.updates.publish("connectors")
 
 

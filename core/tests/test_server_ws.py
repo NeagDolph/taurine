@@ -441,7 +441,7 @@ def test_reenrich_endpoint_is_single_flight_and_exposes_status() -> None:
 
     assert status == {
         "running": True,
-        "phase": "profile",
+        "phase": "notes",
         "done": 0,
         "total": 0,
     }

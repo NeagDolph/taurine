@@ -288,7 +288,7 @@ class NotePreview(BaseModel):
 
 class ReenrichStatus(BaseModel):
     running: bool
-    phase: Literal["idle", "profile", "notes", "finalizing"] = "idle"
+    phase: Literal["idle", "notes", "finalizing"] = "idle"
     done: int = 0
     total: int = 0
 

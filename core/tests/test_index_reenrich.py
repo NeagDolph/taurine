@@ -7,7 +7,6 @@ import pytest
 
 from tests.conftest import enrichment, fixture_units, make_note, unit_vec
 from taurine_core import config
-from taurine_core.ports import LLMError
 
 
 class _Schema:
@@ -114,7 +113,7 @@ def deterministic_reenrich_embeddings(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reenrich_all_rebuilds_profile_and_keeps_prior_extraction_on_note_failure(
+async def test_reenrich_all_starts_with_notes_and_keeps_card_on_extraction_failure(
     store, monkeypatch
 ) -> None:
     from taurine_core.indexer import extract
@@ -128,6 +127,7 @@ async def test_reenrich_all_rebuilds_profile_and_keeps_prior_extraction_on_note_
     prior_beta = enrichment("Old beta gist", aliases=["old beta"], topics=["old"])
     store.upsert_note(alpha, prior_alpha, fixture_units(unit_vec(1), prior_alpha))
     store.upsert_note(beta, prior_beta, fixture_units(unit_vec(2), prior_beta))
+    store.set_user_card("## User\nExisting profile.")
     progress = []
     llm = ScriptedLLM()
 
@@ -138,7 +138,7 @@ async def test_reenrich_all_rebuilds_profile_and_keeps_prior_extraction_on_note_
     assert report.total == 2
     assert report.changed == 1
     assert report.failures == 1
-    assert store.user_card() == "## User\nWorks on Alpha."
+    assert store.user_card() == "## User\nExisting profile."
     assert [entity.surface for entity in alpha_enrichment.entities] == [
         "Alpha Project",
         "reenrich topic",
@@ -147,7 +147,9 @@ async def test_reenrich_all_rebuilds_profile_and_keeps_prior_extraction_on_note_
         "old",
     ]
     assert ("fresh alpha", "alpha", False) in store.aliases()
-    assert [status.phase for status in progress if status.done == 0][:2] == ["profile", "notes"]
+    assert [status.phase for status in progress if status.done == 0][:1] == ["notes"]
+    assert not hasattr(report, "profile_failed")
+    assert all(call[3] != config.PROFILE_TIMEOUT_S for call in llm.calls)
     assert progress[-1].running is False
     assert progress[-1].phase == "idle"
     assert progress[-1].done == 2
@@ -155,28 +157,27 @@ async def test_reenrich_all_rebuilds_profile_and_keeps_prior_extraction_on_note_
 
 
 @pytest.mark.asyncio
-async def test_reenrich_all_keeps_old_card_when_profile_fails(store, monkeypatch) -> None:
+async def test_reenrich_all_never_invokes_profile_generation(store, monkeypatch) -> None:
     from taurine_core.indexer import extract
     from taurine_core.indexer.reenrich import reenrich_all
 
-    class ProfileFailingLLM(ScriptedLLM):
-        async def complete_json(
-            self, model: str, system: str, user: str, timeout_s: float | None = None
-        ) -> dict:
-            if timeout_s == config.PROFILE_TIMEOUT_S:
-                raise LLMError("profile failed")
-            return await super().complete_json(model, system, user, timeout_s)
+    async def fail_profile(*_args, **_kwargs):
+        raise AssertionError("re-enrichment must not launch profile generation")
 
     monkeypatch.setattr(extract, "_extractor_model", lambda: ScriptedExtractorModel())
+    monkeypatch.setattr(
+        "taurine_core.indexer.profile.ProfileGenerator.generate",
+        fail_profile,
+    )
     alpha = make_note("alpha", "Alpha", "Alpha body")
     prior_alpha = enrichment("Old alpha gist", topics=["old"])
     store.upsert_note(alpha, prior_alpha, fixture_units(unit_vec(1), prior_alpha))
     store.set_user_card("## User\nExisting card.")
 
-    report = await reenrich_all(store, ProfileFailingLLM(), lambda _status: None)
+    report = await reenrich_all(store, ScriptedLLM(), lambda _status: None)
 
-    assert report.profile_failed is True
     assert store.user_card() == "## User\nExisting card."
+    assert not hasattr(report, "profile_failed")
     assert [entity.surface for entity in store.enrichment_for("alpha").entities] == [
         "Alpha Project",
         "reenrich topic",
@@ -207,7 +208,6 @@ async def test_reenrich_scoped_to_source_skips_profile_and_other_sources(
 
     assert report.total == 1
     assert report.changed == 1
-    assert report.profile_failed is False
     assert store.user_card() == "existing card"
     assert [entity.surface for entity in store.enrichment_for("alpha").entities] == ["old"]
     assert [entity.surface for entity in store.enrichment_for("imsg").entities] == [

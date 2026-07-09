@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from taurine_core.ports import LLMPort
 from taurine_core.schemas import ReenrichStatus
 
-from .profile import build_user_card
 from .sync import (
     _apply_slim_enrichment,
     _drop_cached_extraction,
@@ -23,7 +22,6 @@ class ReenrichReport:
     total: int
     changed: int
     failures: int
-    profile_failed: bool = False
 
 
 async def reenrich_all(
@@ -32,11 +30,7 @@ async def reenrich_all(
     progress: Callable[[ReenrichStatus], None],
     source: str | None = None,
 ) -> ReenrichReport:
-    """Re-enrich every note, or only one connector's notes when `source` is set.
-
-    Scoped runs skip the profile phase: the user card is corpus-wide and only
-    worth regenerating on a full pass.
-    """
+    """Re-extract every note, or only one connector's notes when `source` is set."""
     disabled = getattr(index, "disabled_sources", set)()
     notes = [
         note
@@ -44,19 +38,6 @@ async def reenrich_all(
         if (source is None or note.source == source) and note.source not in disabled
     ]
     total = len(notes)
-
-    profile_failed = False
-    if source is None:
-        progress(ReenrichStatus(running=True, phase="profile", done=0, total=total))
-        old_card = index.user_card()  # type: ignore[attr-defined]
-        try:
-            user_card = await build_user_card(index, llm)
-            index.set_user_card(user_card)  # type: ignore[attr-defined]
-        except Exception:
-            profile_failed = True
-            user_card = old_card
-    else:
-        user_card = index.user_card()  # type: ignore[attr-defined]
 
     progress(ReenrichStatus(running=True, phase="notes", done=0, total=total))
 
@@ -143,5 +124,4 @@ async def reenrich_all(
         total=total,
         changed=len(changed_note_ids),
         failures=failures,
-        profile_failed=profile_failed,
     )
