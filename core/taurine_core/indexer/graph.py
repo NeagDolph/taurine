@@ -109,14 +109,94 @@ def _candidates(index: object) -> tuple[list[_Candidate], list[_Candidate]]:
     notes: list[NoteRecord] = index.notes()  # type: ignore[attr-defined]
     kept: dict[tuple[str, str], _Candidate] = {}
     relaxed: dict[tuple[str, str], _Candidate] = {}
+    _canonicalize_extractions(index, notes)
     enrichments, resolved_terms = _term_resolution(index, notes)
     _add_semantic_edges(index, notes, kept, relaxed)
     _add_shared_edges(notes, kept, relaxed, "topic", enrichments, resolved_terms)
     _add_shared_edges(notes, kept, relaxed, "entity", enrichments, resolved_terms)
+    _add_relation_edges(index, notes, kept)
     margin = [
         candidate for key, candidate in relaxed.items() if key not in kept
     ]
     return list(kept.values()), _cap_margin_candidates(margin)
+
+
+def _canonicalize_extractions(index: object, notes: list[NoteRecord]) -> None:
+    if not hasattr(index, "replace_note_extraction"):
+        return
+
+    enrichments: dict[str, Enrichment] = {}
+    term_counts_by_etype: dict[str, Counter[str]] = defaultdict(Counter)
+    all_terms: set[str] = set()
+    for note in notes:
+        enrichment = index.enrichment_for(note.note_id)  # type: ignore[attr-defined]
+        if enrichment is None:
+            continue
+        enrichments[note.note_id] = enrichment
+        for entity in enrichment.entities:
+            term = _entity_term(entity.surface, entity.etype)
+            if not term:
+                continue
+            term_counts_by_etype[entity.etype][term] += 1
+            all_terms.add(term)
+
+    if not term_counts_by_etype:
+        return
+
+    _ensure_term_vectors(index, all_terms)
+    resolved_by_etype = {
+        etype: resolve_terms(index, counts)
+        for etype, counts in term_counts_by_etype.items()
+    }
+
+    for note_id, enrichment in enrichments.items():
+        surface_map: dict[str, str] = {}
+        entity_accumulator: dict[tuple[str, str], tuple[float, int]] = {}
+        changed = False
+        for entity in enrichment.entities:
+            normalized = _entity_term(entity.surface, entity.etype)
+            if not normalized:
+                continue
+            canonical = resolved_by_etype.get(entity.etype, {}).get(normalized, normalized)
+            surface_map[entity.surface] = canonical
+            surface_map[normalized] = canonical
+            if canonical != entity.surface:
+                changed = True
+            key = (canonical, entity.etype)
+            prior_conf, prior_count = entity_accumulator.get(key, (0.0, 0))
+            entity_accumulator[key] = (
+                max(prior_conf, float(entity.conf)),
+                prior_count + int(entity.mentions),
+            )
+
+        relations: list[tuple[str, str, str, float]] = []
+        for relation in enrichment.relations:
+            head = _mapped_relation_surface(relation.head, surface_map)
+            tail = _mapped_relation_surface(relation.tail, surface_map)
+            if head != relation.head or tail != relation.tail:
+                changed = True
+            relations.append((head, relation.rel_type, tail, float(relation.conf)))
+
+        if not changed:
+            continue
+
+        entities = [
+            (canonical, etype, conf, count)
+            for (canonical, etype), (conf, count) in entity_accumulator.items()
+        ]
+        index.replace_note_extraction(note_id, entities, relations)  # type: ignore[attr-defined]
+
+
+def _entity_term(surface: str, etype: str) -> str:
+    return _canonicalize_term(surface, lowercase=etype == "concept")
+
+
+def _mapped_relation_surface(surface: str, surface_map: Mapping[str, str]) -> str:
+    stripped = surface.strip()
+    if stripped in surface_map:
+        return surface_map[stripped]
+    normalized = _canonicalize_term(stripped, lowercase=False)
+    return surface_map.get(normalized, stripped)
 
 
 def _add_semantic_edges(
@@ -190,6 +270,53 @@ def _add_shared_edges(
                 _candidate(kept, left.note_id, right.note_id).add(
                     mechanism, weight, shared
                 )
+
+
+def _add_relation_edges(
+    index: object,
+    notes: list[NoteRecord],
+    kept: dict[tuple[str, str], _Candidate],
+) -> None:
+    if not (
+        hasattr(index, "entity_rows")
+        and hasattr(index, "note_entity_rows")
+        and hasattr(index, "relation_rows")
+    ):
+        return
+
+    note_ids = {note.note_id for note in notes}
+    entity_labels = {
+        entity_id: canonical
+        for entity_id, canonical, _etype, _df in index.entity_rows()  # type: ignore[attr-defined]
+    }
+    notes_by_entity: dict[int, set[str]] = defaultdict(set)
+    for note_id, entity_id, _conf, _count in index.note_entity_rows():  # type: ignore[attr-defined]
+        if note_id in note_ids:
+            notes_by_entity[int(entity_id)].add(note_id)
+
+    relation_conf: dict[tuple[int, str, int], float] = {}
+    for note_id, src_entity, rel_type, dst_entity, conf in index.relation_rows():  # type: ignore[attr-defined]
+        if note_id not in note_ids:
+            continue
+        key = (int(src_entity), str(rel_type), int(dst_entity))
+        relation_conf[key] = max(relation_conf.get(key, 0.0), float(conf))
+
+    for (src_entity, rel_type, dst_entity), conf in relation_conf.items():
+        weight = config.REL_EDGE_W * conf
+        if rel_type == "related_to":
+            weight *= config.REL_CATCHALL_FACTOR
+        if weight <= 0.0:
+            continue
+        shared = {
+            label
+            for label in (entity_labels.get(src_entity), entity_labels.get(dst_entity))
+            if label
+        }
+        for src_note in notes_by_entity.get(src_entity, set()):
+            for dst_note in notes_by_entity.get(dst_entity, set()):
+                if src_note == dst_note:
+                    continue
+                _candidate(kept, src_note, dst_note).add("entity", weight, shared)
 
 
 def pair_sig(
@@ -304,25 +431,7 @@ def resolve_terms(index: object, terms: Mapping[str, int] | Iterable[str]) -> di
         return {}
 
     ordered_terms = sorted(term_counts)
-    vectors = index.term_vectors(ordered_terms)  # type: ignore[attr-defined]
-    missing = [term for term in ordered_terms if term not in vectors]
-    if missing:
-        embedded = np.asarray(embed_texts(missing), dtype=np.float32)
-        if embedded.shape != (len(missing), config.EMBED_DIM):
-            raise ValueError(
-                f"term embedding model returned {embedded.shape}, "
-                f"expected {(len(missing), config.EMBED_DIM)}"
-            )
-        new_vectors: dict[str, np.ndarray] = {}
-        for term, vector in zip(missing, embedded, strict=True):
-            normalized = _normalize(vector)
-            new_vectors[term] = (
-                normalized.astype(np.float32)
-                if normalized is not None
-                else np.asarray(vector, dtype=np.float32)
-            )
-        index.set_term_vectors(new_vectors)  # type: ignore[attr-defined]
-        vectors.update(new_vectors)
+    vectors = _ensure_term_vectors(index, ordered_terms)
 
     vector_terms: list[str] = []
     normalized_vectors: list[np.ndarray] = []
@@ -374,6 +483,32 @@ def resolve_terms(index: object, terms: Mapping[str, int] | Iterable[str]) -> di
         for member in members:
             resolved[member] = canonical
     return resolved
+
+
+def _ensure_term_vectors(index: object, terms: Iterable[str]) -> dict[str, np.ndarray]:
+    ordered_terms = sorted({term for term in terms if term})
+    if not ordered_terms:
+        return {}
+    vectors = index.term_vectors(ordered_terms)  # type: ignore[attr-defined]
+    missing = [term for term in ordered_terms if term not in vectors]
+    if missing:
+        embedded = np.asarray(embed_texts(missing), dtype=np.float32)
+        if embedded.shape != (len(missing), config.EMBED_DIM):
+            raise ValueError(
+                f"term embedding model returned {embedded.shape}, "
+                f"expected {(len(missing), config.EMBED_DIM)}"
+            )
+        new_vectors: dict[str, np.ndarray] = {}
+        for term, vector in zip(missing, embedded, strict=True):
+            normalized = _normalize(vector)
+            new_vectors[term] = (
+                normalized.astype(np.float32)
+                if normalized is not None
+                else np.asarray(vector, dtype=np.float32)
+            )
+        index.set_term_vectors(new_vectors)  # type: ignore[attr-defined]
+        vectors.update(new_vectors)
+    return vectors
 
 
 def _canonicalize_term(term: str, *, lowercase: bool) -> str:

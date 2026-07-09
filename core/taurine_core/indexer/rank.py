@@ -89,6 +89,7 @@ class NoteGraphMatrix:
         self,
         seeds: dict[str, float],
         *,
+        entity_seeds: dict[int, float] | None = None,
         damping: float = config.PPR_DAMPING,
         tol: float = config.PPR_TOL,
         max_iters: int = config.PPR_MAX_ITERS,
@@ -110,7 +111,8 @@ class NoteGraphMatrix:
             row = self.row_of.get(note_id)
             if row is None or weight <= 0.0:
                 continue
-            teleport[row] += float(weight)
+            teleport[row] += float(weight) * config.PPR_PASSAGE_RESET_W
+        del entity_seeds
         total = float(teleport.sum())
         if total <= 0.0:
             return {}, zero
@@ -132,6 +134,140 @@ class NoteGraphMatrix:
             note_id: float(rank[offset])
             for offset, note_id in enumerate(self.note_ids)
             if rank[offset] > 0.0
+        }
+        return masses, rank
+
+
+class HeteroGraphMatrix:
+    """Column-stochastic CSR transition matrix over notes and entities."""
+
+    def __init__(self, note_ids: list[str], entity_ids: list[int], matrix: object) -> None:
+        self.note_ids = note_ids
+        self.entity_ids = entity_ids
+        self.row_ids = [f"note:{note_id}" for note_id in note_ids] + [
+            f"ent:{entity_id}" for entity_id in entity_ids
+        ]
+        self.row_of = {row_id: offset for offset, row_id in enumerate(self.row_ids)}
+        self.note_rows = slice(0, len(note_ids))
+        self.entity_rows = slice(len(note_ids), len(note_ids) + len(entity_ids))
+        self.matrix = matrix
+
+    @classmethod
+    def build(cls, index: Index) -> "HeteroGraphMatrix":
+        from .graph import _term_weight
+
+        graph = index.graph()
+        note_ids = [node.note_id for node in graph.nodes]
+        entity_rows = index.entity_rows()
+        entity_ids = [int(entity_id) for entity_id, _canonical, _etype, _df in entity_rows]
+        size = len(note_ids) + len(entity_ids)
+        if size == 0:
+            return cls([], [], csr_matrix((0, 0), dtype=np.float32))
+
+        note_row = {note_id: offset for offset, note_id in enumerate(note_ids)}
+        entity_row = {
+            entity_id: len(note_ids) + offset
+            for offset, entity_id in enumerate(entity_ids)
+        }
+        entity_df = {
+            int(entity_id): int(df)
+            for entity_id, _canonical, _etype, df in entity_rows
+        }
+        rows: list[int] = []
+        cols: list[int] = []
+        data: list[float] = []
+
+        def add_undirected(left: int, right: int, weight: float) -> None:
+            if weight <= 0.0:
+                return
+            rows.extend((right, left))
+            cols.extend((left, right))
+            data.extend((float(weight), float(weight)))
+
+        for edge in graph.edges:
+            if edge.src not in note_row or edge.dst not in note_row:
+                continue
+            weight = _boosted_edge_weight(edge.weight, edge.type, edge.fact)
+            add_undirected(note_row[edge.src], note_row[edge.dst], weight)
+
+        for note_id, entity_id, conf, _count in index.note_entity_rows():
+            note_offset = note_row.get(note_id)
+            entity_offset = entity_row.get(int(entity_id))
+            if note_offset is None or entity_offset is None:
+                continue
+            df = max(0, entity_df.get(int(entity_id), 0))
+            weight = _term_weight(df) * float(conf)
+            add_undirected(note_offset, entity_offset, weight)
+
+        for note_id, src_entity, rel_type, dst_entity, conf in index.relation_rows():
+            if note_id not in note_row:
+                continue
+            src_offset = entity_row.get(int(src_entity))
+            dst_offset = entity_row.get(int(dst_entity))
+            if src_offset is None or dst_offset is None:
+                continue
+            weight = config.REL_EDGE_W * float(conf)
+            if rel_type == "related_to":
+                weight *= config.REL_CATCHALL_FACTOR
+            add_undirected(src_offset, dst_offset, weight)
+
+        matrix = csr_matrix((data, (rows, cols)), shape=(size, size), dtype=np.float32)
+        normalized = _column_normalize(matrix)
+        return cls(note_ids, entity_ids, normalized.tocsr())
+
+    def ppr(
+        self,
+        seeds: dict[str, float],
+        *,
+        entity_seeds: dict[int, float] | None = None,
+        damping: float = config.PPR_DAMPING,
+        tol: float = config.PPR_TOL,
+        max_iters: int = config.PPR_MAX_ITERS,
+        warm_start: np.ndarray | None = None,
+    ) -> tuple[dict[str, float], np.ndarray]:
+        size = len(self.row_ids)
+        zero = np.zeros(size, dtype=np.float64)
+        if size == 0:
+            return {}, zero
+
+        teleport = np.zeros(size, dtype=np.float64)
+        for note_id, weight in seeds.items():
+            row = self.row_of.get(f"note:{note_id}")
+            if row is None or weight <= 0.0:
+                continue
+            teleport[row] += float(weight) * config.PPR_PASSAGE_RESET_W
+        for entity_id, weight in (entity_seeds or {}).items():
+            row = self.row_of.get(f"ent:{int(entity_id)}")
+            if row is None or weight <= 0.0:
+                continue
+            teleport[row] += float(weight) * config.PPR_ENTITY_RESET_W
+
+        total = float(teleport.sum())
+        if total <= 0.0:
+            return {}, zero
+        teleport /= total
+
+        if warm_start is not None and warm_start.shape == (size,):
+            rank = np.asarray(warm_start, dtype=np.float64).copy()
+        else:
+            rank = teleport.copy()
+
+        for _ in range(max(0, int(max_iters))):
+            updated = damping * (self.matrix @ rank) + (1.0 - damping) * teleport
+            if float(np.abs(updated - rank).sum()) < tol:
+                rank = np.asarray(updated, dtype=np.float64)
+                break
+            rank = np.asarray(updated, dtype=np.float64)
+
+        note_rank = rank[: len(self.note_ids)].copy()
+        note_total = float(note_rank.sum())
+        if note_total <= 0.0:
+            return {}, rank
+        note_rank /= note_total
+        masses = {
+            note_id: float(note_rank[offset])
+            for offset, note_id in enumerate(self.note_ids)
+            if note_rank[offset] > 0.0
         }
         return masses, rank
 
@@ -286,6 +422,14 @@ def _boosted_edge_weight(weight: float, edge_type: str, fact: str) -> float:
     if edge_type in ("topic", "entity", "mixed"):
         boosted *= config.SHARED_EDGE_BOOST
     return min(1.0, boosted)
+
+
+def _column_normalize(matrix: csr_matrix) -> csr_matrix:
+    strengths = np.asarray(matrix.sum(axis=0)).ravel()
+    inv_strengths = np.zeros_like(strengths, dtype=np.float32)
+    nonzero = strengths > 0.0
+    inv_strengths[nonzero] = 1.0 / strengths[nonzero]
+    return matrix @ diags(inv_strengths, dtype=np.float32, format="csr")
 
 
 def _same_source_duplicate_edge(
