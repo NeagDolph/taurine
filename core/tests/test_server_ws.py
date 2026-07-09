@@ -841,3 +841,50 @@ def test_updates_websocket_sends_snapshot_and_change_events() -> None:
             while "graph" not in kinds:
                 kinds.add(websocket.receive_json()["type"])
             assert runtime.graph_version == 1
+
+
+def test_updates_websocket_streams_profile_generation_progress_and_result() -> None:
+    class ProfileIndex(GraphIndex):
+        card: str | None = None
+
+        def user_card(self) -> str | None:
+            return self.card
+
+        def set_user_card(self, text: str) -> None:
+            self.card = text
+
+    runtime = Runtime(
+        index=ProfileIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+        connector_registry=FakeConnectorRegistry(),
+        profile_generator=FakeProfileGenerator("# Streamed profile"),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/updates") as websocket:
+            for _ in range(5):
+                websocket.receive_json()
+
+            assert client.post("/profile/generate").status_code == 202
+            profile_events = []
+            while True:
+                event = websocket.receive_json()
+                if event["type"] != "profile":
+                    continue
+                profile_events.append(event)
+                if event["card"] == "# Streamed profile":
+                    break
+
+            assert any(event["generation"]["running"] for event in profile_events)
+            assert any(
+                event["generation"]["running"] and event["generation"]["activity"]
+                for event in profile_events
+            )
+            assert profile_events[-1]["generation"]["phase"] == "idle"
