@@ -10,7 +10,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from taurine_core import session_log
+from taurine_core.indexer.profile import ProfileProgress
 from taurine_core.indexer.sync import SyncReport
+from taurine_core.ports import LLMError
 from taurine_core.schemas import (
     Actionable,
     ActionableEvent,
@@ -73,6 +75,20 @@ class GraphIndex:
                 )
             ],
         )
+
+
+@dataclass
+class FakeProfileGenerator:
+    result: str | Exception
+    delay_s: float = 0.05
+
+    async def generate(self, on_progress) -> str:
+        on_progress(ProfileProgress("surveying", "Surveying the graph", 0, 0))
+        await asyncio.sleep(self.delay_s)
+        if isinstance(self.result, Exception):
+            raise self.result
+        on_progress(ProfileProgress("synthesizing", "Writing the profile", 7, 3))
+        return self.result
 
 
 @dataclass
@@ -688,12 +704,101 @@ def test_profile_endpoints_roundtrip() -> None:
     )
 
     with TestClient(create_app(runtime)) as client:
-        assert client.get("/profile").json() == {"card": None}
-        assert client.put("/profile", json={"card": "  Neil builds Taurine.  "}).json() == {
-            "card": "Neil builds Taurine."
+        response = client.get("/profile").json()
+        assert response["card"] is None
+        assert response["generation"] == {
+            "running": False,
+            "phase": "idle",
+            "activity": "",
+            "nodes_read": 0,
+            "tool_calls": 0,
+            "started_at": None,
+            "elapsed_s": 0.0,
+            "error": "",
         }
-        assert client.get("/profile").json() == {"card": "Neil builds Taurine."}
+        saved = client.put("/profile", json={"card": "  Neil builds Taurine.  "}).json()
+        assert saved["card"] == "Neil builds Taurine."
+        assert saved["generation"]["phase"] == "idle"
+        assert client.get("/profile").json()["card"] == "Neil builds Taurine."
         assert client.put("/profile", json={"card": "   "}).status_code == 422
+
+
+def test_profile_generation_is_single_flight_and_overwrites_only_on_success() -> None:
+    class ProfileIndex(GraphIndex):
+        card = "Existing manual profile"
+
+        def user_card(self) -> str | None:
+            return self.card
+
+        def set_user_card(self, text: str) -> None:
+            self.card = text
+
+    index = ProfileIndex()
+    runtime = Runtime(
+        index=index,
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+        profile_generator=FakeProfileGenerator("# Generated profile"),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        accepted = client.post("/profile/generate")
+        assert accepted.status_code == 202
+        assert accepted.json()["generation"]["running"] is True
+        assert client.post("/profile/generate").status_code == 409
+        assert index.card == "Existing manual profile"
+
+        deadline = time.time() + 1.0
+        payload = client.get("/profile").json()
+        while payload["generation"]["running"] and time.time() < deadline:
+            time.sleep(0.01)
+            payload = client.get("/profile").json()
+
+        assert payload["generation"]["phase"] == "idle"
+        assert payload["card"] == "# Generated profile"
+
+
+def test_profile_generation_failure_preserves_existing_card() -> None:
+    class ProfileIndex(GraphIndex):
+        card = "Keep this profile"
+
+        def user_card(self) -> str | None:
+            return self.card
+
+        def set_user_card(self, text: str) -> None:
+            self.card = text
+
+    runtime = Runtime(
+        index=ProfileIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+        profile_generator=FakeProfileGenerator(LLMError("provider unavailable"), delay_s=0),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.post("/profile/generate").status_code == 202
+        deadline = time.time() + 1.0
+        payload = client.get("/profile").json()
+        while payload["generation"]["phase"] != "failed" and time.time() < deadline:
+            time.sleep(0.01)
+            payload = client.get("/profile").json()
+
+        assert payload["card"] == "Keep this profile"
+        assert payload["generation"]["running"] is False
+        assert payload["generation"]["phase"] == "failed"
+        assert payload["generation"]["error"] == "provider unavailable"
 
 
 def test_updates_websocket_sends_snapshot_and_change_events() -> None:
@@ -723,6 +828,7 @@ def test_updates_websocket_sends_snapshot_and_change_events() -> None:
             assert snapshot["reenrich"]["status"]["running"] is False
             assert snapshot["graph"]["version"] == 0
             assert snapshot["profile"]["card"] is None
+            assert snapshot["profile"]["generation"]["phase"] == "idle"
             assert snapshot["chats"]["chats"] == []
 
             # a state change publishes fresh events over the socket
