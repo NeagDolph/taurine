@@ -39,6 +39,17 @@ class PassageEntityInput:
 
 
 @dataclass(frozen=True)
+class FactGraphInput:
+    fact_id: str
+    subject_entity_id: str
+    predicate: str
+    object_entity_id: str
+    source_note_id: str
+    confidence: float
+    status: str
+
+
+@dataclass(frozen=True)
 class BaseEdge:
     src_id: str
     dst_id: str
@@ -117,40 +128,21 @@ class BaseGraphBuilder:
             )
 
         edges.extend(self._semantic_edges(passage_rows))
-        for fact in sorted(facts, key=lambda row: row.fact_id):
-            if fact.status != "active":
-                continue
-            if (
-                fact.subject_entity_id not in row_by_id
-                or fact.object_entity_id not in row_by_id
-            ):
-                continue
-            spec = PREDICATES[fact.predicate]
-            temporal_weight = 1.0
-            forward_weight = spec.base_weight * fact.confidence * temporal_weight
-            reverse_weight = forward_weight * spec.reverse_traversal_weight
-            edges.append(
-                BaseEdge(
-                    fact.subject_entity_id,
-                    fact.object_entity_id,
-                    "fact",
-                    forward_weight,
-                    direction="forward",
-                    fact_ids=(fact.fact_id,),
-                    metadata={"predicate": fact.predicate},
-                )
+        graph_facts = (
+            FactGraphInput(
+                fact_id=fact.fact_id,
+                subject_entity_id=fact.subject_entity_id,
+                predicate=fact.predicate,
+                object_entity_id=fact.object_entity_id,
+                source_note_id=fact.source_note_id,
+                confidence=fact.confidence,
+                status=fact.status,
             )
-            edges.append(
-                BaseEdge(
-                    fact.object_entity_id,
-                    fact.subject_entity_id,
-                    "fact",
-                    reverse_weight,
-                    direction="reverse",
-                    fact_ids=(fact.fact_id,),
-                    metadata={"predicate": fact.predicate},
-                )
-            )
+            for fact in facts
+            if fact.subject_entity_id in row_by_id
+            and fact.object_entity_id in row_by_id
+        )
+        edges.extend(grouped_fact_edges(tuple(graph_facts)))
 
         edges.sort(
             key=lambda row: (
@@ -214,6 +206,62 @@ class BaseGraphBuilder:
         return edges
 
 
+def grouped_fact_edges(facts: Sequence[FactGraphInput]) -> tuple[BaseEdge, ...]:
+    """Build one directed edge pair per logical triple and retain its provenance."""
+
+    groups: dict[tuple[str, str, str], list[FactGraphInput]] = {}
+    for fact in facts:
+        if fact.status != "active":
+            continue
+        key = (fact.subject_entity_id, fact.predicate, fact.object_entity_id)
+        groups.setdefault(key, []).append(fact)
+
+    edges: list[BaseEdge] = []
+    for (subject_id, predicate, object_id), support in sorted(groups.items()):
+        spec = PREDICATES[predicate]
+        confidence_by_source: dict[str, float] = {}
+        for fact in support:
+            confidence_by_source[fact.source_note_id] = max(
+                confidence_by_source.get(fact.source_note_id, 0.0),
+                _clip(fact.confidence),
+            )
+        unsupported = math.prod(
+            1.0 - confidence_by_source[source_id]
+            for source_id in sorted(confidence_by_source)
+        )
+        support_confidence = 1.0 - unsupported
+        forward_weight = spec.base_weight * support_confidence
+        fact_ids = tuple(sorted({fact.fact_id for fact in support}))
+        metadata = {
+            "predicate": predicate,
+            "source_note_ids": tuple(sorted(confidence_by_source)),
+            "support_confidence": support_confidence,
+        }
+        edges.extend(
+            (
+                BaseEdge(
+                    subject_id,
+                    object_id,
+                    "fact",
+                    forward_weight,
+                    direction="forward",
+                    fact_ids=fact_ids,
+                    metadata=metadata,
+                ),
+                BaseEdge(
+                    object_id,
+                    subject_id,
+                    "fact",
+                    forward_weight * spec.reverse_traversal_weight,
+                    direction="reverse",
+                    fact_ids=fact_ids,
+                    metadata=metadata,
+                ),
+            )
+        )
+    return tuple(edges)
+
+
 def _matrix(
     node_ids: tuple[str, ...],
     row_by_id: Mapping[str, int],
@@ -244,6 +292,52 @@ def _matrix(
     nonzero = strengths > 0
     inverse[nonzero] = 1.0 / strengths[nonzero]
     return (matrix @ diags(inverse)).tocsr()
+
+
+def materialize_base_graph(
+    *,
+    build_id: str,
+    node_ids: Sequence[str],
+    node_kinds: Sequence[str],
+    edges: Sequence[BaseEdge],
+) -> BaseGraph:
+    """Materialize normalized sparse state from deterministically ordered graph rows."""
+
+    paired = sorted(zip(node_ids, node_kinds, strict=True), key=lambda row: row[0])
+    passages = [row for row in paired if row[1] == "passage"]
+    entities = [row for row in paired if row[1] == "entity"]
+    if len(passages) + len(entities) != len(paired):
+        raise ValueError("base graph node kinds must be passage or entity")
+    ordered = passages + entities
+    ordered_ids = tuple(row[0] for row in ordered)
+    ordered_kinds = tuple(row[1] for row in ordered)
+    if len(set(ordered_ids)) != len(ordered_ids):
+        raise ValueError("base graph node IDs must be globally unique")
+    row_by_id = {node_id: index for index, node_id in enumerate(ordered_ids)}
+    ordered_edges = tuple(
+        sorted(
+            edges,
+            key=lambda row: (
+                row.src_id,
+                row.dst_id,
+                row.kind,
+                row.direction,
+                row.fact_ids,
+            ),
+        )
+    )
+    matrix = _matrix(ordered_ids, row_by_id, list(ordered_edges))
+    strengths = np.asarray(matrix.sum(axis=0)).ravel()
+    dangling = tuple(int(index) for index in np.flatnonzero(strengths == 0.0))
+    return BaseGraph(
+        build_id=build_id,
+        node_ids=ordered_ids,
+        node_kinds=ordered_kinds,
+        row_by_id=row_by_id,
+        matrix=matrix,
+        dangling_rows=dangling,
+        edges=ordered_edges,
+    )
 
 
 def _clip(value: float) -> float:

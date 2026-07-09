@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -86,6 +88,50 @@ def test_fact_edges_preserve_direction_and_weaker_reverse_weight() -> None:
     assert (reverse.src_id, reverse.dst_id) == ("org", "person")
     assert reverse.weight == pytest.approx(forward.weight * 0.35)
     assert forward.fact_ids == ("fact-1",)
+
+
+def test_fact_edges_group_logical_triples_without_counting_one_source_twice() -> None:
+    fact = _fact()
+    graph = _builder().build(
+        passages=(
+            _passage("p1", "n1", 0, [1.0, 0.0]),
+            _passage("p2", "n2", 0, [0.0, 1.0]),
+        ),
+        entities=(
+            EntityGraphInput("person", "Maya", "person", 2, True),
+            EntityGraphInput("org", "Wink", "organization", 2, True),
+        ),
+        contains=(),
+        facts=(
+            replace(fact, fact_id="fact-low", confidence=0.6),
+            replace(fact, fact_id="fact-high", confidence=0.9),
+            replace(
+                fact,
+                fact_id="fact-independent",
+                source_passage_id="p2",
+                source_note_id="n2",
+                confidence=0.5,
+            ),
+            replace(
+                fact,
+                fact_id="fact-inactive",
+                source_passage_id="p2",
+                source_note_id="n2",
+                confidence=1.0,
+                status="historical",
+            ),
+        ),
+    )
+
+    fact_edges = [edge for edge in graph.edges if edge.kind == "fact"]
+    assert len(fact_edges) == 2
+    forward = next(edge for edge in fact_edges if edge.direction == "forward")
+    reverse = next(edge for edge in fact_edges if edge.direction == "reverse")
+    assert forward.fact_ids == ("fact-high", "fact-independent", "fact-low")
+    assert forward.metadata["source_note_ids"] == ("n1", "n2")
+    # Same-note support uses max(0.6, 0.9); the independent note combines by noisy-or.
+    assert forward.weight == pytest.approx(0.25 * (1.0 - (1.0 - 0.9) * (1.0 - 0.5)))
+    assert reverse.weight == pytest.approx(forward.weight * 0.35)
 
 
 def _builder() -> BaseGraphBuilder:

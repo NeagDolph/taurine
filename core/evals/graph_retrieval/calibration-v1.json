@@ -101,7 +101,18 @@
       "bm25_min_token_coverage": 0.34
     }
   },
-  "triple_recognition": {"live_floor": 0.82, "chat_floor": 0.74},
+  "triple_recognition": {
+    "live_floor": 0.82,
+    "chat_floor": 0.74,
+    "tool_floor": 0.72,
+    "live_fallback_embedding_floor": 0.9,
+    "chat_fallback_embedding_floor": 0.86,
+    "tool_fallback_embedding_floor": 0.84,
+    "chat_ambiguity_low": 0.6,
+    "chat_ambiguity_high": 0.84,
+    "tool_ambiguity_low": 0.58,
+    "tool_ambiguity_high": 0.82
+  },
   "rerank": {"live_floor": 0.76, "chat_floor": 0.66},
   "nli": {"entailment_floor": 0.8}
 }

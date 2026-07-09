@@ -122,7 +122,18 @@ def test_calibration_rejects_non_monotonic_curves(tmp_path: Path) -> None:
                     }
                     for mode in ("live", "chat", "tool")
                 },
-                "triple_recognition": {"live_floor": 0.8, "chat_floor": 0.7},
+                "triple_recognition": {
+                    "live_floor": 0.8,
+                    "chat_floor": 0.7,
+                    "tool_floor": 0.68,
+                    "live_fallback_embedding_floor": 0.9,
+                    "chat_fallback_embedding_floor": 0.85,
+                    "tool_fallback_embedding_floor": 0.83,
+                    "chat_ambiguity_low": 0.6,
+                    "chat_ambiguity_high": 0.8,
+                    "tool_ambiguity_low": 0.58,
+                    "tool_ambiguity_high": 0.78,
+                },
                 "rerank": {"live_floor": 0.7, "chat_floor": 0.6},
                 "nli": {"entailment_floor": 0.8},
             }

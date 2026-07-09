@@ -15,7 +15,7 @@ import numpy as np
 
 from taurine_core import config
 from taurine_core.indexer.base_graph import BaseGraphBuilder, EntityGraphInput, PassageEntityInput, PassageGraphInput
-from taurine_core.indexer.embed import embed_passages, embed_texts
+from taurine_core.indexer.embed import embed_facts, embed_passages, embed_texts
 from taurine_core.indexer.entities import EntityResolver, MentionInput
 from taurine_core.indexer.facts import promote_fact, reconcile_temporal_facts
 from taurine_core.indexer.knowledge_store import KnowledgeStore
@@ -185,7 +185,22 @@ class BuildCoordinator:
                 for note, draft in passage_rows
             )
             entity_graph = tuple(EntityGraphInput(e.entity_id, e.canonical, e.etype, e.df, e.traversal_eligible) for e in resolution.entities)
-            contains_graph = tuple(PassageEntityInput(m.passage_id, m.entity_id, m.mention.confidence, 1, next(e.df for e in resolution.entities if e.entity_id == m.entity_id)) for m in resolution.mentions)
+            contains_groups: dict[tuple[str, str], list[float]] = {}
+            for mention in resolution.mentions:
+                contains_groups.setdefault(
+                    (mention.passage_id, mention.entity_id), []
+                ).append(mention.mention.confidence)
+            entity_df = {entity.entity_id: entity.df for entity in resolution.entities}
+            contains_graph = tuple(
+                PassageEntityInput(
+                    passage_id=passage_id,
+                    entity_id=entity_id,
+                    confidence=max(confidences),
+                    mentions=len(confidences),
+                    df=entity_df[entity_id],
+                )
+                for (passage_id, entity_id), confidences in sorted(contains_groups.items())
+            )
             base_graph = BaseGraphBuilder(
                 build_id=build_id,
                 semantic_k=config.BASE_GRAPH_PASSAGE_K,
@@ -196,6 +211,25 @@ class BuildCoordinator:
                     (edge.src_id, edge.dst_id, edge.weight, edge.weight)
                     for edge in base_graph.edges
                     if edge.kind == "semantic" and edge.src_id < edge.dst_id
+                ),
+                build_id=build_id,
+            )
+            contains_by_pair = {
+                (row.passage_id, row.entity_id): row for row in contains_graph
+            }
+            store.write_passage_entity_edges(
+                tuple(
+                    (
+                        edge.src_id,
+                        edge.dst_id,
+                        contains_by_pair[(edge.src_id, edge.dst_id)].confidence,
+                        int(edge.metadata["mentions"]),
+                        float(edge.metadata["idf"]),
+                        edge.weight,
+                    )
+                    for edge in base_graph.edges
+                    if edge.kind == "contains"
+                    and (edge.src_id, edge.dst_id) in contains_by_pair
                 ),
                 build_id=build_id,
             )
@@ -211,6 +245,15 @@ class BuildCoordinator:
             )
             store.write_projection(projection, build_id=build_id)
             stages.append("projection")
+            fact_embeddings = embed_facts(
+                store.fact_contexts(),
+                embedder=self.dependencies.embedder,
+                model_id=self.dependencies.embedding_model_id,
+                build_id=build_id,
+                dim=self.dependencies.embedding_dim,
+            )
+            store.write_fact_embeddings(fact_embeddings)
+            stages.append("fact_embeddings")
             integrity = store.validate_invariants()
             if not integrity.ok:
                 raise BuildError(f"knowledge invariant failure: {integrity}")

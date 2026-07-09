@@ -72,6 +72,35 @@ class ModeCalibration(_StrictModel):
 class TripleRecognitionCalibration(_StrictModel):
     live_floor: float = Field(ge=0.0, le=1.0)
     chat_floor: float = Field(ge=0.0, le=1.0)
+    tool_floor: float = Field(ge=0.0, le=1.0)
+    live_fallback_embedding_floor: float = Field(ge=0.0, le=1.0)
+    chat_fallback_embedding_floor: float = Field(ge=0.0, le=1.0)
+    tool_fallback_embedding_floor: float = Field(ge=0.0, le=1.0)
+    chat_ambiguity_low: float = Field(ge=0.0, le=1.0)
+    chat_ambiguity_high: float = Field(ge=0.0, le=1.0)
+    tool_ambiguity_low: float = Field(ge=0.0, le=1.0)
+    tool_ambiguity_high: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_ambiguity_bands(self) -> "TripleRecognitionCalibration":
+        for mode, recognition, fallback in (
+            ("live", self.live_floor, self.live_fallback_embedding_floor),
+            ("chat", self.chat_floor, self.chat_fallback_embedding_floor),
+            ("tool", self.tool_floor, self.tool_fallback_embedding_floor),
+        ):
+            if fallback <= recognition:
+                raise ValueError(
+                    f"{mode} fallback embedding floor must be stricter than recognition"
+                )
+        for mode, low, floor, high in (
+            ("chat", self.chat_ambiguity_low, self.chat_floor, self.chat_ambiguity_high),
+            ("tool", self.tool_ambiguity_low, self.tool_floor, self.tool_ambiguity_high),
+        ):
+            if not low < floor < high:
+                raise ValueError(
+                    f"{mode} ambiguity band must contain its recognition floor"
+                )
+        return self
 
 
 class RerankCalibration(_StrictModel):

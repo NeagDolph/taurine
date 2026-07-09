@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -11,6 +11,7 @@ from sentence_transformers import SentenceTransformer
 from taurine_core import config
 from taurine_core.models_local import model_ref
 from taurine_core.indexer.passages import PassageDraft
+from taurine_core.indexer.facts import PREDICATES
 
 _MODEL: Any | None = None
 
@@ -22,6 +23,69 @@ class PassageEmbedding:
     dim: int
     vector: np.ndarray
     build_id: str
+
+
+class FactEmbeddingSource(Protocol):
+    fact_id: str
+    subject: str
+    predicate: str
+    object: str
+
+
+@dataclass(frozen=True)
+class FactEmbedding:
+    fact_id: str
+    model_id: str
+    text: str
+    dim: int
+    vector: np.ndarray
+    build_id: str
+
+
+def embed_facts(
+    facts: Sequence[FactEmbeddingSource],
+    *,
+    embedder: Callable[[list[str]], np.ndarray] | None = None,
+    model_id: str,
+    build_id: str,
+    dim: int = config.EMBED_DIM,
+) -> tuple[FactEmbedding, ...]:
+    """Embed deterministic canonical triples, never generated relationship prose."""
+
+    ordered = sorted(facts, key=lambda row: row.fact_id)
+    if not ordered:
+        return ()
+    if len({row.fact_id for row in ordered}) != len(ordered):
+        raise ValueError("duplicate fact_id in embedding batch")
+    texts: list[str] = []
+    for fact in ordered:
+        predicate = PREDICATES.get(fact.predicate)
+        if predicate is None:
+            raise ValueError(f"unregistered predicate: {fact.predicate}")
+        texts.append(
+            f"{fact.subject} — {fact.predicate} ({predicate.description}) — {fact.object}"
+        )
+    matrix = np.asarray((embedder or embed_texts)(texts), dtype=np.float32)
+    expected = (len(ordered), int(dim))
+    if matrix.shape != expected:
+        raise ValueError(f"fact embedder returned {matrix.shape}, expected {expected}")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("fact embedder returned a non-finite vector")
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    if np.any(norms <= 0):
+        raise ValueError("fact embedder returned a zero-norm vector")
+    matrix = matrix / norms
+    return tuple(
+        FactEmbedding(
+            fact_id=fact.fact_id,
+            model_id=model_id,
+            text=texts[index],
+            dim=int(dim),
+            vector=matrix[index].copy(),
+            build_id=build_id,
+        )
+        for index, fact in enumerate(ordered)
+    )
 
 
 def embed_passages(

@@ -5,8 +5,8 @@ from types import MappingProxyType
 
 import numpy as np
 import pytest
-from scipy.sparse import csr_matrix
 
+from taurine_core.indexer.base_graph import materialize_base_graph
 from taurine_core.indexer.store import Index
 from taurine_core.indexer.knowledge_store import KnowledgeStore
 from taurine_core.schemas import NoteRecord
@@ -100,7 +100,12 @@ def _snapshot(tmp_path: Path, build_id: str, value: float) -> IndexSnapshot:
         fact_ids=(f"fact-{build_id}",),
         fact_matrix=np.array([[value]], dtype=np.float32),
         alias_index={"maya": ("entity-1",)},
-        base_graph=csr_matrix(np.array([[1.0]], dtype=np.float64)),
+        base_graph=materialize_base_graph(
+            build_id=build_id,
+            node_ids=(f"passage-{build_id}",),
+            node_kinds=("passage",),
+            edges=(),
+        ),
         projection=(),
         quality_ranks={"note-1": value},
     )

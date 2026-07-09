@@ -4,8 +4,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from scipy.sparse import csr_matrix
 
+from taurine_core.indexer.base_graph import materialize_base_graph
 from taurine_core.evaluation.graph_retrieval import load_calibration
 from taurine_core.indexer.knowledge_store import BM25PassageHit, KnowledgeStore
 from taurine_core.retrieval.calibration import HeadCalibrator
@@ -168,7 +168,12 @@ def _snapshot(tmp_path: Path) -> IndexSnapshot:
             "maya tung": ("e-maya",),
             "maya labs": ("e-maya-labs",),
         },
-        base_graph=csr_matrix((0, 0), dtype=np.float64),
+        base_graph=materialize_base_graph(
+            build_id="build-1",
+            node_ids=("p1", "p2"),
+            node_kinds=("passage", "passage"),
+            edges=(),
+        ),
         projection=(),
         quality_ranks={},
     )

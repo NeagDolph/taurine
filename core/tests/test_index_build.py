@@ -10,6 +10,7 @@ import pytest
 from tests.conftest import make_note
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies, BuildError, main
 from taurine_core.indexer.knowledge_store import KnowledgeStore
+from taurine_core.retrieval.snapshot import load_index_snapshot
 from taurine_core.schemas import ExtractedMention, ExtractedRelation, Extraction
 
 
@@ -53,6 +54,7 @@ def test_clean_build_is_atomic_deterministic_and_order_independent(tmp_path: Pat
         "facts",
         "base_graph",
         "projection",
+        "fact_embeddings",
         "validation",
         "activation",
     )
@@ -64,6 +66,9 @@ def test_clean_build_is_atomic_deterministic_and_order_independent(tmp_path: Pat
         assert store.validate_invariants().ok
     finally:
         store.close()
+    snapshot = load_index_snapshot(first_path)
+    assert snapshot.passage_matrix.shape == (2, 16)
+    assert snapshot.fact_matrix.shape == (0, 16)
 
 
 def test_failed_build_never_replaces_active_target(tmp_path: Path) -> None:
@@ -136,6 +141,11 @@ def test_build_finalizes_extracted_entities_mentions_and_directed_facts(tmp_path
         assert counts["entities"] == 2
         assert counts["entity_mentions"] == 2
         assert counts["facts"] == 1
+        assert counts["fact_embeddings"] == 1
+        assert counts["passage_entity_edges"] == 2
+        assert store.fact_contexts()[0].canonical_text == (
+            "Maya — owns_or_has (owns or has) — Launch"
+        )
         assert report.health == "healthy"
     finally:
         store.close()
