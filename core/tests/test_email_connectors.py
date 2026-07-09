@@ -9,6 +9,7 @@ import pytest
 
 from taurine_core import pii
 from taurine_core.connectors.gmail import GmailConnector
+from taurine_core.connectors.outlook import OutlookConnector
 from taurine_core.ports import ConnectorError
 
 
@@ -202,3 +203,134 @@ def test_gmail_extract_cached_within_interval(monkeypatch) -> None:
     first_calls = calls["count"]
     connector.extract(_test_config(connector))
     assert calls["count"] == first_calls  # second extract served from cache
+
+
+# ── Outlook ────────────────────────────────────────────────────────────
+
+_OUTLOOK_ENV = {"OUTLOOK_CLIENT_ID": "cid", "OUTLOOK_REFRESH_TOKEN": "rtok"}
+
+
+def _set_outlook_env(monkeypatch) -> None:
+    for key, value in _OUTLOOK_ENV.items():
+        monkeypatch.setenv(key, value)
+
+
+def _outlook_message(
+    *,
+    message_id: str = "om1",
+    conversation: str = "conv1",
+    sender: str = "alice@example.com",
+    sender_name: str = "Alice",
+    body: str = "<p>lunch friday?</p>",
+    received: str = "2026-07-07T12:00:00Z",
+    classification: str = "focused",
+    is_draft: bool = False,
+    folder: str = "inboxid",
+    flagged: bool = False,
+) -> dict:
+    return {
+        "id": message_id,
+        "conversationId": conversation,
+        "subject": "Friday lunch",
+        "from": {"emailAddress": {"name": sender_name, "address": sender}},
+        "toRecipients": [{"emailAddress": {"name": "Me", "address": "me@corp.com"}}],
+        "receivedDateTime": received,
+        "isDraft": is_draft,
+        "inferenceClassification": classification,
+        "flag": {"flagStatus": "flagged" if flagged else "notFlagged"},
+        "importance": "normal",
+        "parentFolderId": folder,
+        "body": {"contentType": "html", "content": body},
+    }
+
+
+def _outlook_transport(messages: list[dict]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "login.microsoftonline.com" in url:
+            return httpx.Response(
+                200,
+                json={"access_token": "atok", "expires_in": 3600, "refresh_token": "rtok2"},
+            )
+        assert request.headers["Authorization"] == "Bearer atok"
+        if url.endswith("/me") or "/me?" in url:
+            return httpx.Response(200, json={"mail": "me@corp.com", "userPrincipalName": "me@corp.com"})
+        if "/mailFolders/junkemail" in url:
+            return httpx.Response(200, json={"id": "junkid"})
+        if "/mailFolders/deleteditems" in url:
+            return httpx.Response(200, json={"id": "delid"})
+        if "/me/messages" in url:
+            return httpx.Response(200, json={"value": messages})
+        raise AssertionError(f"unexpected request: {url}")
+
+    return httpx.MockTransport(handler)
+
+
+def _extract_outlook(messages: list[dict]):
+    connector = OutlookConnector()
+    connector._client_factory = lambda: httpx.Client(transport=_outlook_transport(messages))
+    return connector.extract(_test_config(connector))
+
+
+def test_outlook_available_requires_env(monkeypatch) -> None:
+    for key in _OUTLOOK_ENV:
+        monkeypatch.delenv(key, raising=False)
+    available, detail = OutlookConnector().available()
+    assert not available
+    assert "email_auth outlook" in detail
+
+
+def test_outlook_groups_by_conversation_and_detects_me(monkeypatch) -> None:
+    _set_outlook_env(monkeypatch)
+    monkeypatch.setattr("time.time", lambda: 1_783_400_000.0)  # just after 2026-07-07
+    messages = [
+        _outlook_message(message_id="a1", received="2026-07-06T10:00:00Z"),
+        _outlook_message(
+            message_id="a2",
+            sender="me@corp.com",
+            sender_name="Me",
+            body="<p>yes, noon works</p>",
+            received="2026-07-06T11:00:00Z",
+        ),
+        _outlook_message(
+            message_id="b1",
+            conversation="conv2",
+            sender="bob@corp.com",
+            sender_name="Bob",
+            body="<p>standup moved</p>",
+            received="2026-07-07T09:00:00Z",
+        ),
+        _outlook_message(
+            message_id="b2",
+            conversation="conv2",
+            sender="me@corp.com",
+            sender_name="Me",
+            body="<p>thanks for the heads up</p>",
+            received="2026-07-07T09:30:00Z",
+        ),
+    ]
+    records = _extract_outlook(messages)
+    by_id = {record.note_id: record for record in records}
+    assert set(by_id) == {"outlook:conv1", "outlook:conv2"}
+    conv1 = by_id["outlook:conv1"].text
+    assert "[Alice] lunch friday?" in conv1
+    assert "[me] yes, noon works" in conv1
+
+
+def test_outlook_skips_drafts_and_junk(monkeypatch) -> None:
+    _set_outlook_env(monkeypatch)
+    monkeypatch.setattr("time.time", lambda: 1_783_400_000.0)
+    messages = [
+        _outlook_message(message_id="d1", is_draft=True),
+        _outlook_message(message_id="j1", conversation="conv9", folder="junkid"),
+    ]
+    assert _extract_outlook(messages) == []
+
+
+def test_outlook_bulk_classification_funneled_out(monkeypatch) -> None:
+    _set_outlook_env(monkeypatch)
+    monkeypatch.setattr("time.time", lambda: 1_783_400_000.0)
+    messages = [
+        _outlook_message(message_id="o1", conversation="convX", classification="other"),
+    ]
+    assert _extract_outlook(messages) == []
