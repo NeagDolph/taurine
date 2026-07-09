@@ -100,6 +100,38 @@ def test_relations_between_returns_max_conf_in_both_note_orientations(store) -> 
     ]
 
 
+def test_relations_between_scoped_requires_relation_provenance_in_pair(store) -> None:
+    extraction_entities = [
+        ("Jane Doe", "PERSON", 0.9, 1),
+        ("Acme", "ORG", 0.8, 1),
+    ]
+    store.replace_note_extraction("alpha", extraction_entities, [])
+    store.replace_note_extraction("beta", extraction_entities, [])
+    store.replace_note_extraction(
+        "gamma",
+        extraction_entities,
+        [("Jane Doe", "works_at", "Acme", 0.88)],
+    )
+
+    assert store.relations_between("alpha", "beta") == [
+        ("Jane Doe", "works_at", "Acme", pytest.approx(0.88))
+    ]
+    assert store.relations_between_scoped("alpha", "beta") == []
+
+    store.replace_note_extraction(
+        "alpha",
+        extraction_entities,
+        [("Jane Doe", "works_at", "Acme", 0.77)],
+    )
+
+    assert store.relations_between_scoped("alpha", "beta") == [
+        ("Jane Doe", "works_at", "Acme", pytest.approx(0.77))
+    ]
+    assert store.relations_between_scoped("beta", "alpha") == [
+        ("Jane Doe", "works_at", "Acme", pytest.approx(0.77))
+    ]
+
+
 def test_entity_surfaces_for_orders_by_confidence_then_entity_id_and_limits(store) -> None:
     enrich = Enrichment(
         gist="Entity gist",

@@ -248,6 +248,7 @@ def test_explicit_rank_and_fact_refresh_after_graph_rebuild(store, monkeypatch) 
     from taurine_core.indexer import store as store_module
     from taurine_core.indexer.rank import compute_quality_ranks, refresh_fact_embeddings
 
+    monkeypatch.setattr(config, "ENTITY_SHARED_DF_FRACTION_CAP", 1.0, raising=False)
     now = 30_000_000.0
     _install(
         store,

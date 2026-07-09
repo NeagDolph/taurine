@@ -61,6 +61,7 @@ class IMessageConnector:
         return {
             "db": taurine_config.IMESSAGE_DB,
             "contacts_glob": taurine_config.CONTACTS_DB_GLOB,
+            "require_contact": True,
         }
 
     def extract(self, config: dict) -> list[NoteRecord]:
@@ -71,7 +72,11 @@ class IMessageConnector:
         try:
             with _copied_db(db_path) as copied:
                 with _open_readonly(copied) as conn:
-                    return _extract_records(conn, contacts)
+                    return _extract_records(
+                        conn,
+                        contacts,
+                        require_contact=bool(config.get("require_contact", True)),
+                    )
         except PermissionError as exc:
             raise ConnectorError(f"iMessage database unreadable: {_FULL_DISK_ACCESS_DETAIL}") from exc
         except sqlite3.OperationalError as exc:
@@ -110,21 +115,30 @@ def _open_readonly(path: Path) -> Iterator[sqlite3.Connection]:
 
 
 def _extract_records(
-    conn: sqlite3.Connection, contacts: dict[str, str] | None = None
+    conn: sqlite3.Connection,
+    contacts: dict[str, str] | None = None,
+    *,
+    require_contact: bool = True,
 ) -> list[NoteRecord]:
     chats = conn.execute(
         "SELECT ROWID AS chat_rowid, guid, display_name FROM chat ORDER BY ROWID"
     ).fetchall()
     records: list[NoteRecord] = []
     for chat in chats:
-        record = _record_for_chat(conn, chat, contacts or {})
+        record = _record_for_chat(
+            conn, chat, contacts or {}, require_contact=require_contact
+        )
         if record is not None:
             records.append(record)
     return records
 
 
 def _record_for_chat(
-    conn: sqlite3.Connection, chat: sqlite3.Row, contacts: dict[str, str]
+    conn: sqlite3.Connection,
+    chat: sqlite3.Row,
+    contacts: dict[str, str],
+    *,
+    require_contact: bool = True,
 ) -> NoteRecord | None:
     message_columns = {
         str(info["name"]) for info in conn.execute("PRAGMA table_info(message)")
@@ -174,11 +188,25 @@ def _record_for_chat(
             break
 
     handle_ids: list[str] = []
+    participant_handles: list[str] = []
     seen_handles: set[str] = set()
+    seen_participants: set[str] = set()
     for message in selected:
         if message.handle_id and message.handle_id not in seen_handles:
             handle_ids.append(message.handle_id)
             seen_handles.add(message.handle_id)
+        if (
+            not message.is_from_me
+            and message.handle_id
+            and message.handle_id not in seen_participants
+        ):
+            participant_handles.append(message.handle_id)
+            seen_participants.add(message.handle_id)
+
+    if require_contact and not any(
+        _resolve_handle(handle, contacts) for handle in participant_handles
+    ):
+        return None
 
     lines_desc: list[str] = []
     for message in selected:

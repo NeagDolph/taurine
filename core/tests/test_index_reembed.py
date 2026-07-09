@@ -14,6 +14,7 @@ def _vector_lengths(index: object) -> list[int]:
 def test_reembed_all_updates_legacy_vectors_rebuilds_graph_and_reloads(store, monkeypatch):
     from taurine_core.indexer import rank, reembed
 
+    monkeypatch.setattr(config, "ENTITY_SHARED_DF_FRACTION_CAP", 1.0, raising=False)
     alpha = make_note("alpha", "Alpha", "Alpha legacy text")
     beta = make_note("beta", "Beta", "Beta current text")
     alpha_enrich = enrichment("Alpha migration gist", topics=["reembed"])

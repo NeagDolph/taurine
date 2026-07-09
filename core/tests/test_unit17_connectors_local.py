@@ -176,8 +176,8 @@ def test_imessage_extracts_bounded_chat_transcripts_with_attribution_and_hashes(
 
     connector = IMessageConnector()
     available, detail = connector.available()
-    first = connector.extract({})
-    second = connector.extract({})
+    first = connector.extract({"require_contact": False})
+    second = connector.extract({"require_contact": False})
 
     assert available is True
     assert detail == ""
@@ -219,7 +219,7 @@ def test_imessage_caps_at_max_messages_keeping_the_newest(
         )
     monkeypatch.setenv("HOME", str(home))
 
-    record = IMessageConnector().extract({})[0]
+    record = IMessageConnector().extract({"require_contact": False})[0]
     lines = record.text.splitlines()
 
     # only the most-recent N kept, in chronological order (oldest kept first)
@@ -247,7 +247,7 @@ def test_imessage_excludes_conversations_older_than_window(
     _insert_message(db_path, 2, 2, 2, "still chatting", now - timedelta(days=1), from_me=False)
     monkeypatch.setenv("HOME", str(home))
 
-    records = IMessageConnector().extract({})
+    records = IMessageConnector().extract({"require_contact": False})
 
     assert {record.title for record in records} == {"iMessage: Recent Friend"}
 
@@ -263,7 +263,7 @@ def test_imessage_handles_old_second_precision_apple_dates(tmp_path: Path, monke
     _insert_raw_message(db_path, 1, 1, 1, "legacy date", seconds_since_apple_epoch, from_me=True)
     monkeypatch.setenv("HOME", str(home))
 
-    record = IMessageConnector().extract({})[0]
+    record = IMessageConnector().extract({"require_contact": False})[0]
 
     assert record.modified == pytest.approx(when.timestamp(), abs=1.0)
     assert record.text == "[me] legacy date"

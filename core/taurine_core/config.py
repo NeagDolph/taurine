@@ -321,6 +321,11 @@ GLINER_CHUNK_SIZE = 384                  # long-note window tokens
 GLINER_CHUNK_OVERLAP = 64                # long-note overlap tokens
 GLINER_ENTITY_MIN_CONF = 0.5             # calibration-pending entity floor
 GLINER_RELATION_MIN_CONF = 0.45          # calibration-pending relation floor
+# entities above this active-note df fraction are connective stopwords
+# (owner-name/pronoun hubs); contains edges remain for PPR hub dilution
+ENTITY_SHARED_DF_FRACTION_CAP = 0.06
+# time words like "today"/"tomorrow" are not connective tissue
+SHARED_EDGE_ETYPE_STOPLIST = frozenset({"date_or_deadline"})
 INGEST_ENTITY_TYPES: dict[str, str] = {
     "person": "A named individual mentioned in the note",
     "organization": "A company, team, client, vendor, or institution",

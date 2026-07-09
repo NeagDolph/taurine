@@ -57,6 +57,13 @@ class _Candidate:
         )
 
 
+@dataclass(frozen=True)
+class _EntitySpecificity:
+    eligible_ids: frozenset[int]
+    eligible_terms: frozenset[tuple[str, str]]
+    labels: Mapping[int, str]
+
+
 def embed_texts(texts: list[str]) -> np.ndarray:
     from .embed import embed_texts as real_embed_texts
 
@@ -112,10 +119,15 @@ def _candidates(index: object) -> tuple[list[_Candidate], list[_Candidate]]:
     relaxed: dict[tuple[str, str], _Candidate] = {}
     _canonicalize_extractions(index, notes)
     enrichments, resolved_terms = _term_resolution(index, notes)
+    specificity = _entity_specificity(index, notes)
     _add_semantic_edges(index, notes, kept, relaxed)
-    _add_shared_edges(notes, kept, relaxed, "topic", enrichments, resolved_terms)
-    _add_shared_edges(notes, kept, relaxed, "entity", enrichments, resolved_terms)
-    _add_relation_edges(index, notes, kept)
+    _add_shared_edges(
+        notes, kept, relaxed, "topic", enrichments, resolved_terms, specificity
+    )
+    _add_shared_edges(
+        notes, kept, relaxed, "entity", enrichments, resolved_terms, specificity
+    )
+    _add_relation_edges(index, notes, kept, specificity)
     margin = [
         candidate for key, candidate in relaxed.items() if key not in kept
     ]
@@ -265,13 +277,15 @@ def _add_shared_edges(
     mechanism: str,
     enrichments: dict[str, Enrichment | None],
     resolved_terms: dict[str, str],
+    specificity: _EntitySpecificity | None,
 ) -> None:
     terms_by_note: dict[str, set[str]] = {}
     frequency: dict[str, int] = defaultdict(int)
     for note in notes:
         terms = {
             resolved_terms.get(term, term)
-            for term in _terms(enrichments.get(note.note_id), mechanism)
+            for term, etype in _term_keys(enrichments.get(note.note_id), mechanism)
+            if _term_is_specific(term, etype, resolved_terms, specificity)
         }
         terms_by_note[note.note_id] = terms
         for term in terms:
@@ -300,6 +314,7 @@ def _add_relation_edges(
     index: object,
     notes: list[NoteRecord],
     kept: dict[tuple[str, str], _Candidate],
+    specificity: _EntitySpecificity | None,
 ) -> None:
     if not (
         hasattr(index, "entity_rows")
@@ -309,23 +324,29 @@ def _add_relation_edges(
         return
 
     note_ids = {note.note_id for note in notes}
-    entity_labels = {
-        entity_id: canonical
-        for entity_id, canonical, _etype, _df in index.entity_rows()  # type: ignore[attr-defined]
-    }
+    entity_labels = (
+        dict(specificity.labels)
+        if specificity is not None
+        else {
+            entity_id: canonical
+            for entity_id, canonical, _etype, _df in index.entity_rows()  # type: ignore[attr-defined]
+        }
+    )
+    eligible_entity_ids = specificity.eligible_ids if specificity is not None else None
     notes_by_entity: dict[int, set[str]] = defaultdict(set)
     for note_id, entity_id, _conf, _count in index.note_entity_rows():  # type: ignore[attr-defined]
         if note_id in note_ids:
             notes_by_entity[int(entity_id)].add(note_id)
 
-    relation_conf: dict[tuple[int, str, int], float] = {}
     for note_id, src_entity, rel_type, dst_entity, conf in index.relation_rows():  # type: ignore[attr-defined]
         if note_id not in note_ids:
             continue
-        key = (int(src_entity), str(rel_type), int(dst_entity))
-        relation_conf[key] = max(relation_conf.get(key, 0.0), float(conf))
-
-    for (src_entity, rel_type, dst_entity), conf in relation_conf.items():
+        src_entity = int(src_entity)
+        dst_entity = int(dst_entity)
+        if eligible_entity_ids is not None and (
+            src_entity not in eligible_entity_ids or dst_entity not in eligible_entity_ids
+        ):
+            continue
         weight = config.REL_EDGE_W * conf
         if rel_type == "related_to":
             weight *= config.REL_CATCHALL_FACTOR
@@ -339,6 +360,8 @@ def _add_relation_edges(
         for src_note in notes_by_entity.get(src_entity, set()):
             for dst_note in notes_by_entity.get(dst_entity, set()):
                 if src_note == dst_note:
+                    continue
+                if note_id not in (src_note, dst_note):
                     continue
                 _candidate(kept, src_note, dst_note).add("entity", weight, shared)
 
@@ -378,12 +401,26 @@ def _valid_judgments(index: object) -> dict[tuple[str, str], tuple[bool, str]]:
     return valid
 
 
-def promoted_relation_fact(index: object, src: str, dst: str) -> str | None:
-    relations_between = getattr(index, "relations_between", None)
+def promoted_relation_fact(
+    index: object,
+    src: str,
+    dst: str,
+    *,
+    active_note_count: int | None = None,
+    eligible_entity_labels: frozenset[str] | None = None,
+) -> str | None:
+    relations_between = getattr(index, "relations_between_scoped", None)
     if not callable(relations_between):
         return None
+    if eligible_entity_labels is None:
+        active_count = active_note_count or _index_active_note_count(index)
+        eligible_entity_labels = _eligible_entity_labels(index, active_count)
     relations = []
     for head, rel_type, tail, conf in relations_between(src, dst):
+        if eligible_entity_labels is not None and (
+            str(head) not in eligible_entity_labels or str(tail) not in eligible_entity_labels
+        ):
+            continue
         template = config.INGEST_RELATION_TYPES.get(str(rel_type))
         if template is None:
             continue
@@ -406,8 +443,16 @@ def _apply_judgments(
     judgments: Mapping[tuple[str, str], tuple[bool, str]],
 ) -> list[GraphEdge]:
     edges: list[GraphEdge] = []
+    active_note_count = _index_active_note_count(index)
+    eligible_entity_labels = _eligible_entity_labels(index, active_note_count)
     for candidate in kept:
-        promoted_fact = promoted_relation_fact(index, candidate.src, candidate.dst)
+        promoted_fact = promoted_relation_fact(
+            index,
+            candidate.src,
+            candidate.dst,
+            active_note_count=active_note_count,
+            eligible_entity_labels=eligible_entity_labels,
+        )
         if promoted_fact is not None:
             edges.append(candidate.edge(fact=promoted_fact, fact_provenance="gliner"))
             continue
@@ -425,7 +470,13 @@ def _apply_judgments(
         edges.append(edge)
 
     for candidate in margin:
-        promoted_fact = promoted_relation_fact(index, candidate.src, candidate.dst)
+        promoted_fact = promoted_relation_fact(
+            index,
+            candidate.src,
+            candidate.dst,
+            active_note_count=active_note_count,
+            eligible_entity_labels=eligible_entity_labels,
+        )
         if promoted_fact is not None:
             edges.append(candidate.edge(fact=promoted_fact, fact_provenance="gliner"))
             continue
@@ -451,21 +502,93 @@ def _note_vector(index: object, note_id: str) -> np.ndarray | None:
 
 
 def _terms(enrichment: Enrichment | None, mechanism: str) -> set[str]:
+    return {term for term, _etype in _term_keys(enrichment, mechanism)}
+
+
+def _term_keys(enrichment: Enrichment | None, mechanism: str) -> set[tuple[str, str]]:
     if enrichment is None:
         return set()
     if mechanism == "topic":
         return {
-            term
+            (term, entity.etype)
             for entity in enrichment.entities
             if entity.etype == "concept"
             if (term := _canonicalize_term(entity.surface, lowercase=True))
         }
     return {
-        term
+        (term, entity.etype)
         for entity in enrichment.entities
         if entity.etype != "concept"
         if (term := _canonicalize_term(entity.surface, lowercase=False))
     }
+
+
+def _term_is_specific(
+    term: str,
+    etype: str,
+    resolved_terms: Mapping[str, str],
+    specificity: _EntitySpecificity | None,
+) -> bool:
+    if specificity is None:
+        return True
+    return (resolved_terms.get(term, term), etype) in specificity.eligible_terms
+
+
+def _entity_specificity(
+    index: object,
+    notes: list[NoteRecord],
+) -> _EntitySpecificity | None:
+    entity_rows = getattr(index, "entity_rows", None)
+    if not callable(entity_rows):
+        return None
+    active_note_count = len({note.note_id for note in notes})
+    labels: dict[int, str] = {}
+    eligible_ids: set[int] = set()
+    eligible_terms: set[tuple[str, str]] = set()
+    for entity_id, canonical, etype, df in entity_rows():
+        entity_id = int(entity_id)
+        canonical = str(canonical)
+        etype = str(etype)
+        labels[entity_id] = canonical
+        if not _entity_is_specific(etype, int(df), active_note_count):
+            continue
+        eligible_ids.add(entity_id)
+        term = _entity_term(canonical, etype)
+        if term:
+            eligible_terms.add((term, etype))
+    return _EntitySpecificity(
+        eligible_ids=frozenset(eligible_ids),
+        eligible_terms=frozenset(eligible_terms),
+        labels=labels,
+    )
+
+
+def _entity_is_specific(etype: str, df: int, active_note_count: int) -> bool:
+    if etype in config.SHARED_EDGE_ETYPE_STOPLIST:
+        return False
+    cap = math.ceil(config.ENTITY_SHARED_DF_FRACTION_CAP * max(active_note_count, 0))
+    return int(df) <= cap
+
+
+def _index_active_note_count(index: object) -> int:
+    notes = getattr(index, "notes", None)
+    if not callable(notes):
+        return 0
+    return len({note.note_id for note in notes()})
+
+
+def _eligible_entity_labels(
+    index: object,
+    active_note_count: int,
+) -> frozenset[str] | None:
+    entity_rows = getattr(index, "entity_rows", None)
+    if not callable(entity_rows):
+        return None
+    return frozenset(
+        str(canonical)
+        for _entity_id, canonical, etype, df in entity_rows()
+        if _entity_is_specific(str(etype), int(df), active_note_count)
+    )
 
 
 def _term_resolution(

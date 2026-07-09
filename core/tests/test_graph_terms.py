@@ -8,7 +8,7 @@ import pytest
 
 from taurine_core import config
 from taurine_core.indexer import graph
-from taurine_core.schemas import Enrichment, EntityMention, GraphEdge
+from taurine_core.schemas import Enrichment, EntityMention, GraphEdge, RelationTriple
 
 from .conftest import entity, make_note
 
@@ -26,6 +26,7 @@ def _enrichment(
     *,
     topics: Iterable[str] = (),
     entities: Iterable[str | EntityMention] = (),
+    relations: Iterable[RelationTriple] = (),
 ) -> Enrichment:
     typed_entities = [entity(topic, "concept") for topic in topics]
     for item in entities:
@@ -35,7 +36,7 @@ def _enrichment(
         utterances=[gist],
         aliases=[],
         entities=typed_entities,
-        relations=[],
+        relations=list(relations),
         extraction_failed=False,
     )
 
@@ -156,7 +157,10 @@ def test_digit_guard_prevents_merge_for_terms_with_different_digit_sequences(
     assert len(term_embedding_stub) == 1
 
 
-def test_most_frequent_synonym_member_becomes_canonical(store, term_embedding_stub):
+def test_most_frequent_synonym_member_becomes_canonical(
+    store, term_embedding_stub, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(config, "ENTITY_SHARED_DF_FRACTION_CAP", 1.0, raising=False)
     rows: list[tuple[str, Enrichment]] = []
     rows.extend(
         (
@@ -243,3 +247,238 @@ def test_resolve_terms_respects_lexical_gate(store, term_embedding_stub, monkeyp
     )
     mapping = graph.resolve_terms(store, counts)
     assert mapping["Cologne"] != mapping["Düsseldorf"]
+
+
+def test_high_df_and_date_entities_do_not_create_shared_edges(
+    store, term_embedding_stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "ENTITY_SHARED_DF_FRACTION_CAP", 0.5, raising=False)
+    _install_notes(
+        store,
+        [
+            (
+                "alpha",
+                _enrichment(
+                    "Alpha note mentions the hub and one specific project.",
+                    entities=[
+                        entity("Neil", "person"),
+                        entity("Launchpad", "project"),
+                        entity("today", "date_or_deadline"),
+                    ],
+                ),
+            ),
+            (
+                "beta",
+                _enrichment(
+                    "Beta note mentions the same project and date.",
+                    entities=[
+                        entity("Neil", "person"),
+                        entity("Launchpad", "project"),
+                        entity("today", "date_or_deadline"),
+                    ],
+                ),
+            ),
+            (
+                "gamma",
+                _enrichment(
+                    "Gamma note only repeats the owner name.",
+                    entities=[entity("Neil", "person")],
+                ),
+            ),
+            (
+                "delta",
+                _enrichment(
+                    "Delta note has unrelated content.",
+                    entities=[entity("Unrelated Vendor", "organization")],
+                ),
+            ),
+        ],
+    )
+
+    store.rebuild_graph()
+
+    edge = _edge_between(store, "alpha", "beta")
+    assert edge is not None
+    assert edge.type == "entity"
+    assert edge.shared == ["Launchpad"]
+    assert _edge_between(store, "alpha", "gamma") is None
+    assert _edge_between(store, "beta", "gamma") is None
+
+
+def test_relation_candidates_skip_capped_relation_endpoints(
+    store, term_embedding_stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "ENTITY_SHARED_DF_FRACTION_CAP", 0.5, raising=False)
+    _install_notes(
+        store,
+        [
+            (
+                "assertion",
+                _enrichment(
+                    "Assertion note contains the relation.",
+                    entities=[entity("Pankaj", "person"), entity("Neil", "person")],
+                    relations=[
+                        RelationTriple(
+                            head="Pankaj",
+                            rel_type="met_with",
+                            tail="Neil",
+                            conf=0.95,
+                        )
+                    ],
+                ),
+            ),
+            (
+                "pankaj-only",
+                _enrichment(
+                    "A note containing only Pankaj.",
+                    entities=[entity("Pankaj", "person")],
+                ),
+            ),
+            (
+                "neil-only",
+                _enrichment(
+                    "A note containing only Neil.",
+                    entities=[entity("Neil", "person")],
+                ),
+            ),
+            (
+                "neil-extra",
+                _enrichment(
+                    "Another note containing only Neil.",
+                    entities=[entity("Neil", "person")],
+                ),
+            ),
+        ],
+    )
+
+    store.rebuild_graph()
+
+    assert _edge_between(store, "pankaj-only", "neil-only") is None
+
+
+def test_relation_with_capped_endpoint_does_not_promote_fact(
+    store, term_embedding_stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "ENTITY_SHARED_DF_FRACTION_CAP", 0.5, raising=False)
+    _install_notes(
+        store,
+        [
+            (
+                "alpha",
+                _enrichment(
+                    "Alpha has a real below-cap shared project and a capped relation.",
+                    entities=[
+                        entity("Neil", "person"),
+                        entity("Pankaj", "person"),
+                        entity("Launchpad", "project"),
+                    ],
+                    relations=[
+                        RelationTriple(
+                            head="Neil",
+                            rel_type="met_with",
+                            tail="Pankaj",
+                            conf=0.95,
+                        )
+                    ],
+                ),
+            ),
+            (
+                "beta",
+                _enrichment(
+                    "Beta repeats the below-cap shared project.",
+                    entities=[
+                        entity("Neil", "person"),
+                        entity("Pankaj", "person"),
+                        entity("Launchpad", "project"),
+                    ],
+                ),
+            ),
+            (
+                "gamma",
+                _enrichment(
+                    "Gamma repeats the owner name only.",
+                    entities=[entity("Neil", "person")],
+                ),
+            ),
+            (
+                "delta",
+                _enrichment(
+                    "Delta has unrelated content.",
+                    entities=[entity("Unrelated Vendor", "organization")],
+                ),
+            ),
+        ],
+    )
+
+    store.rebuild_graph()
+
+    edge = _edge_between(store, "alpha", "beta")
+    assert edge is not None
+    assert "Launchpad" in edge.shared
+    assert edge.fact == ""
+    assert edge.fact_provenance == ""
+
+
+def test_relation_fact_promotion_is_scoped_to_connected_notes(
+    store, term_embedding_stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "ENTITY_SHARED_DF_FRACTION_CAP", 1.0, raising=False)
+    people = [entity("Neil", "person"), entity("Pankaj", "person")]
+    _install_notes(
+        store,
+        [
+            (
+                "alpha",
+                _enrichment("Alpha contains both people.", entities=people),
+            ),
+            (
+                "beta",
+                _enrichment("Beta contains both people.", entities=people),
+            ),
+            (
+                "gamma",
+                _enrichment(
+                    "Gamma alone asserts the relation.",
+                    entities=people,
+                    relations=[
+                        RelationTriple(
+                            head="Neil",
+                            rel_type="met_with",
+                            tail="Pankaj",
+                            conf=0.95,
+                        )
+                    ],
+                ),
+            ),
+        ],
+    )
+
+    store.rebuild_graph()
+
+    edge = _edge_between(store, "alpha", "beta")
+    assert edge is not None
+    assert edge.fact == ""
+    assert edge.fact_provenance == ""
+
+    store.upsert_note(
+        make_note("alpha", "Alpha", "Alpha now asserts the relation."),
+        _enrichment(
+            "Alpha now asserts the relation.",
+            entities=people,
+            relations=[
+                RelationTriple(
+                    head="Neil",
+                    rel_type="met_with",
+                    tail="Pankaj",
+                    conf=0.95,
+                )
+            ],
+        ),
+        [("chunk", "Alpha now asserts the relation.", _basis_vector(0))],
+    )
+    store.rebuild_graph()
+
+    edge = _edge_between(store, "alpha", "beta")
+    assert edge is not None
+    assert edge.fact == "Neil met with Pankaj"
+    assert edge.fact_provenance == "gliner"

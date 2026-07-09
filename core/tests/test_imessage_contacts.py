@@ -112,12 +112,31 @@ def test_extract_uses_contact_names_in_title_and_speakers(tmp_path: Path) -> Non
     assert "[me] yo" in record.text
 
 
-def test_extract_falls_back_to_raw_handle_without_contacts(tmp_path: Path) -> None:
+def test_default_config_requires_contact_names() -> None:
+    assert IMessageConnector().default_config()["require_contact"] is True
+
+
+def test_extract_drops_raw_handle_chat_by_default(tmp_path: Path) -> None:
+    chat_db = tmp_path / "chat.db"
+    _make_chat_db(chat_db, "+15128509385", [("hey!", False), ("reply", True)])
+
+    records = IMessageConnector().extract(
+        {"db": str(chat_db), "contacts_glob": str(tmp_path / "missing-*.abcddb")}
+    )
+
+    assert records == []
+
+
+def test_extract_keeps_raw_handle_chat_when_contact_requirement_disabled(tmp_path: Path) -> None:
     chat_db = tmp_path / "chat.db"
     _make_chat_db(chat_db, "+15128509385", [("hey!", False)])
 
     records = IMessageConnector().extract(
-        {"db": str(chat_db), "contacts_glob": str(tmp_path / "missing-*.abcddb")}
+        {
+            "db": str(chat_db),
+            "contacts_glob": str(tmp_path / "missing-*.abcddb"),
+            "require_contact": False,
+        }
     )
 
     assert records[0].title == "iMessage: +15128509385"

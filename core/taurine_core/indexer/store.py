@@ -865,6 +865,55 @@ class Index:
             for row in rows
         ]
 
+    def relations_between_scoped(
+        self, src_note: str, dst_note: str
+    ) -> list[tuple[str, str, str, float]]:
+        rows = self._conn.execute(
+            """
+            SELECT src.canonical AS head_canonical,
+                   er.rel_type AS rel_type,
+                   dst.canonical AS tail_canonical,
+                   MAX(er.conf) AS conf
+            FROM entity_relations er
+            JOIN entities src ON src.entity_id = er.src_entity
+            JOIN entities dst ON dst.entity_id = er.dst_entity
+            WHERE er.note_id IN (?, ?)
+              AND (
+                (
+                    EXISTS (
+                        SELECT 1 FROM note_entities ne
+                        WHERE ne.note_id = ? AND ne.entity_id = er.src_entity
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM note_entities ne
+                        WHERE ne.note_id = ? AND ne.entity_id = er.dst_entity
+                    )
+                ) OR (
+                    EXISTS (
+                        SELECT 1 FROM note_entities ne
+                        WHERE ne.note_id = ? AND ne.entity_id = er.src_entity
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM note_entities ne
+                        WHERE ne.note_id = ? AND ne.entity_id = er.dst_entity
+                    )
+                )
+              )
+            GROUP BY er.src_entity, er.rel_type, er.dst_entity
+            ORDER BY head_canonical, rel_type, tail_canonical
+            """,
+            (src_note, dst_note, src_note, dst_note, dst_note, src_note),
+        ).fetchall()
+        return [
+            (
+                row["head_canonical"],
+                row["rel_type"],
+                row["tail_canonical"],
+                float(row["conf"]),
+            )
+            for row in rows
+        ]
+
     def set_ingest_salience(self, scores: dict[str, float]) -> None:
         with self._conn:
             self._conn.execute("UPDATE notes SET ingest_salience = 1.0")

@@ -161,9 +161,12 @@ def deterministic_term_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(store_module, "embed_texts", fake_embed_texts, raising=False)
 
 
-def test_gliner_relation_promotes_fact_with_provenance_and_skips_queue(store) -> None:
+def test_gliner_relation_promotes_fact_with_provenance_and_skips_queue(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from taurine_core.indexer.adjudicate import _pending_pairs
 
+    monkeypatch.setattr(config, "ENTITY_SHARED_DF_FRACTION_CAP", 1.0, raising=False)
     relation = RelationTriple(
         head="Jane Doe",
         rel_type="works_at",

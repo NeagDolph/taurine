@@ -47,7 +47,8 @@ def test_parallel_mechanisms_merge_into_mixed_edge(fixture_index):
     assert edge is not None
     assert edge.type == "mixed"
     assert "roadmap" in edge.shared
-    assert "Taurine" in edge.shared
+    assert "Billing" in edge.shared
+    assert "Taurine" not in edge.shared
 
 
 def test_neighbors_are_sorted_by_edge_weight(fixture_index):
