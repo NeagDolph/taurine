@@ -327,6 +327,25 @@ def test_outlook_skips_drafts_and_junk(monkeypatch) -> None:
     assert _extract_outlook(messages) == []
 
 
+# ── auth CLI helpers ───────────────────────────────────────────────────
+
+
+def test_pkce_pair_is_valid() -> None:
+    import hashlib
+
+    from taurine_core.connectors.email_auth import _pkce_pair
+
+    verifier, challenge = _pkce_pair()
+    assert 43 <= len(verifier) <= 128
+    assert set(verifier) <= set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    )
+    expected = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).decode().rstrip("=")
+    assert challenge == expected
+
+
 def test_outlook_bulk_classification_funneled_out(monkeypatch) -> None:
     _set_outlook_env(monkeypatch)
     monkeypatch.setattr("time.time", lambda: 1_783_400_000.0)
