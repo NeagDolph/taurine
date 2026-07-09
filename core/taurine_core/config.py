@@ -73,6 +73,48 @@ CONTACTS_DB_GLOB = "~/Library/Application Support/AddressBook/**/AddressBook-v22
 GIST_MAX_CHARS = 220                     # was 120: mid-word truncation degraded retrieval docs
                                          # and card copy (audit finding #5)
 
+# ── email connectors (gmail/outlook — spec 2026-07-08-email-connectors) ─
+# Unit of ingestion is the THREAD. A deterministic funnel (no LLM) keeps
+# enrichment cost sane: window → header/sender drops → importance cap.
+EMAIL_WINDOW_DAYS = 120                  # threads whose newest message is older are skipped
+EMAIL_MAX_THREADS = 400                  # hard cap on threads reaching enrichment, per source
+EMAIL_FETCH_CEILING = 1500               # raw threads fetched before the funnel (safety valve)
+EMAIL_MAX_MESSAGES = 25                  # most-recent-N cap per thread
+EMAIL_MESSAGE_MAX_CHARS = 2000           # per-message cap after quote/signature stripping
+EMAIL_SYNC_MIN_INTERVAL_S = 3600.0       # in-process extract cache: the 300s sync loop must
+                                         # not refetch the whole mailbox every pass
+# senders whose local part matches are automated; threads consisting only of
+# these survive only when you replied in the thread
+EMAIL_NOREPLY_LOCALPARTS = frozenset(
+    """noreply no-reply donotreply do-not-reply notifications notification alerts alert
+    billing receipts receipt invoice invoices statement statements mailer-daemon bounce
+    bounces newsletter newsletters news updates update marketing offers deals promo
+    promotions confirm confirmation orders order support help info hello contact
+    account accounts security admin system automated digest reminder reminders
+    """.split()
+)
+# subjects matching this AND never replied to → transactional noise (billing,
+# receipts, account/security boilerplate, marketing). Replying rescues.
+EMAIL_TRANSACTIONAL_SUBJECT_RE = (
+    r"(?i)(receipt|invoice|payment\s+(?:received|due|confirmation|failed)"
+    r"|order\s+(?:confirm\w*|shipped|delivered|placed)"
+    r"|your\s+(?:statement|bill|order|subscription|receipt|invoice|account)"
+    r"|verify\s+your|verification\s+code|confirm\s+your\s+(?:email|account)"
+    r"|password\s+reset|reset\s+your\s+password|security\s+(?:alert|code|notice)"
+    r"|two.factor|sign.in\s+(?:attempt|alert|detected)|new\s+login"
+    r"|terms\s+of\s+service|privacy\s+policy|welcome\s+to|free\s+trial"
+    r"|%\s*off|sale\s+ends|last\s+chance|don.t\s+miss)"
+)
+# importance score: S = Σ weight·signal; survivors sorted desc, capped
+EMAIL_SCORE_WEIGHTS = {
+    "recency": 1.0,                      # exp half-life decay over newest-message age
+    "replied": 2.0,                      # you sent a message in the thread: gold tier
+    "known_participant": 1.0,            # sender in Contacts or prior-correspondent set
+    "flagged": 0.5,                      # starred / flagged / high importance
+    "length": 0.5,                       # min(messages, 8)/8 — real back-and-forth
+}
+EMAIL_RECENCY_SCORE_HALF_LIFE_DAYS = 30.0
+
 # ── graph term resolution (synonym soft-links, no LLM) ────────────────
 # entity/topic strings are embedded (cached in term_vectors) and clustered;
 # canonical forms are what shared-term edges intersect on. Calibrated on the
@@ -183,6 +225,8 @@ SOURCE_RANK = {
     "apple_notes": 1.00,                 # written notes: highest
     "obsidian": 1.00,
     "imessage": 0.85,                    # text messages: a bit lower
+    "gmail": 0.85,                       # email threads: iMessage tier
+    "outlook": 0.85,
     "claude_mem": 0.70,                  # agent memories: a bit lower still
     "codex_mem": 0.70,
 }
@@ -195,6 +239,8 @@ QUALITY_LAMBDA = 0.20                    # blend: multiplier = exp(λ·quality_r
 RECENCY_OFFSET_DAYS = 2.0                # grace window before decay starts
 RECENCY_HALF_LIFE_DAYS = {
     "imessage": 30.0,                    # episodic sources decay fast
+    "gmail": 30.0,                       # email is episodic too
+    "outlook": 30.0,
     "claude_mem": 60.0,
     "codex_mem": 60.0,
     "apple_notes": 90.0,
@@ -253,3 +299,20 @@ GLINER2_SCHEMA = {
     "event": "Meetings, deadlines, launches, or scheduled occurrences",
 }
 GLINER_MAX_SPANS = 4
+
+# ── PII redaction (email bodies: regex layer + GLiNER2 schema layer) ──
+# Regex owns fixed-format identifiers (Luhn-checked cards, SSNs, account
+# numbers, one-time codes); GLiNER2 catches contextual PII with its own
+# schema. person/organization/address are deliberately ABSENT: names and
+# addresses stay — entity linking needs them. Applied per message BEFORE
+# content_hash, so raw PII never lands in the DB, embeddings, or FTS.
+EMAIL_PII_GLINER_THRESHOLD = 0.35        # recall-leaning: a false positive costs one
+                                         # redacted span; a false negative leaks PII
+GLINER2_PII_SCHEMA = {
+    "credit_card_number": "A credit or debit card number, possibly with spaces or dashes",
+    "social_security_number": "A social security number or national identity number",
+    "bank_account_number": "A bank account number, routing number, or IBAN",
+    "password_or_credential": "A password, PIN, access token, or other account credential",
+    "government_id": "A passport, driver's license, or other government ID number",
+    "date_of_birth": "A person's date of birth",
+}
