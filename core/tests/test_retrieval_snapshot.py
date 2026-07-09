@@ -8,6 +8,8 @@ import pytest
 from scipy.sparse import csr_matrix
 
 from taurine_core.indexer.store import Index
+from taurine_core.indexer.knowledge_store import KnowledgeStore
+from taurine_core.schemas import NoteRecord
 from taurine_core.retrieval.snapshot import ActiveSnapshot, IndexSnapshot
 
 
@@ -55,6 +57,37 @@ def test_product_index_exposes_active_retrieval_snapshot_port(tmp_path: Path) ->
         assert index.retrieval_snapshot() is second
     finally:
         index.close()
+
+
+def test_snapshot_opens_its_generation_read_only_for_lexical_heads(tmp_path: Path) -> None:
+    path = tmp_path / "build-1.db"
+    writable = KnowledgeStore(path)
+    try:
+        writable.write_note(
+            NoteRecord(
+                note_id="n1",
+                title="Maya launch",
+                source="apple_notes",
+                text="Maya owns the launch checklist.",
+                content_hash="h1",
+                created=1.0,
+                modified=2.0,
+            ),
+            build_id="build-1",
+            extraction_status="complete",
+        )
+    finally:
+        writable.close()
+
+    snapshot = _snapshot(tmp_path, "build-1", 1.0)
+    store = snapshot.open_knowledge_store()
+    try:
+        assert store.read_only
+        assert store.source_notes()[0].note_id == "n1"
+        with pytest.raises(PermissionError):
+            store.delete_note("n1")
+    finally:
+        store.close()
 
 
 def _snapshot(tmp_path: Path, build_id: str, value: float) -> IndexSnapshot:

@@ -58,6 +58,7 @@ class ModeCalibration(_StrictModel):
     evidence_floor: float = Field(ge=0.0, le=1.0)
     single_head_override: float = Field(ge=0.0, le=1.0)
     minimum_independent_heads: int = Field(ge=1)
+    bm25_min_token_coverage: float = Field(ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_heads(self) -> "ModeCalibration":

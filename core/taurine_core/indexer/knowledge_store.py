@@ -417,7 +417,7 @@ class KnowledgeStore:
                 ORDER BY bm25(passages_fts), f.passage_id
                 LIMIT ?
                 """,
-                (" AND ".join(f'"{term}"' for term in terms), int(k)),
+                (" OR ".join(f'"{term}"' for term in terms), int(k)),
             ).fetchall()
         except sqlite3.OperationalError:
             return ()
@@ -479,6 +479,21 @@ class KnowledgeStore:
                 """,
                 (entity_id, surface, surface.casefold(), origin, float(confidence)),
             )
+
+    def alias_index(self) -> dict[str, tuple[str, ...]]:
+        """Return the immutable-snapshot input keyed by case-folded surface."""
+
+        rows = self._conn.execute(
+            "SELECT surface_cf, entity_id FROM entity_aliases "
+            "ORDER BY surface_cf, entity_id"
+        ).fetchall()
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            target_ids = grouped.setdefault(str(row["surface_cf"]), [])
+            entity_id = str(row["entity_id"])
+            if not target_ids or target_ids[-1] != entity_id:
+                target_ids.append(entity_id)
+        return {surface: tuple(target_ids) for surface, target_ids in grouped.items()}
 
     def insert_mention(
         self,

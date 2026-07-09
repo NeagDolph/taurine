@@ -86,6 +86,7 @@ def test_checked_in_calibration_artifact_is_strict_and_complete() -> None:
         assert {"dense", "bm25", "exact", "entity", "triple"} <= set(mode.heads)
         assert 0.0 <= mode.evidence_floor <= 1.0
         assert 0.0 <= mode.single_head_override <= 1.0
+        assert 0.0 <= mode.bm25_min_token_coverage <= 1.0
     assert 0.0 <= artifact.nli.entailment_floor <= 1.0
 
 

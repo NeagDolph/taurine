@@ -6,10 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol
+from typing import TYPE_CHECKING, Any, Mapping, Protocol
 
 import numpy as np
 from scipy.sparse import csr_matrix
+
+if TYPE_CHECKING:
+    from taurine_core.indexer.knowledge_store import KnowledgeStore
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,13 @@ class IndexSnapshot:
         object.__setattr__(self, "base_graph", graph)
         object.__setattr__(self, "alias_index", MappingProxyType(dict(self.alias_index)))
         object.__setattr__(self, "quality_ranks", MappingProxyType(dict(self.quality_ranks)))
+
+    def open_knowledge_store(self) -> "KnowledgeStore":
+        """Open this generation's immutable DB for lexical/public row reads."""
+
+        from taurine_core.indexer.knowledge_store import KnowledgeStore
+
+        return KnowledgeStore(self.database_path, read_only=True)
 
 
 class RetrievalSnapshotPort(Protocol):

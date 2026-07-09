@@ -99,6 +99,10 @@ def test_store_round_trips_embeddings_and_passage_level_bm25(tmp_path: Path) -> 
         assert hits[0].raw_score > 0.0
         assert hits[0].token_coverage == pytest.approx(1.0)
 
+        partial_hits = store.search_passages_bm25("July missingterm", 5)
+        assert [row.passage_id for row in partial_hits] == ["p2"]
+        assert partial_hits[0].token_coverage == pytest.approx(0.5)
+
         store.delete_note(note.note_id)
         assert store.passage_embeddings() == ()
     finally:

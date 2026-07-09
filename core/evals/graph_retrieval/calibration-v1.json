@@ -71,7 +71,8 @@
       },
       "evidence_floor": 0.75,
       "single_head_override": 0.92,
-      "minimum_independent_heads": 2
+      "minimum_independent_heads": 2,
+      "bm25_min_token_coverage": 0.5
     },
     "chat": {
       "heads": {
@@ -83,7 +84,8 @@
       },
       "evidence_floor": 0.65,
       "single_head_override": 0.9,
-      "minimum_independent_heads": 2
+      "minimum_independent_heads": 2,
+      "bm25_min_token_coverage": 0.5
     },
     "tool": {
       "heads": {
@@ -95,7 +97,8 @@
       },
       "evidence_floor": 0.6,
       "single_head_override": 0.88,
-      "minimum_independent_heads": 2
+      "minimum_independent_heads": 2,
+      "bm25_min_token_coverage": 0.34
     }
   },
   "triple_recognition": {"live_floor": 0.82, "chat_floor": 0.74},
