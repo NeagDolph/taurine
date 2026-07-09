@@ -48,6 +48,21 @@ class FakeLLM:
         return response
 
 
+async def test_live_summary_injects_bounded_profile_as_background_not_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "PROFILE_CONTEXT_MAX_CHARS", 24)
+    index = FakeIndex()
+    index.user_card = lambda: "Neil builds Taurine and studies knowledge graphs."  # type: ignore[attr-defined,method-assign]
+    llm = FakeLLM([{"no_update": True}])
+
+    await Summarizer(llm, index).summarize(None, "minor chatter", _grounding(), [])  # type: ignore[arg-type]
+
+    assert "<user_profile>\nNeil builds Taurine and\n</user_profile>" in llm.calls[0].user
+    assert "background context" in llm.calls[0].system
+    assert "not meeting evidence" in llm.calls[0].system
+
+
 async def test_no_update_passthrough_records_model_and_latency() -> None:
     llm = FakeLLM([{"no_update": True}])
     summarizer = Summarizer(llm, FakeIndex())  # type: ignore[arg-type]

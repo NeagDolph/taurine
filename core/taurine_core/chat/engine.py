@@ -34,6 +34,7 @@ from .. import config
 from ..indexer.store import Index
 from ..llm import OpenRouterClient
 from ..ports import LLMError, SpanExtractorPort
+from ..profile_context import user_profile_block
 from ..schemas import (
     ChatAckEvent,
     ChatActivityEvent,
@@ -599,7 +600,9 @@ class ChatEngine:
             if message.id not in {current_user_id, assistant_id}
         ]
         history = history[-config.CHAT_HISTORY_MAX_TURNS * 2 :]
-        messages: list[dict[str, Any]] = [{"role": "system", "content": _system_prompt()}]
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": _system_prompt(user_profile_block(self.index))}
+        ]
         for message in history:
             if message.role == "assistant" and not message.content:
                 continue
@@ -643,11 +646,20 @@ class ChatEngine:
             await emit(ChatMetaEvent(chat=updated))
 
 
-def _system_prompt() -> str:
-    return (
+def _system_prompt(profile_block: str = "") -> str:
+    prompt = (
         "You answer questions over the user's personal notes. Cite only [N#] and [F#] ids "
         "that appear in the supplied context block or tool results. Use tools when the "
         "context is insufficient. Be direct and write markdown."
+    )
+    if not profile_block:
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        "The user profile below is background context for interpreting names, relationships, "
+        "interests, and likely referents. It is not citable evidence. Ground factual answers "
+        "in the supplied [N#] and [F#] sources.\n\n"
+        f"{profile_block}"
     )
 
 

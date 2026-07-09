@@ -438,9 +438,28 @@ class NotePreview(BaseModel):
 
 class ReenrichStatus(BaseModel):
     running: bool
-    phase: Literal["idle", "profile", "notes", "finalizing"] = "idle"
+    phase: Literal["idle", "notes", "finalizing"] = "idle"
     done: int = 0
     total: int = 0
+
+
+class ProfileGenerationStatus(BaseModel):
+    running: bool = False
+    phase: Literal[
+        "idle",
+        "surveying",
+        "interests",
+        "projects_people",
+        "career_studies",
+        "synthesizing",
+        "failed",
+    ] = "idle"
+    activity: str = ""
+    nodes_read: int = 0
+    tool_calls: int = 0
+    started_at: Optional[float] = None
+    elapsed_s: float = 0.0
+    error: str = ""
 
 
 class IndexStatus(BaseModel):

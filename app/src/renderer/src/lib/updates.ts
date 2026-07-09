@@ -1,5 +1,10 @@
-import { SIDECAR_WS_URL, parseConnectorInfo, parseReenrichStatus } from './sidecar'
-import type { ConnectorInfo, ReenrichStatus } from './sidecar'
+import {
+  SIDECAR_WS_URL,
+  parseConnectorInfo,
+  parseProfileState,
+  parseReenrichStatus
+} from './sidecar'
+import type { ConnectorInfo, ProfileState, ReenrichStatus } from './sidecar'
 
 // Long-lived state channel: the sidecar pushes connector/sync/re-enrich/graph/
 // profile changes here so the renderer never polls REST endpoints. REST is
@@ -23,9 +28,8 @@ export interface GraphUpdate {
   version: number
 }
 
-export interface ProfileUpdate {
+export interface ProfileUpdate extends ProfileState {
   type: 'profile'
-  card: string | null
 }
 
 export type UpdateEvent = ConnectorsUpdate | ReenrichUpdate | GraphUpdate | ProfileUpdate
@@ -159,15 +163,11 @@ export function parseUpdateEvent(raw: string): UpdateEvent | null {
       return status ? { type: 'reenrich', status } : null
     }
     case 'graph': {
-      return typeof record.version === 'number'
-        ? { type: 'graph', version: record.version }
-        : null
+      return typeof record.version === 'number' ? { type: 'graph', version: record.version } : null
     }
     case 'profile': {
-      const card = record.card
-      return card === null || typeof card === 'string'
-        ? { type: 'profile', card: card ?? null }
-        : null
+      const profile = parseProfileState(record)
+      return profile ? { type: 'profile', ...profile } : null
     }
     default:
       return null

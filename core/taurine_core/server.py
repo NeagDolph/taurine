@@ -24,6 +24,7 @@ from taurine_core.asr import ASRClient, ChunkCallback, IndexStatusProvider, Stat
 from taurine_core.chat.engine import ChatEngine
 from taurine_core.connectors.registry import ConnectorRegistry
 from taurine_core.indexer.notes import open_note
+from taurine_core.indexer.profile import ProfileGenerator, ProfileProgress
 from taurine_core.indexer.reenrich import reenrich_all
 from taurine_core.indexer.store import Index
 from taurine_core.indexer.sync import SyncReport
@@ -47,6 +48,7 @@ from taurine_core.schemas import (
     MeetingSummary,
     NotePreview,
     OpenNoteMsg,
+    ProfileGenerationStatus,
     ReenrichStatus,
     StartMsg,
     StatusEvent,
@@ -147,6 +149,12 @@ class Runtime:
     active_live_session: LiveSessionLike | None = None
     make_chat_engine: Callable[[], Any] | None = None
     chat_engine: Any = None
+    make_profile_generator: Callable[[], Any] | None = None
+    profile_generator: Any = None
+    profile_generation: ProfileGenerationStatus = field(
+        default_factory=ProfileGenerationStatus
+    )
+    profile_generation_task: asyncio.Task[Any] | None = None
 
 
 class _MonotonicClock:
@@ -162,6 +170,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         active_runtime.updates.bind_loop(asyncio.get_running_loop())
         if active_runtime.chat_engine is None and active_runtime.make_chat_engine is not None:
             active_runtime.chat_engine = active_runtime.make_chat_engine()
+        if (
+            active_runtime.profile_generator is None
+            and active_runtime.make_profile_generator is not None
+        ):
+            active_runtime.profile_generator = active_runtime.make_profile_generator()
         if active_runtime.connector_registry is not None:
             active_runtime.connector_registry.on_change = lambda: active_runtime.updates.publish(
                 "connectors"
@@ -184,6 +197,12 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             if active_runtime.reenrich_task is not None:
                 active_runtime.reenrich_task.cancel()
                 await asyncio.gather(active_runtime.reenrich_task, return_exceptions=True)
+            if active_runtime.profile_generation_task is not None:
+                active_runtime.profile_generation_task.cancel()
+                await asyncio.gather(
+                    active_runtime.profile_generation_task,
+                    return_exceptions=True,
+                )
             for task in tuple(active_runtime.connector_sync_tasks.values()):
                 task.cancel()
             if active_runtime.connector_sync_tasks:
@@ -316,7 +335,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             active_runtime,
             ReenrichStatus(
                 running=True,
-                phase="notes" if source else "profile",
+                phase="notes",
                 done=0,
                 total=0,
             ),
@@ -335,8 +354,30 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.get("/profile")
     async def get_profile() -> dict[str, Any]:
         active_runtime: Runtime = app.state.runtime
-        card = getattr(active_runtime.index, "user_card", lambda: None)()
-        return {"card": card}
+        return _profile_payload(active_runtime)
+
+    @app.post("/profile/generate", status_code=202)
+    async def generate_profile() -> dict[str, Any]:
+        active_runtime: Runtime = app.state.runtime
+        if (
+            active_runtime.profile_generation.running
+            or active_runtime.profile_generation_task is not None
+            and not active_runtime.profile_generation_task.done()
+        ):
+            raise HTTPException(status_code=409, detail="profile generation already running")
+        if active_runtime.profile_generator is None:
+            raise HTTPException(status_code=503, detail="profile generation unavailable")
+        active_runtime.profile_generation = ProfileGenerationStatus(
+            running=True,
+            phase="surveying",
+            activity="Surveying the knowledge graph",
+            started_at=time.time(),
+        )
+        active_runtime.profile_generation_task = asyncio.create_task(
+            _run_profile_generation(active_runtime)
+        )
+        active_runtime.updates.publish("profile")
+        return _profile_payload(active_runtime)
 
     @app.get("/summary")
     async def get_summary() -> MeetingSummary:
@@ -395,8 +436,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if not isinstance(card, str) or not card.strip():
             raise HTTPException(status_code=422, detail="card must be a non-empty string")
         active_runtime.index.set_user_card(card.strip())  # type: ignore[attr-defined]
+        if not active_runtime.profile_generation.running:
+            active_runtime.profile_generation = ProfileGenerationStatus()
         active_runtime.updates.publish("profile")
-        return {"card": card.strip()}
+        return _profile_payload(active_runtime)
 
     @app.get("/sessions")
     async def sessions() -> list[dict[str, Any]]:
@@ -642,6 +685,7 @@ def build_runtime() -> Runtime:
             SessionLogger.create(session_log.SESSIONS_DIR),
             span_extractor=span_extractor,
         ),
+        make_profile_generator=lambda: ProfileGenerator(index, llm),
     )
 
 
@@ -830,10 +874,69 @@ async def _run_reenrich(runtime: Runtime, source: str | None = None) -> None:
             )
         else:
             await _emit_index_status(runtime)
-        # re-enrichment refreshes extraction/display lines/edges and, on full runs, the user card
+        # re-enrichment refreshes extraction/display lines/edges only
         _bump_graph(runtime)
-        runtime.updates.publish("profile")
         runtime.updates.publish("connectors")
+
+
+async def _run_profile_generation(runtime: Runtime) -> None:
+    generator = runtime.profile_generator
+    assert generator is not None
+    try:
+        card = await generator.generate(
+            lambda progress: _set_profile_progress(runtime, progress)
+        )
+        runtime.index.set_user_card(card)
+        runtime.profile_generation = ProfileGenerationStatus()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        current = _profile_status(runtime)
+        logging.getLogger("taurine.profile").exception("profile generation failed")
+        runtime.profile_generation = ProfileGenerationStatus(
+            running=False,
+            phase="failed",
+            activity=current.activity,
+            nodes_read=current.nodes_read,
+            tool_calls=current.tool_calls,
+            started_at=current.started_at,
+            elapsed_s=current.elapsed_s,
+            error=str(exc)[:300] or "Profile generation failed",
+        )
+    finally:
+        runtime.profile_generation_task = None
+        runtime.updates.publish("profile")
+
+
+def _set_profile_progress(runtime: Runtime, progress: ProfileProgress) -> None:
+    started_at = runtime.profile_generation.started_at or time.time()
+    runtime.profile_generation = ProfileGenerationStatus(
+        running=True,
+        phase=progress.phase,
+        activity=progress.activity,
+        nodes_read=progress.nodes_read,
+        tool_calls=progress.tool_calls,
+        started_at=started_at,
+        elapsed_s=max(0.0, time.time() - started_at),
+    )
+    runtime.updates.publish("profile")
+
+
+def _profile_status(runtime: Runtime) -> ProfileGenerationStatus:
+    status = runtime.profile_generation
+    if not status.running or status.started_at is None:
+        return status
+    return status.model_copy(
+        update={"elapsed_s": max(0.0, time.time() - status.started_at)}
+    )
+
+
+def _profile_payload(runtime: Runtime) -> dict[str, Any]:
+    card = getattr(runtime.index, "user_card", lambda: None)()
+    return {
+        "card": card,
+        "generation": _profile_status(runtime).model_dump(mode="json"),
+    }
 
 
 def _set_reenrich_status(
@@ -891,8 +994,9 @@ async def _send_updates(
             json.dumps({"type": "graph", "version": runtime.graph_version})
         )
     if "profile" in kinds:
-        card = getattr(runtime.index, "user_card", lambda: None)()
-        await websocket.send_text(json.dumps({"type": "profile", "card": card}))
+        await websocket.send_text(
+            json.dumps({"type": "profile", **_profile_payload(runtime)})
+        )
     if "chats" in kinds:
         chats = getattr(runtime.index, "chats", lambda: [])()
         await websocket.send_text(

@@ -1,23 +1,22 @@
 # Taurine
 
 Live meeting copilot: listens to the mic, transcribes through the Taurine ASR
-server, and surfaces relevant Apple Notes in real time — an ambient relevance
-list, LLM-gated pinned cards with a "why this matters now" line, and a live
-note-graph map showing how the conversation connects to your notes.
+server, maintains a grounded rolling summary and actionables, answers questions
+over the user's connected knowledge, and maps how the current conversation
+relates to the knowledge graph.
 
 Architecture: Electron app (`app/`) ↔ localhost ws ↔ Python sidecar (`core/`,
 FastAPI) which owns the ASR connection, the notes index (sqlite + FTS5 +
-local embeddings + note graph), and the live loop (C1 exact / C2 hybrid
-retrieval + graph expansion + Cohere rerank / slate / presenter / cadence).
+local embeddings + heterogeneous graph), and the live loop (C1 exact / C2
+hybrid retrieval + personalized graph traversal + grounded summarization).
 Design docs: `docs/superpowers/specs/`, plan: `docs/superpowers/plans/`.
 
 ## Setup (once)
 
 ```bash
-# secrets — core/.env with three keys:
+# secrets — core/.env with two keys:
 #   TAURINE_ASR_TOKEN      (transcription-service Caddyfile token)
 #   OPEN_ROUTER_API_KEY    (all LLM calls route through OpenRouter)
-#   COHERE_API_KEY         (rerank v3.5)
 
 cd core && uv sync          # python sidecar deps
 cd ../app && npm install    # electron app deps
@@ -31,10 +30,11 @@ uv run python -m taurine_core.indexer.sync --db taurine.db
 ```
 
 First run extracts every note in the default Apple Notes account (macOS will
-ask for automation permission), enriches each via OpenRouter (gist, synthetic
-spoken utterances, aliases, topics/entities), embeds locally
-(bge-small-en-v1.5), and builds the note graph. Re-runs are incremental by
-content hash; the running server also re-syncs every 5 minutes.
+ask for automation permission), extracts typed entities and relations locally,
+embeds content with Qwen3-Embedding-0.6B, and builds the knowledge graph.
+Limited LLM calls remain for high-value spoken aliases and uncertain graph-edge
+adjudication. Re-runs are incremental by content hash; the running server also
+re-syncs every 5 minutes.
 
 ## Run
 
@@ -46,12 +46,13 @@ cd core && uv run uvicorn taurine_core.server:app --host 127.0.0.1 --port 8930
 cd app && npm run dev
 ```
 
-Click **Start listening**, talk. Feed view shows the live transcript, ambient
-sidebar ranks notes for the current moment, pinned cards appear when the
-presenter promotes something (dismiss with ×, or open directly in Notes).
-Map view shows the note graph with live rank-colored edges from the "now"
-node on every retrieval pass and hop-labeled edges for graph-expanded
-candidates.
+Click **Start listening**, talk. Live view shows the transcript, grounded
+rolling summary, actionables, and ambient sources. Chat uses GLM-5.2 with graph
+search/read/traversal tools. Data shows the knowledge map and the editable User
+summary card. **Generate** on that card explicitly launches a GLM-5.2 research
+agent to traverse the current graph; it never runs automatically during sync or
+re-enrichment. The saved summary becomes background user context for subsequent
+chat turns and live-summary passes.
 
 Headless smoke (no audio, no app):
 
@@ -63,7 +64,7 @@ cd core && echo "we should ask the shopify consultant about checkout" \
 ## Development
 
 ```bash
-cd core && uv run pytest tests -q     # 64 tests, offline (RUN_SLOW=1 adds real-model tests)
+cd core && uv run pytest tests -q     # offline (RUN_SLOW=1 adds real-model tests)
 cd app && npm run typecheck
 ```
 

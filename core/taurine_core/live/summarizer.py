@@ -35,6 +35,7 @@ from ..indexer import store
 from ..indexer.store import Index
 from ..llm import OpenRouterClient
 from ..ports import LLMError
+from ..profile_context import user_profile_block
 from ..schemas import Actionable, MeetingSummary, SummaryHighlight
 from .grounding import GroundingUpdate
 
@@ -50,6 +51,10 @@ block ONLY. Be conservative: create an actionable only when the transcript
 contains an explicit commitment with an assignee, a verb, and a deliverable,
 and include the verbatim quote. Prefer {"no_update": true} when nothing
 material changed. Note ages are supplied; discount stale evidence.
+
+The optional <user_profile> block is background context for interpreting names,
+relationships, interests, and continuity. It is not meeting evidence. Never use
+it by itself to add a meeting claim or actionable.
 
 Return only a JSON object in one of these shapes:
 {"no_update": true}
@@ -92,7 +97,13 @@ class Summarizer:
         """One LLM pass; returns None only when both models fail."""
         started = time.monotonic()
         prompt_delta = _truncate_newest(transcript_delta, config.SUMMARY_DELTA_MAX_CHARS)
-        user_prompt = _build_user_prompt(state, prompt_delta, update, open_actionables)
+        user_prompt = _build_user_prompt(
+            state,
+            prompt_delta,
+            update,
+            open_actionables,
+            profile_block=user_profile_block(self.index),
+        )
 
         try:
             raw = await self.llm.complete_json(
@@ -171,11 +182,13 @@ def _build_user_prompt(
     transcript_delta: str,
     update: GroundingUpdate,
     open_actionables: list[Actionable],
+    *,
+    profile_block: str = "",
 ) -> str:
     previous = "none" if state is None else json.dumps(state.model_dump(mode="json"))
     grounding = _grounding_block(update)
     open_rows = _open_actionables_block(open_actionables)
-    return (
+    prompt = (
         "<previous_summary>\n"
         f"{previous}\n"
         "</previous_summary>\n\n"
@@ -189,6 +202,7 @@ def _build_user_prompt(
         f"{open_rows}\n"
         "</open_actionables>"
     )
+    return f"{profile_block}\n\n{prompt}" if profile_block else prompt
 
 
 def _grounding_block(update: GroundingUpdate) -> str:

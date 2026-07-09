@@ -9,8 +9,32 @@ export type TriggerAction = 'grounded' | 'none'
 export type TriggerKind = 'exact' | 'search'
 export type ActionableStatus = 'open' | 'confirmed' | 'dismissed'
 export type ActionableOp = 'new' | 'update' | 'dismiss'
-export type ReenrichPhase = 'idle' | 'profile' | 'notes' | 'finalizing'
+export type ReenrichPhase = 'idle' | 'notes' | 'finalizing'
 export type ConnectorKind = 'local' | 'oauth'
+export type ProfileGenerationPhase =
+  | 'idle'
+  | 'surveying'
+  | 'interests'
+  | 'projects_people'
+  | 'career_studies'
+  | 'synthesizing'
+  | 'failed'
+
+export interface ProfileGenerationStatus {
+  running: boolean
+  phase: ProfileGenerationPhase
+  activity: string
+  nodes_read: number
+  tool_calls: number
+  started_at: number | null
+  elapsed_s: number
+  error: string
+}
+
+export interface ProfileState {
+  card: string | null
+  generation: ProfileGenerationStatus
+}
 
 export interface TranscriptEvent {
   type: 'transcript'
@@ -314,7 +338,7 @@ export class SidecarClient {
     return (
       parseReenrichStatus(payload) ?? {
         running: true,
-        phase: 'profile',
+        phase: 'notes',
         done: 0,
         total: 0
       }
@@ -1149,7 +1173,19 @@ function isActionableOp(value: unknown): value is ActionableOp {
 }
 
 function isReenrichPhase(value: unknown): value is ReenrichPhase {
-  return value === 'idle' || value === 'profile' || value === 'notes' || value === 'finalizing'
+  return value === 'idle' || value === 'notes' || value === 'finalizing'
+}
+
+function isProfileGenerationPhase(value: unknown): value is ProfileGenerationPhase {
+  return (
+    value === 'idle' ||
+    value === 'surveying' ||
+    value === 'interests' ||
+    value === 'projects_people' ||
+    value === 'career_studies' ||
+    value === 'synthesizing' ||
+    value === 'failed'
+  )
 }
 
 function isConnectorKind(value: unknown): value is ConnectorKind {
@@ -1187,20 +1223,53 @@ function restBaseFromWsUrl(url: string): string {
   return parsed.toString().replace(/\/$/, '')
 }
 
-export async function fetchProfile(options: SidecarRequestOptions = {}): Promise<string | null> {
-  const payload = await requestSidecarJson('/profile', { method: 'GET' }, options)
-  if (payload && typeof payload === 'object' && 'card' in payload) {
-    const card = (payload as { card: unknown }).card
-    return typeof card === 'string' ? card : null
+export function parseProfileState(value: unknown): ProfileState | null {
+  const record = asRecord(value)
+  const generation = asRecord(record?.generation)
+  if (
+    !record ||
+    !(record.card === null || typeof record.card === 'string') ||
+    !generation ||
+    typeof generation.running !== 'boolean' ||
+    !isProfileGenerationPhase(generation.phase) ||
+    typeof generation.activity !== 'string' ||
+    typeof generation.nodes_read !== 'number' ||
+    typeof generation.tool_calls !== 'number' ||
+    !(generation.started_at === null || typeof generation.started_at === 'number') ||
+    typeof generation.elapsed_s !== 'number' ||
+    typeof generation.error !== 'string'
+  ) {
+    return null
   }
-  return null
+  return {
+    card: record.card ?? null,
+    generation: {
+      running: generation.running,
+      phase: generation.phase,
+      activity: generation.activity,
+      nodes_read: generation.nodes_read,
+      tool_calls: generation.tool_calls,
+      started_at: generation.started_at,
+      elapsed_s: generation.elapsed_s,
+      error: generation.error
+    }
+  }
+}
+
+export async function fetchProfile(options: SidecarRequestOptions = {}): Promise<ProfileState> {
+  const payload = await requestSidecarJson('/profile', { method: 'GET' }, options)
+  const profile = parseProfileState(payload)
+  if (!profile) {
+    throw new Error('Invalid profile response')
+  }
+  return profile
 }
 
 export async function saveProfile(
   card: string,
   options: SidecarRequestOptions = {}
-): Promise<void> {
-  await requestSidecar(
+): Promise<ProfileState> {
+  const payload = await requestSidecarJson(
     '/profile',
     {
       method: 'PUT',
@@ -1209,4 +1278,18 @@ export async function saveProfile(
     },
     options
   )
+  const profile = parseProfileState(payload)
+  if (!profile) {
+    throw new Error('Invalid profile response')
+  }
+  return profile
+}
+
+export async function generateProfile(options: SidecarRequestOptions = {}): Promise<ProfileState> {
+  const payload = await requestSidecarJson('/profile/generate', { method: 'POST' }, options)
+  const profile = parseProfileState(payload)
+  if (!profile) {
+    throw new Error('Invalid profile generation response')
+  }
+  return profile
 }
