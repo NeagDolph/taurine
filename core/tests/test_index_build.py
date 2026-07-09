@@ -10,6 +10,7 @@ import pytest
 from tests.conftest import make_note
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies, BuildError, main
 from taurine_core.indexer.knowledge_store import KnowledgeStore
+from taurine_core.schemas import ExtractedMention, ExtractedRelation, Extraction
 
 
 class Tokenizer:
@@ -102,3 +103,39 @@ def test_replace_derived_flag_is_required(tmp_path: Path) -> None:
     deps = BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
     with pytest.raises(BuildError, match="replace-derived"):
         BuildCoordinator(deps).build([], tmp_path / "knowledge.db", replace_derived=False)
+
+
+def test_build_finalizes_extracted_entities_mentions_and_directed_facts(tmp_path: Path) -> None:
+    note = make_note("n1", "Launch", "Maya owns Launch.")
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {
+            "n1": Extraction(
+                mentions=[
+                    ExtractedMention(surface="Maya", etype="person", confidence=0.95, char_start=0, char_end=4, extractor="fake", schema_id="s1"),
+                    ExtractedMention(surface="Launch", etype="project", confidence=0.9, char_start=10, char_end=16, extractor="fake", schema_id="s1"),
+                ],
+                fact_candidates=[
+                    ExtractedRelation(head="Maya", predicate="owns_or_has", tail="Launch", confidence=0.9, subject_start=0, subject_end=4, object_start=10, object_end=16, assertion_start=0, assertion_end=17, extraction_method="fake", schema_id="s1", status="active")
+                ],
+                schema_id="s1",
+            )
+        }
+
+    deps = BuildDependencies(
+        tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+    )
+    target = tmp_path / "knowledge.db"
+
+    report = BuildCoordinator(deps).build([note], target, replace_derived=True)
+
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        counts = store.counts()
+        assert counts["entities"] == 2
+        assert counts["entity_mentions"] == 2
+        assert counts["facts"] == 1
+        assert report.health == "healthy"
+    finally:
+        store.close()

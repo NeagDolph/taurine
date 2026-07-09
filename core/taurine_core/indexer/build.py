@@ -9,13 +9,15 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
 from taurine_core import config
-from taurine_core.indexer.base_graph import BaseGraphBuilder, PassageGraphInput
+from taurine_core.indexer.base_graph import BaseGraphBuilder, EntityGraphInput, PassageEntityInput, PassageGraphInput
 from taurine_core.indexer.embed import embed_passages, embed_texts
+from taurine_core.indexer.entities import EntityResolver, MentionInput
+from taurine_core.indexer.facts import promote_fact, reconcile_temporal_facts
 from taurine_core.indexer.knowledge_store import KnowledgeStore
 from taurine_core.indexer.passages import TokenizerPort, build_passages
 from taurine_core.indexer.projection import ProjectionPassage, build_projection
@@ -34,6 +36,7 @@ class BuildDependencies:
     embedding_dim: int = config.EMBED_DIM
     embedding_model_id: str = config.EMBED_MODEL
     now: Callable[[], float] = time.time
+    extractor: Callable[..., dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -119,8 +122,57 @@ class BuildCoordinator:
                 store.write_passage_embeddings(embedded)
                 embedded_by_id.update({row.passage_id: row for row in embedded})
             stages.append("embeddings")
+            extractions = (
+                self.dependencies.extractor(ordered, tokenizer=self.dependencies.tokenizer)
+                if self.dependencies.extractor is not None
+                else {}
+            )
             stages.append("extraction")
+            mention_inputs = []
+            passage_by_note = {
+                note.note_id: [draft for source, draft in passage_rows if source.note_id == note.note_id]
+                for note in ordered
+            }
+            for note in ordered:
+                extraction = extractions.get(note.note_id)
+                store.write_note(
+                    note,
+                    build_id=build_id,
+                    extraction_status=("failed" if extraction is None or extraction.failed else "complete"),
+                    extraction_error=(extraction.error if extraction is not None else "extractor unavailable"),
+                )
+                if extraction is None or extraction.failed:
+                    continue
+                for mention in extraction.mentions:
+                    passage = next((p for p in passage_by_note[note.note_id] if p.char_start <= mention.char_start and mention.char_end <= p.char_end), None)
+                    if passage is None:
+                        continue
+                    identity = f"{note.note_id}\x1f{mention.etype}\x1f{mention.char_start}\x1f{mention.char_end}"
+                    mention_inputs.append(MentionInput("mention-" + hashlib.sha256(identity.encode()).hexdigest()[:24], note.note_id, passage.passage_id, mention))
+            resolution = EntityResolver(total_notes=max(1, len(ordered))).resolve_mentions(mention_inputs)
+            for entity in resolution.entities:
+                store.insert_entity(entity_id=entity.entity_id, canonical=entity.canonical, normalized=entity.normalized, etype=entity.etype, df=entity.df, traversal_eligible=entity.traversal_eligible, ambiguity_key=entity.ambiguity_key, build_id=build_id)
+                for alias in entity.aliases:
+                    store.insert_alias(entity.entity_id, alias, "resolved", 1.0)
+            for row in resolution.mentions:
+                m = row.mention
+                store.insert_mention(mention_id=row.mention_id, entity_id=row.entity_id, passage_id=row.passage_id, note_id=row.note_id, surface=m.surface, etype=m.etype, char_start=m.char_start, char_end=m.char_end, confidence=m.confidence, extractor=m.extractor, schema_id=m.schema_id, build_id=build_id)
             stages.append("entities")
+            resolved_by_note_span = {(row.note_id, row.mention.char_start, row.mention.char_end, row.mention.surface.casefold()): row for row in resolution.mentions}
+            fact_rows = []
+            for note in ordered:
+                extraction = extractions.get(note.note_id)
+                if extraction is None:
+                    continue
+                for candidate in extraction.fact_candidates:
+                    subject = resolved_by_note_span.get((note.note_id, candidate.subject_start, candidate.subject_end, candidate.head.casefold()))
+                    object_ = resolved_by_note_span.get((note.note_id, candidate.object_start, candidate.object_end, candidate.tail.casefold()))
+                    passage = next((p for p in passage_by_note[note.note_id] if p.char_start <= candidate.assertion_start and candidate.assertion_end <= p.char_end), None)
+                    if subject and object_ and passage:
+                        fact_rows.append(promote_fact(candidate, subject_entity_id=subject.entity_id, object_entity_id=object_.entity_id, source_passage_id=passage.passage_id, source_note_id=note.note_id, observed_at=note.modified, build_id=build_id))
+            fact_rows = list(reconcile_temporal_facts(fact_rows))
+            for fact in fact_rows:
+                store.insert_fact(fact)
             stages.append("facts")
 
             graph_passages = tuple(
@@ -132,11 +184,13 @@ class BuildCoordinator:
                 )
                 for note, draft in passage_rows
             )
+            entity_graph = tuple(EntityGraphInput(e.entity_id, e.canonical, e.etype, e.df, e.traversal_eligible) for e in resolution.entities)
+            contains_graph = tuple(PassageEntityInput(m.passage_id, m.entity_id, m.mention.confidence, 1, next(e.df for e in resolution.entities if e.entity_id == m.entity_id)) for m in resolution.mentions)
             base_graph = BaseGraphBuilder(
                 build_id=build_id,
                 semantic_k=config.BASE_GRAPH_PASSAGE_K,
                 semantic_floor=config.GRAPH_MIN_SIM,
-            ).build(graph_passages, (), (), ())
+            ).build(graph_passages, entity_graph, contains_graph, fact_rows)
             store.write_semantic_edges(
                 tuple(
                     (edge.src_id, edge.dst_id, edge.weight, edge.weight)
@@ -165,7 +219,7 @@ class BuildCoordinator:
             store.complete_build(
                 build_id,
                 completed_at=self.dependencies.now(),
-                health="degraded",
+                health="healthy" if self.dependencies.extractor is not None else "degraded",
                 graph_hash=graph_hash,
                 base_edge_count=len(base_graph.edges),
                 projection_count=len(projection),
@@ -179,7 +233,7 @@ class BuildCoordinator:
                 target=target_path,
                 source_snapshot=source_snapshot,
                 graph_hash=graph_hash,
-                health="degraded",
+                health="healthy" if self.dependencies.extractor is not None else "degraded",
                 stages=tuple(stages),
                 note_count=len(ordered),
                 passage_count=len(passage_rows),

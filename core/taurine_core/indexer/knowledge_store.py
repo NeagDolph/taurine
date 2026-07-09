@@ -13,6 +13,7 @@ from urllib.parse import quote
 import numpy as np
 
 from taurine_core.indexer.embed import PassageEmbedding
+from taurine_core.indexer.facts import FactRecord
 from taurine_core.indexer.passages import PassageDraft
 from taurine_core.indexer.projection import ProjectionEdge
 from taurine_core.schemas import NoteRecord
@@ -209,12 +210,20 @@ class KnowledgeStore:
         with self._conn:
             self._conn.execute(
                 """
-                INSERT OR REPLACE INTO notes(
+                INSERT INTO notes(
                     note_id, source, title, folder, text, content_hash,
                     created, modified, display_line, ingest_salience,
                     quality_rank, value_score, extraction_status,
                     extraction_error, build_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(note_id) DO UPDATE SET
+                    source=excluded.source, title=excluded.title, folder=excluded.folder,
+                    text=excluded.text, content_hash=excluded.content_hash,
+                    created=excluded.created, modified=excluded.modified,
+                    display_line=excluded.display_line, ingest_salience=excluded.ingest_salience,
+                    quality_rank=excluded.quality_rank, value_score=excluded.value_score,
+                    extraction_status=excluded.extraction_status,
+                    extraction_error=excluded.extraction_error, build_id=excluded.build_id
                 """,
                 (
                     note.note_id,
@@ -509,6 +518,21 @@ class KnowledgeStore:
                     extractor,
                     schema_id,
                     build_id,
+                ),
+            )
+
+    def insert_fact(self, fact: FactRecord) -> None:
+        self._writable()
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    fact.fact_id, fact.subject_entity_id, fact.predicate, fact.object_entity_id,
+                    fact.source_passage_id, fact.source_note_id, fact.assertion_start,
+                    fact.assertion_end, fact.subject_start, fact.subject_end, fact.object_start,
+                    fact.object_end, fact.confidence, fact.extraction_method, fact.schema_id,
+                    fact.observed_at, fact.valid_from, fact.valid_to, fact.invalidated_at,
+                    fact.superseded_by, fact.status, fact.build_id,
                 ),
             )
 
