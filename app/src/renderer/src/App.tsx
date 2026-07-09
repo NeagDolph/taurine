@@ -13,6 +13,7 @@ import {
   type AsrState,
   type ConnectorInfo,
   type IndexStatus,
+  type ProfileState,
   type RetrievalEvent,
   type SidecarConnectionState,
   type SummaryEvent,
@@ -42,7 +43,7 @@ function App(): React.JSX.Element {
   const [activeTab, setActiveTab] = useState<MainTab>('live')
   const [connectors, setConnectors] = useState<ConnectorInfo[] | null>(null)
   const [graphVersion, setGraphVersion] = useState(0)
-  const [profileCard, setProfileCard] = useState<string | null | undefined>(undefined)
+  const [profile, setProfile] = useState<ProfileState | undefined>(undefined)
   const [connection, setConnection] = useState<SidecarConnectionState>('disconnected')
   const [retryInMs, setRetryInMs] = useState<number | undefined>()
   const [asr, setAsr] = useState<AsrState>('disconnected')
@@ -142,7 +143,7 @@ function App(): React.JSX.Element {
           setGraphVersion(event.version)
           break
         case 'profile':
-          setProfileCard(event.card)
+          setProfile({ card: event.card, generation: event.generation })
           break
       }
     })
@@ -340,7 +341,8 @@ function App(): React.JSX.Element {
           <DataView
             latestFinalText={latestFinalText}
             groundedNoteIds={groundedNoteIds}
-            profileCard={profileCard}
+            profile={profile}
+            onProfileChange={setProfile}
             refreshKey={graphVersion}
             retrieval={lastRetrieval}
             visible={activeTab === 'data'}

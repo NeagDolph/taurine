@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { UserSummary } from '../components/UserSummary'
-import type { RetrievalEvent } from '../lib/sidecar'
+import type { ProfileState, RetrievalEvent } from '../lib/sidecar'
 import { MapView } from './MapView'
 
 interface DataViewProps {
@@ -8,7 +8,8 @@ interface DataViewProps {
   latestFinalText: string
   retrieval: RetrievalEvent | null
   groundedNoteIds: string[]
-  profileCard: string | null | undefined
+  profile: ProfileState | undefined
+  onProfileChange: (profile: ProfileState) => void
   refreshKey: number
 }
 
@@ -29,7 +30,8 @@ export function DataView({
   latestFinalText,
   retrieval,
   groundedNoteIds,
-  profileCard,
+  profile,
+  onProfileChange,
   refreshKey
 }: DataViewProps): React.JSX.Element {
   const [mapHeight, setMapHeight] = useState(initialMapHeight)
@@ -90,7 +92,7 @@ export function DataView({
         <span className="resize-grip" aria-hidden="true" />
       </div>
 
-      <UserSummary card={profileCard} />
+      <UserSummary profile={profile} onProfileChange={onProfileChange} />
     </div>
   )
 }
