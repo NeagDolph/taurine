@@ -12,6 +12,7 @@ export interface GraphNode {
   title: string
   degree: number
   source: string
+  gist: string
 }
 
 export interface GraphEdge {
@@ -37,6 +38,7 @@ export interface MapNode {
   label: string
   degree: number
   source: string
+  gist: string
   kind: MapNodeKind
   val: number
   fx?: number
@@ -70,20 +72,7 @@ export interface LiveRankLink {
   fadeStartedAt?: number
 }
 
-export interface LiveHopLink {
-  id: string
-  kind: 'hop'
-  source: string
-  target: string
-  color: string
-  fromNoteId: string
-  hop: number
-  score: number
-  createdAt: number
-  fadeStartedAt?: number
-}
-
-export type LiveGraphLink = LiveRankLink | LiveHopLink
+export type LiveGraphLink = LiveRankLink
 export type MapLink = StaticGraphLink | LiveGraphLink
 
 export interface MapGraphData {
@@ -94,6 +83,8 @@ export interface MapGraphData {
 export interface LiveGraphUpdate {
   links: LiveGraphLink[]
   touchedNodeIds: Set<string>
+  /** PPR traversal arrivals: note_id → normalized mass (0..1] within this event */
+  traversalGlow: Map<string, number>
 }
 
 export async function fetchGraph(
@@ -129,6 +120,7 @@ export function graphResponseToMapData(response: GraphResponse, nowLabel: string
       label: nowLabel || 'Now',
       degree: 0,
       source: 'live',
+      gist: '',
       kind: 'now',
       val: nodeRadius(9),
       fx: 0,
@@ -141,6 +133,7 @@ export function graphResponseToMapData(response: GraphResponse, nowLabel: string
       label: node.title,
       degree: node.degree,
       source: node.source,
+      gist: node.gist,
       kind: 'note' as const,
       val: nodeRadius(node.degree)
     }))
@@ -213,23 +206,23 @@ export function liveGraphFromRetrieval(
     })
   }
 
+  // PPR traversal arrivals (spec 2026-07-08) carry no hop chain — render them
+  // as a mass-weighted glow on the arrived-at node instead of edges
+  const traversalGlow = new Map<string, number>()
+  const maxMass = event.expansions.reduce((max, expansion) => Math.max(max, expansion.score), 0)
   for (const expansion of event.expansions) {
-    touchedNodeIds.add(expansion.from_note_id)
+    if (!expansion.note_id) {
+      continue
+    }
     touchedNodeIds.add(expansion.note_id)
-    links.push({
-      id: `hop:${createdAt}:${expansion.from_note_id}:${expansion.note_id}:${expansion.hop}`,
-      kind: 'hop',
-      source: expansion.from_note_id,
-      target: expansion.note_id,
-      color: hopColor(expansion.hop),
-      fromNoteId: expansion.from_note_id,
-      hop: expansion.hop,
-      score: expansion.score,
-      createdAt
-    })
+    const intensity = maxMass > 0 ? clamp(expansion.score / maxMass, 0.25, 1) : 0.25
+    traversalGlow.set(
+      expansion.note_id,
+      Math.max(intensity, traversalGlow.get(expansion.note_id) ?? 0)
+    )
   }
 
-  return { links, touchedNodeIds }
+  return { links, touchedNodeIds, traversalGlow }
 }
 
 export function fadingLiveLinks(
@@ -243,7 +236,7 @@ export function fadingLiveLinks(
 }
 
 export function liveLinkOpacity(link: LiveGraphLink, now = Date.now()): number {
-  const baseOpacity = link.kind === 'rank' ? 0.82 : 0.52
+  const baseOpacity = 0.82
   if (link.fadeStartedAt === undefined) {
     return baseOpacity
   }
@@ -264,11 +257,6 @@ export function rankColor(rank: number, totalRanks: number): string {
   // rank-hot = yellow accent, rank-cold = cool gray-blue
   const t = totalRanks <= 1 ? 0 : clamp((rank - 1) / (totalRanks - 1), 0, 1)
   return mixHex('#ffd75e', '#5f7690', t)
-}
-
-export function hopColor(hop: number): string {
-  // dashed expansion edges: warm amber fading to muted slate as hops grow
-  return mixHex('#e5b23c', '#5b6577', clamp((hop - 1) / 3, 0, 1))
 }
 
 export function sourceColor(source: string): string {
@@ -309,20 +297,6 @@ export function sourcesFromMapData(data: MapGraphData): string[] {
   })
 }
 
-export function linkTooltip(link: MapLink): string {
-  if (link.kind === 'static') {
-    const terms = link.shared.length > 0 ? `: ${link.shared.join(', ')}` : ''
-    const base = `${link.edgeType}${terms}`
-    return link.fact ? `${link.fact}\n(${base})` : base
-  }
-
-  if (link.kind === 'rank') {
-    return `retrieval rank ${link.rank}`
-  }
-
-  return `graph expansion hop ${link.hop}`
-}
-
 function parseGraphNode(value: unknown): GraphNode {
   const record = asRecord(value)
   if (
@@ -338,7 +312,8 @@ function parseGraphNode(value: unknown): GraphNode {
     note_id: record.note_id,
     title: record.title,
     degree: record.degree,
-    source: typeof record.source === 'string' ? record.source : 'apple_notes'
+    source: typeof record.source === 'string' ? record.source : 'apple_notes',
+    gist: typeof record.gist === 'string' ? record.gist : ''
   }
 }
 

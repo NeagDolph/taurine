@@ -54,6 +54,7 @@ class GraphNode(BaseModel):
     title: str
     degree: int
     source: str = "apple_notes"
+    gist: str = ""                 # LLM gist (fallback: first line) for map hover previews
 
 
 class GraphResponse(BaseModel):

@@ -972,6 +972,7 @@ class Index:
                 title=note.title,
                 degree=degree[note.note_id],
                 source=note.source,
+                gist=note.gist,
             )
             for note in active_notes
         ]

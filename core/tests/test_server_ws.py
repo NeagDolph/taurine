@@ -225,7 +225,13 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
     with TestClient(create_app(runtime)) as client:
         assert client.get("/graph").json() == {
             "nodes": [
-                {"note_id": "n1", "title": "Roadmap", "degree": 1, "source": "apple_notes"}
+                {
+                    "note_id": "n1",
+                    "title": "Roadmap",
+                    "degree": 1,
+                    "source": "apple_notes",
+                    "gist": "",
+                }
             ],
             "edges": [
                 {

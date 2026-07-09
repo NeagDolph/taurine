@@ -11,7 +11,6 @@ import {
   fadingLiveLinks,
   fetchGraph,
   graphResponseToMapData,
-  linkTooltip,
   liveGraphFromRetrieval,
   liveLinkOpacity,
   mergeGraphPositions,
@@ -39,8 +38,17 @@ interface MapViewProps {
 type GraphLinkObject = LinkObject<MapNode, MapLink>
 type GraphNodeObject = NodeObject<MapNode>
 
+interface GlowEntry {
+  until: number
+  intensity: number
+}
+
 const EMPTY_GRAPH: MapGraphData = graphResponseToMapData({ nodes: [], edges: [] }, 'Now')
 const GRAPH_REFETCH_DEBOUNCE_MS = 800
+// zoom (globalScale) windows over which node labels fade in: hubs surface
+// first so a zoomed-out map reads as landmarks instead of a text mass
+const HUB_LABEL_FADE: readonly [number, number] = [0.8, 1.4]
+const NODE_LABEL_FADE: readonly [number, number] = [1.6, 2.7]
 // ~760 nodes need a few hundred ticks to untangle from d3's initial spiral;
 // the old 80 froze half-laid-out graphs whenever a refetch reset positions
 const LAYOUT_COOLDOWN_TICKS = 300
@@ -59,10 +67,14 @@ export function MapView({
   const processedRetrievalRef = useRef<RetrievalEvent | null>(null)
   const pruneTimerRef = useRef<number | null>(null)
   const flashTimerRef = useRef<number | null>(null)
+  const glowTimerRef = useRef<number | null>(null)
 
   const [baseGraph, setBaseGraph] = useState<MapGraphData>(EMPTY_GRAPH)
   const [liveLinks, setLiveLinks] = useState<LiveGraphLink[]>([])
   const [flashUntilByNode, setFlashUntilByNode] = useState<Map<string, number>>(new Map())
+  const [glowByNode, setGlowByNode] = useState<Map<string, GlowEntry>>(new Map())
+  const [hoverNode, setHoverNode] = useState<GraphNodeObject | null>(null)
+  const [hoverLink, setHoverLink] = useState<GraphLinkObject | null>(null)
   const [size, setSize] = useState({ width: 720, height: 480 })
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState('')
@@ -73,6 +85,9 @@ export function MapView({
   const nowLabel = useMemo(() => nowLabelFromText(latestFinalText), [latestFinalText])
   const pinnedSet = useMemo(() => new Set(groundedNoteIds), [groundedNoteIds])
   const sourceIds = useMemo(() => sourcesFromMapData(baseGraph), [baseGraph])
+  const hubDegree = useMemo(() => degreePercentile(baseGraph.nodes, 0.75), [baseGraph.nodes])
+  const hoverNodeId = hoverNode ? String(hoverNode.id) : null
+  const hoverLinkId = hoverLink ? hoverLink.id : null
 
   const schedulePrune = useCallback(() => {
     if (pruneTimerRef.current !== null) {
@@ -95,6 +110,17 @@ export function MapView({
       const now = Date.now()
       setFlashUntilByNode((current) => new Map([...current].filter(([, until]) => until > now)))
     }, TOUCH_FLASH_MS + 80)
+  }, [])
+
+  const scheduleGlowPrune = useCallback(() => {
+    if (glowTimerRef.current !== null) {
+      window.clearTimeout(glowTimerRef.current)
+    }
+    glowTimerRef.current = window.setTimeout(() => {
+      glowTimerRef.current = null
+      const now = Date.now()
+      setGlowByNode((current) => new Map([...current].filter(([, entry]) => entry.until > now)))
+    }, LIVE_EDGE_FADE_MS + 120)
   }, [])
 
   const graphData = useMemo(() => {
@@ -283,11 +309,24 @@ export function MapView({
       return next
     })
 
+    setGlowByNode((current) => {
+      const next = new Map([...current].filter(([, entry]) => entry.until > now))
+      for (const [nodeId, intensity] of update.traversalGlow) {
+        const existing = next.get(nodeId)
+        next.set(nodeId, {
+          until: now + LIVE_EDGE_FADE_MS,
+          intensity: Math.max(intensity, existing?.intensity ?? 0)
+        })
+      }
+      return next
+    })
+
     schedulePrune()
     scheduleFlashPrune()
+    scheduleGlowPrune()
 
     return undefined
-  }, [retrieval, scheduleFlashPrune, schedulePrune])
+  }, [retrieval, scheduleFlashPrune, scheduleGlowPrune, schedulePrune])
 
   useEffect(() => {
     if (!visible || hasActiveMapFilter || baseGraph.nodes.length <= 1) {
@@ -325,6 +364,9 @@ export function MapView({
       if (flashTimerRef.current !== null) {
         window.clearTimeout(flashTimerRef.current)
       }
+      if (glowTimerRef.current !== null) {
+        window.clearTimeout(glowTimerRef.current)
+      }
     }
   }, [])
 
@@ -332,8 +374,10 @@ export function MapView({
     (node: GraphNodeObject, ctx: CanvasRenderingContext2D, globalScale: number) => {
       const id = String(node.id)
       const isNow = id === NOW_NODE_ID
+      const isHovered = id === hoverNodeId
       const radius = isNow ? 14 : nodeRadius(node.degree)
       const flashOpacity = nodeFlashOpacity(id, flashUntilByNode)
+      const glow = nodeGlow(id, glowByNode)
       const isPinned = !isNow && pinnedSet.has(id)
       const opacity = nodeOpacity(node, hasActiveMapFilter, matchedNodeIds)
       const x = node.x ?? 0
@@ -341,6 +385,18 @@ export function MapView({
 
       ctx.save()
       ctx.globalAlpha = opacity
+
+      if (glow > 0) {
+        // PPR traversal arrival: soft amber halo, mass-weighted
+        const glowRadius = radius + 6 + glow * 9
+        const gradient = ctx.createRadialGradient(x, y, radius * 0.6, x, y, glowRadius)
+        gradient.addColorStop(0, rgba('#f5c518', glow * 0.5))
+        gradient.addColorStop(1, rgba('#f5c518', 0))
+        ctx.beginPath()
+        ctx.arc(x, y, glowRadius, 0, Math.PI * 2)
+        ctx.fillStyle = gradient
+        ctx.fill()
+      }
 
       if (flashOpacity > 0) {
         ctx.beginPath()
@@ -359,6 +415,14 @@ export function MapView({
         ctx.stroke()
       }
 
+      if (isHovered && !isNow) {
+        ctx.beginPath()
+        ctx.arc(x, y, radius + 3, 0, Math.PI * 2)
+        ctx.strokeStyle = 'rgba(236, 235, 230, 0.92)'
+        ctx.lineWidth = Math.max(1.6 / globalScale, 1.1)
+        ctx.stroke()
+      }
+
       ctx.beginPath()
       ctx.arc(x, y, radius, 0, Math.PI * 2)
       ctx.fillStyle = isNow ? '#f5c518' : sourceColor(node.source)
@@ -369,11 +433,25 @@ export function MapView({
       ctx.fillStyle = isNow ? '#231b06' : '#0b0b0c'
       ctx.fill()
 
-      const label = isNow ? nowLabel : node.title
-      drawNodeLabel(ctx, label, x, y + radius + 4, isNow, globalScale)
+      const matched = hasActiveMapFilter && node.kind === 'note' && matchedNodeIds.has(id)
+      const alpha =
+        isNow || isHovered || matched ? 1 : labelAlpha(globalScale, node.degree >= hubDegree)
+      if (alpha > 0.02) {
+        const label = isNow ? nowLabel : node.title
+        drawNodeLabel(ctx, label, x, y + radius + 4, isNow, globalScale, alpha)
+      }
       ctx.restore()
     },
-    [flashUntilByNode, hasActiveMapFilter, matchedNodeIds, nowLabel, pinnedSet]
+    [
+      flashUntilByNode,
+      glowByNode,
+      hasActiveMapFilter,
+      hoverNodeId,
+      hubDegree,
+      matchedNodeIds,
+      nowLabel,
+      pinnedSet
+    ]
   )
 
   const drawLink = useCallback(
@@ -385,8 +463,11 @@ export function MapView({
       }
 
       const isStatic = link.kind === 'static'
+      const isHovered = link.id === hoverLinkId
       const baseOpacity = isStatic ? staticLinkOpacity(link.weight) : liveLinkOpacity(link)
-      const opacity = linkOpacity(link, baseOpacity, hasActiveMapFilter, matchedNodeIds)
+      const opacity = isHovered
+        ? Math.max(baseOpacity, 0.85)
+        : linkOpacity(link, baseOpacity, hasActiveMapFilter, matchedNodeIds)
       if (opacity <= 0) {
         return
       }
@@ -395,21 +476,18 @@ export function MapView({
       ctx.beginPath()
       ctx.moveTo(source.x, source.y)
       ctx.lineTo(target.x, target.y)
-      ctx.strokeStyle = isStatic ? `rgba(108, 116, 128, ${opacity})` : rgba(link.color, opacity)
+      ctx.strokeStyle = isStatic
+        ? isHovered
+          ? `rgba(236, 235, 230, ${opacity})`
+          : `rgba(108, 116, 128, ${opacity})`
+        : rgba(link.color, opacity)
       ctx.lineWidth = isStatic
-        ? Math.max(0.75 / globalScale, 0.35)
-        : Math.max((link.kind === 'rank' ? 2.6 : 1.8) / globalScale, 0.8)
-      if (link.kind === 'hop') {
-        ctx.setLineDash([4 / globalScale, 5 / globalScale])
-      }
+        ? Math.max((isHovered ? 1.8 : 0.75) / globalScale, isHovered ? 0.9 : 0.35)
+        : Math.max((isHovered ? 3.4 : 2.6) / globalScale, 0.8)
       ctx.stroke()
       ctx.restore()
-
-      if (link.kind === 'hop') {
-        drawHopLabel(ctx, source, target, link.hop, globalScale, opacity)
-      }
     },
-    [hasActiveMapFilter, matchedNodeIds]
+    [hasActiveMapFilter, hoverLinkId, matchedNodeIds]
   )
 
   const noteCount = Math.max(0, baseGraph.nodes.length - 1)
@@ -477,19 +555,33 @@ export function MapView({
           linkCanvasObject={drawLink}
           linkCanvasObjectMode={() => 'replace'}
           linkHoverPrecision={6}
-          linkLabel={(link) => linkTooltip(link)}
+          linkLabel={() => ''}
           linkSource="source"
           linkTarget="target"
           nodeCanvasObject={drawNode}
           nodeCanvasObjectMode={() => 'replace'}
           nodeId="id"
-          nodeLabel={(node) => (String(node.id) === NOW_NODE_ID ? nowLabel : node.title)}
+          nodeLabel={() => ''}
           nodeRelSize={1}
           nodeVal={(node) => node.val}
           showPointerCursor={(item) => isNoteNodeObject(item)}
+          onLinkHover={(link) => {
+            setHoverLink(link ?? null)
+            if (link) {
+              setHoverNode(null)
+            }
+          }}
           onNodeClick={(node) => openPreview(node)}
+          onNodeHover={(node) => {
+            setHoverNode(node ?? null)
+            if (node) {
+              setHoverLink(null)
+            }
+          }}
           width={size.width}
         />
+
+        <MapHoverPanel hoverLink={hoverLink} hoverNode={hoverNode} nowLabel={nowLabel} />
 
         <div
           aria-live="polite"
@@ -506,8 +598,8 @@ export function MapView({
             rank hot → cold
           </span>
           <span className="map-legend-row">
-            <span className="map-legend-dash" aria-hidden="true" />
-            hop expansion
+            <span className="map-legend-glow" aria-hidden="true" />
+            graph traversal
           </span>
           <span className="map-legend-row">
             <span className="map-legend-ring" aria-hidden="true" />
@@ -628,7 +720,8 @@ function drawNodeLabel(
   x: number,
   y: number,
   isNow: boolean,
-  globalScale: number
+  globalScale: number,
+  alpha: number
 ): void {
   const text = truncateLabel(label, isNow ? 38 : 28)
   const fontSize = (isNow ? 12 : 9.5) / globalScale
@@ -641,48 +734,162 @@ function drawNodeLabel(
   const paddingY = 2 / globalScale
   const height = fontSize + paddingY * 2
 
-  ctx.fillStyle = isNow ? 'rgba(35, 27, 6, 0.86)' : 'rgba(11, 11, 12, 0.72)'
+  ctx.fillStyle = isNow ? `rgba(35, 27, 6, ${0.86 * alpha})` : `rgba(11, 11, 12, ${0.72 * alpha})`
   roundedRect(ctx, x - width / 2 - paddingX, y, width + paddingX * 2, height, 4 / globalScale)
   ctx.fill()
 
-  ctx.fillStyle = isNow ? '#ffe9a6' : 'rgba(226, 224, 218, 0.82)'
+  ctx.fillStyle = isNow ? rgba('#ffe9a6', alpha) : `rgba(226, 224, 218, ${0.82 * alpha})`
   ctx.fillText(text, x, y + paddingY)
 }
 
-function drawHopLabel(
-  ctx: CanvasRenderingContext2D,
-  source: { x: number; y: number },
-  target: { x: number; y: number },
-  hop: number,
-  globalScale: number,
-  opacity: number
-): void {
-  const text = `hop ${hop}`
-  const x = (source.x + target.x) / 2
-  const y = (source.y + target.y) / 2
-  const fontSize = 10 / globalScale
-  ctx.font = `750 ${fontSize}px Inter, system-ui, sans-serif`
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'middle'
+/** Zoom-based label level-of-detail: 0 hidden → 1 fully visible. */
+function labelAlpha(globalScale: number, isHub: boolean): number {
+  const [start, end] = isHub ? HUB_LABEL_FADE : NODE_LABEL_FADE
+  return Math.max(0, Math.min(1, (globalScale - start) / (end - start)))
+}
 
-  const width = ctx.measureText(text).width
-  const paddingX = 4 / globalScale
-  const paddingY = 2 / globalScale
-  const height = fontSize + paddingY * 2
+function degreePercentile(nodes: MapNode[], percentile: number): number {
+  const degrees = nodes
+    .filter((node) => node.kind === 'note')
+    .map((node) => node.degree)
+    .sort((left, right) => left - right)
+  if (degrees.length === 0) {
+    return Number.POSITIVE_INFINITY
+  }
 
-  ctx.fillStyle = `rgba(11, 11, 12, ${Math.min(0.86, opacity + 0.18)})`
-  roundedRect(
-    ctx,
-    x - width / 2 - paddingX,
-    y - height / 2,
-    width + paddingX * 2,
-    height,
-    4 / globalScale
+  const index = Math.min(degrees.length - 1, Math.floor(degrees.length * percentile))
+  return Math.max(1, degrees[index])
+}
+
+function nodeGlow(nodeId: string, glowByNode: Map<string, GlowEntry>): number {
+  const entry = glowByNode.get(nodeId)
+  if (!entry) {
+    return 0
+  }
+
+  const remaining = (entry.until - Date.now()) / LIVE_EDGE_FADE_MS
+  return remaining <= 0 ? 0 : Math.min(1, remaining) * entry.intensity
+}
+
+function endpointNode(value: unknown): MapNode | null {
+  if (typeof value !== 'object' || value === null) {
+    return null
+  }
+
+  const maybeNode = value as Partial<MapNode>
+  return typeof maybeNode.id === 'string' && typeof maybeNode.title === 'string'
+    ? (maybeNode as MapNode)
+    : null
+}
+
+function MapHoverPanel({
+  hoverNode,
+  hoverLink,
+  nowLabel
+}: {
+  hoverNode: GraphNodeObject | null
+  hoverLink: GraphLinkObject | null
+  nowLabel: string
+}): React.JSX.Element | null {
+  if (hoverNode) {
+    const isNow = String(hoverNode.id) === NOW_NODE_ID
+    if (isNow) {
+      return (
+        <aside className="map-hover-panel" aria-label="Hovered element">
+          <div className="map-hover-kicker">
+            <span
+              className="map-hover-dot"
+              style={{ '--dot-color': '#f5c518' } as CSSProperties}
+              aria-hidden="true"
+            />
+            Live transcript
+          </div>
+          <h3 className="map-hover-title">Now</h3>
+          <p className="map-hover-gist">&ldquo;&hellip;{nowLabel}&rdquo;</p>
+        </aside>
+      )
+    }
+
+    return (
+      <aside className="map-hover-panel" aria-label="Hovered note">
+        <div className="map-hover-kicker">
+          <span
+            className="map-hover-dot"
+            style={{ '--dot-color': sourceColor(hoverNode.source) } as CSSProperties}
+            aria-hidden="true"
+          />
+          {sourceLabel(hoverNode.source)}
+        </div>
+        <h3 className="map-hover-title">{hoverNode.title}</h3>
+        <p className={`map-hover-gist${hoverNode.gist ? '' : ' muted'}`}>
+          {hoverNode.gist || 'No summary yet'}
+        </p>
+        <div className="map-hover-meta">
+          <span>
+            {hoverNode.degree} connection{hoverNode.degree === 1 ? '' : 's'}
+          </span>
+          <span>click to open</span>
+        </div>
+      </aside>
+    )
+  }
+
+  if (hoverLink) {
+    const source = endpointNode(hoverLink.source)
+    const target = endpointNode(hoverLink.target)
+
+    if (hoverLink.kind === 'rank') {
+      return (
+        <aside className="map-hover-panel" aria-label="Hovered retrieval edge">
+          <div className="map-hover-kicker">
+            <span className="map-hover-edge-swatch rank" aria-hidden="true" />
+            Live retrieval · rank {hoverLink.rank}
+          </div>
+          {target ? <HoverEndpoint node={target} /> : null}
+        </aside>
+      )
+    }
+
+    if (hoverLink.kind !== 'static') {
+      return null
+    }
+
+    return (
+      <aside className="map-hover-panel" aria-label="Hovered connection">
+        <div className="map-hover-kicker">
+          <span className="map-hover-edge-swatch" aria-hidden="true" />
+          Connection · {hoverLink.edgeType} · w {hoverLink.weight.toFixed(2)}
+        </div>
+        {hoverLink.fact ? (
+          <p className="map-hover-fact">{hoverLink.fact}</p>
+        ) : hoverLink.shared.length > 0 ? (
+          <p className="map-hover-fact muted">Shared: {hoverLink.shared.join(', ')}</p>
+        ) : null}
+        <div className="map-hover-endpoints">
+          {source ? <HoverEndpoint node={source} /> : null}
+          {target ? <HoverEndpoint node={target} /> : null}
+        </div>
+      </aside>
+    )
+  }
+
+  return null
+}
+
+function HoverEndpoint({ node }: { node: MapNode }): React.JSX.Element {
+  return (
+    <div className="map-hover-endpoint">
+      <span
+        className="map-hover-dot"
+        style={{ '--dot-color': sourceColor(node.source) } as CSSProperties}
+        aria-hidden="true"
+      />
+      <div className="map-hover-endpoint-body">
+        <strong>{node.title}</strong>
+        {node.gist ? <p>{node.gist}</p> : null}
+      </div>
+    </div>
   )
-  ctx.fill()
-
-  ctx.fillStyle = rgba('#e5b23c', Math.min(0.95, opacity + 0.28))
-  ctx.fillText(text, x, y)
 }
 
 function roundedRect(

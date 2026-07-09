@@ -526,6 +526,10 @@ export async function syncConnector(
   return payload === null ? null : parseConnectorSyncReport(payload)
 }
 
+export async function syncAllConnectors(options: SidecarRequestOptions = {}): Promise<void> {
+  await requestSidecar('/index/sync', { method: 'POST' }, options)
+}
+
 export async function updateConnectorConfig(
   connectorId: string,
   config: Record<string, unknown>,

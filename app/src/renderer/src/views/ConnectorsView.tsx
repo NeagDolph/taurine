@@ -21,14 +21,13 @@ export function ConnectorsView({
   onReenrich
 }: ConnectorsViewProps): React.JSX.Element {
   return (
-    <div className="page connectors-page" aria-label="Connectors">
+    <div className="page connectors-page" aria-label="Connectors" aria-hidden={!visible}>
       <header className="page-intro">
         <h2>Connectors</h2>
         <p>
-          Local sources feeding the index. Enable a connector and sync it to pull its documents
-          into the graph — everything downstream (enrichment, retrieval, the map) treats every
-          source the same. Disabling keeps the data stored but drops it from the graph and
-          retrieval until re-enabled.
+          Local sources feeding the index. Every enabled source flows through the same pipeline —
+          enrichment, retrieval, and the map treat all documents alike. Disabling keeps the data
+          stored but drops it from the graph until re-enabled.
         </p>
       </header>
       <ConnectionsPanel
@@ -38,7 +37,6 @@ export function ConnectorsView({
         reenrichError={reenrichError}
         reenriching={reenriching}
         reenrichTarget={reenrichTarget}
-        visible={visible}
       />
     </div>
   )

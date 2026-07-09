@@ -2,14 +2,15 @@ import {
   deleteConnectorData,
   disableConnector,
   enableConnector,
+  syncAllConnectors,
   syncConnector,
   updateConnectorConfig,
   type ConnectorInfo
 } from '../lib/sidecar'
+import { sourceColor } from '../lib/graph'
 import { useCallback, useMemo, useState } from 'react'
 
 interface ConnectionsPanelProps {
-  visible: boolean
   connectors: ConnectorInfo[] | null
   reenriching: boolean
   reenrichError: string
@@ -18,13 +19,12 @@ interface ConnectionsPanelProps {
   onReenrich: (source?: string) => void
 }
 
-type PendingAction = 'enable' | 'disable' | 'delete' | 'sync' | 'config'
+type PendingAction = 'enable' | 'disable' | 'delete' | 'sync' | 'config' | 'sync-all'
+type ConnectorStatus = 'syncing' | 'attention' | 'active' | 'off'
 
 const APPLE_NOTES_CONNECTOR_ID = 'apple_notes'
-const OBSIDIAN_CONNECTOR_ID = 'obsidian'
 
 export function ConnectionsPanel({
-  visible,
   connectors,
   reenriching,
   reenrichError,
@@ -32,20 +32,20 @@ export function ConnectionsPanel({
   reenrichTarget,
   onReenrich
 }: ConnectionsPanelProps): React.JSX.Element {
-  const [cardErrors, setCardErrors] = useState<Record<string, string>>({})
+  const [rowErrors, setRowErrors] = useState<Record<string, string>>({})
   const [pendingById, setPendingById] = useState<Record<string, PendingAction | undefined>>({})
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set())
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
-  const [configDrafts, setConfigDrafts] = useState<Record<string, string>>({})
-  const [dirtyConfigIds, setDirtyConfigIds] = useState<Set<string>>(() => new Set())
+  const [configDrafts, setConfigDrafts] = useState<Record<string, Record<string, string>>>({})
+  const [syncAllPending, setSyncAllPending] = useState(false)
+  const [panelError, setPanelError] = useState('')
 
-  void visible
-
-  const setCardError = useCallback((connectorId: string, message: string) => {
-    setCardErrors((current) => ({ ...current, [connectorId]: message }))
+  const setRowError = useCallback((connectorId: string, message: string) => {
+    setRowErrors((current) => ({ ...current, [connectorId]: message }))
   }, [])
 
-  const clearCardError = useCallback((connectorId: string) => {
-    setCardErrors((current) => {
+  const clearRowError = useCallback((connectorId: string) => {
+    setRowErrors((current) => {
       if (!current[connectorId]) {
         return current
       }
@@ -60,39 +60,71 @@ export function ConnectionsPanel({
   const runConnectorAction = useCallback(
     async (connectorId: string, action: PendingAction, request: () => Promise<void>) => {
       setPendingById((current) => ({ ...current, [connectorId]: action }))
-      clearCardError(connectorId)
+      clearRowError(connectorId)
 
       try {
         await request()
         setConfirmDeleteId(null)
       } catch (error) {
-        setCardError(connectorId, error instanceof Error ? error.message : 'Connector action failed')
+        setRowError(connectorId, error instanceof Error ? error.message : 'Connector action failed')
       } finally {
         setPendingById((current) => ({ ...current, [connectorId]: undefined }))
       }
     },
-    [clearCardError, setCardError]
+    [clearRowError, setRowError]
   )
 
-  const updateConfigDraft = useCallback((connectorId: string, value: string) => {
-    setConfigDrafts((current) => ({ ...current, [connectorId]: value }))
-    setDirtyConfigIds((current) => new Set(current).add(connectorId))
+  const toggleExpanded = useCallback((connectorId: string) => {
+    setExpandedIds((current) => {
+      const next = new Set(current)
+      if (next.has(connectorId)) {
+        next.delete(connectorId)
+      } else {
+        next.add(connectorId)
+      }
+      return next
+    })
   }, [])
 
-  const saveObsidianConfig = useCallback(
-    async (connectorId: string) => {
-      const vaultPath = configDrafts[connectorId] ?? ''
-      await runConnectorAction(connectorId, 'config', async () => {
-        await updateConnectorConfig(connectorId, { vault_path: vaultPath.trim() })
-        setDirtyConfigIds((current) => {
-          const next = new Set(current)
-          next.delete(connectorId)
+  const updateConfigDraft = useCallback((connectorId: string, key: string, value: string) => {
+    setConfigDrafts((current) => ({
+      ...current,
+      [connectorId]: { ...current[connectorId], [key]: value }
+    }))
+  }, [])
+
+  const saveConfig = useCallback(
+    async (connector: ConnectorInfo) => {
+      const drafts = configDrafts[connector.connector_id] ?? {}
+      // PUT replaces the whole config dict, so merge drafts over current values
+      const payload: Record<string, unknown> = { ...connector.config }
+      for (const [key, draft] of Object.entries(drafts)) {
+        payload[key] = parseConfigValue(draft, connector.config[key])
+      }
+
+      await runConnectorAction(connector.connector_id, 'config', async () => {
+        await updateConnectorConfig(connector.connector_id, payload)
+        setConfigDrafts((current) => {
+          const next = { ...current }
+          delete next[connector.connector_id]
           return next
         })
       })
     },
     [configDrafts, runConnectorAction]
   )
+
+  const runSyncAll = useCallback(async () => {
+    setSyncAllPending(true)
+    setPanelError('')
+    try {
+      await syncAllConnectors()
+    } catch (error) {
+      setPanelError(error instanceof Error ? error.message : 'Sync failed')
+    } finally {
+      setSyncAllPending(false)
+    }
+  }, [])
 
   const sortedConnectors = useMemo(() => {
     return [...(connectors ?? [])].sort((left, right) => {
@@ -106,11 +138,40 @@ export function ConnectionsPanel({
     })
   }, [connectors])
 
+  const activeCount = useMemo(
+    () => sortedConnectors.filter((c) => c.enabled && c.available).length,
+    [sortedConnectors]
+  )
+  const totalDocs = useMemo(
+    () => sortedConnectors.reduce((sum, c) => sum + Math.max(0, c.docs), 0),
+    [sortedConnectors]
+  )
+  const anySyncing = sortedConnectors.some((c) => c.syncing)
+
   return (
     <section className="connections-panel" aria-label="Connections">
       <div className="connections-panel-header">
-        <span className="section-label">Sources</span>
+        <div className="connections-panel-heading">
+          <span className="section-label">Sources</span>
+          {connectors !== null ? (
+            <span className="connections-panel-stats">
+              {activeCount} active · {formatCount(totalDocs)} docs indexed
+            </span>
+          ) : null}
+        </div>
         <div className="panel-card-actions">
+          <button
+            className="secondary-button compact"
+            type="button"
+            disabled={syncAllPending || anySyncing}
+            onClick={() => void runSyncAll()}
+            title="Sync every enabled connector now"
+          >
+            {syncAllPending || anySyncing ? (
+              <span className="inline-spinner" aria-hidden="true" />
+            ) : null}
+            {syncAllPending || anySyncing ? 'Syncing' : 'Sync all'}
+          </button>
           <button
             className="secondary-button compact"
             type="button"
@@ -126,29 +187,35 @@ export function ConnectionsPanel({
         </div>
       </div>
 
-      {reenrichError ? (
+      {reenrichError || panelError ? (
         <div className="connections-panel-error" role="alert">
-          {reenrichError}
+          {reenrichError || panelError}
         </div>
       ) : null}
 
       {connectors === null ? (
-        <div className="empty-surface">Loading connections</div>
+        <div className="connector-list" aria-hidden="true">
+          {[0, 1, 2, 3].map((index) => (
+            <div className="connector-row skeleton" key={index}>
+              <span className="connector-glyph" />
+              <span className="connector-skeleton-lines">
+                <span />
+                <span />
+              </span>
+            </div>
+          ))}
+        </div>
       ) : sortedConnectors.length === 0 ? (
         <div className="empty-surface">No connectors reported</div>
       ) : (
         <div className="connector-list">
           {sortedConnectors.map((connector) => (
-            <ConnectorCard
-              configDirty={dirtyConfigIds.has(connector.connector_id)}
-              configDraft={
-                dirtyConfigIds.has(connector.connector_id)
-                  ? configDrafts[connector.connector_id] ?? ''
-                  : configString(connector, 'vault_path')
-              }
+            <ConnectorRow
+              configDrafts={configDrafts[connector.connector_id] ?? {}}
               connector={connector}
               confirmDelete={confirmDeleteId === connector.connector_id}
-              error={cardErrors[connector.connector_id] ?? ''}
+              error={rowErrors[connector.connector_id] ?? ''}
+              expanded={expandedIds.has(connector.connector_id)}
               key={connector.connector_id}
               pendingAction={pendingById[connector.connector_id]}
               reenrichDisabled={reenrichDisabled}
@@ -160,6 +227,12 @@ export function ConnectionsPanel({
                 )
               }
               onRequestDelete={() => setConfirmDeleteId(connector.connector_id)}
+              onSaveConfig={() => void saveConfig(connector)}
+              onSync={() =>
+                void runConnectorAction(connector.connector_id, 'sync', async () => {
+                  await syncConnector(connector.connector_id)
+                })
+              }
               onToggle={() =>
                 void runConnectorAction(
                   connector.connector_id,
@@ -170,14 +243,9 @@ export function ConnectionsPanel({
                       : enableConnector(connector.connector_id)
                 )
               }
+              onToggleExpanded={() => toggleExpanded(connector.connector_id)}
               onReenrich={() => onReenrich(connector.connector_id)}
-              onSaveConfig={() => void saveObsidianConfig(connector.connector_id)}
-              onSync={() =>
-                void runConnectorAction(connector.connector_id, 'sync', async () => {
-                  await syncConnector(connector.connector_id)
-                })
-              }
-              onUpdateConfig={(value) => updateConfigDraft(connector.connector_id, value)}
+              onUpdateConfig={(key, value) => updateConfigDraft(connector.connector_id, key, value)}
             />
           ))}
         </div>
@@ -186,16 +254,17 @@ export function ConnectionsPanel({
   )
 }
 
-function ConnectorCard({
+function ConnectorRow({
   connector,
   pendingAction,
   error,
-  configDraft,
-  configDirty,
+  expanded,
+  configDrafts,
   confirmDelete,
   reenriching,
   reenrichDisabled,
   onToggle,
+  onToggleExpanded,
   onRequestDelete,
   onConfirmDelete,
   onCancelDelete,
@@ -207,140 +276,233 @@ function ConnectorCard({
   connector: ConnectorInfo
   pendingAction?: PendingAction
   error: string
-  configDraft: string
-  configDirty: boolean
+  expanded: boolean
+  configDrafts: Record<string, string>
   confirmDelete: boolean
   reenriching: boolean
   reenrichDisabled: boolean
   onToggle: () => void
+  onToggleExpanded: () => void
   onRequestDelete: () => void
   onConfirmDelete: () => void
   onCancelDelete: () => void
   onSync: () => void
-  onUpdateConfig: (value: string) => void
+  onUpdateConfig: (key: string, value: string) => void
   onSaveConfig: () => void
   onReenrich: () => void
 }): React.JSX.Element {
-  const isObsidian = connector.connector_id === OBSIDIAN_CONNECTOR_ID
+  const status = connectorStatus(connector)
+  const signInRequired = connector.kind === 'oauth' && !connector.available
   const syncRunning = connector.syncing || pendingAction === 'sync'
   const syncDisabled = syncRunning || !connector.available || !connector.enabled
   const toggleDisabled = pendingAction === 'enable' || pendingAction === 'disable'
-  const deleteDisabled =
-    pendingAction === 'delete' || connector.syncing || connector.docs === 0
-  const configInputId = `connector-config-${connector.connector_id}`
+  const deleteDisabled = pendingAction === 'delete' || connector.syncing || connector.docs === 0
+  const configKeys = Object.keys(connector.config).filter((key) =>
+    isEditableConfigValue(connector.config[key])
+  )
+  const configDirty = Object.entries(configDrafts).some(
+    ([key, draft]) => draft !== formatConfigValue(connector.config[key])
+  )
+  const detailId = `connector-detail-${connector.connector_id}`
+  const progressFraction =
+    connector.syncing && connector.sync_total > 0
+      ? Math.min(1, connector.sync_done / connector.sync_total)
+      : null
 
   return (
-    <article className="connector-card">
-      <div className="connector-card-main">
-        <div className="connector-title-block">
-          <div className="connector-label-row">
-            <h2>{connector.label}</h2>
-            <span className="connector-kind-badge">{connector.kind}</span>
-          </div>
-          <div className={`connector-availability ${connector.available ? 'available' : 'unavailable'}`}>
-            <span aria-hidden="true" />
-            <p>{connector.available ? 'Available' : connector.detail || 'Unavailable'}</p>
-          </div>
-        </div>
+    <article className={`connector-row status-${status}${expanded ? ' expanded' : ''}`}>
+      <div
+        className="connector-row-head"
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        aria-controls={detailId}
+        onClick={onToggleExpanded}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            onToggleExpanded()
+          }
+        }}
+      >
+        <span
+          className="connector-glyph"
+          style={{ '--glyph-color': sourceColor(connector.connector_id) } as React.CSSProperties}
+          aria-hidden="true"
+        >
+          <ConnectorGlyph connectorId={connector.connector_id} />
+        </span>
 
-        <div className="connector-stats">
-          <span>
-            <strong>{formatCount(connector.docs)}</strong>
-            {connector.enabled ? 'docs' : 'docs stored'}
+        <span className="connector-identity">
+          <span className="connector-name">
+            {connector.label}
+            {connector.kind === 'oauth' ? (
+              <span className="connector-oauth-badge">OAuth</span>
+            ) : null}
           </span>
-          <span>
-            <strong>{formatRelativeTime(connector.last_sync)}</strong>
-            last sync
+          <span className="connector-subtitle">
+            <span className={`connector-status-dot ${status}`} aria-hidden="true" />
+            {subtitleFor(connector, status, signInRequired)}
           </span>
-        </div>
+        </span>
+
+        <span className="connector-head-actions">
+          <button
+            className={`connector-switch${connector.enabled ? ' on' : ''}`}
+            type="button"
+            role="switch"
+            aria-checked={connector.enabled}
+            aria-label={`${connector.label} ${connector.enabled ? 'enabled' : 'disabled'}`}
+            disabled={toggleDisabled}
+            title={
+              connector.enabled
+                ? 'Disable — keeps stored data, removes it from the graph and retrieval'
+                : 'Enable — stored data rejoins the graph and retrieval'
+            }
+            onClick={(event) => {
+              event.stopPropagation()
+              onToggle()
+            }}
+          >
+            <span aria-hidden="true" />
+          </button>
+          <span className={`connector-chevron${expanded ? ' open' : ''}`} aria-hidden="true">
+            <svg viewBox="0 0 12 12" width="12" height="12">
+              <path
+                d="M3 4.5 6 7.5 9 4.5"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </span>
+        </span>
       </div>
 
-      {isObsidian ? (
-        <div className="connector-config-row">
-          <label htmlFor={configInputId}>Vault path</label>
-          <input
-            id={configInputId}
-            type="text"
-            value={configDraft}
-            placeholder="/Users/name/Obsidian/Vault"
-            onChange={(event) => onUpdateConfig(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && configDirty && pendingAction !== 'config') {
-                onSaveConfig()
-              }
-            }}
+      {connector.syncing ? (
+        <div className="connector-progress" aria-hidden="true">
+          <span
+            className={progressFraction === null ? 'indeterminate' : ''}
+            style={
+              progressFraction === null
+                ? undefined
+                : { width: `${Math.round(progressFraction * 100)}%` }
+            }
           />
-          <button
-            className="secondary-button compact"
-            type="button"
-            disabled={!configDirty || pendingAction === 'config'}
-            onClick={onSaveConfig}
-          >
-            {pendingAction === 'config' ? 'Saving' : 'Save'}
-          </button>
         </div>
       ) : null}
 
-      <div className="connector-actions">
-        <button
-          className={`connector-toggle${connector.enabled ? ' enabled' : ''}`}
-          type="button"
-          aria-pressed={connector.enabled}
-          disabled={toggleDisabled}
-          onClick={onToggle}
-          title={
-            connector.enabled
-              ? 'Disable — keeps stored data, removes it from the graph and retrieval'
-              : 'Enable — stored data rejoins the graph and retrieval'
-          }
-        >
-          <span aria-hidden="true" />
-          {connector.enabled ? 'Enabled' : 'Disabled'}
-        </button>
-
-        <button className="secondary-button compact" type="button" disabled={syncDisabled} onClick={onSync}>
-          {syncRunning ? (
-            <span className="inline-spinner" aria-hidden="true" />
+      {expanded ? (
+        <div className="connector-detail" id={detailId}>
+          {!signInRequired && connector.detail ? (
+            <p className={`connector-detail-note${status === 'attention' ? ' attention' : ''}`}>
+              {connector.detail}
+            </p>
           ) : null}
-          {syncRunning ? syncProgressLabel(connector) : 'Sync'}
-        </button>
 
-        <button
-          className="secondary-button compact"
-          type="button"
-          disabled={reenrichDisabled || !connector.enabled || connector.docs === 0}
-          onClick={onReenrich}
-          title={`Re-run enrichment for the ${connector.docs} ${connector.label} document${connector.docs === 1 ? '' : 's'} already indexed`}
-        >
-          {reenriching ? (
-            <span className="inline-spinner" aria-hidden="true" />
+          {signInRequired ? <SignInBlock connector={connector} /> : null}
+
+          {configKeys.length > 0 ? (
+            <div className="connector-config">
+              <span className="connector-detail-label">Configuration</span>
+              {configKeys.map((key) => {
+                const inputId = `connector-config-${connector.connector_id}-${key}`
+                const meta = configFieldMeta(key)
+                const draft = configDrafts[key] ?? formatConfigValue(connector.config[key])
+
+                return (
+                  <div className="connector-config-field" key={key}>
+                    <label htmlFor={inputId}>{meta.label}</label>
+                    <input
+                      id={inputId}
+                      type="text"
+                      value={draft}
+                      placeholder={meta.placeholder}
+                      spellCheck={false}
+                      onChange={(event) => onUpdateConfig(key, event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' && configDirty && pendingAction !== 'config') {
+                          onSaveConfig()
+                        }
+                      }}
+                    />
+                  </div>
+                )
+              })}
+              <div className="connector-config-actions">
+                <button
+                  className="secondary-button compact"
+                  type="button"
+                  disabled={!configDirty || pendingAction === 'config'}
+                  onClick={onSaveConfig}
+                >
+                  {pendingAction === 'config' ? 'Saving' : 'Save changes'}
+                </button>
+              </div>
+            </div>
           ) : null}
-          {reenriching ? 'Re-enriching' : 'Re-enrich'}
-        </button>
 
-        <button
-          className="secondary-button compact danger"
-          type="button"
-          disabled={deleteDisabled}
-          onClick={onRequestDelete}
-          title={`Delete all ${formatCount(connector.docs)} stored ${connector.label} documents from the index`}
-        >
-          {pendingAction === 'delete' ? 'Deleting' : 'Delete data'}
-        </button>
-      </div>
+          <div className="connector-detail-actions">
+            <button
+              className="secondary-button compact"
+              type="button"
+              disabled={syncDisabled}
+              onClick={onSync}
+            >
+              {syncRunning ? <span className="inline-spinner" aria-hidden="true" /> : null}
+              {syncRunning ? syncProgressLabel(connector) : 'Sync now'}
+            </button>
+            <button
+              className="secondary-button compact"
+              type="button"
+              disabled={reenrichDisabled || !connector.enabled || connector.docs === 0}
+              onClick={onReenrich}
+              title={`Re-run enrichment for the ${connector.docs} ${connector.label} document${connector.docs === 1 ? '' : 's'} already indexed`}
+            >
+              {reenriching ? <span className="inline-spinner" aria-hidden="true" /> : null}
+              {reenriching ? 'Re-enriching' : 'Re-enrich'}
+            </button>
+            <span className="connector-detail-spacer" />
+            <button
+              className="secondary-button compact danger"
+              type="button"
+              disabled={deleteDisabled}
+              onClick={onRequestDelete}
+              title={`Delete all ${formatCount(connector.docs)} stored ${connector.label} documents from the index`}
+            >
+              {pendingAction === 'delete' ? 'Deleting' : 'Delete data'}
+            </button>
+          </div>
 
-      {confirmDelete ? (
-        <div className="connector-confirm" role="group" aria-label={`Delete ${connector.label} data`}>
-          <span>
-            Delete all {formatCount(connector.docs)} stored document
-            {connector.docs === 1 ? '' : 's'}? A future sync can re-import them.
-          </span>
-          <button className="secondary-button compact danger" type="button" onClick={onConfirmDelete}>
-            Delete
-          </button>
-          <button className="icon-button" type="button" aria-label="Cancel delete" onClick={onCancelDelete}>
-            &times;
-          </button>
+          {confirmDelete ? (
+            <div
+              className="connector-confirm"
+              role="group"
+              aria-label={`Delete ${connector.label} data`}
+            >
+              <span>
+                Delete all {formatCount(connector.docs)} stored document
+                {connector.docs === 1 ? '' : 's'}? A future sync can re-import them.
+              </span>
+              <button
+                className="secondary-button compact danger"
+                type="button"
+                onClick={onConfirmDelete}
+              >
+                Delete
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label="Cancel delete"
+                onClick={onCancelDelete}
+              >
+                &times;
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
 
@@ -353,9 +515,201 @@ function ConnectorCard({
   )
 }
 
-function configString(connector: ConnectorInfo, key: string): string {
-  const value = connector.config[key]
-  return typeof value === 'string' ? value : ''
+function SignInBlock({ connector }: { connector: ConnectorInfo }): React.JSX.Element {
+  const [copied, setCopied] = useState(false)
+  const command = signInCommand(connector)
+
+  return (
+    <div className="connector-signin">
+      <p>
+        Sign in runs a one-time local OAuth flow in your terminal and stores the tokens in{' '}
+        <code>core/.env</code>. Restart the sidecar afterwards.
+      </p>
+      <div className="connector-command">
+        <code>{command}</code>
+        <button
+          className="secondary-button compact"
+          type="button"
+          onClick={() => {
+            void navigator.clipboard.writeText(command).then(() => {
+              setCopied(true)
+              window.setTimeout(() => setCopied(false), 1600)
+            })
+          }}
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function ConnectorGlyph({ connectorId }: { connectorId: string }): React.JSX.Element {
+  const common = {
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.6,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const
+  }
+
+  switch (connectorId) {
+    case 'apple_notes':
+      return (
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+          <rect x="3.5" y="3" width="13" height="14" rx="2.5" {...common} />
+          <path d="M6.5 7.5h7M6.5 10.5h7M6.5 13.5h4" {...common} />
+        </svg>
+      )
+    case 'obsidian':
+      return (
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+          <path d="M10 2.5 15.5 7l-1.8 9.5H6.3L4.5 7 10 2.5Z" {...common} />
+          <path d="M10 2.5 8.8 16.5" {...common} />
+        </svg>
+      )
+    case 'imessage':
+      return (
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+          <path
+            d="M10 3.5c-4 0-7 2.6-7 5.8 0 1.9 1 3.5 2.7 4.6-.1.9-.5 1.9-1.2 2.6 1.4-.2 2.6-.7 3.4-1.3.7.2 1.4.3 2.1.3 4 0 7-2.6 7-5.9s-3-6.1-7-6.1Z"
+            {...common}
+          />
+        </svg>
+      )
+    case 'claude_mem':
+      return (
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+          <path d="M10 3v14M4 6.5l12 7M16 6.5l-12 7" {...common} />
+        </svg>
+      )
+    case 'codex_mem':
+      return (
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+          <rect x="2.5" y="4" width="15" height="12" rx="2" {...common} />
+          <path d="M6 8.5 8.5 10.5 6 12.5M10.5 13h3.5" {...common} />
+        </svg>
+      )
+    case 'gmail':
+    case 'outlook':
+      return (
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+          <rect x="2.5" y="4.5" width="15" height="11" rx="2" {...common} />
+          <path d="m3.5 6.5 6.5 4.8 6.5-4.8" {...common} />
+        </svg>
+      )
+    default:
+      return (
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+          <circle cx="10" cy="10" r="6.5" {...common} />
+          <path d="M10 6.5v3.5l2.5 2" {...common} />
+        </svg>
+      )
+  }
+}
+
+function connectorStatus(connector: ConnectorInfo): ConnectorStatus {
+  if (connector.syncing) {
+    return 'syncing'
+  }
+  if (!connector.enabled) {
+    return 'off'
+  }
+  return connector.available ? 'active' : 'attention'
+}
+
+function subtitleFor(
+  connector: ConnectorInfo,
+  status: ConnectorStatus,
+  signInRequired: boolean
+): string {
+  if (status === 'syncing') {
+    return syncProgressLabel(connector)
+  }
+  if (status === 'attention') {
+    return signInRequired ? 'Sign in required' : 'Needs attention'
+  }
+  if (status === 'off') {
+    return connector.docs > 0 ? `Off · ${formatCount(connector.docs)} docs stored` : 'Off'
+  }
+  if (connector.docs === 0) {
+    return 'Ready · no documents yet'
+  }
+  return `${formatCount(connector.docs)} docs · synced ${formatRelativeTime(connector.last_sync)}`
+}
+
+function signInCommand(connector: ConnectorInfo): string {
+  if (connector.connector_id === 'gmail' || connector.connector_id === 'outlook') {
+    return `cd core && uv run python -m taurine_core.connectors.email_auth ${connector.connector_id}`
+  }
+
+  const match = connector.detail.match(/run: (.+)$/)
+  return match ? match[1] : ''
+}
+
+const CONFIG_FIELD_META: Record<string, { label: string; placeholder: string }> = {
+  vault: { label: 'Vault path', placeholder: '/Users/name/Obsidian/Vault' },
+  glob: { label: 'Memory file glob', placeholder: '~/.claude/**/MEMORY.md' },
+  globs: { label: 'Memory file globs (comma-separated)', placeholder: '~/.codex/memory/*.md' },
+  db: { label: 'Database path', placeholder: '~/Library/Messages/chat.db' },
+  contacts_glob: {
+    label: 'Contacts database glob',
+    placeholder: '~/Library/Application Support/AddressBook/**/*.abcddb'
+  },
+  window_days: { label: 'Sync window (days)', placeholder: '30' }
+}
+
+function configFieldMeta(key: string): { label: string; placeholder: string } {
+  const known = CONFIG_FIELD_META[key]
+  if (known) {
+    return known
+  }
+
+  const label = key
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((part, index) => (index === 0 ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+    .join(' ')
+  return { label, placeholder: '' }
+}
+
+function isEditableConfigValue(value: unknown): boolean {
+  return (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    (Array.isArray(value) && value.every((item) => typeof item === 'string'))
+  )
+}
+
+function formatConfigValue(value: unknown): string {
+  if (typeof value === 'string') {
+    return value
+  }
+  if (typeof value === 'number') {
+    return String(value)
+  }
+  if (Array.isArray(value)) {
+    return value.join(', ')
+  }
+  return ''
+}
+
+/** Parse a draft back to the type of the value it replaces. */
+function parseConfigValue(draft: string, current: unknown): unknown {
+  const trimmed = draft.trim()
+  if (typeof current === 'number') {
+    const parsed = Number(trimmed)
+    return Number.isFinite(parsed) ? parsed : current
+  }
+  if (Array.isArray(current)) {
+    return trimmed.length === 0
+      ? []
+      : trimmed
+          .split(',')
+          .map((item) => item.trim())
+          .filter(Boolean)
+  }
+  return trimmed
 }
 
 function formatCount(value: number): string {
@@ -364,7 +718,7 @@ function formatCount(value: number): string {
 
 function formatRelativeTime(epoch: number | null | undefined): string {
   if (!epoch) {
-    return 'Never'
+    return 'never'
   }
 
   const millis = epoch > 1_000_000_000_000 ? epoch : epoch * 1000
@@ -372,7 +726,7 @@ function formatRelativeTime(epoch: number | null | undefined): string {
   const absSeconds = Math.abs(diffSeconds)
 
   if (absSeconds < 60) {
-    return diffSeconds >= 0 ? 'Just now' : 'Soon'
+    return 'just now'
   }
 
   const units: Array<[Intl.RelativeTimeFormatUnit, number]> = [
@@ -391,9 +745,8 @@ function formatRelativeTime(epoch: number | null | undefined): string {
     }
   }
 
-  return 'Just now'
+  return 'just now'
 }
-
 
 function syncProgressLabel(connector: ConnectorInfo): string {
   if (connector.sync_total > 0) {
