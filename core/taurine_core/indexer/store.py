@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
 
 import numpy as np
@@ -32,6 +32,9 @@ from taurine_core.schemas import (
     NoteRecord,
     RelationTriple,
 )
+
+if TYPE_CHECKING:
+    from taurine_core.retrieval.snapshot import IndexSnapshot, RetrievalSnapshotPort
 
 EmbeddingKind = Literal["chunk", "gist", "utterance"]
 EmbeddingInput = tuple[EmbeddingKind, str, np.ndarray]
@@ -134,9 +137,16 @@ def _embed_queries_with_prompt(texts: list[str], prompt: str | None) -> np.ndarr
 
 
 class Index:
-    def __init__(self, db_path: str | Path, *, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        read_only: bool = False,
+        knowledge_snapshots: "RetrievalSnapshotPort | None" = None,
+    ) -> None:
         self.db_path = Path(db_path)
         self._read_only = bool(read_only)
+        self._knowledge_snapshots = knowledge_snapshots
         if self._read_only:
             if not self.db_path.exists():
                 raise FileNotFoundError(self.db_path)
@@ -240,6 +250,16 @@ class Index:
 
     def close(self) -> None:
         self._conn.close()
+
+    def retrieval_snapshot(self) -> "IndexSnapshot":
+        if self._knowledge_snapshots is None:
+            raise RuntimeError("no active derived knowledge snapshot")
+        return self._knowledge_snapshots.get()
+
+    def active_snapshot_id(self) -> str:
+        if self._knowledge_snapshots is None:
+            return ""
+        return self._knowledge_snapshots.get().build_id
 
     def upsert_note(
         self,
