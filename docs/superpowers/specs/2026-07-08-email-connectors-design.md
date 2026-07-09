@@ -81,9 +81,13 @@ thread re-enriches; unchanged threads are skipped.
 4. Subject matches `EMAIL_TRANSACTIONAL_SUBJECT_RE` (receipt/invoice/verify/password
    reset/security alert/statement/order confirmation/…) **and** you never replied →
    drop (transactional noise; a billing thread you actually discussed survives).
-5. Single-message thread, not from you, sender not in Contacts and not in the
-   correspondent set (addresses appearing in any thread where you sent a message) →
-   drop (cold outreach, one-off automation).
+
+There is deliberately no unknown-sender drop (removed 2026-07-09 after real-inbox
+calibration): calendar invites/accepts are single-message threads from addresses the
+user may never have written to, and the rule ate exactly those. Unknown senders
+instead earn no `known_participant` weight in stage 2, so they sink in the cap
+ordering; a future system will keep low-value notes away from expensive LLM
+adjudication.
 
 Contacts resolution reuses the iMessage AddressBook reader (`_contact_names` /
 `CONTACTS_DB_GLOB`), whose map already contains email → display-name entries. The

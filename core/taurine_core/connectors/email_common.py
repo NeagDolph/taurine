@@ -3,8 +3,8 @@ and thread → NoteRecord conversion. Deterministic — no LLM anywhere.
 
 Funnel stages (spec 2026-07-08-email-connectors):
   1. deterministic drops   — window, unsubscribe/bulk, noreply-only,
-                             transactional subjects, unknown single-message
-                             senders (a reply from you rescues any of these)
+                             transactional subjects (a reply from you rescues
+                             any of these)
   2. importance score+cap  — recency × replied × known-participant × flagged
                              × length, top EMAIL_MAX_THREADS survive
   3. rendering             — [me]/[Name] transcript, quote/signature stripping
@@ -71,7 +71,6 @@ def funnel_threads(
         "unsubscribe": 0,
         "noreply": 0,
         "transactional": 0,
-        "unknown_single": 0,
         "cap": 0,
     }
     survivors: list[EmailThread] = []
@@ -95,11 +94,11 @@ def funnel_threads(
             if transactional.search(thread.subject or ""):
                 dropped["transactional"] += 1
                 continue
-            if len(thread.messages) == 1 and not _known_sender(
-                thread.messages[0], contacts, correspondents
-            ):
-                dropped["unknown_single"] += 1
-                continue
+        # no unknown-sender drop: calendar invites/accepts are single-message
+        # threads from addresses you may never have written to, and real-inbox
+        # calibration (2026-07-09) showed the rule eating exactly those.
+        # Unknown senders simply score no known_participant weight, so they
+        # sink in the cap ordering instead of vanishing.
         survivors.append(thread)
 
     survivors.sort(

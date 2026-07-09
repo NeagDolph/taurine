@@ -103,35 +103,43 @@ def test_transactional_rescued_by_reply() -> None:
     assert len(kept) == 1
 
 
-def test_unknown_single_message_sender_dropped() -> None:
-    kept, report = _run(_thread(_msg(sender="stranger@cold-outreach.io")))
-    assert kept == []
-    assert report.dropped["unknown_single"] == 1
-
-
-def test_single_message_from_contact_kept() -> None:
-    kept, _ = _run(
-        _thread(_msg(sender="alice@example.com")),
-        contacts={"alice@example.com": "Alice"},
-    )
+def test_unknown_single_message_sender_kept() -> None:
+    # no unknown-sender drop (2026-07-09 calibration): calendar invites and
+    # accepts are single-message threads from unfamiliar addresses
+    kept, _ = _run(_thread(_msg(sender="stranger@cold-outreach.io")))
     assert len(kept) == 1
 
 
-def test_correspondent_set_rescues_single_message() -> None:
-    # bob appears as a recipient of a message YOU sent in another thread →
-    # bob's separate single-message thread is a known correspondent, kept
+def test_unknown_sender_ranks_below_known_sender() -> None:
+    known = EmailThread(
+        thread_id="known", subject="Sync", messages=[_msg(sender="alice@example.com")]
+    )
+    unknown = EmailThread(
+        thread_id="unknown",
+        subject="Intro",
+        messages=[_msg(sender="stranger@cold-outreach.io")],
+    )
+    kept, _ = _run(unknown, known, contacts={"alice@example.com": "Alice"})
+    assert [t.thread_id for t in kept] == ["known", "unknown"]
+
+
+def test_correspondent_counts_as_known_for_ranking() -> None:
+    # bob is a recipient of a message YOU sent in another thread → his
+    # single-message thread outranks an equally-recent unknown sender's
     replied = EmailThread(
         thread_id="t-replied",
         subject="Q3 numbers",
         messages=[_msg(from_me=True, recipients=("bob@corp.com",)), _msg(sender="bob@corp.com")],
     )
-    single = EmailThread(
-        thread_id="t-single",
-        subject="One more thing",
-        messages=[_msg(sender="bob@corp.com")],
+    from_bob = EmailThread(
+        thread_id="t-bob", subject="One more thing", messages=[_msg(sender="bob@corp.com")]
     )
-    kept, _ = _run(replied, single)
-    assert {t.thread_id for t in kept} == {"t-replied", "t-single"}
+    from_stranger = EmailThread(
+        thread_id="t-stranger", subject="Hello", messages=[_msg(sender="who@nowhere.io")]
+    )
+    kept, _ = _run(replied, from_stranger, from_bob)
+    assert kept[-1].thread_id == "t-stranger"
+    assert {t.thread_id for t in kept} == {"t-replied", "t-bob", "t-stranger"}
 
 
 def test_empty_thread_dropped() -> None:
