@@ -43,3 +43,34 @@
 - Idempotency: safe to rerun. Embedding deletes become zero-count on later runs; display-line recomputation is deterministic; extraction backfill replaces per-note entity/relation rows and cache on success; failed extractions leave old state untouched; graph/rank/value passes are full rebuilds; adjudication skips cached valid judgments and reports only positive cache count delta.
 - Matrix consistency: after step 1 deletes embeddings, `index.load()` refreshes the in-memory dense matrix before step 4. The focused test patches `rebuild_graph` and asserts no `gist` rows remain in `index._embedding_rows` when rebuild starts.
 - Concern: `rank.refresh_fact_embeddings` is explicitly called after `adjudicate_graph`, even though current `adjudicate_graph` also refreshes internally. The extra call is idempotent and keeps the migration aligned with the task's explicit step 5 requirement.
+
+## Review Fix Follow-Up: Resumable Backfill and Failure Preservation
+
+### Files Changed
+
+- `core/migrate_enrichment.py`
+- `core/tests/test_migrate_enrichment.py`
+- `.superpowers/sdd/task-10-report.md`
+
+### Implementation
+
+- `_backfill_extractions()` now skips notes before batching when `index.cached_extraction(note_id, note.content_hash)` returns a non-failed extraction. Skipped notes are treated as already migrated and are not included in `notes_backfilled`.
+- Documented `notes_backfilled` semantics on `MigrationReport` and `_backfill_extractions`: real migrations count only freshly extracted, successfully written notes from the current run.
+- Seeded beta with prior `note_entities`, `entity_relations`, and an `enrich_cache` failed row, then asserted those beta rows remain byte-for-byte equivalent after another failed extraction.
+- Added a cache-hit regression test that pre-seeds alpha with a valid current cache entry and asserts the fake extractor receives only beta.
+- Removed the dead `dry_run` parameter and unreachable dry-run branches from `_migrate_index()`; dry runs continue through `_dry_run()` only.
+
+### TDD Evidence
+
+- Red: `uv run pytest tests/test_migrate_enrichment.py -q`
+  - Failed because the fake extractor saw `["alpha", "beta"]` instead of only `["beta"]`.
+  - The beta failure-preservation assertion was also exercised and passed pre-fix because the existing failed-extraction path already preserved prior rows.
+- Green: `uv run pytest tests/test_migrate_enrichment.py -q`
+  - `6 passed, 2 warnings`.
+
+### Final Verification
+
+- `uv run pytest tests/test_migrate_enrichment.py -q`
+  - `6 passed, 2 warnings in 1.82s`.
+- `uv run pytest -q`
+  - `308 passed, 2 skipped, 3 warnings in 12.16s`.

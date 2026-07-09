@@ -1,4 +1,5 @@
 """One-time enrichment-streamlining migration."""
+
 from __future__ import annotations
 
 import argparse
@@ -20,6 +21,13 @@ from taurine_core.indexer.sync import _cli_llm, _run_async
 
 @dataclass(frozen=True)
 class MigrationReport:
+    """Summary of migration effects.
+
+    For real migrations, notes_backfilled counts only notes freshly extracted
+    and written during the run. Notes with a current, non-failed extraction
+    cache hit are treated as already migrated and excluded from the count.
+    """
+
     gist_rows_deleted: int
     utterance_rows_deleted: int
     notes_backfilled: int
@@ -33,12 +41,12 @@ def migrate(db_path: Path, *, llm: LLMPort | None, dry_run: bool) -> MigrationRe
 
     index = Index(db_path)
     try:
-        return _migrate_index(index, llm=llm, dry_run=dry_run)
+        return _migrate_index(index, llm=llm)
     finally:
         index.close()
 
 
-def _migrate_index(index: Index, *, llm: LLMPort | None, dry_run: bool) -> MigrationReport:
+def _migrate_index(index: Index, *, llm: LLMPort | None) -> MigrationReport:
     active_notes = _active_notes(index)
 
     print("step 1/5: remove stale enrichment embeddings", flush=True)
@@ -46,56 +54,31 @@ def _migrate_index(index: Index, *, llm: LLMPort | None, dry_run: bool) -> Migra
     utterance_rows_deleted = (
         _embedding_count(index, "utterance") if not config.SLIM_UTTERANCES else 0
     )
-    if dry_run:
-        print(
-            "dry-run: would delete "
-            f"{gist_rows_deleted} gist rows and {utterance_rows_deleted} utterance rows",
-            flush=True,
+    with index._conn:  # type: ignore[attr-defined]
+        index._conn.execute(  # type: ignore[attr-defined]
+            "DELETE FROM embeddings WHERE kind = 'gist'"
         )
-    else:
-        with index._conn:  # type: ignore[attr-defined]
+        if not config.SLIM_UTTERANCES:
             index._conn.execute(  # type: ignore[attr-defined]
-                "DELETE FROM embeddings WHERE kind = 'gist'"
+                "DELETE FROM embeddings WHERE kind = 'utterance'"
             )
-            if not config.SLIM_UTTERANCES:
-                index._conn.execute(  # type: ignore[attr-defined]
-                    "DELETE FROM embeddings WHERE kind = 'utterance'"
-                )
-        index.load()
+    index.load()
 
     print("step 2/5: recompute display lines", flush=True)
-    if dry_run:
-        print(f"dry-run: would recompute {len(active_notes)} display lines", flush=True)
-    else:
-        _recompute_display_lines(index, active_notes)
+    _recompute_display_lines(index, active_notes)
 
     print("step 3/5: backfill GLiNER extractions", flush=True)
-    if dry_run:
-        notes_backfilled = len(active_notes)
-        extraction_failures = 0
-        print(
-            "dry-run: extraction is not run; "
-            f"reporting {notes_backfilled} notes that would be attempted "
-            "and 0 measured failures",
-            flush=True,
-        )
-    else:
-        notes_backfilled, extraction_failures = _backfill_extractions(index, active_notes)
+    notes_backfilled, extraction_failures = _backfill_extractions(index, active_notes)
 
     print("step 4/5: rebuild graph and ranks", flush=True)
-    if dry_run:
-        print("dry-run: would rebuild graph, quality ranks, and value scores", flush=True)
-    else:
-        index.rebuild_graph()
-        rank.compute_quality_ranks(index)
-        rank.compute_value_scores(index)
+    index.rebuild_graph()
+    rank.compute_quality_ranks(index)
+    rank.compute_value_scores(index)
 
     judgments_written = 0
     print("step 5/5: adjudicate graph facts", flush=True)
     if llm is None:
         print("llm disabled: skipping adjudication", flush=True)
-    elif dry_run:
-        print("dry-run: would run one adjudication pass", flush=True)
     else:
         judgments_written = _adjudicate_once(index, llm)
 
@@ -231,7 +214,9 @@ def _readonly_table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 
 def _readonly_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    return {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
 
 
 def _embedding_count(index: Index, kind: str) -> int:
@@ -255,12 +240,27 @@ def _backfill_extractions(
     index: Index,
     notes: Sequence[NoteRecord],
 ) -> tuple[int, int]:
+    """Extract and write notes that are not already migrated.
+
+    A current, non-failed cache hit means the note already has migrated
+    extraction state from a previous run, so it is skipped before batching.
+    The returned backfill count includes only freshly extracted, successfully
+    written notes from this run.
+    """
+
     batch_size = max(1, int(config.GLINER_INGEST_BATCH))
     notes_backfilled = 0
     extraction_failures = 0
-    total = len(notes)
+    needs_extract: list[NoteRecord] = []
+    for note in notes:
+        hit = index.cached_extraction(note.note_id, note.content_hash)
+        if hit is not None and not hit.failed:
+            continue
+        needs_extract.append(note)
+
+    total = len(needs_extract)
     for offset in range(0, total, batch_size):
-        batch = list(notes[offset : offset + batch_size])
+        batch = needs_extract[offset : offset + batch_size]
         results = _extract_batch(batch)
         for note in batch:
             extraction = results.get(note.note_id, Extraction(failed=True))
