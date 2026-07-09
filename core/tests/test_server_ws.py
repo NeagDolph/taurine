@@ -800,6 +800,10 @@ def test_profile_generation_failure_preserves_existing_card() -> None:
         assert payload["generation"]["phase"] == "failed"
         assert payload["generation"]["error"] == "provider unavailable"
 
+        edited = client.put("/profile", json={"card": "Manual replacement"}).json()
+        assert edited["card"] == "Manual replacement"
+        assert edited["generation"]["phase"] == "idle"
+
 
 def test_updates_websocket_sends_snapshot_and_change_events() -> None:
     registry = FakeConnectorRegistry()

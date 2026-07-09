@@ -436,6 +436,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if not isinstance(card, str) or not card.strip():
             raise HTTPException(status_code=422, detail="card must be a non-empty string")
         active_runtime.index.set_user_card(card.strip())  # type: ignore[attr-defined]
+        if not active_runtime.profile_generation.running:
+            active_runtime.profile_generation = ProfileGenerationStatus()
         active_runtime.updates.publish("profile")
         return _profile_payload(active_runtime)
 
