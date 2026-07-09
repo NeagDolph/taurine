@@ -4,7 +4,7 @@ Owned state (per session):
 - meeting seed accumulator (decayed sum of fused top-K across passes — the
   "entire transcription so far" as a PPR personalization vector),
 - previous PPR vector (warm start),
-- cached NoteGraphMatrix, rebuilt when ``index.graph_version()`` changes,
+- cached HeteroGraphMatrix, rebuilt when ``index.graph_version()`` changes,
 - stable short-id registries: note_id → "N#" and (src, dst) → "F#"
   (assigned once per session, never reused — citations must stay valid
   across summary revisions).
@@ -20,7 +20,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .. import config
-from ..indexer.rank import NoteGraphMatrix, recency_multiplier, source_rank
+from ..indexer.rank import HeteroGraphMatrix, recency_multiplier, source_rank
 from ..indexer.store import Index
 from ..schemas import GroundedFact, GroundingItem, GroundingWhy, NoteRecord
 
@@ -69,7 +69,7 @@ class GroundingEngine:
         self._seeds: dict[str, float] = {}
         self._prev_ppr_raw: np.ndarray | None = None
         self._prev_ppr_matrix_identity: int | None = None
-        self._matrix: NoteGraphMatrix | None = None
+        self._matrix: HeteroGraphMatrix | None = None
         self._matrix_version: int | None = None
         self._note_short_ids: dict[str, str] = {}
         self._fact_short_ids: dict[tuple[str, str], str] = {}
@@ -161,6 +161,7 @@ class GroundingEngine:
         now: float,
         *,
         head_hits: dict[str, set[str]] | None = None,
+        gliner_spans: Sequence[tuple[str, float, str]] | None = None,
         decay_seeds: bool = True,
     ) -> GroundingUpdate:
         """Advance the accumulator and produce the current grounding set.
@@ -189,7 +190,12 @@ class GroundingEngine:
             if self._prev_ppr_matrix_identity == matrix_identity
             else None
         )
-        ppr_mass, raw = matrix.ppr(self._seeds, warm_start=warm_start)
+        entity_seeds = _entity_seeds(self.index, gliner_spans or [])
+        ppr_mass, raw = matrix.ppr(
+            self._seeds,
+            entity_seeds=entity_seeds,
+            warm_start=warm_start,
+        )
         self._prev_ppr_raw = raw
         self._prev_ppr_matrix_identity = matrix_identity
 
@@ -340,10 +346,10 @@ class GroundingEngine:
             if score >= SEED_PRUNE_EPSILON
         }
 
-    def _graph_matrix(self) -> NoteGraphMatrix:
+    def _graph_matrix(self) -> HeteroGraphMatrix:
         version = int(self.index.graph_version())
         if self._matrix is None or self._matrix_version != version:
-            self._matrix = NoteGraphMatrix.build(self.index)
+            self._matrix = HeteroGraphMatrix.build(self.index)
             self._matrix_version = version
             self._prev_ppr_raw = None
             self._prev_ppr_matrix_identity = None
@@ -541,6 +547,25 @@ def _exact_aliases(exact_hits: Sequence[tuple[str, str]]) -> dict[str, str]:
     for note_id, alias in exact_hits:
         aliases.setdefault(note_id, alias)
     return aliases
+
+
+def _entity_seeds(
+    index: Index,
+    gliner_spans: Sequence[tuple[str, float, str]],
+) -> dict[int, float]:
+    entity_by_surface = getattr(index, "entity_by_surface", None)
+    if not callable(entity_by_surface):
+        return {}
+    seeds: dict[int, float] = {}
+    for span, score, _label in gliner_spans:
+        entity_id = entity_by_surface(span)
+        if entity_id is None:
+            continue
+        weight = config.ENTITY_SEED_W * max(0.0, float(score))
+        if weight <= 0.0:
+            continue
+        seeds[int(entity_id)] = max(seeds.get(int(entity_id), 0.0), weight)
+    return seeds
 
 
 def _top_items(scores: dict[str, float], limit: int) -> list[tuple[str, float]]:

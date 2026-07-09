@@ -141,6 +141,7 @@ def _canonicalize_extractions(index: object, notes: list[NoteRecord]) -> None:
             all_terms.add(term)
 
     if not term_counts_by_etype:
+        _replace_entity_surfaces(index, {})
         return
 
     _ensure_term_vectors(index, all_terms)
@@ -186,6 +187,8 @@ def _canonicalize_extractions(index: object, notes: list[NoteRecord]) -> None:
         ]
         index.replace_note_extraction(note_id, entities, relations)  # type: ignore[attr-defined]
 
+    _replace_entity_surfaces(index, resolved_by_etype)
+
 
 def _entity_term(surface: str, etype: str) -> str:
     return _canonicalize_term(surface, lowercase=etype == "concept")
@@ -197,6 +200,26 @@ def _mapped_relation_surface(surface: str, surface_map: Mapping[str, str]) -> st
         return surface_map[stripped]
     normalized = _canonicalize_term(stripped, lowercase=False)
     return surface_map.get(normalized, stripped)
+
+
+def _replace_entity_surfaces(
+    index: object,
+    resolved_by_etype: Mapping[str, Mapping[str, str]],
+) -> None:
+    replace_entity_surfaces = getattr(index, "replace_entity_surfaces", None)
+    if not callable(replace_entity_surfaces):
+        return
+    entity_ids = {
+        (canonical, etype): int(entity_id)
+        for entity_id, canonical, etype, _df in index.entity_rows()  # type: ignore[attr-defined]
+    }
+    rows: list[tuple[int, str]] = []
+    for etype, resolved in resolved_by_etype.items():
+        for surface, canonical in resolved.items():
+            entity_id = entity_ids.get((canonical, etype))
+            if entity_id is not None:
+                rows.append((entity_id, surface))
+    replace_entity_surfaces(rows)
 
 
 def _add_semantic_edges(

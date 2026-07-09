@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import re
 import time
 from collections.abc import Callable
@@ -104,6 +105,9 @@ class AmbientRetriever:
         self._snap_vocabulary = _snap_vocabulary(index.aliases())
         self._exact = ExactCollector(index)
         self._grounding = GroundingEngine(index)  # type: ignore[arg-type]
+        self._grounding_accepts_gliner_spans = _accepts_gliner_spans(
+            self._grounding.on_pass
+        )
 
     async def on_window(
         self,
@@ -145,12 +149,15 @@ class AmbientRetriever:
         # note ages need wall-clock time: the session clock is monotonic
         # (seconds since boot), which would make every age negative and
         # saturate the recency decay to 1.0
+        grounding_kwargs: dict[str, Any] = {"head_hits": heads.head_hits}
+        if self._grounding_accepts_gliner_spans:
+            grounding_kwargs["gliner_spans"] = gliner_spans
         update = self._grounding.on_pass(
             window_text,
             heads.fused,
             exact_hits,
             self._wall_clock(),
-            head_hits=heads.head_hits,
+            **grounding_kwargs,
         )
         self.last_grounding = update
         self.last_extracted = extracted
@@ -309,6 +316,13 @@ def _head_hits(
         for note_id, _score in rows:
             heads.setdefault(note_id, set()).add(label)
     return heads
+
+
+def _accepts_gliner_spans(on_pass: Callable[..., object]) -> bool:
+    try:
+        return "gliner_spans" in inspect.signature(on_pass).parameters
+    except (TypeError, ValueError):
+        return True
 
 
 def _dense_search(

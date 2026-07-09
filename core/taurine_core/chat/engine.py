@@ -32,8 +32,8 @@ from uuid import uuid4
 
 from .. import config
 from ..indexer.store import Index
-from ..llm import OpenRouterClient, StreamEvent
-from ..ports import LLMError
+from ..llm import OpenRouterClient
+from ..ports import LLMError, SpanExtractorPort
 from ..schemas import (
     ChatAckEvent,
     ChatActivityEvent,
@@ -90,10 +90,18 @@ class _StreamFailure(Exception):
 
 
 class ChatEngine:
-    def __init__(self, index: Index, llm: OpenRouterClient, logger: Any) -> None:
+    def __init__(
+        self,
+        index: Index,
+        llm: OpenRouterClient,
+        logger: Any,
+        *,
+        span_extractor: SpanExtractorPort | None = None,
+    ) -> None:
         self.index = index
         self.llm = llm
         self.logger = logger
+        self._span_extractor = span_extractor
         self._lock = asyncio.Lock()
         self._active: dict[str, asyncio.Task[Any]] = {}
         self._active_count = 0
@@ -213,7 +221,10 @@ class ChatEngine:
             )
         )
 
-        retriever = ChatRetriever(self.index, chat_id)
+        retriever_kwargs: dict[str, Any] = {}
+        if self._span_extractor is not None:
+            retriever_kwargs["span_extractor"] = self._span_extractor
+        retriever = ChatRetriever(self.index, chat_id, **retriever_kwargs)
         context_items: list[GroundingItem] = []
         context_facts: list[GroundedFact] = []
         content_parts: list[str] = []

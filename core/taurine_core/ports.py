@@ -65,6 +65,9 @@ class IndexPort(Protocol):
     def graph_version(self) -> int:
         ...
 
+    def entity_by_surface(self, surface: str) -> int | None:
+        ...
+
     def status(self) -> tuple[int, float | None]:
         """(note_count, last_sync_ts)"""
         ...

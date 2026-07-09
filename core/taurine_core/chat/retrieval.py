@@ -2,8 +2,8 @@
 
 Reuses the live pipeline's machinery with chat posture:
 - heads: dense(message, CHAT_EMBED_QUERY_PROMPT), BM25, exact aliases at
-  rank 1, fact_dense_search — NO GLiNER, NO fuzzy snapping (typed text has
-  no ASR drift);
+  rank 1, fact_dense_search, GLiNER entity spans as transient PPR seeds
+  (typed text has no ASR fuzzy snapping);
 - RRF fusion (RRF_K), per-chat seed accumulator (CHAT_SEED_DECAY per turn),
   PPR (warm-started per chat, matrix cached on graph_version), blend with
   the same recency/source/quality priors;
@@ -26,15 +26,23 @@ from ..indexer.store import Index
 from ..live.ambient import run_head_fusion
 from ..live.exact import ExactCollector
 from ..live.grounding import GroundingEngine
+from ..ports import SpanExtractorPort
 from ..schemas import Chunk, GroundedFact, GroundingItem
 
 
 class ChatRetriever:
     """One instance per chat_id; state restored from the chat registry."""
 
-    def __init__(self, index: Index, chat_id: str) -> None:
+    def __init__(
+        self,
+        index: Index,
+        chat_id: str,
+        *,
+        span_extractor: SpanExtractorPort | None = None,
+    ) -> None:
         self.index = index
         self.chat_id = chat_id
+        self._span_extractor = span_extractor
         self._exact = ExactCollector(index)
         self._grounding = GroundingEngine(
             index,
@@ -81,6 +89,7 @@ class ChatRetriever:
 
     def _run(self, text: str, *, now: float, decay_seeds: bool):
         exact_hits = self._exact_hits(text, now)
+        gliner_spans = self._extract_spans(text)
         heads = run_head_fusion(
             self.index,
             text,
@@ -93,8 +102,17 @@ class ChatRetriever:
             exact_hits,
             now,
             head_hits=heads.head_hits,
+            gliner_spans=gliner_spans,
             decay_seeds=decay_seeds,
         )
+
+    def _extract_spans(self, text: str) -> list[tuple[str, float, str]]:
+        if self._span_extractor is None:
+            return []
+        try:
+            return self._span_extractor.extract(text)
+        except Exception:
+            return []
 
     def _exact_hits(self, text: str, now: float) -> list[tuple[str, str]]:
         chunk = Chunk(channel=0, text=text, ts=now, final=True)

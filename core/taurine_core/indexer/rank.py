@@ -158,7 +158,8 @@ class HeteroGraphMatrix:
 
         graph = index.graph()
         note_ids = [node.note_id for node in graph.nodes]
-        entity_rows = index.entity_rows()
+        entity_rows_fn = getattr(index, "entity_rows", None)
+        entity_rows = entity_rows_fn() if callable(entity_rows_fn) else []
         entity_ids = [int(entity_id) for entity_id, _canonical, _etype, _df in entity_rows]
         size = len(note_ids) + len(entity_ids)
         if size == 0:
@@ -190,7 +191,11 @@ class HeteroGraphMatrix:
             weight = _boosted_edge_weight(edge.weight, edge.type, edge.fact)
             add_undirected(note_row[edge.src], note_row[edge.dst], weight)
 
-        for note_id, entity_id, conf, _count in index.note_entity_rows():
+        note_entity_rows_fn = getattr(index, "note_entity_rows", None)
+        note_entity_rows = (
+            note_entity_rows_fn() if callable(note_entity_rows_fn) else []
+        )
+        for note_id, entity_id, conf, _count in note_entity_rows:
             note_offset = note_row.get(note_id)
             entity_offset = entity_row.get(int(entity_id))
             if note_offset is None or entity_offset is None:
@@ -199,7 +204,9 @@ class HeteroGraphMatrix:
             weight = _term_weight(df) * float(conf)
             add_undirected(note_offset, entity_offset, weight)
 
-        for note_id, src_entity, rel_type, dst_entity, conf in index.relation_rows():
+        relation_rows_fn = getattr(index, "relation_rows", None)
+        relation_rows = relation_rows_fn() if callable(relation_rows_fn) else []
+        for note_id, src_entity, rel_type, dst_entity, conf in relation_rows:
             if note_id not in note_row:
                 continue
             src_offset = entity_row.get(int(src_entity))

@@ -151,6 +151,7 @@ class Index:
             [],
             np.empty((0, config.EMBED_DIM), dtype=np.float32),
         )
+        self._entity_surface_state: dict[str, int] = {}
         self._doc_frequency_cache: dict[str, int] = {}
         self._init_schema()
         self._disabled_sources = self._load_disabled_sources()
@@ -185,6 +186,7 @@ class Index:
             else np.empty((0, config.EMBED_DIM), dtype=np.float32),
         )
         self.load_facts()
+        self.load_entity_surfaces()
 
     @property
     def _embedding_rows(self) -> list[tuple[int, str, EmbeddingKind, str]]:
@@ -715,6 +717,51 @@ class Index:
             )
             for row in rows
         ]
+
+    def replace_entity_surfaces(
+        self, rows: Sequence[tuple[int, str]],
+    ) -> None:
+        """Replace the query-time entity surface lookup table."""
+        with self._conn:
+            self._conn.execute("DELETE FROM entity_surfaces")
+            self._conn.executemany(
+                """
+                INSERT OR IGNORE INTO entity_surfaces(entity_id, surface)
+                VALUES (?, ?)
+                """,
+                [
+                    (int(entity_id), surface.strip())
+                    for entity_id, surface in rows
+                    if surface.strip()
+                ],
+            )
+        self.load_entity_surfaces()
+
+    def load_entity_surfaces(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT entity_id, surface
+            FROM entity_surfaces
+            ORDER BY entity_id, surface
+            """
+        ).fetchall()
+        surface_state: dict[str, int] = {}
+        for row in rows:
+            surface = str(row["surface"]).strip()
+            if not surface:
+                continue
+            surface_state.setdefault(surface, int(row["entity_id"]))
+        self._entity_surface_state = surface_state
+
+    def entity_by_surface(self, surface: str) -> int | None:
+        cleaned = surface.strip()
+        if not cleaned:
+            return None
+        for candidate in _entity_surface_candidates(cleaned):
+            entity_id = self._entity_surface_state.get(candidate)
+            if entity_id is not None:
+                return entity_id
+        return None
 
     def relations_between(
         self, src_note: str, dst_note: str
@@ -1414,6 +1461,12 @@ class Index:
                     UNIQUE(canonical, etype)
                 );
 
+                CREATE TABLE IF NOT EXISTS entity_surfaces(
+                    entity_id INTEGER NOT NULL,
+                    surface TEXT NOT NULL,
+                    PRIMARY KEY(entity_id, surface)
+                );
+
                 CREATE TABLE IF NOT EXISTS note_entities(
                     note_id TEXT NOT NULL,
                     entity_id INTEGER NOT NULL,
@@ -1704,6 +1757,25 @@ class Index:
 
 def _normalize_alias(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+
+
+def _entity_surface_candidates(surface: str) -> tuple[str, ...]:
+    normalized = _normalize_entity_surface(surface, lowercase=False)
+    lowered = surface.lower()
+    lowered_normalized = _normalize_entity_surface(surface, lowercase=True)
+    return tuple(
+        dict.fromkeys(
+            candidate
+            for candidate in (surface, normalized, lowered, lowered_normalized)
+            if candidate
+        )
+    )
+
+
+def _normalize_entity_surface(surface: str, *, lowercase: bool) -> str:
+    normalized = re.sub(r"[-_]+", " ", surface.strip())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized.lower() if lowercase else normalized
 
 
 def _display_line(note: NoteRecord) -> str:
