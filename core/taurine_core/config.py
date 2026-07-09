@@ -41,11 +41,13 @@ LLM_REASONING_BY_MODEL = {
     "deepseek/deepseek-v4-flash": {"enabled": False},
 }
 
-# ── user information card (full-corpus profile fed to every enrichment) ─
-PROFILE_MODEL = "z-ai/glm-5.2"           # 1M context: the whole corpus fits
-PROFILE_TIMEOUT_S = 300.0
-PROFILE_NOTE_CHAR_BUDGET = 2400          # per-note truncation when building card input
-PROFILE_MAX_CHARS = 6000                 # cap on the generated card itself
+# ── user information card (explicit agentic graph research) ───────────
+PROFILE_MODEL = "z-ai/glm-5.2"
+PROFILE_REASONING = {"enabled": True}
+PROFILE_TIMEOUT_S = 180.0
+PROFILE_MAX_TOOL_CALLS = 24
+PROFILE_MAX_CHARS = 12_000
+PROFILE_CONTEXT_MAX_CHARS = 12_000
 REENRICH_CONCURRENCY = 4
 
 # ── batched enrichment (similarity-clustered, keyed by note_id) ────────
