@@ -36,7 +36,7 @@ class _Candidate:
         if terms:
             self.shared.update(terms)
 
-    def edge(self, *, fact: str = "") -> GraphEdge:
+    def edge(self, *, fact: str = "", fact_provenance: str = "") -> GraphEdge:
         mechanism_names = set(self.mechanisms)
         edge_type: EdgeType
         if len(mechanism_names) == 1:
@@ -53,6 +53,7 @@ class _Candidate:
             weight=1.0 - remaining,
             shared=sorted(self.shared),
             fact=fact,
+            fact_provenance=fact_provenance,
         )
 
 
@@ -64,7 +65,7 @@ def embed_texts(texts: list[str]) -> np.ndarray:
 
 def rebuild_all(index: object) -> None:
     kept, margin = _candidates(index)
-    edges = _cap_edges(_apply_judgments(kept, margin, _valid_judgments(index)))
+    edges = _cap_edges(_apply_judgments(index, kept, margin, _valid_judgments(index)))
     index.replace_edges(edges)  # type: ignore[attr-defined]
 
 
@@ -80,7 +81,7 @@ def rebuild_for(index: object, note_id: str) -> None:
         existing_degree[edge.dst] += 1
 
     kept, margin = _candidates(index)
-    candidate_edges = _apply_judgments(kept, margin, _valid_judgments(index))
+    candidate_edges = _apply_judgments(index, kept, margin, _valid_judgments(index))
     incident = [edge for edge in candidate_edges if note_id in (edge.src, edge.dst)]
     incident.sort(key=lambda edge: edge.weight, reverse=True)
 
@@ -377,13 +378,39 @@ def _valid_judgments(index: object) -> dict[tuple[str, str], tuple[bool, str]]:
     return valid
 
 
+def promoted_relation_fact(index: object, src: str, dst: str) -> str | None:
+    relations_between = getattr(index, "relations_between", None)
+    if not callable(relations_between):
+        return None
+    relations = []
+    for head, rel_type, tail, conf in relations_between(src, dst):
+        template = config.INGEST_RELATION_TYPES.get(str(rel_type))
+        if template is None:
+            continue
+        if float(conf) < config.REL_FACT_MIN_CONF:
+            continue
+        relations.append((float(conf), str(head), str(rel_type), str(tail), template))
+    if not relations:
+        return None
+    _conf, head, _rel_type, tail, template = sorted(
+        relations,
+        key=lambda item: (-item[0], item[1], item[2], item[3]),
+    )[0]
+    return _WHITESPACE_RE.sub(" ", template.format(head=head, tail=tail).strip())
+
+
 def _apply_judgments(
+    index: object,
     kept: list[_Candidate],
     margin: list[_Candidate],
     judgments: Mapping[tuple[str, str], tuple[bool, str]],
 ) -> list[GraphEdge]:
     edges: list[GraphEdge] = []
     for candidate in kept:
+        promoted_fact = promoted_relation_fact(index, candidate.src, candidate.dst)
+        if promoted_fact is not None:
+            edges.append(candidate.edge(fact=promoted_fact, fact_provenance="gliner"))
+            continue
         edge = candidate.edge()
         judgment = judgments.get((candidate.src, candidate.dst))
         if judgment is not None:
@@ -391,16 +418,28 @@ def _apply_judgments(
             if not related and edge.weight < config.VETO_MAX_W:
                 continue
             if related:
-                edge = candidate.edge(fact=fact)
+                edge = candidate.edge(
+                    fact=fact,
+                    fact_provenance="llm" if fact else "",
+                )
         edges.append(edge)
 
     for candidate in margin:
+        promoted_fact = promoted_relation_fact(index, candidate.src, candidate.dst)
+        if promoted_fact is not None:
+            edges.append(candidate.edge(fact=promoted_fact, fact_provenance="gliner"))
+            continue
         judgment = judgments.get((candidate.src, candidate.dst))
         if judgment is None:
             continue
         related, fact = judgment
         if related:
-            edges.append(candidate.edge(fact=fact))
+            edges.append(
+                candidate.edge(
+                    fact=fact,
+                    fact_provenance="llm" if fact else "",
+                )
+            )
     return edges
 
 

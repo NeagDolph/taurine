@@ -1210,7 +1210,7 @@ class Index:
         degree: dict[str, int] = defaultdict(int)
         edge_rows = self._conn.execute(
             """
-            SELECT src, dst, type, weight, shared_json, fact
+            SELECT src, dst, type, weight, shared_json, fact, fact_provenance
             FROM edges ORDER BY weight DESC, src, dst
             """
         ).fetchall()
@@ -1228,6 +1228,7 @@ class Index:
                     weight=float(row["weight"]),
                     shared=json.loads(row["shared_json"]),
                     fact=row["fact"],
+                    fact_provenance=row["fact_provenance"],
                 )
             )
         nodes = [
@@ -1268,8 +1269,10 @@ class Index:
                 src, dst = sorted((edge.src, edge.dst))
                 self._conn.execute(
                     """
-                    INSERT OR REPLACE INTO edges(src, dst, type, weight, shared_json, fact)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO edges(
+                        src, dst, type, weight, shared_json, fact, fact_provenance
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         src,
@@ -1278,6 +1281,7 @@ class Index:
                         float(edge.weight),
                         json.dumps(sorted(set(edge.shared))),
                         edge.fact,
+                        edge.fact_provenance,
                     ),
                 )
             self._conn.execute(
@@ -1498,6 +1502,8 @@ class Index:
                     type TEXT NOT NULL,
                     weight REAL NOT NULL,
                     shared_json TEXT NOT NULL,
+                    fact TEXT NOT NULL DEFAULT '',
+                    fact_provenance TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(src, dst)
                 );
 
@@ -1564,6 +1570,7 @@ class Index:
             )
             self._ensure_notes_source_column()
             self._ensure_edges_fact_column()
+            self._ensure_edges_fact_provenance_column()
             self._ensure_notes_created_column()
             self._ensure_notes_quality_rank_column()
             self._ensure_notes_value_columns()
@@ -1613,6 +1620,16 @@ class Index:
         if "fact" in columns:
             return
         self._conn.execute("ALTER TABLE edges ADD COLUMN fact TEXT NOT NULL DEFAULT ''")
+
+    def _ensure_edges_fact_provenance_column(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(edges)").fetchall()
+        }
+        if "fact_provenance" in columns:
+            return
+        self._conn.execute(
+            "ALTER TABLE edges ADD COLUMN fact_provenance TEXT NOT NULL DEFAULT ''"
+        )
 
     def _replace_note_extraction_rows(
         self,

@@ -193,6 +193,8 @@ def _normalize_extraction(raw_results: list[object], note_text: str) -> Extracti
                 continue
             surface_head = entity_surfaces[head_key]
             surface_tail = entity_surfaces[tail_key]
+            if not _valid_relation_endpoints(surface_head, surface_tail):
+                continue
             key = (head_key, rel_type, tail_key)
             current = relation_acc.get(key)
             if current is None:
@@ -361,3 +363,20 @@ def _chunk_max_len() -> int | None:
 
 def _lower_normalized(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def _valid_relation_endpoints(head: str, tail: str) -> bool:
+    if _relation_identity(head) == _relation_identity(tail):
+        return False
+    return (
+        len(_relation_compact(head)) >= 3
+        and len(_relation_compact(tail)) >= 3
+    )
+
+
+def _relation_identity(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def _relation_compact(text: str) -> str:
+    return re.sub(r"\s+", "", text.strip())

@@ -6,6 +6,8 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
+import numpy as np
+
 from taurine_core import config
 from taurine_core.ports import LLMError, LLMPort
 from taurine_core.schemas import NoteRecord
@@ -109,6 +111,10 @@ def _pending_pairs(index: object) -> list[_PendingPair]:
         note.note_id: note
         for note in index.notes()  # type: ignore[attr-defined]
     }
+    active_ids = _active_note_ids(index, notes)
+    values = _active_value_scores(index, active_ids)
+    value_threshold = _value_threshold(values, active_ids)
+    communities = _note_communities(index)
     note_hashes = {note_id: note.content_hash for note_id, note in notes.items()}
     judgments = index.edge_judgments()  # type: ignore[attr-defined]
     # bands only cover kept candidates that survive the degree cap — pre-cap
@@ -122,8 +128,23 @@ def _pending_pairs(index: object) -> list[_PendingPair]:
     capped = [
         candidate for candidate in kept if (candidate.src, candidate.dst) in capped_keys
     ]
-    strong_fact_keys = _fact_eligible_strong_keys(capped)
-    pending: list[tuple[str, graph._Candidate]] = []
+    strong_fact_keys = _fact_eligible_strong_keys(capped, values, value_threshold)
+    pending: list[tuple[float, bool, str, graph._Candidate]] = []
+
+    def add_pending(band: str, candidate: graph._Candidate, *, gated: bool) -> None:
+        if graph.promoted_relation_fact(index, candidate.src, candidate.dst) is not None:
+            return
+        if _has_valid_judgment(candidate, judgments, note_hashes):
+            return
+        bridge = _is_bridge(candidate, communities)
+        if gated and not bridge and not _pair_clears_value(candidate, values, value_threshold):
+            return
+        pending.append((
+            _rank_score(candidate, values, bridge),
+            bridge,
+            band,
+            candidate,
+        ))
 
     for candidate in capped:
         key = (candidate.src, candidate.dst)
@@ -131,21 +152,17 @@ def _pending_pairs(index: object) -> list[_PendingPair]:
         if edge.weight >= config.VETO_MAX_W:
             if key not in strong_fact_keys:
                 continue
-            band = "strong"
+            add_pending("strong", candidate, gated=False)
         else:
-            band = "weak"
-        if _has_valid_judgment(candidate, judgments, note_hashes):
-            continue
-        pending.append((band, candidate))
+            add_pending("weak", candidate, gated=True)
 
     for candidate in margin:
-        if _has_valid_judgment(candidate, judgments, note_hashes):
-            continue
-        pending.append(("margin", candidate))
+        add_pending("margin", candidate, gated=True)
 
     pending.sort(
-        key=lambda item: (-item[1].edge().weight, item[0], item[1].src, item[1].dst)
+        key=lambda item: (-item[0], item[2], item[3].src, item[3].dst)
     )
+    pending = pending[: max(0, int(config.ADJUDICATE_MAX_PAIRS_PER_SYNC))]
     return [
         _PendingPair(
             pair_id=f"pair-{index_ + 1}",
@@ -156,12 +173,14 @@ def _pending_pairs(index: object) -> list[_PendingPair]:
             marker="[KEEP]" if band == "strong" else "[JUDGE]",
             candidate=candidate,
         )
-        for index_, (band, candidate) in enumerate(pending)
+        for index_, (_score, _bridge, band, candidate) in enumerate(pending)
     ]
 
 
 def _fact_eligible_strong_keys(
     kept: Sequence[graph._Candidate],
+    values: Mapping[str, float],
+    value_threshold: float,
 ) -> set[tuple[str, str]]:
     counts: dict[str, int] = defaultdict(int)
     selected: set[tuple[str, str]] = set()
@@ -172,6 +191,8 @@ def _fact_eligible_strong_keys(
     ]
     strong.sort(key=lambda candidate: (-candidate.edge().weight, candidate.src, candidate.dst))
     for candidate in strong:
+        if not _pair_clears_value(candidate, values, value_threshold):
+            continue
         if counts[candidate.src] >= config.FACT_TOP_EDGES_PER_NOTE:
             continue
         if counts[candidate.dst] >= config.FACT_TOP_EDGES_PER_NOTE:
@@ -180,6 +201,90 @@ def _fact_eligible_strong_keys(
         counts[candidate.src] += 1
         counts[candidate.dst] += 1
     return selected
+
+
+def _active_note_ids(
+    index: object,
+    notes: Mapping[str, NoteRecord],
+) -> set[str]:
+    disabled_sources_fn = getattr(index, "disabled_sources", None)
+    disabled_sources = (
+        disabled_sources_fn() if callable(disabled_sources_fn) else set()
+    )
+    return {
+        note_id
+        for note_id, note in notes.items()
+        if note.source not in disabled_sources
+    }
+
+
+def _active_value_scores(index: object, active_ids: set[str]) -> dict[str, float]:
+    value_scores_fn = getattr(index, "value_scores", None)
+    raw_scores = value_scores_fn() if callable(value_scores_fn) else {}
+    return {
+        note_id: float(raw_scores.get(note_id, 0.0))
+        for note_id in active_ids
+    }
+
+
+def _value_threshold(
+    values: Mapping[str, float],
+    active_ids: set[str],
+) -> float:
+    if not active_ids:
+        return 0.0
+    scores = np.asarray(
+        [float(values.get(note_id, 0.0)) for note_id in sorted(active_ids)],
+        dtype=np.float64,
+    )
+    if scores.size == 0 or float(np.max(scores)) <= 0.0:
+        return 0.0
+    fraction = min(max(float(config.ADJ_VALUE_FRACTION), 0.0), 1.0)
+    return float(np.quantile(scores, 1.0 - fraction))
+
+
+def _clears_value_threshold(value: float, threshold: float) -> bool:
+    if threshold <= 0.0:
+        return value > 0.0
+    return value >= threshold
+
+
+def _pair_clears_value(
+    candidate: graph._Candidate,
+    values: Mapping[str, float],
+    value_threshold: float,
+) -> bool:
+    return (
+        _clears_value_threshold(float(values.get(candidate.src, 0.0)), value_threshold)
+        or _clears_value_threshold(float(values.get(candidate.dst, 0.0)), value_threshold)
+    )
+
+
+def _note_communities(index: object) -> dict[str, int]:
+    from .communities import label_propagation
+    from .rank import NoteGraphMatrix
+
+    return label_propagation(NoteGraphMatrix.build(index))
+
+
+def _is_bridge(
+    candidate: graph._Candidate,
+    communities: Mapping[str, int],
+) -> bool:
+    src_label = communities.get(candidate.src)
+    dst_label = communities.get(candidate.dst)
+    return src_label is not None and dst_label is not None and src_label != dst_label
+
+
+def _rank_score(
+    candidate: graph._Candidate,
+    values: Mapping[str, float],
+    bridge: bool,
+) -> float:
+    score = float(values.get(candidate.src, 0.0)) + float(values.get(candidate.dst, 0.0))
+    if bridge:
+        score *= float(config.BRIDGE_RANK_BOOST)
+    return score
 
 
 def _has_valid_judgment(

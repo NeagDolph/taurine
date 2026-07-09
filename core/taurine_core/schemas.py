@@ -68,6 +68,7 @@ class GraphEdge(BaseModel):
     weight: float                  # combined: 1 - prod(1 - w_i)
     shared: list[str] = []         # canonical topics/entities behind the edge
     fact: str = ""                 # LLM-written one-sentence relationship (adjudicated edges)
+    fact_provenance: str = ""      # "llm" or "gliner" when fact is populated
 
 
 class GraphNode(BaseModel):

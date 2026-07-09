@@ -11,7 +11,7 @@ from tests.conftest import entity, fixture_units, make_note, unit_vec
 from taurine_core import config
 from taurine_core.indexer import graph
 from taurine_core.ports import LLMError
-from taurine_core.schemas import Enrichment, EntityMention, GraphEdge
+from taurine_core.schemas import Enrichment, EntityMention, GraphEdge, RelationTriple
 
 
 _PAIR_ID_RE = re.compile(r"\bpair-\d+\b")
@@ -35,6 +35,7 @@ def _enrichment(
     *,
     topics: Iterable[str] = (),
     entities: Iterable[str | EntityMention] = (),
+    relations: Iterable[RelationTriple] = (),
 ) -> Enrichment:
     typed_entities = [entity(topic, "concept") for topic in topics]
     for item in entities:
@@ -44,7 +45,7 @@ def _enrichment(
         utterances=[gist],
         aliases=[],
         entities=typed_entities,
-        relations=[],
+        relations=list(relations),
         extraction_failed=False,
     )
 
@@ -58,8 +59,9 @@ def _install(
     *,
     topics: Iterable[str] = (),
     entities: Iterable[str] = (),
+    relations: Iterable[RelationTriple] = (),
 ) -> None:
-    enrich = _enrichment(gist, topics=topics, entities=entities)
+    enrich = _enrichment(gist, topics=topics, entities=entities, relations=relations)
     note = make_note(note_id, title, gist)
     index.upsert_note(note, enrich, [("chunk", enrich.gist, vector)])  # type: ignore[attr-defined]
 
@@ -80,6 +82,36 @@ def _pairs_with(note_id: str, candidates: Iterable[object]) -> set[str]:
         if note_id in (src, dst):
             result.add(dst if src == note_id else src)
     return result
+
+
+def _candidate(src: str, dst: str, weight: float) -> graph._Candidate:
+    candidate = graph._Candidate(*sorted((src, dst)))
+    candidate.add("semantic", weight)
+    return candidate
+
+
+def _install_ids(store: object, note_ids: Iterable[str]) -> None:
+    for offset, note_id in enumerate(note_ids):
+        _install(
+            store,
+            note_id,
+            note_id.upper(),
+            f"{note_id} body.",
+            _basis(700 + offset),
+        )
+
+
+def _replace_cliques(store: object) -> None:
+    store.replace_edges(  # type: ignore[attr-defined]
+        [
+            GraphEdge(src="a0", dst="a1", type="semantic", weight=0.9),
+            GraphEdge(src="a0", dst="a2", type="semantic", weight=0.9),
+            GraphEdge(src="a1", dst="a2", type="semantic", weight=0.9),
+            GraphEdge(src="b0", dst="b1", type="semantic", weight=0.9),
+            GraphEdge(src="b0", dst="b2", type="semantic", weight=0.9),
+            GraphEdge(src="b1", dst="b2", type="semantic", weight=0.9),
+        ]
+    )
 
 
 class ScriptedAdjudicationLLM:
@@ -127,6 +159,117 @@ def deterministic_term_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(graph, "embed_texts", fake_embed_texts, raising=False)
     monkeypatch.setattr(store_module, "embed_texts", fake_embed_texts, raising=False)
+
+
+def test_gliner_relation_promotes_fact_with_provenance_and_skips_queue(store) -> None:
+    from taurine_core.indexer.adjudicate import _pending_pairs
+
+    relation = RelationTriple(
+        head="Jane Doe",
+        rel_type="works_at",
+        tail="Acme",
+        conf=0.82,
+    )
+    for note_id, relations in (("alpha", [relation]), ("beta", [])):
+        _install(
+            store,
+            note_id,
+            note_id.title(),
+            f"{note_id} relation note.",
+            _basis(100 if note_id == "alpha" else 101),
+            entities=["Jane Doe", "Acme"],
+            relations=relations,
+        )
+
+    store.rebuild_graph()
+
+    edge = _edge_between(store, "alpha", "beta")
+    assert edge is not None
+    assert edge.fact == "Jane Doe works at Acme"
+    assert edge.fact_provenance == "gliner"
+    assert _pending_pairs(store) == []
+
+
+def test_gate_excludes_non_bridge_low_value_and_keeps_bridge_low_value(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from taurine_core.indexer.adjudicate import _pending_pairs
+
+    _install_ids(store, ["a0", "a1", "a2", "b0", "b1", "b2"])
+    _replace_cliques(store)
+    monkeypatch.setattr(
+        graph,
+        "_candidates",
+        lambda _index: (
+            [],
+            [_candidate("a0", "a1", 0.52), _candidate("a2", "b0", 0.52)],
+        ),
+    )
+
+    pending = _pending_pairs(store)
+
+    assert [(pair.src, pair.dst) for pair in pending] == [("a2", "b0")]
+
+
+def test_gate_budget_keeps_highest_ranked_pairs(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from taurine_core.indexer.adjudicate import _pending_pairs
+
+    _install_ids(store, ["a0", "a1", "a2", "b0", "b1", "b2"])
+    _replace_cliques(store)
+    store.set_value_scores(
+        {
+            "a0": 0.90,
+            "a1": 0.90,
+            "a2": 0.65,
+            "b0": 0.65,
+            "b1": 0.10,
+            "b2": 0.10,
+        }
+    )
+    monkeypatch.setattr(config, "ADJ_VALUE_FRACTION", 1.0)
+    monkeypatch.setattr(config, "ADJUDICATE_MAX_PAIRS_PER_SYNC", 2)
+    monkeypatch.setattr(config, "BRIDGE_RANK_BOOST", 1.5)
+    monkeypatch.setattr(
+        graph,
+        "_candidates",
+        lambda _index: (
+            [],
+            [
+                _candidate("a0", "a1", 0.52),
+                _candidate("a2", "b0", 0.52),
+                _candidate("b0", "b1", 0.52),
+            ],
+        ),
+    )
+
+    pending = _pending_pairs(store)
+
+    assert [(pair.src, pair.dst) for pair in pending] == [
+        ("a2", "b0"),
+        ("a0", "a1"),
+    ]
+
+
+def test_value_threshold_quantile_and_zero_behavior(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from taurine_core.indexer.adjudicate import (
+        _clears_value_threshold,
+        _value_threshold,
+    )
+
+    monkeypatch.setattr(config, "ADJ_VALUE_FRACTION", 0.20)
+
+    assert _value_threshold({}, set()) == pytest.approx(0.0)
+    assert _value_threshold({"a": 0.0, "b": 0.0}, {"a", "b"}) == pytest.approx(0.0)
+    assert not _clears_value_threshold(0.0, 0.0)
+    assert _clears_value_threshold(0.01, 0.0)
+    assert _value_threshold(
+        {"a": 0.0, "b": 0.1, "c": 0.5, "d": 0.9, "e": 1.0},
+        {"a", "b", "c", "d", "e"},
+    ) == pytest.approx(0.92)
 
 
 @pytest.mark.asyncio
@@ -193,6 +336,7 @@ async def test_bands_and_prompt_caps_margin_and_fact_candidates(
             f"Near semantic note {index}.",
             _cosine_to_anchor(cosine, 40 + index),
         )
+    store.set_value_scores({"anchor": 1.0, "strong-b": 1.0})
 
     kept, margin = graph._candidates(store)
 
@@ -279,6 +423,13 @@ async def test_veto_drops_weak_edge_but_strong_edge_survives(store) -> None:
     store.rebuild_graph()
     assert _edge_between(store, "strong-a", "strong-b") is not None
     assert _edge_between(store, "weak-0", "weak-1") is not None
+    store.set_value_scores(
+        {
+            "strong-a": 1.0,
+            "strong-b": 1.0,
+            **{f"weak-{index}": 1.0 for index in range(4)},
+        }
+    )
 
     await adjudicate_graph(store, ScriptedAdjudicationLLM(related=False, fact=""))
 
@@ -315,6 +466,7 @@ async def test_facts_attach_to_strong_edges_and_unjudged_pairs_remain(store) -> 
             _basis(20 + index),
             entities=["weak-unchanged"],
         )
+    store.set_value_scores({"strong-a": 1.0, "strong-b": 1.0})
 
     await adjudicate_graph(
         store,
@@ -346,6 +498,7 @@ async def test_cached_judgments_skip_llm_until_pair_signature_changes(store) -> 
     store.upsert_note(note_b, ab_enrichment, fixture_units(unit_vec(2), ab_enrichment))
     store.upsert_note(note_c, cd_enrichment, fixture_units(unit_vec(3), cd_enrichment))
     store.upsert_note(note_d, cd_enrichment, fixture_units(unit_vec(4), cd_enrichment))
+    store.set_value_scores({"a": 1.0, "b": 1.0, "c": 1.0, "d": 1.0})
     llm = ScriptedAdjudicationLLM()
 
     await adjudicate_graph(store, llm)

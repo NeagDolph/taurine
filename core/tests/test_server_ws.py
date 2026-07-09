@@ -241,6 +241,7 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
                     "weight": 0.7,
                     "shared": ["roadmap"],
                     "fact": "",
+                    "fact_provenance": "",
                 }
             ],
         }
@@ -330,7 +331,15 @@ def test_connector_rest_endpoints_and_single_flight_sync() -> None:
 
         assert client.put("/connectors/fake/config", json={"path": "/tmp/new"}).status_code == 200
         assert registry.config_calls == [("fake", {"path": "/tmp/new"})]
+        assert (
+            client.put("/connectors/fake/config", json={"folders": ["/a", "/b"]}).status_code
+            == 200
+        )
+        assert registry.config_calls[-1] == ("fake", {"folders": ["/a", "/b"]})
         assert client.put("/connectors/fake/config", json={"nested": {"path": "/tmp"}}).status_code == 422
+        assert (
+            client.put("/connectors/fake/config", json={"folders": [["/a"]]}).status_code == 422
+        )
 
         assert client.post("/connectors/fake/sync").status_code == 202
         assert client.post("/connectors/fake/sync").status_code == 409

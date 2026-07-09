@@ -141,6 +141,51 @@ def test_extract_notes_filters_thresholds_and_relation_endpoints(monkeypatch: py
     ]
 
 
+def test_extract_notes_drops_self_and_tiny_endpoint_relations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeModel(
+        {
+            "calibration": {
+                "entities": {
+                    "person": [
+                        {"text": "Sharon", "confidence": 0.94},
+                        {"text": "Matthew Tung", "confidence": 0.93},
+                    ],
+                    "organization": [{"text": "ts", "confidence": 0.91}],
+                },
+                "relation_extraction": {
+                    "works_with": [
+                        {
+                            "head": {"text": " Sharon ", "confidence": 0.9},
+                            "tail": {"text": "sharon", "confidence": 0.9},
+                            "confidence": 0.8,
+                        }
+                    ],
+                    "works_at": [
+                        {
+                            "head": {"text": "Matthew Tung", "confidence": 0.92},
+                            "tail": {"text": "ts", "confidence": 0.92},
+                            "confidence": 0.72,
+                        }
+                    ],
+                },
+            }
+        }
+    )
+    _install_fake(monkeypatch, fake)
+
+    result = extract.extract_notes([make_note("n1", "calibration", "body")])["n1"]
+
+    assert result.failed is False
+    assert [(entity.surface, entity.etype) for entity in result.entities] == [
+        ("Sharon", "person"),
+        ("Matthew Tung", "person"),
+        ("ts", "organization"),
+    ]
+    assert result.relations == []
+
+
 def test_extract_notes_derives_mentions_from_note_text_occurrences(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
