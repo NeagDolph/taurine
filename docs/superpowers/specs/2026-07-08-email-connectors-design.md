@@ -135,7 +135,8 @@ Applied per message (short, bounded inputs for the model), before joining/hashin
 Both connectors read tokens from env at `extract()` time and cache the short-lived
 access token in-process. `available()` returns
 `(False, "Sign in required — run: python -m taurine_core.connectors.email_auth <id>")`
-until the env vars exist, then verifies with a cheap profile call.
+until the env vars exist. It checks env presence only — no network: `available()`
+runs on every UI poll, so auth errors surface at sync time instead.
 
 - **Gmail** (bring-your-own OAuth client, Desktop type): env `GMAIL_CLIENT_ID`,
   `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`. Bootstrap runs the loopback flow

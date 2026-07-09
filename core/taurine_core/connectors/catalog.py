@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from .claude_memories import ClaudeMemoriesConnector
 from .codex_memories import CodexMemoriesConnector
+from .gmail import GmailConnector
 from .imessage import IMessageConnector
 from .obsidian import ObsidianConnector
+from .outlook import OutlookConnector
 
 
 CONNECTORS: list = [
@@ -11,6 +13,8 @@ CONNECTORS: list = [
     CodexMemoriesConnector(),
     ObsidianConnector(),
     IMessageConnector(),
+    GmailConnector(),
+    OutlookConnector(),
 ]
 
 try:
