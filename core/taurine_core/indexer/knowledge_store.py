@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
 
+import numpy as np
+
+from taurine_core.indexer.embed import PassageEmbedding
 from taurine_core.indexer.passages import PassageDraft
 from taurine_core.schemas import NoteRecord
 
@@ -62,6 +66,13 @@ class IntegrityReport:
                 self.self_facts,
             )
         )
+
+
+@dataclass(frozen=True)
+class BM25PassageHit:
+    passage_id: str
+    raw_score: float
+    token_coverage: float
 
 
 class KnowledgeStore:
@@ -254,23 +265,79 @@ class KnowledgeStore:
                     (passage.passage_id, note_id, note["title"], passage.text),
                 )
 
-    def search_passages_bm25(self, query: str, k: int) -> tuple[tuple[str, float], ...]:
+    def write_passage_embeddings(
+        self, embeddings: tuple[PassageEmbedding, ...]
+    ) -> None:
+        self._writable()
+        with self._conn:
+            for embedding in embeddings:
+                vector = np.asarray(embedding.vector, dtype=np.float32)
+                if vector.shape != (embedding.dim,):
+                    raise ValueError(
+                        f"passage {embedding.passage_id} vector has shape {vector.shape}, "
+                        f"expected {(embedding.dim,)}"
+                    )
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO passage_embeddings(
+                        passage_id, model_id, dim, vec, build_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        embedding.passage_id,
+                        embedding.model_id,
+                        embedding.dim,
+                        vector.tobytes(),
+                        embedding.build_id,
+                    ),
+                )
+
+    def passage_embeddings(self) -> tuple[PassageEmbedding, ...]:
+        rows = self._conn.execute(
+            "SELECT passage_id, model_id, dim, vec, build_id "
+            "FROM passage_embeddings ORDER BY passage_id"
+        ).fetchall()
+        return tuple(
+            PassageEmbedding(
+                passage_id=row["passage_id"],
+                model_id=row["model_id"],
+                dim=int(row["dim"]),
+                vector=np.frombuffer(row["vec"], dtype=np.float32).copy(),
+                build_id=row["build_id"],
+            )
+            for row in rows
+        )
+
+    def search_passages_bm25(self, query: str, k: int) -> tuple[BM25PassageHit, ...]:
         if not query.strip() or k <= 0:
+            return ()
+        terms = _query_terms(query)
+        if not terms:
             return ()
         try:
             rows = self._conn.execute(
                 """
-                SELECT passage_id, -bm25(passages_fts) AS score
-                FROM passages_fts
+                SELECT f.passage_id, -bm25(passages_fts) AS score,
+                       p.text, n.title
+                FROM passages_fts f
+                JOIN passages p ON p.passage_id = f.passage_id
+                JOIN notes n ON n.note_id = p.note_id
                 WHERE passages_fts MATCH ?
-                ORDER BY bm25(passages_fts), passage_id
+                ORDER BY bm25(passages_fts), f.passage_id
                 LIMIT ?
                 """,
-                (query, int(k)),
+                (" AND ".join(f'"{term}"' for term in terms), int(k)),
             ).fetchall()
         except sqlite3.OperationalError:
             return ()
-        return tuple((row["passage_id"], float(row["score"])) for row in rows)
+        return tuple(
+            BM25PassageHit(
+                passage_id=row["passage_id"],
+                raw_score=float(row["score"]),
+                token_coverage=_token_coverage(terms, f"{row['title']} {row['text']}"),
+            )
+            for row in rows
+        )
 
     def insert_entity(
         self,
@@ -698,3 +765,14 @@ CREATE TABLE index_builds (
 
 def _display_line(text: str) -> str:
     return next((line.strip()[:220] for line in text.splitlines() if line.strip()), "")
+
+
+def _query_terms(text: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(match.casefold() for match in re.findall(r"\w+", text)))
+
+
+def _token_coverage(terms: tuple[str, ...], text: str) -> float:
+    if not terms:
+        return 0.0
+    haystack = set(re.findall(r"\w+", text.casefold()))
+    return sum(term in haystack for term in terms) / len(terms)

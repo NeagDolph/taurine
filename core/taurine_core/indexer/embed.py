@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -8,8 +10,58 @@ from sentence_transformers import SentenceTransformer
 
 from taurine_core import config
 from taurine_core.models_local import model_ref
+from taurine_core.indexer.passages import PassageDraft
 
 _MODEL: Any | None = None
+
+
+@dataclass(frozen=True)
+class PassageEmbedding:
+    passage_id: str
+    model_id: str
+    dim: int
+    vector: np.ndarray
+    build_id: str
+
+
+def embed_passages(
+    passages: Sequence[PassageDraft],
+    *,
+    title: str,
+    source: str,
+    embedder: Callable[[list[str]], np.ndarray] | None = None,
+    model_id: str,
+    build_id: str,
+    dim: int = config.EMBED_DIM,
+) -> tuple[PassageEmbedding, ...]:
+    """Embed exact passages with deterministic document metadata."""
+    ordered = sorted(passages, key=lambda row: row.passage_id)
+    if not ordered:
+        return ()
+    if len({row.passage_id for row in ordered}) != len(ordered):
+        raise ValueError("duplicate passage_id in embedding batch")
+    texts = [
+        f"Title: {title}\nSource: {source}\nPassage:\n{row.text}"
+        for row in ordered
+    ]
+    matrix = np.asarray((embedder or embed_texts)(texts), dtype=np.float32)
+    expected = (len(ordered), int(dim))
+    if matrix.shape != expected:
+        raise ValueError(f"passage embedder returned {matrix.shape}, expected {expected}")
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    if np.any(norms <= 0):
+        raise ValueError("passage embedder returned a zero-norm vector")
+    matrix = matrix / norms
+    return tuple(
+        PassageEmbedding(
+            passage_id=passage.passage_id,
+            model_id=model_id,
+            dim=int(dim),
+            vector=matrix[index].copy(),
+            build_id=build_id,
+        )
+        for index, passage in enumerate(ordered)
+    )
 
 
 def embed_texts(texts: list[str]) -> np.ndarray:
