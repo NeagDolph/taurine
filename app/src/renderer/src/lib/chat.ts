@@ -1,7 +1,7 @@
 import type { GroundedFact, GroundingItem } from './sidecar'
-import { SIDECAR_REST_URL } from './sidecar'
+import { SIDECAR_PORT, SIDECAR_REST_URL } from './sidecar'
 
-export const CHAT_WS_URL = 'ws://127.0.0.1:8930/chat'
+export const CHAT_WS_URL = `ws://127.0.0.1:${SIDECAR_PORT}/chat`
 
 export interface ChatMeta {
   chat_id: string

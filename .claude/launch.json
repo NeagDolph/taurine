@@ -8,6 +8,38 @@
       "cwd": "app",
       "port": 5174,
       "autoPort": true
+    },
+    {
+      "name": "taurine-renderer-scratch",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "--rendererOnly"],
+      "cwd": "app",
+      "port": 5174,
+      "autoPort": true,
+      "env": {
+        "VITE_SIDECAR_PORT": "8931"
+      }
+    },
+    {
+      "name": "taurine-sidecar-scratch",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": [
+        "run",
+        "--project",
+        "/Users/neil/taurine/core",
+        "uvicorn",
+        "taurine_core.server:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8931"
+      ],
+      "cwd": "core/.scratch-sidecar",
+      "port": 8931,
+      "autoPort": false,
+      "env": {
+        "PYTHONPATH": "/Users/neil/taurine/core"
+      }
     }
   ]
 }

@@ -960,13 +960,20 @@ def _new_chat_id(index: Any) -> str:
 
 
 def _flat_config(payload: Any) -> dict[str, Any]:
+    """Scalars and lists of scalars only — matches connector configs like
+    codex_mem globs / local_folders folders; nesting stays rejected."""
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="config must be a JSON object")
     config_payload: dict[str, Any] = {}
     for key, value in payload.items():
         if not isinstance(key, str):
             raise HTTPException(status_code=422, detail="config keys must be strings")
-        if isinstance(value, dict | list | tuple | set):
+        if isinstance(value, list):
+            if any(isinstance(item, dict | list | tuple | set) for item in value):
+                raise HTTPException(status_code=422, detail="config lists must hold scalars")
+            config_payload[key] = list(value)
+            continue
+        if isinstance(value, dict | tuple | set):
             raise HTTPException(status_code=422, detail="config values must be flat")
         config_payload[key] = value
     return config_payload

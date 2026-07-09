@@ -230,6 +230,7 @@ DUP_EDGE_SIM = 0.95                      # same-source mean chunk cosine ≥ thi
 SOURCE_RANK = {
     "apple_notes": 1.00,                 # written notes: highest
     "obsidian": 1.00,
+    "local_folders": 1.00,               # user-attached documents: deliberate, notes tier
     "imessage": 0.85,                    # text messages: a bit lower
     "gmail": 0.85,                       # email threads: iMessage tier
     "outlook": 0.85,
@@ -258,6 +259,7 @@ RECENCY_HALF_LIFE_DAYS = {
     "codex_mem": 60.0,
     "apple_notes": 90.0,
     "obsidian": 120.0,                   # evergreen notes barely decay
+    "local_folders": 120.0,              # attached documents: evergreen tier
 }
 RECENCY_HALF_LIFE_DEFAULT_DAYS = 90.0
 RECENCY_FLOOR = 0.15                     # decay is a downweight, never an exclusion

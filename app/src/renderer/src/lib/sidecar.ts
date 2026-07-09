@@ -1,4 +1,6 @@
-export const SIDECAR_WS_URL = 'ws://127.0.0.1:8930/session'
+// dev override: VITE_SIDECAR_PORT lets a preview/dev instance target a scratch sidecar
+export const SIDECAR_PORT: string = import.meta.env.VITE_SIDECAR_PORT ?? '8930'
+export const SIDECAR_WS_URL = `ws://127.0.0.1:${SIDECAR_PORT}/session`
 export const SIDECAR_REST_URL = restBaseFromWsUrl(SIDECAR_WS_URL)
 
 export type AsrState = 'disconnected' | 'connecting' | 'connected' | 'error'

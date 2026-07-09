@@ -23,6 +23,7 @@ type PendingAction = 'enable' | 'disable' | 'delete' | 'sync' | 'config' | 'sync
 type ConnectorStatus = 'syncing' | 'attention' | 'active' | 'off'
 
 const APPLE_NOTES_CONNECTOR_ID = 'apple_notes'
+const FOLDERS_CONNECTOR_ID = 'local_folders'
 
 export function ConnectionsPanel({
   connectors,
@@ -112,6 +113,15 @@ export function ConnectionsPanel({
       })
     },
     [configDrafts, runConnectorAction]
+  )
+
+  const saveFolders = useCallback(
+    async (connector: ConnectorInfo, folders: string[]) => {
+      await runConnectorAction(connector.connector_id, 'config', () =>
+        updateConnectorConfig(connector.connector_id, { ...connector.config, folders })
+      )
+    },
+    [runConnectorAction]
   )
 
   const runSyncAll = useCallback(async () => {
@@ -228,6 +238,7 @@ export function ConnectionsPanel({
               }
               onRequestDelete={() => setConfirmDeleteId(connector.connector_id)}
               onSaveConfig={() => void saveConfig(connector)}
+              onSaveFolders={(folders) => void saveFolders(connector, folders)}
               onSync={() =>
                 void runConnectorAction(connector.connector_id, 'sync', async () => {
                   await syncConnector(connector.connector_id)
@@ -271,6 +282,7 @@ function ConnectorRow({
   onSync,
   onUpdateConfig,
   onSaveConfig,
+  onSaveFolders,
   onReenrich
 }: {
   connector: ConnectorInfo
@@ -289,16 +301,18 @@ function ConnectorRow({
   onSync: () => void
   onUpdateConfig: (key: string, value: string) => void
   onSaveConfig: () => void
+  onSaveFolders: (folders: string[]) => void
   onReenrich: () => void
 }): React.JSX.Element {
   const status = connectorStatus(connector)
   const signInRequired = connector.kind === 'oauth' && !connector.available
+  const isFolders = connector.connector_id === FOLDERS_CONNECTOR_ID
   const syncRunning = connector.syncing || pendingAction === 'sync'
   const syncDisabled = syncRunning || !connector.available || !connector.enabled
   const toggleDisabled = pendingAction === 'enable' || pendingAction === 'disable'
   const deleteDisabled = pendingAction === 'delete' || connector.syncing || connector.docs === 0
-  const configKeys = Object.keys(connector.config).filter((key) =>
-    isEditableConfigValue(connector.config[key])
+  const configKeys = Object.keys(connector.config).filter(
+    (key) => isEditableConfigValue(connector.config[key]) && !(isFolders && key === 'folders')
   )
   const configDirty = Object.entries(configDrafts).some(
     ([key, draft]) => draft !== formatConfigValue(connector.config[key])
@@ -403,6 +417,14 @@ function ConnectorRow({
           ) : null}
 
           {signInRequired ? <SignInBlock connector={connector} /> : null}
+
+          {isFolders ? (
+            <FolderManager
+              connector={connector}
+              pending={pendingAction === 'config'}
+              onSaveFolders={onSaveFolders}
+            />
+          ) : null}
 
           {configKeys.length > 0 ? (
             <div className="connector-config">
@@ -515,6 +537,95 @@ function ConnectorRow({
   )
 }
 
+function FolderManager({
+  connector,
+  pending,
+  onSaveFolders
+}: {
+  connector: ConnectorInfo
+  pending: boolean
+  onSaveFolders: (folders: string[]) => void
+}): React.JSX.Element {
+  const folders = folderList(connector.config)
+
+  const addFolder = async (): Promise<void> => {
+    const chosen = await chooseDirectory()
+    const trimmed = chosen?.trim() ?? ''
+    if (!trimmed || folders.includes(trimmed)) {
+      return
+    }
+    onSaveFolders([...folders, trimmed])
+  }
+
+  return (
+    <div className="connector-folders">
+      <span className="connector-detail-label">Attached folders</span>
+      {folders.length === 0 ? (
+        <p className="connector-folders-empty">
+          No folders attached yet. Documents inside attached folders (.md, .txt, .pdf, .docx, .rtf)
+          are indexed into the corpus and re-synced automatically.
+        </p>
+      ) : (
+        <ul className="connector-folder-list">
+          {folders.map((folder) => (
+            <li key={folder}>
+              <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+                <path
+                  d="M2.5 6a2 2 0 0 1 2-2h3.2l1.6 2h6.2a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2Z"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinejoin="round"
+                />
+              </svg>
+              <code title={folder}>{folder}</code>
+              <button
+                className="icon-button"
+                type="button"
+                aria-label={`Detach ${folder}`}
+                title="Detach folder — already-indexed documents stay until the next sync"
+                disabled={pending}
+                onClick={() => onSaveFolders(folders.filter((item) => item !== folder))}
+              >
+                &times;
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="connector-folders-actions">
+        <button
+          className="secondary-button compact"
+          type="button"
+          disabled={pending}
+          onClick={() => void addFolder()}
+        >
+          {pending ? <span className="inline-spinner" aria-hidden="true" /> : null}
+          {pending ? 'Saving' : 'Add folder…'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+async function chooseDirectory(): Promise<string | null> {
+  const picker = window.api?.chooseDirectory
+  if (picker) {
+    try {
+      return await picker()
+    } catch {
+      return null
+    }
+  }
+  // non-Electron fallback (e.g. dev preview in a plain browser)
+  return window.prompt('Folder path to attach (e.g. /Users/you/Documents/Research)')
+}
+
+function folderList(config: Record<string, unknown>): string[] {
+  const raw = config.folders
+  return Array.isArray(raw) ? raw.filter((item): item is string => typeof item === 'string') : []
+}
+
 function SignInBlock({ connector }: { connector: ConnectorInfo }): React.JSX.Element {
   const [copied, setCopied] = useState(false)
   const command = signInCommand(connector)
@@ -590,6 +701,16 @@ function ConnectorGlyph({ connectorId }: { connectorId: string }): React.JSX.Ele
           <path d="M6 8.5 8.5 10.5 6 12.5M10.5 13h3.5" {...common} />
         </svg>
       )
+    case 'local_folders':
+      return (
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+          <path
+            d="M2.5 6a2 2 0 0 1 2-2h3.2l1.6 2h6.2a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2Z"
+            {...common}
+          />
+          <path d="M2.5 9h15" {...common} />
+        </svg>
+      )
     case 'gmail':
     case 'outlook':
       return (
@@ -631,6 +752,12 @@ function subtitleFor(
   }
   if (status === 'off') {
     return connector.docs > 0 ? `Off · ${formatCount(connector.docs)} docs stored` : 'Off'
+  }
+  if (
+    connector.connector_id === FOLDERS_CONNECTOR_ID &&
+    folderList(connector.config).length === 0
+  ) {
+    return 'No folders attached yet'
   }
   if (connector.docs === 0) {
     return 'Ready · no documents yet'

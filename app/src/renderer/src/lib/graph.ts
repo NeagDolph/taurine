@@ -1,7 +1,7 @@
-import type { RetrievalEvent } from './sidecar'
+import { SIDECAR_PORT, type RetrievalEvent } from './sidecar'
 
 export const NOW_NODE_ID = '__taurine_now__'
-export const SIDECAR_GRAPH_URL = 'http://127.0.0.1:8930/graph'
+export const SIDECAR_GRAPH_URL = `http://127.0.0.1:${SIDECAR_PORT}/graph`
 export const LIVE_EDGE_FADE_MS = 3000
 export const TOUCH_FLASH_MS = 1800
 
@@ -359,7 +359,9 @@ const SOURCE_COLORS: Record<string, string> = {
   apple_notes: '#7aa7ff',
   claude_mem: '#ff8da1',
   codex_mem: '#6dd6d6',
+  gmail: '#ffffff',
   imessage: '#5fd18d',
+  local_folders: '#f0a35e',
   obsidian: '#b98cff'
 }
 
@@ -368,6 +370,7 @@ const SOURCE_LABELS: Record<string, string> = {
   claude_mem: 'Claude',
   codex_mem: 'Codex',
   imessage: 'iMessage',
+  local_folders: 'Folders',
   obsidian: 'Obsidian'
 }
 
