@@ -66,10 +66,6 @@ def rebuild_all(index: object) -> None:
     kept, margin = _candidates(index)
     edges = _cap_edges(_apply_judgments(kept, margin, _valid_judgments(index)))
     index.replace_edges(edges)  # type: ignore[attr-defined]
-    from .rank import compute_quality_ranks, refresh_fact_embeddings
-
-    compute_quality_ranks(index)  # type: ignore[arg-type]
-    refresh_fact_embeddings(index)  # type: ignore[arg-type]
 
 
 def rebuild_for(index: object, note_id: str) -> None:
@@ -102,10 +98,6 @@ def rebuild_for(index: object, note_id: str) -> None:
         other_degree[other] = other_degree.get(other, 0) + 1
 
     index.replace_edges(selected, incident_note_id=note_id)  # type: ignore[attr-defined]
-    from .rank import compute_quality_ranks, refresh_fact_embeddings
-
-    compute_quality_ranks(index)  # type: ignore[arg-type]
-    refresh_fact_embeddings(index)  # type: ignore[arg-type]
 
 
 def _candidate_edges(index: object) -> list[GraphEdge]:
@@ -263,9 +255,6 @@ def _apply_judgments(
 
 
 def _note_vector(index: object, note_id: str) -> np.ndarray | None:
-    gist_vectors = index.embedding_vectors(note_id, "gist")  # type: ignore[attr-defined]
-    if gist_vectors:
-        return _normalize(gist_vectors[0])
     chunk_vectors = index.embedding_vectors(note_id, "chunk")  # type: ignore[attr-defined]
     if not chunk_vectors:
         return None
@@ -278,13 +267,15 @@ def _terms(enrichment: Enrichment | None, mechanism: str) -> set[str]:
     if mechanism == "topic":
         return {
             term
-            for topic in enrichment.topics
-            if (term := _canonicalize_term(topic, lowercase=True))
+            for entity in enrichment.entities
+            if entity.etype == "concept"
+            if (term := _canonicalize_term(entity.surface, lowercase=True))
         }
     return {
         term
         for entity in enrichment.entities
-        if (term := _canonicalize_term(entity, lowercase=False))
+        if entity.etype != "concept"
+        if (term := _canonicalize_term(entity.surface, lowercase=False))
     }
 
 

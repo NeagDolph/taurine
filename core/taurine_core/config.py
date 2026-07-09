@@ -224,7 +224,7 @@ PPR_ENTITY_RESET_W = 1.0                 # entity-seed reset weight
 ENTITY_SEED_W = 0.8                      # GLiNER entity seed weight
 FACT_EDGE_BOOST = 1.5                    # traversal weight multiplier for adjudicated fact edges
 SHARED_EDGE_BOOST = 1.35                 # entity/topic/mixed edges (audit F3.1 correction)
-DUP_EDGE_SIM = 0.95                      # same-source gist cosine ≥ this → edge excluded from quality rank
+DUP_EDGE_SIM = 0.95                      # same-source mean chunk cosine ≥ this → edge excluded from quality rank
 
 # ── static priors (source rank, quality rank, recency decay) ───────────
 SOURCE_RANK = {

@@ -88,6 +88,10 @@ async def adjudicate_graph(
     }
     index.prune_edge_judgments(active_ids)  # type: ignore[attr-defined]
     graph.rebuild_all(index)
+    from .rank import compute_quality_ranks, refresh_fact_embeddings
+
+    compute_quality_ranks(index)  # type: ignore[arg-type]
+    refresh_fact_embeddings(index)  # type: ignore[arg-type]
     index.load()  # type: ignore[attr-defined]
 
     return AdjudicationReport(
@@ -301,10 +305,10 @@ def _pair_section(pair: _PendingPair, left: NoteRecord, right: NoteRecord) -> li
         f"Band: {pair.marker} {pair.band}",
         f"Left note id: {left.note_id}",
         f"Left title: {left.title}",
-        f"Left gist: {left.gist}",
+        f"Left text: {left.text[:config.ADJ_TEXT_CAP]}",
         f"Right note id: {right.note_id}",
         f"Right title: {right.title}",
-        f"Right gist: {right.gist}",
+        f"Right text: {right.text[:config.ADJ_TEXT_CAP]}",
         f"Shared canonical terms: {shared}",
         f"Semantic cosine: {cosine}",
     ]

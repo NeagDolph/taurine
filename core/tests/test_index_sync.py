@@ -8,6 +8,7 @@ import pytest
 from tests.conftest import make_note
 from taurine_core import config
 from taurine_core.ports import LLMError
+from taurine_core.schemas import Extraction
 
 NOTE_A = make_note(
     "note-a",
@@ -20,26 +21,56 @@ def source_with(*notes):
     return lambda: list(notes)
 
 
-class StubLLM:
+class _Schema:
+    def entities(self, _types: dict[str, str]) -> "_Schema":
+        return self
+
+    def relations(self, _types: list[str]) -> "_Schema":
+        return self
+
+
+class FakeExtractorModel:
     def __init__(self) -> None:
         self.calls: list[str] = []
+
+    def create_schema(self) -> _Schema:
+        return _Schema()
+
+    def batch_extract(
+        self,
+        texts: list[str],
+        schema: object,
+        *,
+        batch_size: int,
+        threshold: float,
+        include_confidence: bool,
+        max_len: int | None,
+    ) -> list[dict]:
+        del schema, batch_size, threshold, include_confidence, max_len
+        self.calls.extend(texts)
+        return [_raw_extraction_for(text) for text in texts]
+
+
+class SlimLLM:
+    def __init__(self) -> None:
+        self.slim_calls: list[str] = []
+        self.adjudication_calls = 0
 
     async def complete_json(
         self, model: str, system: str, user: str, timeout_s: float | None = None
     ) -> dict:
-        del model, system, timeout_s
-        self.calls.append(user)
+        del system, timeout_s
+        if model == config.ADJUDICATE_MODEL:
+            self.adjudication_calls += 1
+            return {"pairs": {}}
+        self.slim_calls.append(user)
         return {
-            "gist": "Alpha rollout and billing launch.",
-            "utterances": [
-                "Can we talk about the alpha rollout?",
-                "What is happening with billing launch?",
-                "Do we have the alpha plan?",
-                "Where did the rollout land?",
-            ],
-            "aliases": ["alpha plan", "billing launch"],
-            "topics": ["planning", "billing"],
-            "entities": ["Alpha"],
+            "notes": {
+                "note-a": {
+                    "aliases": ["billing launch"],
+                    "utterances": ["Can we talk through the billing launch?"],
+                }
+            }
         }
 
 
@@ -52,13 +83,12 @@ class FailingLLM:
 
 
 @pytest.fixture
-def stub_llm() -> StubLLM:
-    return StubLLM()
+def fake_extractor(monkeypatch) -> FakeExtractorModel:
+    from taurine_core.indexer import extract
 
-
-@pytest.fixture
-def failing_llm() -> FailingLLM:
-    return FailingLLM()
+    model = FakeExtractorModel()
+    monkeypatch.setattr(extract, "_extractor_model", lambda: model)
+    return model
 
 
 @pytest.fixture(autouse=True)
@@ -79,25 +109,71 @@ def deterministic_sync_embeddings(monkeypatch):
     monkeypatch.setattr(sync, "embed_texts", fake_embed_texts)
 
 
-def test_unchanged_hash_skips_enrichment(store, stub_llm):
+def _raw_extraction_for(text: str) -> dict:
+    title = text.splitlines()[0]
+    if "Alpha" in title:
+        return {
+            "entities": {
+                "project": [{"text": "Alpha Plan", "confidence": 0.96}],
+                "concept": [{"text": "billing launch", "confidence": 0.91}],
+                "organization": [{"text": "Stripe", "confidence": 0.88}],
+            },
+            "relation_extraction": {
+                "about": [
+                    {
+                        "head": {"text": "Alpha Plan", "confidence": 0.96},
+                        "tail": {"text": "billing launch", "confidence": 0.91},
+                        "confidence": 0.89,
+                    }
+                ]
+            },
+        }
+    return {
+        "entities": {"project": [{"text": title, "confidence": 0.9}]},
+        "relation_extraction": {},
+    }
+
+
+def test_unchanged_hash_skips_extraction_and_slim(store, fake_extractor):
     from taurine_core.indexer.sync import sync_once
 
-    sync_once(store, source_with(NOTE_A), stub_llm)
-    stub_llm.calls.clear()
-    sync_once(store, source_with(NOTE_A), stub_llm)   # same content
-    assert stub_llm.calls == []
+    llm = SlimLLM()
+    sync_once(store, source_with(NOTE_A), llm)
+    fake_extractor.calls.clear()
+    llm.slim_calls.clear()
+
+    sync_once(store, source_with(NOTE_A), llm)
+
+    assert fake_extractor.calls == []
+    assert llm.slim_calls == []
 
 
-def test_enrich_failure_still_indexes(store, failing_llm):
+def test_extraction_failure_still_indexes_and_retries_next_sync(store, monkeypatch):
+    from taurine_core.indexer import extract
     from taurine_core.indexer.sync import sync_once
 
-    report = sync_once(store, source_with(NOTE_A), failing_llm)
+    monkeypatch.setattr(extract, "_extractor_model", lambda: None)
+    report = sync_once(store, source_with(NOTE_A), None)  # type: ignore[arg-type]
+
     assert report.enrich_failures == 1
     assert store.note(NOTE_A.note_id) is not None
-    assert store.bm25_search(NOTE_A.title, 5)          # searchable on raw text
+    assert store.bm25_search(NOTE_A.title, 5)
+    assert store.cached_extraction(NOTE_A.note_id, NOTE_A.content_hash) is None
+
+    model = FakeExtractorModel()
+    monkeypatch.setattr(extract, "_extractor_model", lambda: model)
+    retry = sync_once(store, source_with(NOTE_A), None)  # type: ignore[arg-type]
+
+    assert retry.changed == 1
+    assert model.calls
+    assert store.cached_extraction(NOTE_A.note_id, NOTE_A.content_hash) == Extraction(
+        entities=store.enrichment_for(NOTE_A.note_id).entities,
+        relations=store.enrichment_for(NOTE_A.note_id).relations,
+        failed=False,
+    )
 
 
-def test_changed_hash_reenriches_and_reports_changed(store, stub_llm):
+def test_changed_hash_reextracts_and_reports_changed(store, fake_extractor):
     from taurine_core.indexer.sync import sync_once
 
     changed = make_note(
@@ -106,37 +182,58 @@ def test_changed_hash_reenriches_and_reports_changed(store, stub_llm):
         NOTE_A.text + "\nA new launch detail.",
     )
 
-    first = sync_once(store, source_with(NOTE_A), stub_llm)
-    second = sync_once(store, source_with(changed), stub_llm)
+    first = sync_once(store, source_with(NOTE_A), None)  # type: ignore[arg-type]
+    fake_extractor.calls.clear()
+    second = sync_once(store, source_with(changed), None)  # type: ignore[arg-type]
 
     assert first.added == 1
     assert second.changed == 1
-    assert len(stub_llm.calls) == 2
+    assert fake_extractor.calls
     assert store.note(NOTE_A.note_id).content_hash == changed.content_hash
 
 
-def test_removed_note_is_deleted(store, stub_llm):
+def test_sync_passes_stored_user_card_to_slim_enrichment(store, fake_extractor):
     from taurine_core.indexer.sync import sync_once
 
-    sync_once(store, source_with(NOTE_A), stub_llm)
-    report = sync_once(store, source_with(), stub_llm)
+    store.set_user_card("## User\nWorks with Stripe.")
+    llm = SlimLLM()
+
+    sync_once(store, source_with(NOTE_A), llm)
+
+    assert len(llm.slim_calls) == 1
+    assert "## User\nWorks with Stripe." in llm.slim_calls[0]
+
+
+def test_sync_adds_display_line_heuristic_aliases_and_slim_utterances(
+    store, fake_extractor
+):
+    from taurine_core.indexer.sync import sync_once
+
+    sync_once(store, source_with(NOTE_A), SlimLLM())
+
+    note = store.note(NOTE_A.note_id)
+    assert note.gist == "Alpha rollout first line."
+    aliases = set(store.aliases())
+    assert ("alpha plan", NOTE_A.note_id, True) in aliases
+    assert ("billing launch", NOTE_A.note_id, False) in aliases
+    assert ("stripe", NOTE_A.note_id, False) not in aliases
+    kinds = [kind for _row_id, _note_id, kind, _text in store._embedding_rows]
+    assert "gist" not in kinds
+    assert "chunk" in kinds
+    assert "utterance" in kinds
+
+
+def test_removed_note_is_deleted(store, fake_extractor):
+    from taurine_core.indexer.sync import sync_once
+
+    sync_once(store, source_with(NOTE_A), None)  # type: ignore[arg-type]
+    report = sync_once(store, source_with(), None)  # type: ignore[arg-type]
 
     assert report.removed == 1
     assert store.note(NOTE_A.note_id) is None
 
 
-def test_sync_passes_stored_user_card_to_enrichment(store, stub_llm):
-    from taurine_core.indexer.sync import sync_once
-
-    store.set_user_card("## User\nWorks with Stripe.")
-
-    sync_once(store, source_with(NOTE_A), stub_llm)
-
-    assert len(stub_llm.calls) == 1
-    assert "## User\nWorks with Stripe." in stub_llm.calls[0]
-
-
-def test_sync_source_removes_only_notes_from_that_source(store, stub_llm):
+def test_sync_source_removes_only_notes_from_that_source(store, fake_extractor):
     from taurine_core.indexer.sync import sync_source
 
     source_a = make_note("source-a:alpha", "Alpha", "Alpha source text").model_copy(
@@ -146,9 +243,9 @@ def test_sync_source_removes_only_notes_from_that_source(store, stub_llm):
         update={"source": "source-b"}
     )
 
-    sync_source(store, "source-a", [source_a], stub_llm)
-    sync_source(store, "source-b", [source_b], stub_llm)
-    report = sync_source(store, "source-a", [], stub_llm)
+    sync_source(store, "source-a", [source_a], None)  # type: ignore[arg-type]
+    sync_source(store, "source-b", [source_b], None)  # type: ignore[arg-type]
+    report = sync_source(store, "source-a", [], None)  # type: ignore[arg-type]
 
     assert report.connector_id == "source-a"
     assert report.removed == 1
@@ -156,14 +253,14 @@ def test_sync_source_removes_only_notes_from_that_source(store, stub_llm):
     assert store.note(source_b.note_id) is not None
 
 
-def test_sync_source_tags_records_with_requested_source(store, stub_llm):
+def test_sync_source_tags_records_with_requested_source(store, fake_extractor):
     from taurine_core.indexer.sync import sync_source
 
     raw = make_note("obsidian:vault/plan.md", "Plan", "Plan body").model_copy(
         update={"source": "wrong-source"}
     )
 
-    report = sync_source(store, "obsidian", [raw], stub_llm)
+    report = sync_source(store, "obsidian", [raw], None)  # type: ignore[arg-type]
 
     assert report.connector_id == "obsidian"
     assert report.added == 1

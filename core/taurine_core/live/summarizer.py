@@ -3,7 +3,7 @@
 Input (ReSum-style bounded state, never the whole transcript):
 previous MeetingSummary JSON (or "none") + transcript delta since the last
 *accepted* pass (≤ SUMMARY_DELTA_MAX_CHARS) + grounding block
-(``[N3] "title" (source, age) — gist`` / ``[F7] (N3↔N9) "fact"``) + open
+(``[N3] "title" (source, age) — display line`` / ``[F7] (N3↔N9) "fact"``) + open
 actionables with status.
 
 Output: MeetingSummary delta or no_update (a first-class, correct answer).

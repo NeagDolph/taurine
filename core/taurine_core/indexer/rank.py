@@ -5,7 +5,7 @@ Two consumers share the boosted-weight CSR graph built here:
 - ``compute_quality_ranks`` — rebuild-time weighted PageRank with a
   trust+recency teleport (source_rank × recency per note), log-median
   transformed and clipped; persisted via ``Index.set_quality_ranks``.
-  Same-source near-duplicate edges (gist cosine ≥ DUP_EDGE_SIM) are
+  Same-source near-duplicate edges (mean chunk cosine ≥ DUP_EDGE_SIM) are
   excluded from the transition matrix (collusion-clique guard).
 - ``ppr`` — query-time Personalized PageRank over the same matrix,
   damping PPR_DAMPING, warm-startable from the previous pass's vector.
@@ -52,7 +52,7 @@ class NoteGraphMatrix:
 
         row_of = {note_id: offset for offset, note_id in enumerate(note_ids)}
         source_by_id = {node.note_id: node.source for node in graph.nodes}
-        gist_cache: dict[str, np.ndarray | None] = {}
+        vector_cache: dict[str, np.ndarray | None] = {}
         rows: list[int] = []
         cols: list[int] = []
         data: list[float] = []
@@ -61,7 +61,7 @@ class NoteGraphMatrix:
             if edge.src not in row_of or edge.dst not in row_of:
                 continue
             if for_quality and _same_source_duplicate_edge(
-                index, edge.src, edge.dst, source_by_id, gist_cache
+                index, edge.src, edge.dst, source_by_id, vector_cache
             ):
                 continue
             weight = _boosted_edge_weight(edge.weight, edge.type, edge.fact)
@@ -293,29 +293,29 @@ def _same_source_duplicate_edge(
     left: str,
     right: str,
     source_by_id: dict[str, str],
-    gist_cache: dict[str, np.ndarray | None],
+    vector_cache: dict[str, np.ndarray | None],
 ) -> bool:
     if source_by_id.get(left) != source_by_id.get(right):
         return False
-    left_vector = _first_gist_vector(index, left, gist_cache)
-    right_vector = _first_gist_vector(index, right, gist_cache)
+    left_vector = _note_mean_vector(index, left, vector_cache)
+    right_vector = _note_mean_vector(index, right, vector_cache)
     if left_vector is None or right_vector is None:
         return False
     return float(left_vector @ right_vector) >= config.DUP_EDGE_SIM
 
 
-def _first_gist_vector(
+def _note_mean_vector(
     index: Index,
     note_id: str,
     cache: dict[str, np.ndarray | None],
 ) -> np.ndarray | None:
     if note_id in cache:
         return cache[note_id]
-    vectors = index.embedding_vectors(note_id, kind="gist")
+    vectors = index.embedding_vectors(note_id, kind="chunk")
     if not vectors:
         cache[note_id] = None
         return None
-    vector = np.asarray(vectors[0], dtype=np.float32)
+    vector = np.mean(np.vstack(vectors), axis=0).astype(np.float32)
     norm = float(np.linalg.norm(vector))
     if norm <= 0.0:
         cache[note_id] = None

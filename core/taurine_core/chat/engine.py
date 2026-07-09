@@ -800,7 +800,11 @@ def _materialize_registry_note(ref: str, retriever: Any) -> GroundingItem | None
         note_id=str(getattr(note, "note_id", note_id)),
         short_id=ref,
         title=str(getattr(note, "title", "")),
-        gist=str(getattr(note, "gist", "")),
+        gist=_display_line_with_entities(
+            index,
+            str(getattr(note, "note_id", note_id)),
+            str(getattr(note, "gist", "")),
+        ),
         source=str(getattr(note, "source", "apple_notes")),
         age_days=age_days,
         score=0.0,
@@ -825,6 +829,22 @@ def _materialize_registry_fact(
             return None
         return GroundedFact(fact_id=ref, src=src, dst=dst, text=fact_text)
     return None
+
+
+def _display_line_with_entities(index: Any, note_id: str, display_line: str) -> str:
+    enrichment_for = getattr(index, "enrichment_for", None)
+    if not callable(enrichment_for):
+        return display_line
+    enrichment = enrichment_for(note_id)
+    entities = getattr(enrichment, "entities", []) if enrichment is not None else []
+    surfaces = [
+        str(getattr(entity, "surface", "")).strip()
+        for entity in entities
+        if str(getattr(entity, "surface", "")).strip()
+    ][:3]
+    if not surfaces:
+        return display_line
+    return f"{display_line} [{', '.join(surfaces)}]"
 
 
 def _unique(values: list[str]) -> list[str]:

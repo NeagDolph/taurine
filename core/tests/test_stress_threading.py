@@ -20,8 +20,7 @@ import pytest
 from taurine_core import config
 from taurine_core.connectors.registry import ConnectorRegistry
 from taurine_core.indexer.store import Index
-from taurine_core.ports import LLMError
-from taurine_core.schemas import Enrichment, NoteRecord
+from taurine_core.schemas import NoteRecord
 
 
 def _note(source: str, n: int, body: str | None = None) -> NoteRecord:
@@ -47,14 +46,51 @@ class InstantLLM:
         }
 
 
-class FlakyLLM:
-    """Deterministically fails every call for one note (attempt AND retry),
-    regardless of concurrency ordering — sync must survive and report."""
+class _Schema:
+    def entities(self, _types):
+        return self
 
-    async def complete_json(self, model, system, user, timeout_s=None):
-        if "doc 3" in user:
-            raise LLMError("synthetic failure")
-        return await InstantLLM().complete_json(model, system, user, timeout_s)
+    def relations(self, _types):
+        return self
+
+
+class FakeExtractorModel:
+    def create_schema(self):
+        return _Schema()
+
+    def batch_extract(self, texts, schema, *, batch_size, threshold, include_confidence, max_len):
+        del schema, batch_size, threshold, include_confidence, max_len
+        return [self._raw(text) for text in texts]
+
+    def extract(self, text, schema, *, threshold, include_confidence, max_len):
+        del schema, threshold, include_confidence, max_len
+        return self._raw(text)
+
+    def _raw(self, text):
+        title = text.splitlines()[0]
+        return {
+            "entities": {
+                "concept": [{"text": "topic", "confidence": 0.9}],
+                "project": [{"text": title, "confidence": 0.9}],
+            },
+            "relation_extraction": {},
+        }
+
+
+class FlakyExtractorModel(FakeExtractorModel):
+    """Deterministically fails one note after batch fallback; sync must survive and report."""
+
+    def batch_extract(self, texts, schema, *, batch_size, threshold, include_confidence, max_len):
+        del schema, batch_size, threshold, include_confidence, max_len
+        if any("doc 3" in text for text in texts):
+            raise RuntimeError("synthetic batch failure")
+        return [self._raw(text) for text in texts]
+
+    def extract(self, text, schema, *, threshold, include_confidence, max_len):
+        del schema, threshold, include_confidence, max_len
+        if "doc 3" in text:
+            raise RuntimeError("synthetic extraction failure")
+        return self._raw(text)
 
 
 class FakeConnector:
@@ -77,6 +113,7 @@ class FakeConnector:
 
 @pytest.fixture(autouse=True)
 def _stub_embeddings(monkeypatch):
+    from taurine_core.indexer import extract as extract_mod
     from taurine_core.indexer import store as store_mod
     from taurine_core.indexer import sync as sync_mod
 
@@ -87,6 +124,7 @@ def _stub_embeddings(monkeypatch):
     monkeypatch.setattr(store_mod, "embed_texts", fake_embed, raising=False)
     monkeypatch.setattr(store_mod, "embed_queries", fake_embed, raising=False)
     monkeypatch.setattr(sync_mod, "embed_texts", fake_embed, raising=False)
+    monkeypatch.setattr(extract_mod, "_extractor_model", lambda: FakeExtractorModel())
     yield
 
 
@@ -168,12 +206,15 @@ def test_unexpected_extract_crash_surfaces_in_report(tmp_path) -> None:
     assert "last sync failed" in info.detail
 
 
-def test_flaky_llm_reports_failures_without_crashing(tmp_path) -> None:
+def test_flaky_extraction_reports_failures_without_crashing(tmp_path, monkeypatch) -> None:
+    from taurine_core.indexer import extract as extract_mod
+
+    monkeypatch.setattr(extract_mod, "_extractor_model", lambda: FlakyExtractorModel())
     index = Index(tmp_path / "flaky.db")
     registry = ConnectorRegistry([FakeConnector("src_a", 12)])
     registry.set_enabled(index, "src_a", True)
 
-    report = registry.sync_connector("src_a", index, FlakyLLM())
+    report = registry.sync_connector("src_a", index, None)  # type: ignore[arg-type]
     assert report.error == ""
-    assert report.added == 12                      # fallback enrichment still indexes
+    assert report.added == 12                      # failed extraction still indexes raw text
     assert report.enrich_failures > 0

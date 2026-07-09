@@ -7,11 +7,11 @@ from collections.abc import Iterable
 import numpy as np
 import pytest
 
-from tests.conftest import fixture_units, make_note, unit_vec
+from tests.conftest import entity, fixture_units, make_note, unit_vec
 from taurine_core import config
 from taurine_core.indexer import graph
 from taurine_core.ports import LLMError
-from taurine_core.schemas import Enrichment, GraphEdge
+from taurine_core.schemas import Enrichment, EntityMention, GraphEdge
 
 
 _PAIR_ID_RE = re.compile(r"\bpair-\d+\b")
@@ -34,14 +34,18 @@ def _enrichment(
     gist: str,
     *,
     topics: Iterable[str] = (),
-    entities: Iterable[str] = (),
+    entities: Iterable[str | EntityMention] = (),
 ) -> Enrichment:
+    typed_entities = [entity(topic, "concept") for topic in topics]
+    for item in entities:
+        typed_entities.append(item if isinstance(item, EntityMention) else entity(item))
     return Enrichment(
         gist=gist,
         utterances=[gist],
         aliases=[],
-        topics=list(topics),
-        entities=list(entities),
+        entities=typed_entities,
+        relations=[],
+        extraction_failed=False,
     )
 
 
@@ -57,7 +61,7 @@ def _install(
 ) -> None:
     enrich = _enrichment(gist, topics=topics, entities=entities)
     note = make_note(note_id, title, gist)
-    index.upsert_note(note, enrich, [("gist", enrich.gist, vector)])  # type: ignore[attr-defined]
+    index.upsert_note(note, enrich, [("chunk", enrich.gist, vector)])  # type: ignore[attr-defined]
 
 
 def _edge_between(index: object, left: str, right: str) -> GraphEdge | None:
@@ -215,6 +219,10 @@ async def test_bands_and_prompt_caps_margin_and_fact_candidates(
     assert "## User\nWorks on the launch graph." in prompt
     assert "anchor" in prompt
     assert "Anchor" in prompt
+    assert "Left text: Central launch graph note." in prompt
+    assert "Right text: Strongest anchor neighbor." in prompt
+    assert "Left gist:" not in prompt
+    assert "Right gist:" not in prompt
     assert "Strong B" in prompt
     assert "Strong C" not in prompt
 
@@ -367,12 +375,45 @@ async def test_missing_pair_response_stays_unjudged_and_retries_next_run(store) 
 def test_sync_source_runs_adjudication_and_keeps_sync_successful_on_failure(
     store, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from taurine_core.indexer import extract
     from taurine_core.indexer import sync
     from taurine_core.indexer.store import Index
     from taurine_core.indexer.sync import sync_source
 
     def fake_embed_texts(texts: list[str]) -> np.ndarray:
         return np.vstack([unit_vec(index + 100) for index, _text in enumerate(texts)])
+
+    class _Schema:
+        def entities(self, _types: dict[str, str]) -> "_Schema":
+            return self
+
+        def relations(self, _types: list[str]) -> "_Schema":
+            return self
+
+    class SharedProjectExtractor:
+        def create_schema(self) -> _Schema:
+            return _Schema()
+
+        def batch_extract(
+            self,
+            texts: list[str],
+            schema: object,
+            *,
+            batch_size: int,
+            threshold: float,
+            include_confidence: bool,
+            max_len: int | None,
+        ) -> list[dict]:
+            del schema, batch_size, threshold, include_confidence, max_len
+            return [
+                {
+                    "entities": {
+                        "project": [{"text": "Launch Project", "confidence": 0.95}]
+                    },
+                    "relation_extraction": {},
+                }
+                for _text in texts
+            ]
 
     class SyncAndAdjudicateLLM:
         def __init__(self, *, fail_adjudication: bool = False) -> None:
@@ -398,14 +439,20 @@ def test_sync_source_runs_adjudication_and_keeps_sync_successful_on_failure(
                     }
                 }
             return {
-                "gist": "Shared launch work.",
-                "utterances": ["Discuss the shared launch work."],
-                "aliases": ["shared launch"],
-                "topics": ["launch"],
-                "entities": ["Launch Project"],
+                "notes": {
+                    "alpha": {
+                        "aliases": ["shared launch"],
+                        "utterances": ["Discuss the shared launch work."],
+                    },
+                    "beta": {
+                        "aliases": ["shared launch"],
+                        "utterances": ["Discuss the shared launch work."],
+                    },
+                }
             }
 
     monkeypatch.setattr(sync, "embed_texts", fake_embed_texts)
+    monkeypatch.setattr(extract, "_extractor_model", lambda: SharedProjectExtractor())
     store.set_user_card("## User\nBuilds launch systems.")
     first_llm = SyncAndAdjudicateLLM()
     notes = [
@@ -425,6 +472,7 @@ def test_sync_source_runs_adjudication_and_keeps_sync_successful_on_failure(
 
     second_store = Index(tmp_path / "failure.db")
     monkeypatch.setattr(sync, "embed_texts", fake_embed_texts)
+    monkeypatch.setattr(extract, "_extractor_model", lambda: SharedProjectExtractor())
     failing_llm = SyncAndAdjudicateLLM(fail_adjudication=True)
     failure_report = sync_source(second_store, "test", notes, failing_llm)
 

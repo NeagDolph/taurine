@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from tests.conftest import enrichment, fixture_units, make_note, shifted_vec, unit_vec
-from taurine_core.schemas import GraphEdge
+from taurine_core.schemas import Extraction, GraphEdge
 
 
 def test_upsert_note_updates_fts_aliases_and_cache(store):
@@ -17,14 +17,33 @@ def test_upsert_note_updates_fts_aliases_and_cache(store):
         topics=["billing", "planning"],
         entities=["Stripe"],
     )
-    store.cache_enrichment(note.note_id, note.content_hash, enrich)
+    extraction = Extraction(entities=enrich.entities, relations=enrich.relations)
+    store.cache_extraction(note.note_id, note.content_hash, extraction)
     store.upsert_note(note, enrich, fixture_units(unit_vec(1), enrich))
 
     assert store.note("alpha") is not None
+    assert store.note("alpha").gist == "Body mentions invoice migration and rollout."
     assert store.bm25_search("invoice", 5) == [("alpha", store.bm25_search("invoice", 5)[0][1])]
     assert ("alpha plan", "alpha", True) in store.aliases()
     assert ("invoice rollout", "alpha", False) in store.aliases()
-    assert store.cached_enrichment(note.note_id, note.content_hash) == enrich
+    assert store.cached_extraction(note.note_id, note.content_hash) == extraction
+
+
+def test_upsert_note_uses_clamped_first_non_empty_note_line_as_display_line(store):
+    note = make_note(
+        "alpha",
+        "Alpha Title",
+        "\n\n" + ("alpha " * 80) + "\nsecond line",
+    )
+    enrich = enrichment("LLM-style gist should be ignored")
+
+    store.upsert_note(note, enrich, fixture_units(unit_vec(3), enrich))
+
+    stored = store.note("alpha")
+    assert stored.gist.startswith("alpha alpha")
+    assert "LLM-style" not in stored.gist
+    assert len(stored.gist) <= 220
+    assert not stored.gist.endswith(" ")
 
 
 def test_dense_search_uses_per_note_max_unit_score(store, monkeypatch):
@@ -37,9 +56,9 @@ def test_dense_search_uses_per_note_max_unit_score(store, monkeypatch):
     store.upsert_note(
         note_a,
         enrich_a,
-        [("chunk", "weak alpha", weaker), ("gist", "strong alpha", query_vec)],
+        [("chunk", "weak alpha", weaker), ("utterance", "strong alpha", query_vec)],
     )
-    store.upsert_note(note_b, enrich_b, [("gist", "beta", unit_vec(9))])
+    store.upsert_note(note_b, enrich_b, [("chunk", "beta", unit_vec(9))])
 
     monkeypatch.setattr(
         "taurine_core.indexer.store.embed_queries",
@@ -76,7 +95,6 @@ def test_best_chunk_returns_nearest_chunk_text(store, monkeypatch):
         [
             ("chunk", "unrelated chunk", unit_vec(13)),
             ("chunk", "matching chunk", query_vec),
-            ("gist", "Alpha gist", unit_vec(14)),
         ],
     )
     monkeypatch.setattr(
@@ -96,7 +114,6 @@ def test_best_chunk_considers_utterance_units_and_prefixes_spoken_reference(stor
         enrich,
         [
             ("chunk", "unrelated chunk", unit_vec(16)),
-            ("gist", "unrelated gist", unit_vec(17)),
             ("utterance", "matching spoken sentence", query_vec),
         ],
     )
@@ -226,7 +243,7 @@ def test_preview_resolves_neighbors_sorted_by_weight(store):
     assert preview is not None
     assert preview.title == "Alpha"
     assert preview.source == "obsidian"
-    assert preview.gist == "Alpha gist"
+    assert preview.gist == "Alpha body"
     assert preview.text == "Alpha body"
     assert [neighbor.note_id for neighbor in preview.neighbors] == ["gamma", "beta"]
     assert [neighbor.title for neighbor in preview.neighbors] == ["Gamma", "Beta"]

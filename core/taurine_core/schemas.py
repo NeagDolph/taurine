@@ -15,15 +15,6 @@ class Chunk(BaseModel):
     seq: int = 0                   # monotonic per session, assigned at ingest
 
 
-# ── index shapes ───────────────────────────────────────────────────────
-class Enrichment(BaseModel):
-    gist: str                      # <=120 chars
-    utterances: list[str]          # 4 synthetic spoken sentences
-    aliases: list[str]             # <=6
-    topics: list[str]              # 2-4, lowercase normalized
-    entities: list[str]
-
-
 class EntityMention(BaseModel):
     surface: str
     etype: str                     # key of config.INGEST_ENTITY_TYPES
@@ -36,6 +27,16 @@ class RelationTriple(BaseModel):
     rel_type: str                  # key of config.INGEST_RELATION_TYPES
     tail: str
     conf: float
+
+
+# ── index shapes ───────────────────────────────────────────────────────
+class Enrichment(BaseModel):
+    gist: str = ""                 # heuristic display line; not an LLM artifact
+    aliases: list[str] = []        # title + heuristic + slim-call spoken variants
+    utterances: list[str] = []     # slim-call only, while SLIM_UTTERANCES
+    entities: list[EntityMention] = []
+    relations: list[RelationTriple] = []
+    extraction_failed: bool = False
 
 
 class Extraction(BaseModel):
@@ -52,7 +53,7 @@ class NoteRecord(BaseModel):
     created: float = 0.0           # creation ts (0 → store falls back to modified)
     content_hash: str
     text: str                      # plain text body
-    gist: str = ""                 # filled after enrichment (fallback: first line)
+    gist: str = ""                 # heuristic display line (fallback: first non-empty line)
     source: str = "apple_notes"    # connector_id that produced this document
     quality_rank: float = 0.0      # log(pagerank/median), clipped ±QUALITY_CLIP; set at rebuild
 
@@ -74,7 +75,7 @@ class GraphNode(BaseModel):
     title: str
     degree: int
     source: str = "apple_notes"
-    gist: str = ""                 # LLM gist (fallback: first line) for map hover previews
+    gist: str = ""                 # heuristic display line for map hover previews
 
 
 class GraphResponse(BaseModel):
@@ -252,7 +253,7 @@ class ConnectorInfo(BaseModel):
     docs: int = 0
     last_sync: Optional[float] = None
     syncing: bool = False
-    sync_phase: str = ""           # extracting | enriching | indexing | finalizing
+    sync_phase: str = ""           # extracting | indexing | finalizing | adjudicating
     sync_done: int = 0
     sync_total: int = 0
     config: dict = {}

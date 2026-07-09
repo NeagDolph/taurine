@@ -19,6 +19,8 @@ from taurine_core.schemas import (
     ChatMeta,
     ChatUsage,
     Enrichment,
+    EntityMention,
+    Extraction,
     GraphEdge,
     GraphNode,
     GraphResponse,
@@ -27,6 +29,7 @@ from taurine_core.schemas import (
     NeighborRef,
     NotePreview,
     NoteRecord,
+    RelationTriple,
 )
 
 EmbeddingKind = Literal["chunk", "gist", "utterance"]
@@ -233,7 +236,7 @@ class Index:
         enrichment: Enrichment,
         embedding_units: Sequence[EmbeddingInput],
     ) -> None:
-        stored = note.model_copy(update={"gist": enrichment.gist})
+        stored = note.model_copy(update={"gist": _display_line(note)})
         with self._conn:
             # quality_rank is deliberately absent: it is owned by the rank pass
             # (set_quality_ranks) and must survive note upserts untouched.
@@ -280,13 +283,28 @@ class Index:
             self._conn.execute("DELETE FROM embeddings WHERE note_id = ?", (stored.note_id,))
             for kind, text, vector in embedding_units:
                 self._insert_embedding(stored.note_id, kind, text, vector)
-            self._conn.execute(
-                """
-                INSERT OR REPLACE INTO enrich_cache(note_id, content_hash, enrichment_json)
-                VALUES (?, ?, ?)
-                """,
-                (stored.note_id, stored.content_hash, enrichment.model_dump_json()),
-            )
+            if not enrichment.extraction_failed:
+                self._replace_note_extraction_rows(
+                    stored.note_id,
+                    [
+                        (
+                            entity.surface,
+                            entity.etype,
+                            entity.conf,
+                            entity.mentions,
+                        )
+                        for entity in enrichment.entities
+                    ],
+                    [
+                        (
+                            relation.head,
+                            relation.rel_type,
+                            relation.tail,
+                            relation.conf,
+                        )
+                        for relation in enrichment.relations
+                    ],
+                )
             self._set_last_sync(time.time())
         self._doc_frequency_cache.clear()
         self.load()
@@ -309,8 +327,8 @@ class Index:
         self._doc_frequency_cache.clear()
         self.load()
 
-    def cache_enrichment(
-        self, note_id: str, content_hash: str, enrichment: Enrichment
+    def cache_extraction(
+        self, note_id: str, content_hash: str, extraction: Extraction
     ) -> None:
         with self._conn:
             self._conn.execute(
@@ -318,10 +336,10 @@ class Index:
                 INSERT OR REPLACE INTO enrich_cache(note_id, content_hash, enrichment_json)
                 VALUES (?, ?, ?)
                 """,
-                (note_id, content_hash, enrichment.model_dump_json()),
+                (note_id, content_hash, extraction.model_dump_json()),
             )
 
-    def cached_enrichment(self, note_id: str, content_hash: str) -> Enrichment | None:
+    def cached_extraction(self, note_id: str, content_hash: str) -> Extraction | None:
         row = self._conn.execute(
             """
             SELECT enrichment_json FROM enrich_cache
@@ -331,7 +349,33 @@ class Index:
         ).fetchone()
         if row is None:
             return None
-        return Enrichment.model_validate_json(row["enrichment_json"])
+        try:
+            return Extraction.model_validate_json(row["enrichment_json"])
+        except Exception:
+            return None
+
+    def cache_enrichment(
+        self, note_id: str, content_hash: str, enrichment: Enrichment
+    ) -> None:
+        self.cache_extraction(
+            note_id,
+            content_hash,
+            Extraction(
+                entities=enrichment.entities,
+                relations=enrichment.relations,
+                failed=enrichment.extraction_failed,
+            ),
+        )
+
+    def cached_enrichment(self, note_id: str, content_hash: str) -> Enrichment | None:
+        extraction = self.cached_extraction(note_id, content_hash)
+        if extraction is None:
+            return None
+        return Enrichment(
+            entities=extraction.entities,
+            relations=extraction.relations,
+            extraction_failed=extraction.failed,
+        )
 
     def set_user_card(self, text: str) -> None:
         with self._conn:
@@ -583,43 +627,7 @@ class Index:
     ) -> None:
         """Replace GLiNER extraction rows for one note and refresh entity df."""
         with self._conn:
-            touched_entity_ids = self._entity_ids_touched_by_note(note_id)
-            self._conn.execute("DELETE FROM note_entities WHERE note_id = ?", (note_id,))
-            self._conn.execute("DELETE FROM entity_relations WHERE note_id = ?", (note_id,))
-
-            canonical_entity_ids: dict[str, set[int]] = defaultdict(set)
-            for canonical, etype, conf, count in entities:
-                entity_id = self._upsert_entity(canonical, etype)
-                touched_entity_ids.add(entity_id)
-                canonical_entity_ids[canonical].add(entity_id)
-                self._conn.execute(
-                    """
-                    INSERT INTO note_entities(note_id, entity_id, conf, count)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(note_id, entity_id) DO UPDATE SET
-                        conf = excluded.conf,
-                        count = excluded.count
-                    """,
-                    (note_id, entity_id, float(conf), int(count)),
-                )
-
-            for src_canonical, rel_type, dst_canonical, conf in relations:
-                src_entity = self._resolve_entity_id(src_canonical, canonical_entity_ids)
-                dst_entity = self._resolve_entity_id(dst_canonical, canonical_entity_ids)
-                if src_entity is None or dst_entity is None:
-                    continue
-                touched_entity_ids.update((src_entity, dst_entity))
-                self._conn.execute(
-                    """
-                    INSERT INTO entity_relations(note_id, src_entity, rel_type, dst_entity, conf)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(note_id, src_entity, rel_type, dst_entity) DO UPDATE SET
-                        conf = MAX(entity_relations.conf, excluded.conf)
-                    """,
-                    (note_id, src_entity, rel_type, dst_entity, float(conf)),
-                )
-
-            self._recompute_entity_df(touched_entity_ids)
+            self._replace_note_extraction_rows(note_id, entities, relations)
 
     def entity_rows(self) -> list[tuple[int, str, str, int]]:
         rows = self._conn.execute(
@@ -1023,9 +1031,9 @@ class Index:
     def best_chunk(self, note_id: str, query_text: str) -> str:
         """Embedding unit of the note most similar to query_text for rerank docs.
 
-        The method name is historical: candidates may be chunks, gists, or
-        synthetic utterances. Utterance winners are labeled as spoken references
-        so rerank documents read naturally.
+        The method name is historical: candidates may be chunks, legacy stored
+        summary rows, or synthetic utterances. Utterance winners are labeled as
+        spoken references so rerank documents read naturally.
         """
         embedding_rows, matrix = self._dense_state
         rows = [
@@ -1243,25 +1251,58 @@ class Index:
         note = self.note(note_id)
         if note is None:
             return None
-        row = self._conn.execute(
-            """
-            SELECT enrichment_json FROM enrich_cache
-            WHERE note_id = ? AND content_hash = ?
-            """,
-            (note_id, note.content_hash),
-        ).fetchone()
-        if row is not None:
-            return Enrichment.model_validate_json(row["enrichment_json"])
         alias_rows = self._conn.execute(
             "SELECT alias_lowercase FROM aliases WHERE note_id = ? AND is_title = 0",
             (note_id,),
         ).fetchall()
+        entity_rows = self._conn.execute(
+            """
+            SELECT e.canonical, e.etype, ne.conf, ne.count
+            FROM note_entities ne
+            JOIN entities e ON e.entity_id = ne.entity_id
+            WHERE ne.note_id = ?
+            ORDER BY e.entity_id
+            """,
+            (note_id,),
+        ).fetchall()
+        relation_rows = self._conn.execute(
+            """
+            SELECT src.canonical AS head,
+                   er.rel_type AS rel_type,
+                   dst.canonical AS tail,
+                   er.conf AS conf
+            FROM entity_relations er
+            JOIN entities src ON src.entity_id = er.src_entity
+            JOIN entities dst ON dst.entity_id = er.dst_entity
+            WHERE er.note_id = ?
+            ORDER BY er.rowid
+            """,
+            (note_id,),
+        ).fetchall()
+        cached = self.cached_extraction(note_id, note.content_hash)
         return Enrichment(
             gist=note.gist,
             utterances=[],
             aliases=[row["alias_lowercase"] for row in alias_rows],
-            topics=[],
-            entities=[],
+            entities=[
+                EntityMention(
+                    surface=row["canonical"],
+                    etype=row["etype"],
+                    conf=float(row["conf"]),
+                    mentions=int(row["count"]),
+                )
+                for row in entity_rows
+            ],
+            relations=[
+                RelationTriple(
+                    head=row["head"],
+                    rel_type=row["rel_type"],
+                    tail=row["tail"],
+                    conf=float(row["conf"]),
+                )
+                for row in relation_rows
+            ],
+            extraction_failed=bool(cached.failed) if cached is not None else False,
         )
 
     def rebuild_graph(self) -> None:
@@ -1458,6 +1499,52 @@ class Index:
             return
         self._conn.execute("ALTER TABLE edges ADD COLUMN fact TEXT NOT NULL DEFAULT ''")
 
+    def _replace_note_extraction_rows(
+        self,
+        note_id: str,
+        entities: list[tuple[str, str, float, int]],
+        relations: list[tuple[str, str, str, float]],
+    ) -> None:
+        touched_entity_ids = self._entity_ids_touched_by_note(note_id)
+        self._conn.execute("DELETE FROM note_entities WHERE note_id = ?", (note_id,))
+        self._conn.execute("DELETE FROM entity_relations WHERE note_id = ?", (note_id,))
+
+        canonical_entity_ids: dict[str, set[int]] = defaultdict(set)
+        for canonical, etype, conf, count in entities:
+            if not canonical.strip() or not etype.strip():
+                continue
+            entity_id = self._upsert_entity(canonical, etype)
+            touched_entity_ids.add(entity_id)
+            canonical_entity_ids[canonical].add(entity_id)
+            self._conn.execute(
+                """
+                INSERT INTO note_entities(note_id, entity_id, conf, count)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(note_id, entity_id) DO UPDATE SET
+                    conf = excluded.conf,
+                    count = excluded.count
+                """,
+                (note_id, entity_id, float(conf), int(count)),
+            )
+
+        for src_canonical, rel_type, dst_canonical, conf in relations:
+            src_entity = self._resolve_entity_id(src_canonical, canonical_entity_ids)
+            dst_entity = self._resolve_entity_id(dst_canonical, canonical_entity_ids)
+            if src_entity is None or dst_entity is None:
+                continue
+            touched_entity_ids.update((src_entity, dst_entity))
+            self._conn.execute(
+                """
+                INSERT INTO entity_relations(note_id, src_entity, rel_type, dst_entity, conf)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(note_id, src_entity, rel_type, dst_entity) DO UPDATE SET
+                    conf = MAX(entity_relations.conf, excluded.conf)
+                """,
+                (note_id, src_entity, rel_type, dst_entity, float(conf)),
+            )
+
+        self._recompute_entity_df(touched_entity_ids)
+
     def _upsert_entity(self, canonical: str, etype: str) -> int:
         self._conn.execute(
             "INSERT OR IGNORE INTO entities(canonical, etype) VALUES (?, ?)",
@@ -1555,6 +1642,25 @@ class Index:
 
 def _normalize_alias(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+
+
+def _display_line(note: NoteRecord) -> str:
+    for line in note.text.splitlines():
+        cleaned = line.strip()
+        if cleaned:
+            return _clamp_display_line(cleaned)
+    return _clamp_display_line(note.title)
+
+
+def _clamp_display_line(value: str) -> str:
+    max_chars = config.GIST_MAX_CHARS
+    if len(value) <= max_chars:
+        return value
+    clipped = value[:max_chars]
+    if clipped[-1].isspace() or value[max_chars : max_chars + 1].isspace():
+        return clipped.rstrip()
+    head = clipped.rsplit(" ", 1)[0].rstrip()
+    return head or clipped.rstrip()
 
 
 def _rerank_evidence_text(kind: EmbeddingKind, text: str) -> str:

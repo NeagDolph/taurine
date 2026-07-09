@@ -8,9 +8,9 @@ import pytest
 
 from taurine_core import config
 from taurine_core.indexer import graph
-from taurine_core.schemas import Enrichment, GraphEdge
+from taurine_core.schemas import Enrichment, EntityMention, GraphEdge
 
-from .conftest import make_note
+from .conftest import entity, make_note
 
 
 def _edge_between(index: object, left: str, right: str) -> GraphEdge | None:
@@ -25,14 +25,18 @@ def _enrichment(
     gist: str,
     *,
     topics: Iterable[str] = (),
-    entities: Iterable[str] = (),
+    entities: Iterable[str | EntityMention] = (),
 ) -> Enrichment:
+    typed_entities = [entity(topic, "concept") for topic in topics]
+    for item in entities:
+        typed_entities.append(item if isinstance(item, EntityMention) else entity(item))
     return Enrichment(
         gist=gist,
         utterances=[gist],
         aliases=[],
-        topics=list(topics),
-        entities=list(entities),
+        entities=typed_entities,
+        relations=[],
+        extraction_failed=False,
     )
 
 
@@ -54,7 +58,7 @@ def _install_notes(index: object, rows: Iterable[tuple[str, Enrichment]]) -> Non
     for offset, (note_id, enrichment) in enumerate(rows):
         note = make_note(note_id, note_id.replace("-", " ").title(), enrichment.gist)
         vector = _basis_vector(offset)
-        index.upsert_note(note, enrichment, [("gist", enrichment.gist, vector)])  # type: ignore[attr-defined]
+        index.upsert_note(note, enrichment, [("chunk", enrichment.gist, vector)])  # type: ignore[attr-defined]
 
 
 @pytest.fixture
@@ -108,6 +112,17 @@ def test_entity_separator_variants_share_one_canonical_term(store, term_embeddin
     assert edge.type == "entity"
     assert edge.shared == ["recommendation engine"]
     assert len(term_embedding_stub) == 1
+
+
+def test_concept_entities_create_topic_terms_and_other_entities_keep_case() -> None:
+    enrichment = _enrichment(
+        "Typed extraction.",
+        topics=["Billing Flow"],
+        entities=["Stripe Team"],
+    )
+
+    assert graph._terms(enrichment, "topic") == {"billing flow"}
+    assert graph._terms(enrichment, "entity") == {"Stripe Team"}
 
 
 def test_digit_guard_prevents_merge_for_terms_with_different_digit_sequences(

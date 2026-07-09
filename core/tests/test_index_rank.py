@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
 
-from tests.conftest import make_note
+from tests.conftest import entity, make_note
 from taurine_core import config
 from taurine_core.indexer import graph
 from taurine_core.schemas import Enrichment, GraphEdge, NoteRecord
@@ -29,19 +29,22 @@ def _install(
     topics: list[str] | None = None,
     entities: list[str] | None = None,
 ) -> NoteRecord:
+    typed_entities = [entity(topic, "concept") for topic in (topics or [])]
+    typed_entities.extend(entity(item) for item in (entities or []))
     enrich = Enrichment(
         gist=f"{note_id} gist",
         utterances=[f"Discuss {note_id}."],
         aliases=[],
-        topics=topics or [],
-        entities=entities or [],
+        entities=typed_entities,
+        relations=[],
+        extraction_failed=False,
     )
     note = make_note(note_id, note_id.title(), f"{note_id} body", modified=modified)
     note = note.model_copy(update={"source": source})
     index.upsert_note(  # type: ignore[attr-defined]
         note,
         enrich,
-        [("gist", enrich.gist, vector if vector is not None else _basis(abs(hash(note_id))))],
+        [("chunk", note.text, vector if vector is not None else _basis(abs(hash(note_id))))],
     )
     return note
 
@@ -241,8 +244,9 @@ def test_refresh_fact_embeddings_is_content_addressed_and_prunes(store, monkeypa
     assert store.fact_dense_search(first_fact, 1) == []
 
 
-def test_rebuild_hook_refreshes_quality_ranks_and_fact_embeddings(store, monkeypatch) -> None:
+def test_explicit_rank_and_fact_refresh_after_graph_rebuild(store, monkeypatch) -> None:
     from taurine_core.indexer import store as store_module
+    from taurine_core.indexer.rank import compute_quality_ranks, refresh_fact_embeddings
 
     now = 30_000_000.0
     _install(
@@ -289,6 +293,8 @@ def test_rebuild_hook_refreshes_quality_ranks_and_fact_embeddings(store, monkeyp
     )
 
     store.rebuild_graph()
+    compute_quality_ranks(store, now=now)
+    refresh_fact_embeddings(store)
 
     ranks = store.quality_ranks()
     assert any(abs(value) > 0 for value in ranks.values())

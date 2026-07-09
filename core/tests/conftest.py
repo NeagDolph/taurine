@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from taurine_core import config
-from taurine_core.schemas import Enrichment, NoteRecord
+from taurine_core.schemas import Enrichment, EntityMention, NoteRecord, RelationTriple
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -48,14 +48,29 @@ def shifted_vec(base: np.ndarray, seed: int, *, noise: float = 0.01) -> np.ndarr
     return values.astype(np.float32)
 
 
+def entity(
+    surface: str,
+    etype: str = "project",
+    *,
+    conf: float = 0.9,
+    mentions: int = 1,
+) -> EntityMention:
+    return EntityMention(surface=surface, etype=etype, conf=conf, mentions=mentions)
+
+
 def enrichment(
     gist: str,
     *,
     aliases: list[str] | None = None,
     topics: list[str] | None = None,
-    entities: list[str] | None = None,
+    entities: list[str | EntityMention] | None = None,
+    relations: list[RelationTriple] | None = None,
     utterances: list[str] | None = None,
+    extraction_failed: bool = False,
 ) -> Enrichment:
+    typed_entities = [entity(topic, "concept") for topic in (topics or ["work"])]
+    for item in entities or []:
+        typed_entities.append(item if isinstance(item, EntityMention) else entity(item))
     return Enrichment(
         gist=gist,
         utterances=utterances
@@ -66,8 +81,9 @@ def enrichment(
             f"Let's revisit {gist.lower()}.",
         ],
         aliases=aliases or [],
-        topics=topics or ["work"],
-        entities=entities or [],
+        entities=typed_entities,
+        relations=relations or [],
+        extraction_failed=extraction_failed,
     )
 
 
@@ -169,11 +185,10 @@ for i in range(1, 19):
 
 
 def fixture_units(vector: np.ndarray, enrich: Enrichment) -> list[tuple[str, str, np.ndarray]]:
-    return [
-        ("gist", enrich.gist, vector),
-        ("chunk", enrich.gist, vector),
-        ("utterance", enrich.utterances[0], vector),
-    ]
+    units = [("chunk", enrich.gist, vector)]
+    if enrich.utterances:
+        units.append(("utterance", enrich.utterances[0], vector))
+    return units
 
 
 def install_fixture(
@@ -183,6 +198,39 @@ def install_fixture(
     for note, enrich, vector in rows:
         index.upsert_note(note, enrich, fixture_units(vector, enrich))  # type: ignore[attr-defined]
     index.rebuild_graph()  # type: ignore[attr-defined]
+
+
+class _DefaultExtractorSchema:
+    def entities(self, _types: dict[str, str]) -> "_DefaultExtractorSchema":
+        return self
+
+    def relations(self, _types: list[str]) -> "_DefaultExtractorSchema":
+        return self
+
+
+class _DefaultExtractorModel:
+    def create_schema(self) -> _DefaultExtractorSchema:
+        return _DefaultExtractorSchema()
+
+    def batch_extract(
+        self,
+        texts: list[str],
+        schema: object,
+        *,
+        batch_size: int,
+        threshold: float,
+        include_confidence: bool,
+        max_len: int | None,
+    ) -> list[dict]:
+        del schema, batch_size, threshold, include_confidence, max_len
+        return [{"entities": {}, "relation_extraction": {}} for _text in texts]
+
+
+@pytest.fixture(autouse=True)
+def no_real_indexer_extractor(monkeypatch: pytest.MonkeyPatch) -> None:
+    from taurine_core.indexer import extract
+
+    monkeypatch.setattr(extract, "_extractor_model", lambda: _DefaultExtractorModel())
 
 
 @pytest.fixture

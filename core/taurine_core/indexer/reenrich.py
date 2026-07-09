@@ -4,14 +4,16 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
-import numpy as np
-
 from taurine_core.ports import LLMPort
-from taurine_core.schemas import Enrichment, NoteRecord, ReenrichStatus
+from taurine_core.schemas import ReenrichStatus
 
-from .batch_enrich import enrich_all_batched
 from .profile import build_user_card
-from .sync import _embedding_units
+from .sync import (
+    _apply_slim_enrichment,
+    _drop_cached_extraction,
+    _embedding_units,
+    _enrichment_from_extraction,
+)
 
 _LOG = logging.getLogger("taurine.session")
 
@@ -59,44 +61,57 @@ async def reenrich_all(
     progress(ReenrichStatus(running=True, phase="notes", done=0, total=total))
 
     changed_note_ids: list[str] = []
+    changed_notes = []
+    enrichments = {}
     done = 0
     failures = 0
 
-    typed_notes: list[NoteRecord] = notes  # type: ignore[assignment]
-    notes_by_id: dict[str, NoteRecord] = {note.note_id: note for note in typed_notes}
+    from . import extract
 
-    def on_note_done(note_id: str, enrichment: Enrichment, failed: bool) -> None:
-        nonlocal done, failures
-        note = notes_by_id[note_id]
-        if failed:
+    extractions = extract.extract_notes(notes)  # type: ignore[arg-type]
+    for note in notes:
+        extraction = extractions.get(note.note_id)
+        if extraction is None or extraction.failed:
             failures += 1
+            _drop_cached_extraction(index, note)  # type: ignore[arg-type]
         else:
-            index.cache_enrichment(  # type: ignore[attr-defined]
+            index.cache_extraction(  # type: ignore[attr-defined]
                 note.note_id,
                 note.content_hash,
-                enrichment,
+                extraction,
             )
+            enrichment = _enrichment_from_extraction(note, extraction)
+            enrichments[note.note_id] = enrichment
             index.upsert_note(  # type: ignore[attr-defined]
                 note,
                 enrichment,
                 _embedding_units(note, enrichment),  # type: ignore[arg-type]
             )
             changed_note_ids.append(note.note_id)
+            changed_notes.append(note)
         done += 1
         progress(ReenrichStatus(running=True, phase="notes", done=done, total=total))
-
-    await enrich_all_batched(
-        typed_notes,
-        llm,
-        user_card,
-        _embed_texts,
-        on_note_done,
-    )
 
     progress(ReenrichStatus(running=True, phase="finalizing", done=done, total=total))
     for note_id in changed_note_ids:
         index.rebuild_for(note_id)  # type: ignore[attr-defined]
     index.load()  # type: ignore[attr-defined]
+    from .rank import compute_quality_ranks, compute_value_scores, refresh_fact_embeddings
+
+    compute_quality_ranks(index)  # type: ignore[arg-type]
+    value_scores = compute_value_scores(index)  # type: ignore[arg-type]
+    await _apply_slim_enrichment(  # type: ignore[arg-type]
+        index,
+        changed_notes,
+        enrichments,
+        llm,
+        value_scores,
+    )
+    for note_id in changed_note_ids:
+        index.rebuild_for(note_id)  # type: ignore[attr-defined]
+    index.load()  # type: ignore[attr-defined]
+    compute_quality_ranks(index)  # type: ignore[arg-type]
+    compute_value_scores(index)  # type: ignore[arg-type]
     if llm is not None:
         try:
             from .adjudicate import adjudicate_graph
@@ -121,6 +136,7 @@ async def reenrich_all(
             )
         except Exception:
             _LOG.exception("adjudicate failed; continuing reenrich")
+    refresh_fact_embeddings(index)  # type: ignore[arg-type]
     progress(ReenrichStatus(running=False, phase="idle", done=done, total=total))
 
     return ReenrichReport(
@@ -129,9 +145,3 @@ async def reenrich_all(
         failures=failures,
         profile_failed=profile_failed,
     )
-
-
-def _embed_texts(texts: list[str]) -> np.ndarray:
-    from . import sync
-
-    return sync.embed_texts(texts)

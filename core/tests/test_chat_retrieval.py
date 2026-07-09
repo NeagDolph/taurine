@@ -10,7 +10,7 @@ from taurine_core import config
 from taurine_core.chat.retrieval import ChatRetriever
 from taurine_core.indexer import store as store_module
 from taurine_core.live.grounding import GroundingEngine
-from taurine_core.schemas import Enrichment, GraphEdge, GraphNode, GraphResponse, NoteRecord
+from taurine_core.schemas import Enrichment, EntityMention, GraphEdge, GraphNode, GraphResponse, NoteRecord
 
 from tests.fakes import note
 
@@ -34,8 +34,9 @@ def _enrichment(gist: str) -> Enrichment:
         gist=gist,
         utterances=[gist],
         aliases=[],
-        topics=["work"],
-        entities=[],
+        entities=[EntityMention(surface="work", etype="concept", conf=0.9)],
+        relations=[],
+        extraction_failed=False,
     )
 
 
@@ -215,7 +216,7 @@ def test_chat_uses_chat_query_prompt_and_store_default_stays_live_prompt(
     store.upsert_note(
         note("stored-alpha", "Stored Alpha"),
         _enrichment("stored alpha gist"),
-        [("gist", "stored alpha gist", _vec(0))],
+        [("chunk", "stored alpha text", _vec(0))],
     )
     prompts: list[str | None] = []
 

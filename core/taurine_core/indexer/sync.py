@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 import threading
 from collections.abc import Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass
@@ -11,8 +12,9 @@ from typing import Any, TypeVar
 
 import numpy as np
 
+from taurine_core import config
 from taurine_core.ports import LLMError, LLMPort
-from taurine_core.schemas import ConnectorSyncReport, Enrichment, NoteRecord
+from taurine_core.schemas import ConnectorSyncReport, Enrichment, Extraction, NoteRecord
 
 from .embed import chunk_text, embed_texts
 from .notes import extract_notes
@@ -48,7 +50,7 @@ def sync_source(
     index: Index,
     source_id: str,
     records: Iterable[NoteRecord],
-    llm: LLMPort,
+    llm: LLMPort | None,
     progress: SyncProgress | None = None,
 ) -> ConnectorSyncReport:
     def report(phase: str, done: int, total: int) -> None:
@@ -72,7 +74,14 @@ def sync_source(
     changed = 0
     for note in incoming:
         existing = existing_by_id.get(note.note_id)
-        if existing is not None and existing.content_hash == note.content_hash:
+        has_valid_extraction = (
+            index.cached_extraction(note.note_id, note.content_hash) is not None
+        )
+        if (
+            existing is not None
+            and existing.content_hash == note.content_hash
+            and has_valid_extraction
+        ):
             continue
         if existing is None:
             added += 1
@@ -84,45 +93,39 @@ def sync_source(
         "sync %s: %d extracted, %d to index (%d new, %d changed), %d removed",
         source_id, len(incoming), len(pending), added, changed, len(removed_ids),
     )
-    report("enriching", 0, len(pending))
-
-    user_card = index.user_card()
+    report("extracting", 0, len(pending))
     enrich_failures = 0
-    cached: dict[str, Enrichment] = {}
-    needs_llm: list[NoteRecord] = []
+    cached: dict[str, Extraction] = {}
+    needs_extract: list[NoteRecord] = []
     for note in pending:
-        hit = index.cached_enrichment(note.note_id, note.content_hash)
-        if hit is not None:
+        hit = index.cached_extraction(note.note_id, note.content_hash)
+        if hit is not None and not hit.failed:
             cached[note.note_id] = hit
         else:
-            needs_llm.append(note)
+            needs_extract.append(note)
 
-    fresh: dict[str, tuple[Enrichment, bool]] = {}
-    if needs_llm:
-        fresh = _run_async(
-            _enrich_concurrently(
-                needs_llm,
-                llm,
-                user_card,
-                source_id,
-                lambda done: report("enriching", done, len(pending)),
-                already_done=len(cached),
-            )
-        )
+    fresh: dict[str, Extraction] = {}
+    if needs_extract:
+        from . import extract
+
+        fresh = extract.extract_notes(needs_extract)
+    report("extracting", len(pending), len(pending))
 
     rebuilt: list[str] = []
+    enrichments: dict[str, Enrichment] = {}
     for position, note in enumerate(pending, start=1):
-        failed = False
         if note.note_id in cached:
-            enrichment = cached[note.note_id]
+            extraction = cached[note.note_id]
         else:
-            enrichment, failed = fresh[note.note_id]
-            enrich_failures += int(failed)
-            if not failed:  # fallback enrichments must retry on the next sync
-                index.cache_enrichment(note.note_id, note.content_hash, enrichment)
+            extraction = fresh.get(note.note_id, Extraction(failed=True))
+            enrich_failures += int(extraction.failed)
+            if extraction.failed:
+                _drop_cached_extraction(index, note)
+            else:
+                index.cache_extraction(note.note_id, note.content_hash, extraction)
+        enrichment = _enrichment_from_extraction(note, extraction)
+        enrichments[note.note_id] = enrichment
         index.upsert_note(note, enrichment, _embedding_units(note, enrichment))
-        if failed:
-            _drop_cached_enrichment(index, note)
         rebuilt.append(note.note_id)
         report("indexing", position, len(pending))
 
@@ -130,6 +133,17 @@ def sync_source(
     for note_id in rebuilt:
         index.rebuild_for(note_id)
     index.load()
+    from .rank import compute_quality_ranks, compute_value_scores, refresh_fact_embeddings
+
+    compute_quality_ranks(index)
+    value_scores = compute_value_scores(index)
+    if llm is not None:
+        _run_async(_apply_slim_enrichment(index, pending, enrichments, llm, value_scores))
+        for note_id in rebuilt:
+            index.rebuild_for(note_id)
+        index.load()
+        compute_quality_ranks(index)
+        compute_value_scores(index)
     if llm is not None:
         try:
             from .adjudicate import adjudicate_graph
@@ -149,6 +163,7 @@ def sync_source(
             )
         except Exception:
             _LOG.exception("adjudicate failed; continuing sync")
+    refresh_fact_embeddings(index)
     _LOG.info(
         "sync %s: done — +%d new, ~%d changed, -%d removed, %d enrich failures",
         source_id, added, changed, len(removed_ids), enrich_failures,
@@ -160,30 +175,6 @@ def sync_source(
         removed=len(removed_ids),
         enrich_failures=enrich_failures,
     )
-
-
-async def _enrich_concurrently(
-    notes: list[NoteRecord],
-    llm: LLMPort,
-    user_card: str | None,
-    source_id: str,
-    on_progress: Callable[[int], None],
-    already_done: int,
-) -> dict[str, tuple[Enrichment, bool]]:
-    from .batch_enrich import enrich_all_batched
-
-    done = already_done
-
-    def note_done(note_id: str, enrichment: Enrichment, failed: bool) -> None:
-        nonlocal done
-        del note_id, enrichment, failed
-        done += 1
-        current = done
-        on_progress(current)
-        if current % 5 == 0 or current == already_done + len(notes):
-            _LOG.info("sync %s: enriched %d/%d", source_id, current, already_done + len(notes))
-
-    return await enrich_all_batched(notes, llm, user_card, embed_texts, note_done)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -205,9 +196,6 @@ def _embedding_units(note: NoteRecord, enrichment: Enrichment) -> list[Embedding
         if chunk.strip():
             texts.append(chunk)
             kinds.append("chunk")
-    if enrichment.gist.strip():
-        texts.append(enrichment.gist)
-        kinds.append("gist")
     for utterance in enrichment.utterances:
         if utterance.strip():
             texts.append(utterance)
@@ -220,7 +208,80 @@ def _embedding_units(note: NoteRecord, enrichment: Enrichment) -> list[Embedding
     return units
 
 
-def _drop_cached_enrichment(index: Index, note: NoteRecord) -> None:
+async def _apply_slim_enrichment(
+    index: Index,
+    changed: list[NoteRecord],
+    enrichments: dict[str, Enrichment],
+    llm: LLMPort,
+    value_scores: dict[str, float],
+) -> None:
+    from .slim_enrich import select_slim_notes, slim_enrich_batch
+
+    selected = select_slim_notes(changed, value_scores)
+    if not selected:
+        return
+    slim = await slim_enrich_batch(selected, llm, index.user_card())
+    for note in selected:
+        base = enrichments.get(note.note_id)
+        if base is None:
+            continue
+        slim_item = slim.get(note.note_id)
+        if slim_item is None:
+            continue
+        merged = base.model_copy(
+            update={
+                "aliases": [*base.aliases, *slim_item.aliases],
+                "utterances": slim_item.utterances,
+            }
+        )
+        enrichments[note.note_id] = merged
+        index.upsert_note(note, merged, _embedding_units(note, merged))
+
+
+def _enrichment_from_extraction(note: NoteRecord, extraction: Extraction) -> Enrichment:
+    return Enrichment(
+        aliases=_heuristic_aliases(note, extraction),
+        entities=extraction.entities,
+        relations=extraction.relations,
+        extraction_failed=extraction.failed,
+    )
+
+
+def _heuristic_aliases(note: NoteRecord, extraction: Extraction) -> list[str]:
+    aliases: list[str] = []
+    for entity in extraction.entities:
+        surface = entity.surface.strip()
+        if not surface or not _alias_allowed(surface):
+            continue
+        if re.search(rf"(?<!\w){re.escape(surface)}(?!\w)", note.title, re.IGNORECASE):
+            aliases.append(surface)
+    return _dedupe(aliases)
+
+
+def _alias_allowed(value: str) -> bool:
+    normalized = " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+    if not normalized:
+        return False
+    words = normalized.split()
+    compact_len = sum(len(word) for word in words)
+    if compact_len < config.ALIAS_MIN_COMPACT_LEN:
+        return False
+    return not (words and all(word in config.ALIAS_STOPWORDS for word in words))
+
+
+def _dedupe(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def _drop_cached_extraction(index: Index, note: NoteRecord) -> None:
     with index._conn:  # type: ignore[attr-defined]
         index._conn.execute(  # type: ignore[attr-defined]
             """

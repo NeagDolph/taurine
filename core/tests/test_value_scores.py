@@ -14,7 +14,7 @@ from taurine_core.connectors.email_common import (
     funnel_threads,
 )
 from taurine_core import pii
-from taurine_core.schemas import Enrichment, NoteRecord
+from taurine_core.schemas import EntityMention, Extraction, NoteRecord
 
 _NOW = 1_760_000_000.0
 _DAY = 86_400.0
@@ -270,15 +270,15 @@ def test_registry_persists_email_salience_after_sync_upserts(
     note = make_note("gmail:thread-1", "Thread 1", "Body", modified=_NOW).model_copy(
         update={"source": "gmail"}
     )
-    store.cache_enrichment(
+    store.cache_extraction(
         note.note_id,
         note.content_hash,
-        Enrichment(
-            gist="Thread one gist.",
-            utterances=["Discuss thread one."],
-            aliases=[],
-            topics=["email"],
-            entities=[],
+        Extraction(
+            entities=[
+                EntityMention(surface="email", etype="concept", conf=0.9, mentions=1)
+            ],
+            relations=[],
+            failed=False,
         ),
     )
     connector = _FakeEmailConnector(

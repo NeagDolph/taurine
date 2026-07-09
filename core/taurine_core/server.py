@@ -829,7 +829,7 @@ async def _run_reenrich(runtime: Runtime, source: str | None = None) -> None:
             )
         else:
             await _emit_index_status(runtime)
-        # re-enrichment rewrites gists/edges and (on full runs) the user card
+        # re-enrichment refreshes extraction/display lines/edges and, on full runs, the user card
         _bump_graph(runtime)
         runtime.updates.publish("profile")
         runtime.updates.publish("connectors")

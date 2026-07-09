@@ -427,7 +427,7 @@ class GroundingEngine:
             note_id=note_id,
             short_id=self._note_short_id(note_id),
             title=note.title,
-            gist=note.gist,
+            gist=_display_line_with_entities(self.index, note_id, note.gist),
             source=note.source,
             age_days=blend["age_days"],
             score=blend["final"],
@@ -582,6 +582,19 @@ def _fact_dense_search(
         if "prompt" not in str(exc):
             raise
         return index.fact_dense_search(text, k)
+
+
+def _display_line_with_entities(index: Index, note_id: str, display_line: str) -> str:
+    enrichment_for = getattr(index, "enrichment_for", None)
+    if not callable(enrichment_for):
+        return display_line
+    enrichment = enrichment_for(note_id)
+    if enrichment is None or not enrichment.entities:
+        return display_line
+    surfaces = [entity.surface for entity in enrichment.entities if entity.surface][:3]
+    if not surfaces:
+        return display_line
+    return f"{display_line} [{', '.join(surfaces)}]"
 
 
 def _state_counter(value: Any, prefix: str) -> int:
