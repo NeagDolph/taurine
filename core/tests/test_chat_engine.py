@@ -12,7 +12,7 @@ from taurine_core.chat import engine as engine_module
 from taurine_core.chat.engine import ChatEngine
 from taurine_core.llm import StreamEvent
 from taurine_core.ports import LLMError
-from taurine_core.schemas import ChatActivityStep, ChatMessage, GroundedFact, GroundingItem
+from taurine_core.schemas import ChatActivityStep, GroundedFact, GroundingItem
 from tests.fakes import note as fake_note
 
 
@@ -126,6 +126,48 @@ async def _capture(event: Any, events: list[dict[str, Any]]) -> None:
 
 def _terminal_types(events: list[dict[str, Any]]) -> list[str]:
     return [event["type"] for event in events if event["type"] in {"chat_done", "chat_error"}]
+
+
+@pytest.mark.asyncio
+async def test_chat_injects_latest_user_profile_as_uncitable_system_context(store: Any) -> None:
+    store.set_user_card("Neil builds Taurine and works on live knowledge systems.")
+    llm = FakeLLM(
+        streams=[
+            [
+                StreamEvent(kind="content", text="Grounded answer [N1]"),
+                StreamEvent(kind="done"),
+            ]
+        ]
+    )
+
+    await ChatEngine(store, llm, MemoryLogger()).send(
+        "",
+        "What am I working on?",
+        lambda _event: _capture(_event, []),
+    )
+
+    system = llm.calls[0]["messages"][0]["content"]
+    assert (
+        "<user_profile>\nNeil builds Taurine and works on live knowledge systems.\n"
+        "</user_profile>"
+    ) in system
+    assert "background context" in system
+    assert "not citable evidence" in system
+
+
+@pytest.mark.asyncio
+async def test_chat_omits_user_profile_block_when_card_is_missing(store: Any) -> None:
+    llm = FakeLLM(
+        streams=[[StreamEvent(kind="content", text="Answer"), StreamEvent(kind="done")]]
+    )
+
+    await ChatEngine(store, llm, MemoryLogger()).send(
+        "",
+        "Question",
+        lambda _event: _capture(_event, []),
+    )
+
+    assert "<user_profile>" not in llm.calls[0]["messages"][0]["content"]
 
 
 @pytest.mark.asyncio
