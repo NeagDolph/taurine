@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,50 @@ def _install_old_shape_fixture(db_path: Path) -> None:
         )
         index._conn.execute(
             "UPDATE notes SET gist = 'LLM-generated summary for beta' WHERE note_id = 'beta'"
+        )
+    index.close()
+
+
+def _insert_legacy_empty_cache_note(db_path: Path) -> None:
+    index = Index(db_path)
+    note = make_note(
+        "gamma",
+        "Gamma Legacy",
+        "Gamma legacy note has real text that mentions Delta Project.",
+        modified=30.0,
+    )
+    vector = unit_vec(3)
+    index.upsert_note(
+        note,
+        Enrichment(gist="LLM era gist gamma"),
+        [
+            ("chunk", "chunk gamma", vector),
+            ("gist", "old gist gamma", vector),
+            ("utterance", "old utterance gamma", vector),
+        ],
+    )
+    with index._conn:
+        index._conn.execute(
+            "UPDATE notes SET gist = 'LLM-generated summary for gamma' WHERE note_id = 'gamma'"
+        )
+        index._conn.execute(
+            """
+            INSERT OR REPLACE INTO enrich_cache(note_id, content_hash, enrichment_json)
+            VALUES (?, ?, ?)
+            """,
+            (
+                note.note_id,
+                note.content_hash,
+                json.dumps(
+                    {
+                        "gist": "Legacy empty entity summary",
+                        "utterances": [],
+                        "aliases": [],
+                        "topics": [],
+                        "entities": [],
+                    }
+                ),
+            ),
         )
     index.close()
 
@@ -291,6 +336,7 @@ def test_backfill_skips_valid_cached_extractions_and_counts_only_fresh_backfills
 
     db_path = tmp_path / "cached-skip.db"
     _install_old_shape_fixture(db_path)
+    _insert_legacy_empty_cache_note(db_path)
     calls = _patch_non_extraction_work(monkeypatch)
 
     cached_alpha = Extraction(
@@ -342,6 +388,16 @@ def test_backfill_skips_valid_cached_extractions_and_counts_only_fresh_backfills
                         mentions=1,
                     )
                 ]
+            ),
+            "gamma": Extraction(
+                entities=[
+                    EntityMention(
+                        surface="Fresh Gamma Project",
+                        etype="project",
+                        conf=0.84,
+                        mentions=1,
+                    )
+                ]
             )
         }
 
@@ -350,15 +406,22 @@ def test_backfill_skips_valid_cached_extractions_and_counts_only_fresh_backfills
 
     report = migrate_enrichment.migrate(db_path, llm=None, dry_run=False)
 
-    assert extracted_batches == [["beta"]]
+    assert extracted_batches == [["beta", "gamma"]]
     assert report == migrate_enrichment.MigrationReport(
-        gist_rows_deleted=2,
+        gist_rows_deleted=3,
         utterance_rows_deleted=0,
-        notes_backfilled=1,
+        notes_backfilled=2,
         extraction_failures=0,
         judgments_written=0,
     )
     assert calls == ["rebuild", "quality", "value"]
+    index = Index(db_path)
+    gamma = index.note("gamma")
+    assert gamma is not None
+    cached_gamma = index.cached_extraction("gamma", gamma.content_hash)
+    assert cached_gamma is not None
+    assert [entity.surface for entity in cached_gamma.entities] == ["Fresh Gamma Project"]
+    index.close()
 
 
 def test_dry_run_mutates_nothing_and_reports_read_only_estimates(

@@ -174,6 +174,48 @@ def test_extraction_failure_still_indexes_and_retries_next_sync(store, monkeypat
     )
 
 
+def test_failed_extraction_with_llm_is_not_slim_cached_and_retries_same_hash(
+    store, monkeypatch
+):
+    from taurine_core.indexer import extract
+    from taurine_core.indexer.sync import sync_once
+
+    llm = SlimLLM()
+    monkeypatch.setattr(extract, "_extractor_model", lambda: None)
+
+    report = sync_once(store, source_with(NOTE_A), llm)  # type: ignore[arg-type]
+
+    assert report.enrich_failures == 1
+    assert llm.slim_calls == []
+    assert store.cached_extraction(NOTE_A.note_id, NOTE_A.content_hash) is None
+    assert (
+        store._conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM enrich_cache
+            WHERE note_id = ? AND content_hash = ?
+            """,
+            (NOTE_A.note_id, NOTE_A.content_hash),
+        ).fetchone()["count"]
+        == 0
+    )
+    assert (
+        "billing launch",
+        NOTE_A.note_id,
+        False,
+    ) not in store.aliases()
+
+    model = FakeExtractorModel()
+    monkeypatch.setattr(extract, "_extractor_model", lambda: model)
+    llm.slim_calls.clear()
+
+    retry = sync_once(store, source_with(NOTE_A), llm)  # type: ignore[arg-type]
+
+    assert retry.changed == 1
+    assert model.calls
+    assert llm.slim_calls
+    assert store.cached_extraction(NOTE_A.note_id, NOTE_A.content_hash) is not None
+
+
 def test_changed_hash_reextracts_and_reports_changed(store, fake_extractor):
     from taurine_core.indexer.sync import sync_once
 

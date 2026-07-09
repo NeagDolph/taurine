@@ -409,7 +409,12 @@ class Index:
         if row is None:
             return None
         try:
-            return Extraction.model_validate_json(row["enrichment_json"])
+            data = json.loads(row["enrichment_json"])
+            if not isinstance(data, dict):
+                return None
+            if set(data) - set(Extraction.model_fields):
+                return None
+            return Extraction.model_validate(data, strict=False)
         except Exception:
             return None
 

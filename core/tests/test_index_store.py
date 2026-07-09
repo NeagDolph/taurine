@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import numpy as np
@@ -27,6 +28,31 @@ def test_upsert_note_updates_fts_aliases_and_cache(store):
     assert ("alpha plan", "alpha", True) in store.aliases()
     assert ("invoice rollout", "alpha", False) in store.aliases()
     assert store.cached_extraction(note.note_id, note.content_hash) == extraction
+
+
+def test_cached_extraction_rejects_legacy_llm_payload_extra_keys(store):
+    note = make_note("legacy-empty", "Legacy Empty", "Legacy note with real text.")
+    legacy_payload = {
+        "gist": "LLM-era summary",
+        "utterances": [],
+        "aliases": [],
+        "topics": [],
+        "entities": [],
+    }
+    with store._conn:
+        store._conn.execute(
+            """
+            INSERT INTO enrich_cache(note_id, content_hash, enrichment_json)
+            VALUES (?, ?, ?)
+            """,
+            (note.note_id, note.content_hash, json.dumps(legacy_payload)),
+        )
+
+    assert store.cached_extraction(note.note_id, note.content_hash) is None
+
+    store.cache_extraction(note.note_id, note.content_hash, Extraction())
+
+    assert store.cached_extraction(note.note_id, note.content_hash) == Extraction()
 
 
 def test_upsert_note_uses_clamped_first_non_empty_note_line_as_display_line(store):

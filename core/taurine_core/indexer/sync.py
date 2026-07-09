@@ -74,9 +74,8 @@ def sync_source(
     changed = 0
     for note in incoming:
         existing = existing_by_id.get(note.note_id)
-        has_valid_extraction = (
-            index.cached_extraction(note.note_id, note.content_hash) is not None
-        )
+        extraction_hit = index.cached_extraction(note.note_id, note.content_hash)
+        has_valid_extraction = extraction_hit is not None and not extraction_hit.failed
         if (
             existing is not None
             and existing.content_hash == note.content_hash
@@ -228,7 +227,14 @@ async def _apply_slim_enrichment(
 ) -> None:
     from .slim_enrich import select_slim_notes, slim_enrich_batch
 
-    selected = select_slim_notes(changed, value_scores)
+    slim_candidates: list[NoteRecord] = []
+    for note in changed:
+        base = enrichments.get(note.note_id)
+        if base is None or base.extraction_failed:
+            continue
+        slim_candidates.append(note)
+
+    selected = select_slim_notes(slim_candidates, value_scores)
     if not selected:
         return
     slim = await slim_enrich_batch(selected, llm, index.user_card())
