@@ -129,21 +129,24 @@ TERM_SYNONYM_MIN_SIM = 0.95
 # variants are always string-close too
 TERM_LEXICAL_MIN_RATIO = 0.80
 
-# ── graph adjudication (margin LLM pass + edge facts) ─────────────────
-# deepseek-v4-pro judges only band pairs (never O(n^2)): near-misses that
-# just failed the edge thresholds (may admit) and weak kept edges (may
-# veto), writing a one-sentence fact for every pair it confirms plus each
-# note's strongest edges. Judgments cache by note-content signature; cheap
-# rebuilds apply the cache synchronously.
+# ── graph adjudication (corners LLM pass + edge facts) ────────────────
+# GLiNER-confirmed facts skip the queue; remaining uncertainty-band pairs
+# are gated by value score or bridge status before the LLM budget.
 ADJUDICATE_MODEL = "deepseek/deepseek-v4-pro"
 ADJUDICATE_TIMEOUT_S = 90.0
 ADJUDICATE_BATCH_PAIRS = 20              # pairs per LLM call
 ADJUDICATE_CONCURRENCY = 4
-MARGIN_SEMANTIC_SIM = 0.50               # near-miss dense floor (< GRAPH_MIN_SIM)
-MARGIN_SHARED_W = 0.15                   # near-miss shared-term floor (< GRAPH_MIN_SHARED_W)
-MARGIN_MAX_PER_NOTE = 5                  # margin pairs sent per note per pass
-VETO_MAX_W = 0.45                        # kept edges below this weight can be vetoed
-FACT_TOP_EDGES_PER_NOTE = 6              # strongest kept edges per note that get facts
+ADJ_VALUE_FRACTION = 0.20                # corners value gate
+ADJUDICATE_MAX_PAIRS_PER_SYNC = 100      # sync adjudication budget
+BRIDGE_RANK_BOOST = 1.5                  # bridge-pair budget boost
+COMMUNITY_LP_ITERS = 20                  # label-propagation passes
+ADJ_TEXT_CAP = 700                       # note-text chars per side
+# Legacy margin/band knobs stay until Task 9 removes old callers.
+MARGIN_SEMANTIC_SIM = 0.50               # legacy near-miss dense floor
+MARGIN_SHARED_W = 0.15                   # legacy near-miss shared-term floor
+MARGIN_MAX_PER_NOTE = 5                  # legacy margin-pair cap
+VETO_MAX_W = 0.45                        # legacy weak-kept edge band
+FACT_TOP_EDGES_PER_NOTE = 6              # strong edges fact candidates
 
 # ── note graph ─────────────────────────────────────────────────────────
 GRAPH_KNN = 6
@@ -216,6 +219,9 @@ PPR_DAMPING = 0.5                        # HippoRAG value: mass stays within ~2 
 PPR_TOL = 1e-8                           # L1 convergence tolerance
 PPR_MAX_ITERS = 50
 PPR_BLEND = 0.35                         # rel = (1-β)·norm(fused RRF) + β·norm(PPR mass)
+PPR_PASSAGE_RESET_W = 1.0                # note-seed reset weight
+PPR_ENTITY_RESET_W = 1.0                 # entity-seed reset weight
+ENTITY_SEED_W = 0.8                      # GLiNER entity seed weight
 FACT_EDGE_BOOST = 1.5                    # traversal weight multiplier for adjudicated fact edges
 SHARED_EDGE_BOOST = 1.35                 # entity/topic/mixed edges (audit F3.1 correction)
 DUP_EDGE_SIM = 0.95                      # same-source gist cosine ≥ this → edge excluded from quality rank
@@ -231,6 +237,13 @@ SOURCE_RANK = {
     "codex_mem": 0.70,
 }
 SOURCE_RANK_DEFAULT = 0.85               # future connectors until explicitly ranked
+
+# ── value score / slim LLM call ────────────────────────────────────────
+VALUE_RECENCY_HALF_LIFE_DAYS = 30.0      # value-score recency decay
+SLIM_LLM_VALUE_FRACTION = 0.15           # top-value changed notes
+SLIM_LLM_MIN_NOTES = 5                   # slim-call floor per sync
+SLIM_UTTERANCES = True                   # Task 12 ablation may flip off
+
 QUALITY_DAMPING = 0.85                   # quality-rank PageRank damping
 QUALITY_TOL = 1e-6                       # L1 convergence tolerance
 QUALITY_MAX_ITERS = 100
@@ -299,6 +312,40 @@ GLINER2_SCHEMA = {
     "event": "Meetings, deadlines, launches, or scheduled occurrences",
 }
 GLINER_MAX_SPANS = 4
+
+# ── GLiNER ingestion (local entities + relations) ─────────────────────
+GLINER_INGEST_BATCH = 8                  # notes per forward batch
+GLINER_CHUNK_SIZE = 384                  # long-note window tokens
+GLINER_CHUNK_OVERLAP = 64                # long-note overlap tokens
+GLINER_ENTITY_MIN_CONF = 0.5             # calibration-pending entity floor
+GLINER_RELATION_MIN_CONF = 0.45          # calibration-pending relation floor
+INGEST_ENTITY_TYPES: dict[str, str] = {
+    "person": "A named individual mentioned in the note",
+    "organization": "A company, team, client, vendor, or institution",
+    "project": "An internal work initiative, codename, feature, or plan",
+    "product": "A product, service, app, or tool",
+    "place": "A physical location, city, venue, or region",
+    "event": "A meeting, launch, trip, conference, or scheduled occurrence",
+    "date_or_deadline": "A date, time, deadline, milestone, or time window",
+    "concept": "abstract topic, technology, or practice the note is about",
+}
+INGEST_RELATION_TYPES: dict[str, str] = {
+    "works_with": "{head} works with {tail}",
+    "works_at": "{head} works at {tail}",
+    "member_of": "{head} is a member of {tail}",
+    "part_of": "{head} is part of {tail}",
+    "located_at": "{head} is located at {tail}",
+    "scheduled_for": "{head} is scheduled for {tail}",
+    "paid_or_owes": "{head} paid or owes {tail}",
+    "owns_or_has": "{head} owns or has {tail}",
+    "uses": "{head} uses {tail}",
+    "about": "{head} is about {tail}",
+    "met_with": "{head} met with {tail}",
+    "related_to": "{head} is related to {tail}",
+}
+REL_FACT_MIN_CONF = 0.7                  # relation fact without LLM
+REL_EDGE_W = 0.25                        # relation edge base weight
+REL_CATCHALL_FACTOR = 0.5                # related_to down-weight
 
 # ── PII redaction (email bodies: regex layer + GLiNER2 schema layer) ──
 # Regex owns fixed-format identifiers (Luhn-checked cards, SSNs, account
