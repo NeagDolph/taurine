@@ -714,6 +714,12 @@ class Index:
                 [(float(score), note_id) for note_id, score in scores.items()],
             )
 
+    def ingest_salience(self) -> dict[str, float]:
+        rows = self._conn.execute(
+            "SELECT note_id, ingest_salience FROM notes"
+        ).fetchall()
+        return {row["note_id"]: float(row["ingest_salience"]) for row in rows}
+
     def set_value_scores(self, scores: dict[str, float]) -> None:
         with self._conn:
             self._conn.execute("UPDATE notes SET value_score = 0.0")

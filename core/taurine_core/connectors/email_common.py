@@ -51,6 +51,7 @@ class EmailThread:
 class FunnelReport:
     dropped: dict[str, int]
     kept: int
+    scores: dict[str, float] = field(default_factory=dict)
 
 
 def funnel_threads(
@@ -101,13 +102,18 @@ def funnel_threads(
         # sink in the cap ordering instead of vanishing.
         survivors.append(thread)
 
-    survivors.sort(
-        key=lambda thread: _score(thread, contacts, correspondents, now), reverse=True
-    )
+    raw_scores = {
+        thread.thread_id: _score(thread, contacts, correspondents, now)
+        for thread in survivors
+    }
+    survivors.sort(key=lambda thread: raw_scores[thread.thread_id], reverse=True)
     if len(survivors) > config.EMAIL_MAX_THREADS:
         dropped["cap"] = len(survivors) - config.EMAIL_MAX_THREADS
         survivors = survivors[: config.EMAIL_MAX_THREADS]
-    return survivors, FunnelReport(dropped=dropped, kept=len(survivors))
+    scores = _normalize_scores(
+        {thread.thread_id: raw_scores[thread.thread_id] for thread in survivors}
+    )
+    return survivors, FunnelReport(dropped=dropped, kept=len(survivors), scores=scores)
 
 
 def log_funnel(connector_id: str, report: FunnelReport) -> None:
@@ -173,6 +179,20 @@ def _score(
         + weights["flagged"] * thread.flagged
         + weights["length"] * length
     )
+
+
+def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
+    if not scores:
+        return {}
+    low = min(scores.values())
+    high = max(scores.values())
+    span = high - low
+    if span == 0.0:
+        return {thread_id: 1.0 for thread_id in scores}
+    return {
+        thread_id: 0.1 + ((score - low) / span) * 0.9
+        for thread_id, score in scores.items()
+    }
 
 
 # ── rendering ──────────────────────────────────────────────────────────

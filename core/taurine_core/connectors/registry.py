@@ -113,6 +113,17 @@ class ConnectorRegistry:
                             connector_id, phase, done, total
                         ),
                     )
+                    salience_scores = getattr(connector, "ingest_salience_scores", None)
+                    set_ingest_salience = getattr(index, "set_ingest_salience", None)
+                    ingest_salience = getattr(index, "ingest_salience", None)
+                    if isinstance(salience_scores, dict) and salience_scores and callable(
+                        set_ingest_salience
+                    ):
+                        merged_scores = (
+                            dict(ingest_salience()) if callable(ingest_salience) else {}
+                        )
+                        merged_scores.update(salience_scores)
+                        set_ingest_salience(merged_scores)
                 except ConnectorError as exc:
                     report = ConnectorSyncReport(connector_id=connector_id, error=str(exc))
                 except Exception as exc:  # any layer failing must surface, not vanish

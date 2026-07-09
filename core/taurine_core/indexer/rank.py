@@ -180,6 +180,47 @@ def compute_quality_ranks(index: Index, *, now: float | None = None) -> dict[str
     return ranks
 
 
+def compute_value_scores(index: Index, *, now: float | None = None) -> dict[str, float]:
+    """Persist per-note value scores for slim enrichment prioritization.
+
+    value = minmax(quality_rank) × value-recency × source_rank × ingest_salience.
+    The quality min-max maps active notes to [0.1, 1.0]; if all ranks are
+    equal, quality contributes 1.0 for every note.
+    """
+    disabled_sources = (
+        index.disabled_sources() if hasattr(index, "disabled_sources") else set()
+    )
+    notes = [note for note in index.notes() if note.source not in disabled_sources]
+    if not notes:
+        index.set_value_scores({})
+        return {}
+
+    timestamp = time.time() if now is None else float(now)
+    salience = index.ingest_salience()
+    ranks = [float(note.quality_rank) for note in notes]
+    min_rank = min(ranks)
+    max_rank = max(ranks)
+    rank_span = max_rank - min_rank
+
+    scores: dict[str, float] = {}
+    for note in notes:
+        if rank_span == 0.0:
+            quality = 1.0
+        else:
+            quality = 0.1 + ((float(note.quality_rank) - min_rank) / rank_span) * 0.9
+        age_days = (timestamp - note.modified) / 86400.0
+        recency = float(0.5 ** (age_days / config.VALUE_RECENCY_HALF_LIFE_DAYS))
+        scores[note.note_id] = (
+            quality
+            * recency
+            * source_rank(note.source)
+            * float(salience.get(note.note_id, 1.0))
+        )
+
+    index.set_value_scores(scores)
+    return scores
+
+
 def refresh_fact_embeddings(index: Index) -> None:
     """Embed new/changed edge facts; prune stale rows; ``index.load_facts()``.
 

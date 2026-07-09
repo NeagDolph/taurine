@@ -58,6 +58,7 @@ class OutlookConnector:
         self._access_expiry = 0.0
         self._cached_records: list[NoteRecord] | None = None
         self._cached_at = 0.0
+        self.ingest_salience_scores: dict[str, float] = {}
         self._client_factory = lambda: httpx.Client(timeout=30.0)
 
     def available(self) -> tuple[bool, str]:
@@ -91,6 +92,10 @@ class OutlookConnector:
             raise ConnectorError(f"Outlook API unreachable: {exc}") from exc
         survivors, report = funnel_threads(threads, contacts=contacts)
         log_funnel(self.connector_id, report)
+        self.ingest_salience_scores = {
+            f"{self.connector_id}:{thread_id}": score
+            for thread_id, score in report.scores.items()
+        }
         records = [thread_to_record(thread, self.connector_id) for thread in survivors]
         self._cached_records = [record for record in records if record is not None]
         self._cached_at = now
