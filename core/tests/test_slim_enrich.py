@@ -78,6 +78,51 @@ def test_select_slim_notes_uses_fraction_when_above_floor(monkeypatch) -> None:
     ]
 
 
+def test_select_slim_notes_uses_ceil_for_fractional_count(monkeypatch) -> None:
+    from taurine_core.indexer.slim_enrich import select_slim_notes
+
+    monkeypatch.setattr(config, "SLIM_LLM_VALUE_FRACTION", 0.15)
+    monkeypatch.setattr(config, "SLIM_LLM_MIN_NOTES", 5)
+    notes = _notes(41)
+    scores = {
+        note.note_id: float(len(notes) - index) for index, note in enumerate(notes)
+    }
+
+    selected = select_slim_notes(notes, scores)
+
+    assert [note.note_id for note in selected] == [
+        "note-0",
+        "note-1",
+        "note-2",
+        "note-3",
+        "note-4",
+        "note-5",
+        "note-6",
+    ]
+
+
+def test_select_slim_notes_prefers_earlier_original_index_at_cutoff_tie(
+    monkeypatch,
+) -> None:
+    from taurine_core.indexer.slim_enrich import select_slim_notes
+
+    monkeypatch.setattr(config, "SLIM_LLM_VALUE_FRACTION", 0.50)
+    monkeypatch.setattr(config, "SLIM_LLM_MIN_NOTES", 0)
+    notes = _notes(6)
+    scores = {
+        "note-0": 100.0,
+        "note-1": 90.0,
+        "note-2": 80.0,
+        "note-3": 80.0,
+        "note-4": 10.0,
+        "note-5": 0.0,
+    }
+
+    selected = select_slim_notes(notes, scores)
+
+    assert [note.note_id for note in selected] == ["note-0", "note-1", "note-2"]
+
+
 def test_select_slim_notes_respects_floor_and_short_changed_set(monkeypatch) -> None:
     from taurine_core.indexer.slim_enrich import select_slim_notes
 

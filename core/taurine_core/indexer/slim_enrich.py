@@ -23,6 +23,7 @@ def select_slim_notes(
     if not changed:
         return []
 
+    # Ceil is deliberate: favor covering more high-value notes.
     fraction_count = math.ceil(
         len(changed) * max(0.0, float(config.SLIM_LLM_VALUE_FRACTION))
     )
@@ -90,6 +91,7 @@ def _empty_results(notes: list[NoteRecord]) -> dict[str, SlimEnrichment]:
 
 
 def _validate_slim_enrichment(data: dict) -> SlimEnrichment:
+    # Drop empty values before clamping so later valid entries can fill the limit.
     return SlimEnrichment(
         aliases=_clean_list(data.get("aliases"))[:6],
         utterances=_clean_list(data.get("utterances"))[:4]
