@@ -141,18 +141,15 @@ def test_extract_notes_filters_thresholds_and_relation_endpoints(monkeypatch: py
     ]
 
 
-def test_extract_notes_dedupes_entities_with_max_conf_and_mention_count(
+def test_extract_notes_derives_mentions_from_note_text_occurrences(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = FakeModel(
         {
             "duplicates": {
                 "entities": {
-                    "person": [
-                        {"text": "Jane Doe", "confidence": 0.61},
-                        {"text": "JANE DOE", "confidence": 0.93},
-                        {"text": " Jane Doe ", "confidence": 0.72},
-                    ]
+                    "person": [{"text": "Jane Doe", "confidence": 0.93}],
+                    "organization": [{"text": "Acme, Inc.", "confidence": 0.8}],
                 },
                 "relation_extraction": {},
             }
@@ -160,10 +157,20 @@ def test_extract_notes_dedupes_entities_with_max_conf_and_mention_count(
     )
     _install_fake(monkeypatch, fake)
 
-    result = extract.extract_notes([make_note("n1", "duplicates", "body")])["n1"]
+    result = extract.extract_notes(
+        [
+            make_note(
+                "n1",
+                "Jane Doe",
+                "Jane Doe met jane doe at Acme, Inc. Later ACME, INC. expanded. "
+                "Acme, Inc.x is not a full mention. duplicates",
+            )
+        ]
+    )["n1"]
 
     assert [(entity.surface, entity.etype, entity.conf, entity.mentions) for entity in result.entities] == [
-        ("JANE DOE", "person", pytest.approx(0.93), 3)
+        ("Jane Doe", "person", pytest.approx(0.93), 3),
+        ("Acme, Inc.", "organization", pytest.approx(0.8), 2),
     ]
 
 
@@ -218,11 +225,11 @@ def test_extract_notes_chunks_long_notes_and_merges_chunk_outputs(
     fake = FakeModel(
         {
             "alpha beta gamma": {
-                "entities": {"person": [{"text": "Jane", "confidence": 0.7}]},
+                "entities": {"person": [{"text": "gamma", "confidence": 0.7}]},
                 "relation_extraction": {},
             },
             "gamma delta epsilon": {
-                "entities": {"person": [{"text": "Jane", "confidence": 0.9}]},
+                "entities": {"person": [{"text": "gamma", "confidence": 0.9}]},
                 "relation_extraction": {},
             },
         }
@@ -236,5 +243,5 @@ def test_extract_notes_chunks_long_notes_and_merges_chunk_outputs(
     assert fake.batch_sizes == []
     assert fake.extract_texts == ["alpha beta gamma", "gamma delta epsilon"]
     assert [(entity.surface, entity.conf, entity.mentions) for entity in result.entities] == [
-        ("Jane", pytest.approx(0.9), 2)
+        ("gamma", pytest.approx(0.9), 1)
     ]

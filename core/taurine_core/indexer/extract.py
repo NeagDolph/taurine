@@ -22,7 +22,6 @@ _LOGGER = logging.getLogger("taurine.indexer.extract")
 class _EntityAccumulator:
     surface: str
     conf: float
-    mentions: int = 1
 
 
 @dataclass
@@ -110,9 +109,9 @@ def _flush_short_batch(
             results[note.note_id] = _extract_one(model, schema, note, text)
         return
 
-    for (note, _), raw in zip(items, raw_results):
+    for (note, text), raw in zip(items, raw_results):
         try:
-            results[note.note_id] = _normalize_extraction([raw])
+            results[note.note_id] = _normalize_extraction([raw], text)
         except Exception as exc:
             _LOGGER.warning("GLiNER2 result parsing failed for note %s: %s", note.note_id, exc)
             results[note.note_id] = Extraction(failed=True)
@@ -135,13 +134,13 @@ def _extract_one(model: Any, schema: Any, note: NoteRecord, text: str) -> Extrac
         return Extraction(failed=True)
 
     try:
-        return _normalize_extraction(raw_results)
+        return _normalize_extraction(raw_results, text)
     except Exception as exc:
         _LOGGER.warning("GLiNER2 result parsing failed for note %s: %s", note.note_id, exc)
         return Extraction(failed=True)
 
 
-def _normalize_extraction(raw_results: list[object]) -> Extraction:
+def _normalize_extraction(raw_results: list[object], note_text: str) -> Extraction:
     entity_acc: dict[tuple[str, str], _EntityAccumulator] = {}
     entity_order: list[tuple[str, str]] = []
 
@@ -158,7 +157,6 @@ def _normalize_extraction(raw_results: list[object]) -> Extraction:
                 entity_acc[key] = _EntityAccumulator(surface=surface, conf=conf)
                 entity_order.append(key)
             else:
-                current.mentions += 1
                 if conf > current.conf:
                     current.surface = surface
                     current.conf = conf
@@ -168,7 +166,7 @@ def _normalize_extraction(raw_results: list[object]) -> Extraction:
             surface=entity_acc[key].surface,
             etype=key[1],
             conf=entity_acc[key].conf,
-            mentions=entity_acc[key].mentions,
+            mentions=_surface_mentions(entity_acc[key].surface, note_text),
         )
         for key in entity_order
     ]
@@ -310,6 +308,11 @@ def _batches(notes: list[NoteRecord], size: int) -> list[list[NoteRecord]]:
 
 def _note_text(note: NoteRecord) -> str:
     return f"{note.title}\n{note.text}"
+
+
+def _surface_mentions(surface: str, text: str) -> int:
+    pattern = re.compile(rf"(?<!\w){re.escape(surface)}(?!\w)", re.IGNORECASE)
+    return max(1, len(pattern.findall(text)))
 
 
 def _is_long_text(text: str) -> bool:

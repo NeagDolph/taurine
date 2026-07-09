@@ -63,3 +63,42 @@ $ cd /Users/neil/taurine/core && uv run pytest -q
 - GLiNER2 1.3.2 has no separate long-document method; local chunking is a best-effort adapter layer until Task 12 validates behavior against the real model.
 - Relation confidence is derived from endpoint confidences because the installed formatted relation output does not include a relation-level score.
 - Tests intentionally do not load the real model; live model compatibility remains for Task 12.
+
+## Review Fix: Entity mention counts
+
+STATUS: DONE
+
+### What changed
+
+- Replaced raw entity-row mention counting with occurrence-derived mention counts after entity dedupe/merge.
+- `_normalize_extraction` now receives the exact note text sent to GLiNER2 (`f"{title}\n{text}"`) and computes each kept entity's `mentions` with a case-insensitive escaped surface pattern using `(?<!\w)` / `(?!\w)` boundaries, minimum `1`.
+- Kept the existing max-confidence merge behavior across duplicate entities and chunks.
+- Updated tests so the fake model mirrors GLiNER2 1.3.2 formatted output more closely: one deduped entity per surface per call, with `mentions` derived from occurrences in the note text.
+- Updated the chunk merge test to cover an entity emitted from two overlapping chunks while appearing only once in the full note text.
+
+### RED evidence
+
+```text
+$ cd /Users/neil/taurine/core && uv run pytest tests/test_index_extract.py -q
+.F..F                                                                    [100%]
+FAILED tests/test_index_extract.py::test_extract_notes_derives_mentions_from_note_text_occurrences
+FAILED tests/test_index_extract.py::test_extract_notes_chunks_long_notes_and_merges_chunk_outputs
+2 failed, 3 passed in 0.03s
+```
+
+The failures showed the old behavior: single-call deduped entities reported `mentions=1`, and the overlapping chunk entity reported `mentions=2`.
+
+### GREEN evidence
+
+```text
+$ cd /Users/neil/taurine/core && uv run pytest tests/test_index_extract.py -q
+.....                                                                    [100%]
+5 passed in 0.01s
+```
+
+```text
+$ cd /Users/neil/taurine/core && uv run pytest -q
+274 passed, 3 skipped, 3 warnings in 17.88s
+```
+
+Full-suite warnings were unchanged dependency/import warnings from SWIG and Starlette `TestClient`.
