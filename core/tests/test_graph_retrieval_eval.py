@@ -78,6 +78,9 @@ def test_checked_in_calibration_artifact_is_strict_and_complete() -> None:
 
     assert artifact.artifact_version == "1"
     assert artifact.hash
+    assert artifact.extraction.entity_thresholds["person"] == pytest.approx(0.5)
+    assert artifact.extraction.relation_thresholds["responsible_for"] == pytest.approx(0.45)
+    assert artifact.extraction.promotion_thresholds["responsible_for"] == pytest.approx(0.7)
     assert set(artifact.modes) == {"live", "chat", "tool"}
     for mode in artifact.modes.values():
         assert {"dense", "bm25", "exact", "entity", "triple"} <= set(mode.heads)
@@ -95,6 +98,11 @@ def test_calibration_rejects_non_monotonic_curves(tmp_path: Path) -> None:
                 "hash": "sha256:bad",
                 "model_manifest": {"embedding": "fake"},
                 "config_hash": "sha256:config",
+                "extraction": {
+                    "entity_thresholds": {"person": 0.5},
+                    "relation_thresholds": {"responsible_for": 0.45},
+                    "promotion_thresholds": {"responsible_for": 0.7},
+                },
                 "modes": {
                     mode: {
                         "heads": {

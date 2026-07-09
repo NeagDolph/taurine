@@ -8,7 +8,6 @@ import pytest
 from tests.conftest import make_note
 from taurine_core import config
 from taurine_core.ports import LLMError
-from taurine_core.schemas import Extraction
 
 NOTE_A = make_note(
     "note-a",
@@ -44,9 +43,10 @@ class FakeExtractorModel:
         batch_size: int,
         threshold: float,
         include_confidence: bool,
+        include_spans: bool,
         max_len: int | None,
     ) -> list[dict]:
-        del schema, batch_size, threshold, include_confidence, max_len
+        del schema, batch_size, threshold, include_confidence, include_spans, max_len
         self.calls.extend(texts)
         return [_raw_extraction_for(text) for text in texts]
 
@@ -167,11 +167,13 @@ def test_extraction_failure_still_indexes_and_retries_next_sync(store, monkeypat
 
     assert retry.changed == 1
     assert model.calls
-    assert store.cached_extraction(NOTE_A.note_id, NOTE_A.content_hash) == Extraction(
-        entities=store.enrichment_for(NOTE_A.note_id).entities,
-        relations=store.enrichment_for(NOTE_A.note_id).relations,
-        failed=False,
-    )
+    cached = store.cached_extraction(NOTE_A.note_id, NOTE_A.content_hash)
+    assert cached is not None
+    assert cached.entities == store.enrichment_for(NOTE_A.note_id).entities
+    assert cached.relations == store.enrichment_for(NOTE_A.note_id).relations
+    assert cached.schema_id
+    assert cached.mentions
+    assert cached.failed is False
 
 
 def test_failed_extraction_with_llm_is_not_slim_cached_and_retries_same_hash(

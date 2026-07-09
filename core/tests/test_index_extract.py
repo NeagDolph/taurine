@@ -33,6 +33,7 @@ class FakeModel:
         self.batch_texts: list[list[str]] = []
         self.extract_texts: list[str] = []
         self.schemas: list[FakeSchema] = []
+        self.include_spans: list[bool] = []
 
     def create_schema(self) -> FakeSchema:
         schema = FakeSchema()
@@ -47,9 +48,11 @@ class FakeModel:
         batch_size: int,
         threshold: float,
         include_confidence: bool,
+        include_spans: bool = False,
         max_len: int | None = None,
     ) -> list[dict]:
         assert include_confidence is True
+        self.include_spans.append(include_spans)
         self.batch_sizes.append(len(texts))
         self.batch_texts.append(list(texts))
         if any(marker in text for marker in self.fail_on for text in texts):
@@ -63,9 +66,11 @@ class FakeModel:
         *,
         threshold: float,
         include_confidence: bool,
+        include_spans: bool = False,
         max_len: int | None = None,
     ) -> dict:
         assert include_confidence is True
+        self.include_spans.append(include_spans)
         self.extract_texts.append(text)
         if any(marker in text for marker in self.fail_on):
             raise RuntimeError("note inference failed")
@@ -129,7 +134,9 @@ def test_extract_notes_filters_thresholds_and_relation_endpoints(monkeypatch: py
     )
     _install_fake(monkeypatch, fake)
 
-    result = extract.extract_notes([make_note("n1", "alpha", "body")])["n1"]
+    result = extract.extract_notes(
+        [make_note("n1", "alpha", "alpha Jane Doe works at Acme.")]
+    )["n1"]
 
     assert result.failed is False
     assert [(entity.surface, entity.etype, entity.conf, entity.mentions) for entity in result.entities] == [
@@ -175,7 +182,9 @@ def test_extract_notes_drops_self_and_tiny_endpoint_relations(
     )
     _install_fake(monkeypatch, fake)
 
-    result = extract.extract_notes([make_note("n1", "calibration", "body")])["n1"]
+    result = extract.extract_notes(
+        [make_note("n1", "calibration", "calibration Sharon and Matthew Tung at ts.")]
+    )["n1"]
 
     assert result.failed is False
     assert [(entity.surface, entity.etype) for entity in result.entities] == [
@@ -214,7 +223,7 @@ def test_extract_notes_derives_mentions_from_note_text_occurrences(
     )["n1"]
 
     assert [(entity.surface, entity.etype, entity.conf, entity.mentions) for entity in result.entities] == [
-        ("Jane Doe", "person", pytest.approx(0.93), 3),
+        ("Jane Doe", "person", pytest.approx(0.93), 2),
         ("Acme, Inc.", "organization", pytest.approx(0.8), 2),
     ]
 
@@ -235,8 +244,8 @@ def test_extract_notes_marks_only_failed_notes_after_batch_failure(
 
     result = extract.extract_notes(
         [
-            make_note("good", "good", "body"),
-            make_note("bad", "boom", "body"),
+            make_note("good", "good", "good Taurine body"),
+            make_note("bad", "boom", "boom body"),
         ]
     )
 
@@ -285,8 +294,154 @@ def test_extract_notes_chunks_long_notes_and_merges_chunk_outputs(
         [make_note("n1", "", "alpha beta gamma delta epsilon")]
     )["n1"]
 
-    assert fake.batch_sizes == []
-    assert fake.extract_texts == ["alpha beta gamma", "gamma delta epsilon"]
+    assert fake.batch_sizes == [2]
+    assert fake.batch_texts == [["alpha beta gamma", "gamma delta epsilon"]]
     assert [(entity.surface, entity.conf, entity.mentions) for entity in result.entities] == [
         ("gamma", pytest.approx(0.9), 1)
     ]
+
+
+class OffsetTokenizer:
+    def __call__(
+        self,
+        text: str,
+        *,
+        add_special_tokens: bool,
+        return_offsets_mapping: bool,
+    ) -> dict[str, list]:
+        import re
+
+        assert add_special_tokens is False
+        assert return_offsets_mapping is True
+        offsets = [(match.start(), match.end()) for match in re.finditer(r"\S+", text)]
+        return {"input_ids": list(range(len(offsets))), "offset_mapping": offsets}
+
+
+class NativeLongFake(FakeModel):
+    def __init__(self, output: dict) -> None:
+        super().__init__({})
+        self.output = output
+        self.long_calls: list[dict] = []
+
+    def batch_extract_long(self, texts: list[str], schema: FakeSchema, **kwargs: object) -> list[dict]:
+        self.long_calls.append({"texts": list(texts), "schema": schema, **kwargs})
+        return [self.output for _ in texts]
+
+
+def test_short_batch_requests_spans_and_records_note_global_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "Maya owns the launch checklist."
+    fake = FakeModel(
+        {
+            "Maya": {
+                "entities": {
+                    "person": [{"text": "Maya", "confidence": 0.95, "start": 0, "end": 4}],
+                    "concept": [
+                        {
+                            "text": "launch checklist",
+                            "confidence": 0.9,
+                            "start": 14,
+                            "end": 30,
+                        }
+                    ],
+                },
+                "relation_extraction": {
+                    "responsible_for": [
+                        {
+                            "head": {"text": "Maya", "confidence": 0.94, "start": 0, "end": 4},
+                            "tail": {
+                                "text": "launch checklist",
+                                "confidence": 0.89,
+                                "start": 14,
+                                "end": 30,
+                            },
+                        }
+                    ]
+                },
+            }
+        }
+    )
+    _install_fake(monkeypatch, fake, chunk_size=50)
+
+    result = extract.extract_notes(
+        [make_note("n1", "Launch", text)], tokenizer=OffsetTokenizer()
+    )["n1"]
+
+    assert fake.include_spans == [True]
+    assert [(row.surface, row.char_start, row.char_end) for row in result.mentions] == [
+        ("Maya", 0, 4),
+        ("launch checklist", 14, 30),
+    ]
+    relation = result.fact_candidates[0]
+    assert (relation.subject_start, relation.subject_end) == (0, 4)
+    assert (relation.object_start, relation.object_end) == (14, 30)
+    assert text[relation.assertion_start : relation.assertion_end] == text
+    assert relation.status == "active"
+    assert relation.schema_id == result.schema_id
+
+
+def test_native_long_api_is_used_with_global_spans_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "alpha beta gamma delta epsilon"
+    fake = NativeLongFake(
+        {
+            "entities": {
+                "person": [{"text": "delta", "confidence": 0.91, "start": 17, "end": 22}]
+            },
+            "relation_extraction": {},
+        }
+    )
+    _install_fake(monkeypatch, fake, chunk_size=3, chunk_overlap=1)
+
+    result = extract.extract_notes(
+        [make_note("n1", "Long", text)], tokenizer=OffsetTokenizer()
+    )["n1"]
+
+    assert len(fake.long_calls) == 1
+    call = fake.long_calls[0]
+    assert call["chunk_size"] == 3
+    assert call["chunk_overlap"] == 1
+    assert call["include_confidence"] is True
+    assert call["include_spans"] is True
+    assert [(row.surface, row.char_start, row.char_end) for row in result.mentions] == [
+        ("delta", 17, 22)
+    ]
+
+
+def test_invalid_returned_entity_span_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeModel(
+        {
+            "Maya": {
+                "entities": {
+                    "person": [{"text": "Maya", "confidence": 0.95, "start": 5, "end": 9}]
+                },
+                "relation_extraction": {},
+            }
+        }
+    )
+    _install_fake(monkeypatch, fake)
+
+    result = extract.extract_notes(
+        [make_note("n1", "Title", "Maya owns launch.")], tokenizer=OffsetTokenizer()
+    )["n1"]
+
+    assert result.mentions == []
+    assert result.entities == []
+
+
+def test_source_families_produce_distinct_stable_schema_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeModel({})
+    _install_fake(monkeypatch, fake)
+    email = make_note("email", "Email", "body").model_copy(update={"source": "gmail"})
+    conversation = make_note("chat", "Chat", "body").model_copy(update={"source": "imessage"})
+
+    first = extract.extract_notes([email, conversation], tokenizer=OffsetTokenizer())
+    second = extract.extract_notes([email, conversation], tokenizer=OffsetTokenizer())
+
+    assert first["email"].schema_id != first["chat"].schema_id
+    assert first["email"].schema_id == second["email"].schema_id
+    assert len(fake.schemas) == 4

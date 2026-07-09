@@ -82,11 +82,34 @@ class NLICalibration(_StrictModel):
     entailment_floor: float = Field(ge=0.0, le=1.0)
 
 
+class ExtractionCalibration(_StrictModel):
+    entity_thresholds: dict[str, float]
+    relation_thresholds: dict[str, float]
+    promotion_thresholds: dict[str, float]
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> "ExtractionCalibration":
+        for name, values in (
+            ("entity", self.entity_thresholds),
+            ("relation", self.relation_thresholds),
+            ("promotion", self.promotion_thresholds),
+        ):
+            if not values:
+                raise ValueError(f"{name} thresholds cannot be empty")
+            if any(not 0.0 <= value <= 1.0 for value in values.values()):
+                raise ValueError(f"{name} thresholds must be within [0, 1]")
+        missing = set(self.relation_thresholds) - set(self.promotion_thresholds)
+        if missing:
+            raise ValueError(f"missing promotion thresholds: {', '.join(sorted(missing))}")
+        return self
+
+
 class CalibrationArtifact(_StrictModel):
     artifact_version: str = Field(min_length=1)
     hash: str = Field(min_length=1)
     model_manifest: dict[str, str]
     config_hash: str = Field(min_length=1)
+    extraction: ExtractionCalibration
     modes: dict[Literal["live", "chat", "tool"], ModeCalibration]
     triple_recognition: TripleRecognitionCalibration
     rerank: RerankCalibration

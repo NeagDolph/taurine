@@ -377,6 +377,12 @@ INGEST_RELATION_TYPES: dict[str, str] = {
     "about": "{head} is about {tail}",
     "met_with": "{head} met with {tail}",
     "related_to": "{head} is related to {tail}",
+    "decided": "{head} decided {tail}",
+    "prefers": "{head} prefers {tail}",
+    "blocked_by": "{head} is blocked by {tail}",
+    "responsible_for": "{head} is responsible for {tail}",
+    "completed": "{head} completed {tail}",
+    "supersedes": "{head} supersedes {tail}",
 }
 REL_FACT_MIN_CONF = 0.7                  # relation fact without LLM
 REL_EDGE_W = 0.25                        # relation edge base weight

@@ -34,10 +34,11 @@ class ScriptedExtractorModel:
         batch_size: int,
         threshold: float,
         include_confidence: bool,
+        include_spans: bool,
         max_len: int | None,
     ) -> list[dict]:
-        del schema, batch_size, threshold, include_confidence, max_len
-        if any(text.splitlines()[0] in self.fail_titles for text in texts):
+        del schema, batch_size, threshold, include_confidence, include_spans, max_len
+        if any(any(text.startswith(title) for title in self.fail_titles) for text in texts):
             raise RuntimeError("batch fallback")
         return [self._raw(text) for text in texts]
 
@@ -48,22 +49,22 @@ class ScriptedExtractorModel:
         *,
         threshold: float,
         include_confidence: bool,
+        include_spans: bool,
         max_len: int | None,
     ) -> dict:
-        del schema, threshold, include_confidence, max_len
+        del schema, threshold, include_confidence, include_spans, max_len
         self.calls.append(text)
-        title = text.splitlines()[0]
-        if title in self.fail_titles:
-            raise RuntimeError(f"{title} failed")
+        if any(text.startswith(title) for title in self.fail_titles):
+            raise RuntimeError("configured note failed")
         return self._raw(text)
 
     def _raw(self, text: str) -> dict:
         self.calls.append(text)
-        title = text.splitlines()[0]
+        title = text.split()[0]
         return {
             "entities": {
-                "project": [{"text": f"{title} Project", "confidence": 0.95}],
-                "concept": [{"text": "reenrich topic", "confidence": 0.9}],
+                "project": [{"text": title, "confidence": 0.95}],
+                "concept": [{"text": "body", "confidence": 0.9}],
             },
             "relation_extraction": {},
         }
@@ -140,8 +141,8 @@ async def test_reenrich_all_rebuilds_profile_and_keeps_prior_extraction_on_note_
     assert report.failures == 1
     assert store.user_card() == "## User\nWorks on Alpha."
     assert [entity.surface for entity in alpha_enrichment.entities] == [
-        "Alpha Project",
-        "reenrich topic",
+        "Alpha",
+        "body",
     ]
     assert [entity.surface for entity in beta_enrichment.entities] == [
         "old",
@@ -178,8 +179,8 @@ async def test_reenrich_all_keeps_old_card_when_profile_fails(store, monkeypatch
     assert report.profile_failed is True
     assert store.user_card() == "## User\nExisting card."
     assert [entity.surface for entity in store.enrichment_for("alpha").entities] == [
-        "Alpha Project",
-        "reenrich topic",
+        "Alpha",
+        "body",
     ]
 
 
@@ -211,8 +212,8 @@ async def test_reenrich_scoped_to_source_skips_profile_and_other_sources(
     assert store.user_card() == "existing card"
     assert [entity.surface for entity in store.enrichment_for("alpha").entities] == ["old"]
     assert [entity.surface for entity in store.enrichment_for("imsg").entities] == [
-        "iMessage: Jonah Project",
-        "reenrich topic",
+        "chat",
+        "body",
     ]
     assert ("fresh chat", "imsg", False) in store.aliases()
     assert all(status.phase != "profile" for status in progress)

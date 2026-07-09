@@ -1,382 +1,758 @@
-"""GLiNER2 ingestion extraction adapter.
+"""GLiNER2 batch extraction with source-global mention and fact provenance."""
 
-This module is intentionally not wired into sync yet. It turns local GLiNER2
-entity/relation output into the typed extraction shape the ingest graph will
-store in later tasks.
-"""
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Protocol, Sequence
 
 from taurine_core import config
+from taurine_core.evaluation.graph_retrieval import CalibrationArtifact, load_calibration
 from taurine_core.live import spans
-from taurine_core.schemas import EntityMention, Extraction, NoteRecord, RelationTriple
+from taurine_core.schemas import (
+    EntityMention,
+    ExtractedMention,
+    ExtractedRelation,
+    Extraction,
+    NoteRecord,
+    RelationTriple,
+)
 
 _LOGGER = logging.getLogger("taurine.indexer.extract")
+_EXTRACTOR_ID = "fastino/gliner2-large-v1"
+_CALIBRATION_PATH = (
+    Path(__file__).resolve().parents[2] / "evals" / "graph_retrieval" / "calibration-v1.json"
+)
 
 
-@dataclass
-class _EntityAccumulator:
-    surface: str
-    conf: float
+class OffsetTokenizerPort(Protocol):
+    def __call__(
+        self,
+        text: str,
+        *,
+        add_special_tokens: bool,
+        return_offsets_mapping: bool,
+    ) -> dict[str, Sequence[Any]]: ...
 
 
-@dataclass
-class _RelationAccumulator:
-    head: str
-    rel_type: str
-    tail: str
-    conf: float
+@dataclass(frozen=True)
+class _SchemaBundle:
+    family: str
+    schema_id: str
+    schema: Any
 
 
-def extract_notes(notes: list[NoteRecord]) -> dict[str, Extraction]:
-    """Extract typed entities and relation triples for notes.
+@dataclass(frozen=True)
+class _Pending:
+    note: NoteRecord
+    text: str
+    offsets: tuple[tuple[int, int], ...]
 
-    Inference failures are isolated to the note where possible and never
-    propagate to callers.
-    """
+
+@dataclass(frozen=True)
+class _Span:
+    text: str
+    confidence: float
+    start: int | None
+    end: int | None
+    explicit: bool
+
+
+@dataclass(frozen=True)
+class _RelationRaw:
+    head: _Span
+    predicate: str
+    tail: _Span
+    confidence: float
+
+
+def extract_notes(
+    notes: list[NoteRecord],
+    *,
+    tokenizer: OffsetTokenizerPort | None = None,
+) -> dict[str, Extraction]:
+    """Extract notes in bounded source-family batches with isolated failures."""
     if not notes:
         return {}
-
     model = _extractor_model()
     if model is None:
-        _LOGGER.warning("GLiNER2 unavailable: ingestion extraction skipped")
-        return {note.note_id: Extraction(failed=True) for note in notes}
+        return {
+            note.note_id: Extraction(failed=True, error="GLiNER2 unavailable")
+            for note in notes
+        }
 
-    try:
-        schema = _build_schema(model)
-    except Exception as exc:
-        _LOGGER.warning("GLiNER2 schema build failed: %s", exc)
-        return {note.note_id: Extraction(failed=True) for note in notes}
+    grouped: dict[str, list[NoteRecord]] = {}
+    for note in notes:
+        grouped.setdefault(_source_family(note.source), []).append(note)
 
     results: dict[str, Extraction] = {}
-    for batch in _batches(notes, _ingest_batch_size()):
-        short_items: list[tuple[NoteRecord, str]] = []
-        for note in batch:
-            text = _note_text(note)
-            if _is_long_text(text):
-                _flush_short_batch(model, schema, short_items, results)
-                short_items = []
-                results[note.note_id] = _extract_one(model, schema, note, text)
-            else:
-                short_items.append((note, text))
-        _flush_short_batch(model, schema, short_items, results)
-    return results
+    for family, family_notes in grouped.items():
+        try:
+            bundle = _build_schema(model, family)
+        except Exception as exc:
+            _LOGGER.warning("GLiNER2 schema build failed for %s: %s", family, exc)
+            for note in family_notes:
+                results[note.note_id] = Extraction(
+                    failed=True,
+                    error="schema build failed",
+                )
+            continue
+        _extract_family(model, bundle, family_notes, tokenizer, results)
+
+    return {note.note_id: results[note.note_id] for note in notes}
 
 
 def _extractor_model() -> Any | None:
     return spans.shared_model()
 
 
-def _build_schema(model: Any) -> Any:
-    schema = model.create_schema()
-    schema = schema.entities(dict(config.INGEST_ENTITY_TYPES))
-    return schema.relations(list(config.INGEST_RELATION_TYPES))
+def _build_schema(model: Any, family: str = "written") -> _SchemaBundle:
+    entity_descriptions = dict(config.INGEST_ENTITY_TYPES)
+    relation_descriptions = _relation_descriptions(family)
+    schema_data = {
+        "family": family,
+        "entities": entity_descriptions,
+        "relations": relation_descriptions,
+    }
+    schema_id = "schema-" + hashlib.sha256(
+        json.dumps(schema_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+    schema = model.create_schema().entities(entity_descriptions).relations(relation_descriptions)
+    return _SchemaBundle(family=family, schema_id=schema_id, schema=schema)
+
+
+def _extract_family(
+    model: Any,
+    bundle: _SchemaBundle,
+    notes: list[NoteRecord],
+    tokenizer: OffsetTokenizerPort | None,
+    results: dict[str, Extraction],
+) -> None:
+    short_batch: list[_Pending] = []
+    batch_tokens = 0
+    for note in notes:
+        text = note.text
+        try:
+            offsets = _token_offsets(model, text, tokenizer)
+        except Exception as exc:
+            _LOGGER.warning("GLiNER2 tokenization failed for note %s: %s", note.note_id, exc)
+            results[note.note_id] = Extraction(
+                schema_id=bundle.schema_id,
+                failed=True,
+                error="tokenization failed",
+            )
+            continue
+
+        if _is_long(offsets):
+            _flush_short_batch(model, bundle, short_batch, results)
+            short_batch = []
+            batch_tokens = 0
+            results[note.note_id] = _extract_long(
+                model,
+                bundle,
+                note,
+                text,
+                offsets,
+            )
+            continue
+
+        pending = _Pending(note=note, text=text, offsets=offsets)
+        token_count = len(offsets)
+        would_overflow = bool(short_batch) and (
+            len(short_batch) >= _ingest_batch_size()
+            or batch_tokens + token_count > _batch_token_budget()
+        )
+        if would_overflow:
+            _flush_short_batch(model, bundle, short_batch, results)
+            short_batch = []
+            batch_tokens = 0
+        short_batch.append(pending)
+        batch_tokens += token_count
+    _flush_short_batch(model, bundle, short_batch, results)
 
 
 def _flush_short_batch(
     model: Any,
-    schema: Any,
-    items: list[tuple[NoteRecord, str]],
+    bundle: _SchemaBundle,
+    items: list[_Pending],
     results: dict[str, Extraction],
 ) -> None:
     if not items:
         return
-
-    if not hasattr(model, "batch_extract"):
-        for note, text in items:
-            results[note.note_id] = _extract_one(model, schema, note, text)
-        return
-
-    texts = [text for _, text in items]
+    texts = [item.text for item in items]
     try:
         raw_results = model.batch_extract(
             texts,
-            schema,
+            bundle.schema,
             batch_size=len(texts),
             threshold=_global_threshold(),
             include_confidence=True,
-            max_len=_chunk_max_len(),
+            include_spans=True,
+            max_len=_chunk_size(),
         )
         if not isinstance(raw_results, list) or len(raw_results) != len(items):
             raise ValueError("GLiNER2 batch result length mismatch")
     except Exception as exc:
         _LOGGER.warning("GLiNER2 batch extraction failed; retrying per note: %s", exc)
-        for note, text in items:
-            results[note.note_id] = _extract_one(model, schema, note, text)
+        for item in items:
+            results[item.note.note_id] = _extract_short_one(model, bundle, item)
         return
 
-    for (note, text), raw in zip(items, raw_results):
-        try:
-            results[note.note_id] = _normalize_extraction([raw], text)
-        except Exception as exc:
-            _LOGGER.warning("GLiNER2 result parsing failed for note %s: %s", note.note_id, exc)
-            results[note.note_id] = Extraction(failed=True)
+    for item, raw in zip(items, raw_results, strict=True):
+        results[item.note.note_id] = _safe_normalize(
+            [raw],
+            item.text,
+            bundle.schema_id,
+            "gliner2_batch",
+        )
 
 
-def _extract_one(model: Any, schema: Any, note: NoteRecord, text: str) -> Extraction:
+def _extract_short_one(model: Any, bundle: _SchemaBundle, item: _Pending) -> Extraction:
     try:
-        raw_results = [
-            model.extract(
-                chunk,
-                schema,
+        raw = model.extract(
+            item.text,
+            bundle.schema,
+            threshold=_global_threshold(),
+            include_confidence=True,
+            include_spans=True,
+            max_len=_chunk_size(),
+        )
+    except Exception as exc:
+        _LOGGER.warning("GLiNER2 extraction failed for note %s: %s", item.note.note_id, exc)
+        return Extraction(
+            schema_id=bundle.schema_id,
+            failed=True,
+            error="inference failed",
+        )
+    return _safe_normalize(
+        [raw],
+        item.text,
+        bundle.schema_id,
+        "gliner2_single",
+    )
+
+
+def _extract_long(
+    model: Any,
+    bundle: _SchemaBundle,
+    note: NoteRecord,
+    text: str,
+    offsets: tuple[tuple[int, int], ...],
+) -> Extraction:
+    try:
+        if hasattr(model, "batch_extract_long"):
+            raw_results = model.batch_extract_long(
+                [text],
+                bundle.schema,
+                chunk_size=_chunk_size(),
+                chunk_overlap=_chunk_overlap(),
                 threshold=_global_threshold(),
                 include_confidence=True,
-                max_len=_chunk_max_len(),
+                include_spans=True,
             )
-            for chunk in _text_chunks(text)
+            if not isinstance(raw_results, list) or len(raw_results) != 1:
+                raise ValueError("GLiNER2 long result length mismatch")
+            return _safe_normalize(
+                [raw_results[0]],
+                text,
+                bundle.schema_id,
+                "gliner2_batch_long",
+            )
+
+        windows = _long_windows(text, offsets)
+        raw_windows = model.batch_extract(
+            [window_text for window_text, _ in windows],
+            bundle.schema,
+            batch_size=min(_ingest_batch_size(), len(windows)),
+            threshold=_global_threshold(),
+            include_confidence=True,
+            include_spans=True,
+            max_len=_chunk_size(),
+        )
+        if not isinstance(raw_windows, list) or len(raw_windows) != len(windows):
+            raise ValueError("GLiNER2 compatibility long result length mismatch")
+        remapped = [
+            _shift_spans(raw, char_start)
+            for raw, (_, char_start) in zip(raw_windows, windows, strict=True)
         ]
+        return _safe_normalize(
+            remapped,
+            text,
+            bundle.schema_id,
+            "gliner2_token_window_batch",
+        )
     except Exception as exc:
-        _LOGGER.warning("GLiNER2 extraction failed for note %s: %s", note.note_id, exc)
-        return Extraction(failed=True)
+        _LOGGER.warning("GLiNER2 long extraction failed for note %s: %s", note.note_id, exc)
+        return Extraction(
+            schema_id=bundle.schema_id,
+            failed=True,
+            error="long inference failed",
+        )
 
+
+def _safe_normalize(
+    raw_results: list[object],
+    text: str,
+    schema_id: str,
+    method: str,
+) -> Extraction:
     try:
-        return _normalize_extraction(raw_results, text)
+        return _normalize_extraction(raw_results, text, schema_id, method)
     except Exception as exc:
-        _LOGGER.warning("GLiNER2 result parsing failed for note %s: %s", note.note_id, exc)
-        return Extraction(failed=True)
+        _LOGGER.warning("GLiNER2 result parsing failed: %s", exc)
+        return Extraction(schema_id=schema_id, failed=True, error="result parsing failed")
 
 
-def _normalize_extraction(raw_results: list[object], note_text: str) -> Extraction:
-    entity_acc: dict[tuple[str, str], _EntityAccumulator] = {}
-    entity_order: list[tuple[str, str]] = []
-
+def _normalize_extraction(
+    raw_results: list[object],
+    note_text: str,
+    schema_id: str = "",
+    method: str = "gliner2",
+) -> Extraction:
+    calibration = _calibration()
+    mentions_by_key: dict[tuple[str, int, int, str], ExtractedMention] = {}
     for raw in raw_results:
-        for surface, etype, conf in _iter_entities(raw):
+        for span, etype in _iter_entities(raw):
             if etype not in config.INGEST_ENTITY_TYPES:
                 continue
-            surface = surface.strip()
-            if not surface or conf < config.GLINER_ENTITY_MIN_CONF:
+            floor = calibration.extraction.entity_thresholds.get(
+                etype, config.GLINER_ENTITY_MIN_CONF
+            )
+            if span.confidence < floor:
                 continue
-            key = (_lower_normalized(surface), etype)
-            current = entity_acc.get(key)
-            if current is None:
-                entity_acc[key] = _EntityAccumulator(surface=surface, conf=conf)
-                entity_order.append(key)
-            else:
-                if conf > current.conf:
-                    current.surface = surface
-                    current.conf = conf
-
-    entities = [
-        EntityMention(
-            surface=entity_acc[key].surface,
-            etype=key[1],
-            conf=entity_acc[key].conf,
-            mentions=_surface_mentions(entity_acc[key].surface, note_text),
-        )
-        for key in entity_order
-    ]
-
-    entity_surfaces: dict[str, str] = {}
-    for entity in entities:
-        entity_surfaces.setdefault(_lower_normalized(entity.surface), entity.surface)
-
-    relation_acc: dict[tuple[str, str, str], _RelationAccumulator] = {}
-    relation_order: list[tuple[str, str, str]] = []
-    for raw in raw_results:
-        for head, rel_type, tail, conf in _iter_relations(raw):
-            if rel_type not in config.INGEST_RELATION_TYPES:
-                continue
-            head_key = _lower_normalized(head)
-            tail_key = _lower_normalized(tail)
-            if (
-                not head_key
-                or not tail_key
-                or conf < config.GLINER_RELATION_MIN_CONF
-                or head_key not in entity_surfaces
-                or tail_key not in entity_surfaces
-            ):
-                continue
-            surface_head = entity_surfaces[head_key]
-            surface_tail = entity_surfaces[tail_key]
-            if not _valid_relation_endpoints(surface_head, surface_tail):
-                continue
-            key = (head_key, rel_type, tail_key)
-            current = relation_acc.get(key)
-            if current is None:
-                relation_acc[key] = _RelationAccumulator(
-                    head=surface_head,
-                    rel_type=rel_type,
-                    tail=surface_tail,
-                    conf=conf,
+            for resolved in _resolve_span(span, note_text):
+                key = (etype, resolved.start or 0, resolved.end or 0, resolved.text.casefold())
+                row = ExtractedMention(
+                    surface=resolved.text,
+                    etype=etype,
+                    confidence=resolved.confidence,
+                    char_start=int(resolved.start or 0),
+                    char_end=int(resolved.end or 0),
+                    extractor=_EXTRACTOR_ID,
+                    schema_id=schema_id,
                 )
-                relation_order.append(key)
-            elif conf > current.conf:
-                current.head = surface_head
-                current.tail = surface_tail
-                current.conf = conf
+                current = mentions_by_key.get(key)
+                if current is None or row.confidence > current.confidence:
+                    mentions_by_key[key] = row
 
+    mentions = sorted(
+        mentions_by_key.values(),
+        key=lambda row: (row.char_start, row.char_end, row.etype, row.surface.casefold()),
+    )
+    entities = _legacy_entities(mentions)
+
+    facts_by_key: dict[tuple[str, int, int, int, int], ExtractedRelation] = {}
+    for raw in raw_results:
+        for relation in _iter_relations(raw):
+            if relation.predicate not in config.INGEST_RELATION_TYPES:
+                continue
+            floor = calibration.extraction.relation_thresholds.get(
+                relation.predicate, config.GLINER_RELATION_MIN_CONF
+            )
+            if relation.confidence < floor:
+                continue
+            fact = _resolve_relation(
+                relation,
+                mentions,
+                note_text,
+                schema_id,
+                method,
+                calibration,
+            )
+            if fact is None:
+                continue
+            key = (
+                fact.predicate,
+                fact.subject_start,
+                fact.subject_end,
+                fact.object_start,
+                fact.object_end,
+            )
+            current = facts_by_key.get(key)
+            if current is None or fact.confidence > current.confidence:
+                facts_by_key[key] = fact
+
+    fact_candidates = sorted(
+        facts_by_key.values(),
+        key=lambda row: (
+            row.assertion_start,
+            row.predicate,
+            row.subject_start,
+            row.object_start,
+        ),
+    )
     relations = [
         RelationTriple(
-            head=relation_acc[key].head,
-            rel_type=relation_acc[key].rel_type,
-            tail=relation_acc[key].tail,
-            conf=relation_acc[key].conf,
+            head=row.head,
+            rel_type=row.predicate,
+            tail=row.tail,
+            conf=row.confidence,
         )
-        for key in relation_order
+        for row in fact_candidates
+        if _valid_relation_endpoints(row.head, row.tail)
     ]
-    return Extraction(entities=entities, relations=relations)
+    return Extraction(
+        entities=entities,
+        relations=relations,
+        mentions=mentions,
+        fact_candidates=fact_candidates,
+        schema_id=schema_id,
+    )
 
 
-def _iter_entities(raw: object) -> list[tuple[str, str, float]]:
-    if not isinstance(raw, dict):
+def _iter_entities(raw: object) -> list[tuple[_Span, str]]:
+    if not isinstance(raw, dict) or not isinstance(raw.get("entities"), dict):
         return []
-    entities = raw.get("entities")
-    if not isinstance(entities, dict):
-        return []
-
-    found: list[tuple[str, str, float]] = []
-    for etype, values in entities.items():
+    found: list[tuple[_Span, str]] = []
+    for etype, values in raw["entities"].items():
         if isinstance(values, (str, dict)):
             values = [values]
         if not isinstance(values, list):
             continue
         for item in values:
-            surface, conf = _span_text_conf(item)
-            if surface:
-                found.append((surface, str(etype), conf))
+            span = _span(item)
+            if span.text:
+                found.append((span, str(etype)))
     return found
 
 
-def _iter_relations(raw: object) -> list[tuple[str, str, str, float]]:
+def _iter_relations(raw: object) -> list[_RelationRaw]:
     if not isinstance(raw, dict):
         return []
-
-    rel_map = raw.get("relation_extraction")
-    if not isinstance(rel_map, dict):
-        rel_map = {
-            rel_type: raw.get(rel_type)
-            for rel_type in config.INGEST_RELATION_TYPES
-            if rel_type in raw
+    values_by_type = raw.get("relation_extraction")
+    if not isinstance(values_by_type, dict):
+        values_by_type = {
+            predicate: raw[predicate]
+            for predicate in config.INGEST_RELATION_TYPES
+            if predicate in raw
         }
-    if not isinstance(rel_map, dict):
-        return []
-
-    found: list[tuple[str, str, str, float]] = []
-    for rel_type, values in rel_map.items():
+    found: list[_RelationRaw] = []
+    for predicate, values in values_by_type.items():
         if isinstance(values, (tuple, dict)):
             values = [values]
         if not isinstance(values, list):
             continue
         for item in values:
-            parsed = _relation_item(item)
+            parsed = _relation(item, str(predicate))
             if parsed is not None:
-                head, tail, conf = parsed
-                found.append((head, str(rel_type), tail, conf))
+                found.append(parsed)
     return found
 
 
-def _relation_item(item: object) -> tuple[str, str, float] | None:
-    if isinstance(item, tuple) and len(item) == 2:
-        return str(item[0]), str(item[1]), 1.0
-    if isinstance(item, list) and len(item) == 2:
-        return str(item[0]), str(item[1]), 1.0
+def _relation(item: object, predicate: str) -> _RelationRaw | None:
+    if isinstance(item, (list, tuple)) and len(item) == 2:
+        return _RelationRaw(_span(item[0]), predicate, _span(item[1]), 1.0)
     if not isinstance(item, dict):
         return None
-
-    head, head_conf = _span_text_conf(item.get("head"))
-    tail, tail_conf = _span_text_conf(item.get("tail"))
-    if not head or not tail:
+    head = _span(item.get("head"))
+    tail = _span(item.get("tail"))
+    if not head.text or not tail.text:
         return None
-    item_conf = _confidence(item, default=min(head_conf, tail_conf))
-    return head, tail, item_conf
+    confidence = _confidence(item, default=min(head.confidence, tail.confidence))
+    return _RelationRaw(head, predicate, tail, confidence)
 
 
-def _span_text_conf(item: object) -> tuple[str, float]:
+def _span(item: object) -> _Span:
     if isinstance(item, str):
-        return item.strip(), 1.0
-    if isinstance(item, dict):
-        text = item.get("text", item.get("surface", item.get("span", "")))
-        if not isinstance(text, str):
-            return "", 0.0
-        return text.strip(), _confidence(item)
-    return "", 0.0
+        return _Span(item.strip(), 1.0, None, None, False)
+    if not isinstance(item, dict):
+        return _Span("", 0.0, None, None, False)
+    value = item.get("text", item.get("surface", item.get("span", "")))
+    text = value.strip() if isinstance(value, str) else ""
+    start = item.get("start")
+    end = item.get("end")
+    explicit = isinstance(start, int) and isinstance(end, int)
+    return _Span(
+        text=text,
+        confidence=_confidence(item),
+        start=int(start) if explicit else None,
+        end=int(end) if explicit else None,
+        explicit=explicit,
+    )
+
+
+def _resolve_span(span: _Span, text: str) -> tuple[_Span, ...]:
+    if span.explicit:
+        if (
+            span.start is None
+            or span.end is None
+            or span.start < 0
+            or span.end <= span.start
+            or span.end > len(text)
+            or text[span.start : span.end] != span.text
+        ):
+            return ()
+        return (span,)
+    pattern = re.compile(rf"(?<!\w){re.escape(span.text)}(?!\w)", re.IGNORECASE)
+    return tuple(
+        _Span(
+            text=text[match.start() : match.end()],
+            confidence=span.confidence,
+            start=match.start(),
+            end=match.end(),
+            explicit=False,
+        )
+        for match in pattern.finditer(text)
+    )
+
+
+def _legacy_entities(mentions: list[ExtractedMention]) -> list[EntityMention]:
+    grouped: dict[tuple[str, str], list[ExtractedMention]] = {}
+    order: list[tuple[str, str]] = []
+    for mention in mentions:
+        key = (mention.surface.casefold(), mention.etype)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(mention)
+    return [
+        EntityMention(
+            surface=max(grouped[key], key=lambda row: row.confidence).surface,
+            etype=key[1],
+            conf=max(row.confidence for row in grouped[key]),
+            mentions=len(grouped[key]),
+        )
+        for key in order
+    ]
+
+
+def _resolve_relation(
+    relation: _RelationRaw,
+    mentions: list[ExtractedMention],
+    text: str,
+    schema_id: str,
+    method: str,
+    calibration: CalibrationArtifact,
+) -> ExtractedRelation | None:
+    heads = _endpoint_candidates(relation.head, mentions, text)
+    tails = _endpoint_candidates(relation.tail, mentions, text)
+    pairs: list[tuple[ExtractedMention, ExtractedMention, tuple[int, int]]] = []
+    for head in heads:
+        for tail in tails:
+            if head.etype != tail.etype or head.surface.casefold() != tail.surface.casefold():
+                assertion = _assertion_span(text, head.char_start, head.char_end, tail.char_start, tail.char_end)
+                if assertion is not None:
+                    pairs.append((head, tail, assertion))
+    if not pairs:
+        return None
+    pairs.sort(
+        key=lambda pair: (
+            abs(pair[0].char_start - pair[1].char_start),
+            pair[0].char_start,
+            pair[1].char_start,
+        )
+    )
+    head, tail, assertion = pairs[0]
+    ambiguous = len(pairs) > 1
+    promotion_floor = calibration.extraction.promotion_thresholds.get(
+        relation.predicate, config.REL_FACT_MIN_CONF
+    )
+    return ExtractedRelation(
+        head=head.surface,
+        predicate=relation.predicate,
+        tail=tail.surface,
+        confidence=relation.confidence,
+        subject_start=head.char_start,
+        subject_end=head.char_end,
+        object_start=tail.char_start,
+        object_end=tail.char_end,
+        assertion_start=assertion[0],
+        assertion_end=assertion[1],
+        extraction_method=method,
+        schema_id=schema_id,
+        status=(
+            "active"
+            if relation.confidence >= promotion_floor and not ambiguous
+            else "candidate"
+        ),
+    )
+
+
+def _endpoint_candidates(
+    span: _Span,
+    mentions: list[ExtractedMention],
+    text: str,
+) -> list[ExtractedMention]:
+    candidates = [row for row in mentions if row.surface.casefold() == span.text.casefold()]
+    if not span.explicit:
+        return candidates
+    if (
+        span.start is None
+        or span.end is None
+        or span.start < 0
+        or span.end > len(text)
+        or text[span.start : span.end] != span.text
+    ):
+        return []
+    return [
+        row
+        for row in candidates
+        if row.char_start == span.start and row.char_end == span.end
+    ]
+
+
+def _assertion_span(
+    text: str,
+    subject_start: int,
+    subject_end: int,
+    object_start: int,
+    object_end: int,
+) -> tuple[int, int] | None:
+    left = min(subject_start, object_start)
+    right = max(subject_end, object_end)
+    for start, end in _sentence_spans(text):
+        if start <= left and right <= end:
+            return start, end
+    paragraph_start = text.rfind("\n\n", 0, left) + 2
+    paragraph_end = text.find("\n\n", right)
+    if paragraph_end < 0:
+        paragraph_end = len(text)
+    if paragraph_start <= left and right <= paragraph_end:
+        return paragraph_start, paragraph_end
+    return None
+
+
+def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    spans_out: list[tuple[int, int]] = []
+    start = 0
+    for match in re.finditer(r"[.!?](?:[\"')\]]*)(?:\s+|$)", text):
+        end = match.start() + len(match.group(0).rstrip())
+        if end > start:
+            spans_out.append((start, end))
+        start = match.end()
+    if start < len(text):
+        spans_out.append((start, len(text)))
+    return tuple(spans_out)
+
+
+def _token_offsets(
+    model: Any,
+    text: str,
+    tokenizer: OffsetTokenizerPort | None,
+) -> tuple[tuple[int, int], ...]:
+    if tokenizer is not None:
+        encoded = tokenizer(
+            text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        return tuple(
+            (int(start), int(end))
+            for start, end in encoded["offset_mapping"]
+            if int(end) > int(start)
+        )
+    processor = getattr(model, "processor", None)
+    splitter = getattr(processor, "word_splitter", None)
+    if callable(splitter):
+        return tuple((int(start), int(end)) for _, start, end in splitter(text, lower=True))
+    # Deterministic fake-model seam. Production GLiNER2 always supplies word_splitter.
+    return tuple((match.start(), match.end()) for match in re.finditer(r"\S+", text))
+
+
+def _long_windows(
+    text: str,
+    offsets: tuple[tuple[int, int], ...],
+) -> tuple[tuple[str, int], ...]:
+    size = _chunk_size()
+    overlap = _chunk_overlap()
+    windows: list[tuple[str, int]] = []
+    start = 0
+    while start < len(offsets):
+        end = min(start + size, len(offsets))
+        char_start = offsets[start][0]
+        char_end = offsets[end - 1][1]
+        windows.append((text[char_start:char_end], char_start))
+        if end >= len(offsets):
+            break
+        start = max(start + 1, end - overlap)
+    return tuple(windows)
+
+
+def _shift_spans(value: object, offset: int) -> object:
+    shifted = copy.deepcopy(value)
+
+    def visit(item: object) -> None:
+        if isinstance(item, dict):
+            if isinstance(item.get("start"), int) and isinstance(item.get("end"), int):
+                item["start"] += offset
+                item["end"] += offset
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested)
+
+    visit(shifted)
+    return shifted
+
+
+def _relation_descriptions(family: str) -> dict[str, str]:
+    emphasis = {
+        "email": "email ownership, deadlines, blockers, and completion",
+        "conversation": "conversation decisions, preferences, meetings, and commitments",
+        "written": "durable written facts, plans, relationships, and status",
+    }[family]
+    return {
+        name: f"{template.format(head='subject', tail='object')}; focus on {emphasis}"
+        for name, template in config.INGEST_RELATION_TYPES.items()
+    }
+
+
+def _source_family(source: str) -> str:
+    if source in {"gmail", "outlook"}:
+        return "email"
+    if source in {"imessage", "live_session"}:
+        return "conversation"
+    return "written"
+
+
+def _calibration() -> CalibrationArtifact:
+    return load_calibration(_CALIBRATION_PATH)
+
+
+def _global_threshold() -> float:
+    calibration = _calibration().extraction
+    return min(
+        min(calibration.entity_thresholds.values()),
+        min(calibration.relation_thresholds.values()),
+    )
 
 
 def _confidence(item: dict[str, Any], *, default: float = 1.0) -> float:
     value = item.get("confidence", item.get("conf", item.get("score", default)))
-    if isinstance(value, (int, float)):
-        return float(value)
-    return default
+    return float(value) if isinstance(value, (int, float)) else default
 
 
-def _batches(notes: list[NoteRecord], size: int) -> list[list[NoteRecord]]:
-    return [notes[index : index + size] for index in range(0, len(notes), size)]
-
-
-def _note_text(note: NoteRecord) -> str:
-    return f"{note.title}\n{note.text}"
-
-
-def _surface_mentions(surface: str, text: str) -> int:
-    pattern = re.compile(rf"(?<!\w){re.escape(surface)}(?!\w)", re.IGNORECASE)
-    return max(1, len(pattern.findall(text)))
-
-
-def _is_long_text(text: str) -> bool:
-    size = _chunk_size()
-    return size > 0 and len(_tokens(text)) > size
-
-
-def _text_chunks(text: str) -> list[str]:
-    tokens = _tokens(text)
-    size = _chunk_size()
-    if size <= 0 or len(tokens) <= size:
-        return [text]
-
-    overlap = max(0, min(config.GLINER_CHUNK_OVERLAP, size - 1))
-    chunks: list[str] = []
-    start = 0
-    while start < len(tokens):
-        end = min(start + size, len(tokens))
-        chunks.append(" ".join(tokens[start:end]))
-        if end == len(tokens):
-            break
-        start = max(start + 1, end - overlap)
-    return chunks
-
-
-def _tokens(text: str) -> list[str]:
-    return re.findall(r"\S+", text)
-
-
-def _global_threshold() -> float:
-    return min(config.GLINER_ENTITY_MIN_CONF, config.GLINER_RELATION_MIN_CONF)
+def _is_long(offsets: tuple[tuple[int, int], ...]) -> bool:
+    return _chunk_size() > 0 and len(offsets) > _chunk_size()
 
 
 def _ingest_batch_size() -> int:
     return max(1, int(config.GLINER_INGEST_BATCH))
 
 
+def _batch_token_budget() -> int:
+    return max(1, int(config.GLINER_BATCH_TOKEN_BUDGET))
+
+
 def _chunk_size() -> int:
-    return max(0, int(config.GLINER_CHUNK_SIZE))
+    return max(1, int(config.GLINER_CHUNK_SIZE))
 
 
-def _chunk_max_len() -> int | None:
-    size = _chunk_size()
-    return size if size > 0 else None
-
-
-def _lower_normalized(text: str) -> str:
-    return re.sub(r"\s+", " ", text.lower()).strip()
+def _chunk_overlap() -> int:
+    return max(0, min(int(config.GLINER_CHUNK_OVERLAP), _chunk_size() - 1))
 
 
 def _valid_relation_endpoints(head: str, tail: str) -> bool:
-    if _relation_identity(head) == _relation_identity(tail):
+    if re.sub(r"\s+", " ", head).strip().casefold() == re.sub(
+        r"\s+", " ", tail
+    ).strip().casefold():
         return False
-    return (
-        len(_relation_compact(head)) >= 3
-        and len(_relation_compact(tail)) >= 3
-    )
-
-
-def _relation_identity(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().casefold()
-
-
-def _relation_compact(text: str) -> str:
-    return re.sub(r"\s+", "", text.strip())
+    return len(re.sub(r"\s+", "", head.strip())) >= 3 and len(
+        re.sub(r"\s+", "", tail.strip())
+    ) >= 3

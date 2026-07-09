@@ -8,6 +8,58 @@
     "extractor": "fastino/gliner2-large-v1"
   },
   "config_hash": "sha256:knowledge-graph-overhaul-v1",
+  "extraction": {
+    "entity_thresholds": {
+      "person": 0.5,
+      "organization": 0.5,
+      "project": 0.5,
+      "product": 0.5,
+      "place": 0.5,
+      "event": 0.5,
+      "date_or_deadline": 0.5,
+      "concept": 0.5
+    },
+    "relation_thresholds": {
+      "works_with": 0.45,
+      "works_at": 0.45,
+      "member_of": 0.45,
+      "part_of": 0.45,
+      "located_at": 0.45,
+      "scheduled_for": 0.45,
+      "paid_or_owes": 0.45,
+      "owns_or_has": 0.45,
+      "uses": 0.45,
+      "about": 0.45,
+      "met_with": 0.45,
+      "related_to": 0.45,
+      "decided": 0.45,
+      "prefers": 0.45,
+      "blocked_by": 0.45,
+      "responsible_for": 0.45,
+      "completed": 0.45,
+      "supersedes": 0.45
+    },
+    "promotion_thresholds": {
+      "works_with": 0.7,
+      "works_at": 0.7,
+      "member_of": 0.7,
+      "part_of": 0.7,
+      "located_at": 0.7,
+      "scheduled_for": 0.7,
+      "paid_or_owes": 0.7,
+      "owns_or_has": 0.7,
+      "uses": 0.7,
+      "about": 0.7,
+      "met_with": 0.7,
+      "related_to": 0.7,
+      "decided": 0.7,
+      "prefers": 0.7,
+      "blocked_by": 0.7,
+      "responsible_for": 0.7,
+      "completed": 0.7,
+      "supersedes": 0.7
+    }
+  },
   "modes": {
     "live": {
       "heads": {

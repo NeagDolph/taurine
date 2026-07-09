@@ -32,6 +32,32 @@ class RelationTriple(BaseModel):
     conf: float
 
 
+class ExtractedMention(BaseModel):
+    surface: str
+    etype: str
+    confidence: float
+    char_start: int
+    char_end: int
+    extractor: str
+    schema_id: str
+
+
+class ExtractedRelation(BaseModel):
+    head: str
+    predicate: str
+    tail: str
+    confidence: float
+    subject_start: int
+    subject_end: int
+    object_start: int
+    object_end: int
+    assertion_start: int
+    assertion_end: int
+    extraction_method: str
+    schema_id: str
+    status: Literal["active", "candidate"]
+
+
 # ── index shapes ───────────────────────────────────────────────────────
 class Enrichment(BaseModel):
     gist: str = ""                 # heuristic display line; not an LLM artifact
@@ -45,7 +71,11 @@ class Enrichment(BaseModel):
 class Extraction(BaseModel):
     entities: list[EntityMention] = []
     relations: list[RelationTriple] = []
+    mentions: list[ExtractedMention] = []
+    fact_candidates: list[ExtractedRelation] = []
+    schema_id: str = ""
     failed: bool = False           # GLiNER inference error → retry next sync
+    error: str = ""
 
 
 class NoteRecord(BaseModel):
