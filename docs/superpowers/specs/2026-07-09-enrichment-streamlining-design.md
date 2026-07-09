@@ -312,6 +312,37 @@ Migration (one-time, in `repair_enrich.py` style):
   vocabulary is the chosen tradeoff).
 - Changing the user-card profile build.
 
+## Verification follow-up notes (2026-07-09, post-implementation)
+
+- **GLiNER calibration (55 real notes, 0 failures):** entity conf median
+  0.83 — `GLINER_ENTITY_MIN_CONF=0.5` kept (low band holds legit rare
+  entities; df-rarity absorbs generic nouns; ASR-garbled notes produce
+  high-conf junk no threshold fixes). Relations ≥0.7 ran ~80–85% precise
+  once two guards landed in extract.py: self-relation drop and endpoint
+  compact-length ≥ 3 ('works_at "ts"' at 0.72 was the high-conf failure).
+  `REL_FACT_MIN_CONF=0.7` confirmed; the skip rule stays enabled.
+- **Utterance ablation (219 session logs, migrated corpus): verdict KEEP.**
+  Utterance-only grounding fraction ~10–12% on the two large sessions and
+  mean top-5 Jaccard 0.526 — far from the pre-registered elimination bar
+  (<5% and ≥0.9). Utterances stay, now generated only by the value-gated
+  slim call. Caveats disclosed in the harness output (no GLiNER head in
+  replay; attribution-based metric).
+- **Migration (real-corpus copy):** 6.5 min wall (GLiNER CPU-bound), 769
+  gist embedding rows deleted, 467 fresh extractions + 92 cache-skips, 0
+  failures, 94 judgments written within the 100-pair budget. Post-migration
+  DB: 5,940 canonical entities, 6,918 contains rows, 591 relation triples,
+  466 gliner-promoted + 1,055 llm facts (old judgment cache reused).
+- **E2E on migrated copy:** real `sync_all_enabled` incl. gmail through the
+  funnel; incremental adjudication 100 judged / 7 admitted / 64 vetoed;
+  /graph = 563 note nodes, 0 entity leaks, facts on 1,132 edges; note
+  preview + display lines correct. Hysteresis spot-check: replayed top-5
+  grounding is a strict subset of historically logged grounding (5/5
+  overlap) — PPR reset weights left at defaults.
+- **Production DB swap deferred:** the dev server held taurine.db open
+  during verification. To cut over: stop the server, run
+  `uv run python migrate_enrichment.py --db taurine.db --llm` (resumable),
+  restart. Rollback snapshot: `core/taurine.pre-streamline.db`.
+
 ## Execution split (proposed units)
 
 1. **Unit A** — GLiNER2 ingestion adapter + schema/store changes
