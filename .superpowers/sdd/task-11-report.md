@@ -56,3 +56,21 @@ Final verification:
 
 - Replay intentionally has no active partial transcript state or GLiNER span extractor. This matches the brief's no-LLM/no-extra-calls constraint and exercises the LLM-free retrieval path, but it is not a byte-for-byte recreation of live wall-clock throttling plus partial windows.
 - `--limit` is implemented as a session-file limit, not a window limit.
+
+## Review Fix Addendum: Caveats and Empty-Both Jaccard
+
+Implemented the two review findings on commit `3b5f364`:
+
+- Added fixed replay-fidelity caveats to the machine-readable report under `caveats` and to `render_markdown(...)` under `## Caveats`.
+- Added `empty_both_windows` to the report and markdown summary.
+- Excluded windows where baseline and masked grounding sets are both empty from the mean top-5 Jaccard denominator.
+
+TDD evidence:
+
+- Red: `cd core && uv run pytest tests/test_ablate_utterances.py -q` failed with `KeyError: 'caveats'` and `assert 0.5 == 0.0` for the empty-both regression fixture.
+- Green: `cd core && uv run pytest tests/test_ablate_utterances.py -q` returned `5 passed in 0.11s`.
+
+Final verification:
+
+- `cd core && uv run pytest -q`
+- `313 passed, 2 skipped, 3 warnings in 12.13s`.

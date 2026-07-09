@@ -19,6 +19,21 @@ DECISION_RULE = (
     "mean top-5 Jaccard >= 0.9 else KEEP"
 )
 OTHER_INTRODUCING_HEADS = {"bm25", "exact", "gliner", "fact"}
+CAVEATS = [
+    (
+        "Replay runs without the GLiNER span-extractor head and without "
+        "partial-transcript/wall-clock throttling."
+    ),
+    (
+        "Net bias direction is likely conservative (toward KEEP) but not "
+        "provably one-directional since production GLiNER queries also hit "
+        "utterance rows."
+    ),
+    (
+        "Metric (a) is attribution-based (winning dense row), not "
+        "reachability-based."
+    ),
+]
 
 
 @dataclass(frozen=True)
@@ -87,11 +102,19 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Windows: {corpus['windows']}",
         f"- Utterance-only grounding fraction: {corpus['utterance_only_fraction']:.3%}",
         f"- Mean top-5 grounding Jaccard: {corpus['mean_top5_jaccard']:.3f}",
+        f"- Empty-both grounding windows: {report['empty_both_windows']}",
         f"- Decision rule: {report['decision_rule']}",
         f"- Verdict: **{report['verdict']}**",
         "",
-        "## Per-Session Diffs",
+        "## Caveats",
     ]
+    lines.extend(f"- {caveat}" for caveat in report.get("caveats", CAVEATS))
+    lines.extend(
+        [
+            "",
+            "## Per-Session Diffs",
+        ]
+    )
     diff_lines = report.get("diff_lines") or []
     if diff_lines:
         lines.extend(f"- {line}" for line in diff_lines)
@@ -148,6 +171,8 @@ def _run_ablation_with_indexes(
         "db": str(db_path),
         "sessions_dir": str(sessions_dir),
         "decision_rule": DECISION_RULE,
+        "caveats": list(CAVEATS),
+        "empty_both_windows": corpus["empty_both_windows"],
         "verdict": verdict,
         "corpus": corpus,
         "diff_lines": diff_lines,
@@ -208,6 +233,7 @@ def _run_session(
         masked_top5 = _top_ids(masked_result.update, 5)
         if baseline_top5 != masked_top5:
             changed += 1
+        empty_both = not baseline_top5 and not masked_top5
         utterance_only_ids = _utterance_only_ids(
             baseline_result.update,
             baseline_result.heads,
@@ -228,7 +254,10 @@ def _run_session(
         totals["windows"] += 1
         totals["grounding_items"] += len(baseline_result.update.items)
         totals["utterance_only_items"] += len(utterance_only_ids)
-        totals["jaccard_sum"] += jaccard
+        if empty_both:
+            totals["empty_both_windows"] += 1
+        else:
+            totals["jaccard_sum"] += jaccard
 
     metrics = _metrics_from_totals(totals)
     diff_line = (
@@ -354,6 +383,7 @@ def _empty_totals() -> dict[str, float | int]:
         "grounding_items": 0,
         "utterance_only_items": 0,
         "jaccard_sum": 0.0,
+        "empty_both_windows": 0,
     }
 
 
@@ -366,15 +396,20 @@ def _metrics_from_totals(totals: dict[str, float | int]) -> dict[str, Any]:
     windows = int(totals["windows"])
     grounding_items = int(totals["grounding_items"])
     utterance_only_items = int(totals["utterance_only_items"])
+    empty_both_windows = int(totals["empty_both_windows"])
+    jaccard_denominator = windows - empty_both_windows
     return {
         "windows": windows,
         "grounding_items": grounding_items,
         "utterance_only_items": utterance_only_items,
+        "empty_both_windows": empty_both_windows,
         "utterance_only_fraction": (
             utterance_only_items / grounding_items if grounding_items else 0.0
         ),
         "mean_top5_jaccard": (
-            float(totals["jaccard_sum"]) / windows if windows else 1.0
+            float(totals["jaccard_sum"]) / jaccard_denominator
+            if jaccard_denominator
+            else 1.0
         ),
     }
 
