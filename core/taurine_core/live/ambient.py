@@ -32,6 +32,8 @@ class _Candidate:
 class HeadFusionResult:
     fused: list[tuple[str, float]]
     head_hits: dict[str, set[str]]
+    dense_kinds: dict[str, set[str]]
+    dense_gliner_kinds: dict[str, set[str]]
     dense: list[tuple[str, float]]
     extra_dense: list[tuple[str, float]]
     bm25: list[tuple[str, float]]
@@ -53,8 +55,17 @@ def run_head_fusion(
     snapped_terms = snapped_terms or []
     exact_hits = exact_hits or []
 
-    dense = _dense_search(index, window_text, config.HEAD_TOP_K, query_prompt)
-    extra_dense = _dense_many(index, extra_dense_queries, query_prompt)
+    dense_rows = _dense_search_with_kinds(
+        index,
+        window_text,
+        config.HEAD_TOP_K,
+        query_prompt,
+    )
+    dense = [(note_id, score) for note_id, score, _kind in dense_rows]
+    dense_kinds = _dense_kinds(dense_rows)
+    extra_dense_rows = _dense_many_with_kinds(index, extra_dense_queries, query_prompt)
+    extra_dense = [(note_id, score) for note_id, score, _kind in extra_dense_rows]
+    dense_gliner_kinds = _dense_kinds(extra_dense_rows)
     bm25_query = _bm25_query(window_text, snapped_terms)
     bm25 = index.bm25_search(bm25_query, config.HEAD_TOP_K)
     exact = [(note_id, 1.0) for note_id, _alias in exact_hits]
@@ -73,6 +84,8 @@ def run_head_fusion(
     return HeadFusionResult(
         fused=fused,
         head_hits=head_hits,
+        dense_kinds=dense_kinds,
+        dense_gliner_kinds=dense_gliner_kinds,
         dense=dense,
         extra_dense=extra_dense,
         bm25=bm25,
@@ -179,6 +192,9 @@ class AmbientRetriever:
             exact=heads.exact,
             bm25_query=heads.bm25_query,
             fused=heads.fused,
+            head_hits=heads.head_hits,
+            dense_kinds=heads.dense_kinds,
+            dense_gliner_kinds=heads.dense_gliner_kinds,
             update=update,
             snapped=snapped,
         )
@@ -261,6 +277,9 @@ class AmbientRetriever:
         exact: list[tuple[str, float]],
         bm25_query: str,
         fused: list[tuple[str, float]],
+        head_hits: dict[str, set[str]],
+        dense_kinds: dict[str, set[str]],
+        dense_gliner_kinds: dict[str, set[str]],
         update: GroundingUpdate,
         snapped: list[tuple[str, str]],
     ) -> None:
@@ -278,6 +297,12 @@ class AmbientRetriever:
             "bm25": _rows(bm25),
             "exact": _rows(exact),
             "fused": _rows(fused),
+            "fused_attribution": _fused_attribution(
+                fused,
+                head_hits,
+                dense_kinds,
+                dense_gliner_kinds,
+            ),
             "ppr_top": _rows(update.ppr_top),
             "blend": blend,
             "grounding_revision": update.revision,
@@ -341,18 +366,70 @@ def _dense_search(
         return index.dense_search(text, k)
 
 
-def _dense_many(
+def _dense_search_with_kinds(
+    index: IndexPort,
+    text: str,
+    k: int,
+    prompt: str | None,
+) -> list[tuple[str, float, str]]:
+    search = getattr(index, "dense_search_with_kinds", None)
+    if not callable(search):
+        return [
+            (note_id, score, "")
+            for note_id, score in _dense_search(index, text, k, prompt)
+        ]
+    if prompt is None:
+        return [(note_id, score, str(kind)) for note_id, score, kind in search(text, k)]
+    try:
+        return [
+            (note_id, score, str(kind))
+            for note_id, score, kind in search(text, k, prompt=prompt)
+        ]
+    except TypeError as exc:
+        if "prompt" not in str(exc):
+            raise
+        return [(note_id, score, str(kind)) for note_id, score, kind in search(text, k)]
+
+
+def _dense_kinds(rows: list[tuple[str, float, str]]) -> dict[str, set[str]]:
+    kinds: dict[str, set[str]] = {}
+    for note_id, _score, kind in rows:
+        if kind:
+            kinds.setdefault(note_id, set()).add(kind)
+    return kinds
+
+
+def _dense_many_with_kinds(
     index: IndexPort,
     queries: list[str],
     prompt: str | None,
-) -> list[tuple[str, float]]:
+) -> list[tuple[str, float, str]]:
     scores: dict[str, float] = {}
+    kinds: dict[str, set[str]] = {}
     for query in queries:
-        for note_id, score in _dense_search(index, query, config.HEAD_TOP_K, prompt):
-            scores[note_id] = max(scores.get(note_id, float("-inf")), score)
-    return sorted(scores.items(), key=lambda item: item[1], reverse=True)[
-        : config.HEAD_TOP_K
+        for note_id, score, kind in _dense_search_with_kinds(
+            index,
+            query,
+            config.HEAD_TOP_K,
+            prompt,
+        ):
+            current = scores.get(note_id, float("-inf"))
+            if score > current:
+                scores[note_id] = score
+                kinds[note_id] = {kind} if kind else set()
+            elif score == current and kind:
+                kinds.setdefault(note_id, set()).add(kind)
+    return [
+        (note_id, score, _first_kind(kinds.get(note_id, set())))
+        for note_id, score in sorted(scores.items(), key=lambda item: item[1], reverse=True)[
+            : config.HEAD_TOP_K
+        ]
     ]
+
+
+def _first_kind(kinds: set[str]) -> str:
+    ordered = sorted(kind for kind in kinds if kind)
+    return ordered[0] if ordered else ""
 
 
 def _rrf_scores(
@@ -380,6 +457,24 @@ def _ordered_candidates(scores: dict[str, float]) -> list[_Candidate]:
 
 def _rows(rows: list[tuple[Any, ...]]) -> list[list[Any]]:
     return [list(row) for row in rows]
+
+
+def _fused_attribution(
+    fused: list[tuple[str, float]],
+    head_hits: dict[str, set[str]],
+    dense_kinds: dict[str, set[str]],
+    dense_gliner_kinds: dict[str, set[str]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "note_id": note_id,
+            "score": score,
+            "heads": sorted(head_hits.get(note_id, set())),
+            "dense_kinds": sorted(dense_kinds.get(note_id, set())),
+            "dense_gliner_kinds": sorted(dense_gliner_kinds.get(note_id, set())),
+        }
+        for note_id, score in fused
+    ]
 
 
 def _append_query(queries: list[str], seen: set[str], query: str) -> bool:

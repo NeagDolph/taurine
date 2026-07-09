@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 import numpy as np
 
@@ -133,10 +134,17 @@ def _embed_queries_with_prompt(texts: list[str], prompt: str | None) -> np.ndarr
 
 
 class Index:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, read_only: bool = False) -> None:
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        raw = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._read_only = bool(read_only)
+        if self._read_only:
+            if not self.db_path.exists():
+                raise FileNotFoundError(self.db_path)
+            uri = f"file:{quote(str(self.db_path.resolve()), safe='/')}?mode=ro"
+            raw = sqlite3.connect(uri, check_same_thread=False, uri=True)
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            raw = sqlite3.connect(self.db_path, check_same_thread=False)
         raw.row_factory = sqlite3.Row
         self._conn = _ThreadSafeConnection(raw)
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -153,7 +161,8 @@ class Index:
         )
         self._entity_surface_state: dict[str, int] = {}
         self._doc_frequency_cache: dict[str, int] = {}
-        self._init_schema()
+        if not self._read_only:
+            self._init_schema()
         self._disabled_sources = self._load_disabled_sources()
         self.load()
 
@@ -516,6 +525,22 @@ class Index:
         *,
         prompt: str | None = None,
     ) -> list[tuple[str, float]]:
+        return [
+            (note_id, score)
+            for note_id, score, _kind in self.dense_search_with_kinds(
+                text,
+                k,
+                prompt=prompt,
+            )
+        ]
+
+    def dense_search_with_kinds(
+        self,
+        text: str,
+        k: int,
+        *,
+        prompt: str | None = None,
+    ) -> list[tuple[str, float, EmbeddingKind]]:
         embedding_rows, matrix = self._dense_snapshot()
         if k <= 0 or matrix.size == 0:
             return []
@@ -525,10 +550,36 @@ class Index:
             return []
         query = query / norm
         scores = matrix @ query
-        per_note: dict[str, float] = {}
-        for (_, note_id, _, _), score in zip(embedding_rows, scores, strict=True):
-            per_note[note_id] = max(per_note.get(note_id, -1.0), float(score))
-        return sorted(per_note.items(), key=lambda item: item[1], reverse=True)[:k]
+        per_note: dict[str, tuple[float, EmbeddingKind, int]] = {}
+        for index, ((_, note_id, kind, _), score) in enumerate(
+            zip(embedding_rows, scores, strict=True)
+        ):
+            current = per_note.get(note_id)
+            value = float(score)
+            if current is None or value > current[0]:
+                per_note[note_id] = (value, kind, index)
+        ordered = sorted(
+            per_note.items(),
+            key=lambda item: (-item[1][0], item[1][2], item[0]),
+        )[:k]
+        return [(note_id, score, kind) for note_id, (score, kind, _index) in ordered]
+
+    def mask_embedding_kind(self, kind: EmbeddingKind) -> int:
+        if kind not in {"chunk", "gist", "utterance"}:
+            raise ValueError(f"unknown embedding kind: {kind}")
+        rows, matrix = self._dense_state
+        keep_indexes = [index for index, row in enumerate(rows) if row[2] != kind]
+        removed = len(rows) - len(keep_indexes)
+        if removed == 0:
+            return 0
+        kept_rows = [rows[index] for index in keep_indexes]
+        kept_matrix = (
+            matrix[keep_indexes].astype(np.float32, copy=True)
+            if keep_indexes
+            else np.empty((0, config.EMBED_DIM), dtype=np.float32)
+        )
+        self._dense_state = (kept_rows, kept_matrix)
+        return removed
 
     def bm25_search(self, text: str, k: int) -> list[tuple[str, float]]:
         if k <= 0:
