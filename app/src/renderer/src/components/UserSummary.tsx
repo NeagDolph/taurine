@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import {
   generateProfile,
@@ -59,15 +59,11 @@ export function UserSummary({ profile, onProfileChange }: UserSummaryProps): Rea
     return () => window.clearInterval(timer)
   }, [generating])
 
-  const elapsed = useMemo(() => {
-    if (!generation) {
-      return 0
-    }
-    if (generation.running && generation.started_at !== null) {
-      return Math.max(generation.elapsed_s, now / 1000 - generation.started_at)
-    }
-    return generation.elapsed_s
-  }, [generation, now])
+  const elapsed = !generation
+    ? 0
+    : generation.running && generation.started_at !== null
+      ? Math.max(generation.elapsed_s, now / 1000 - generation.started_at)
+      : generation.elapsed_s
 
   const beginEdit = useCallback(() => {
     setDraft(card)
@@ -325,7 +321,7 @@ function ResearchRail({
   const progress = Math.max(8, ((Math.max(activeIndex, 0) + 0.55) / RESEARCH_STEPS.length) * 100)
 
   return (
-    <div className="user-summary-research" aria-live="polite">
+    <div className="user-summary-research">
       <aside className="user-summary-research-rail" aria-label="Profile research progress">
         <span className="user-summary-rail-label">Profile research</span>
         {RESEARCH_STEPS.map((step, index) => {
@@ -351,7 +347,7 @@ function ResearchRail({
         <div className="user-summary-progress" aria-hidden="true">
           <span style={{ width: `${progress}%` }} />
         </div>
-        <div className="user-summary-activity-row">
+        <div className="user-summary-activity-row" role="status" aria-live="polite">
           <span className="user-summary-activity-spinner" aria-hidden="true" />
           <span>{generation.activity || 'Researching your graph'}</span>
         </div>
