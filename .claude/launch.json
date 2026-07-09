@@ -4,9 +4,10 @@
     {
       "name": "taurine-renderer",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": ["run", "dev", "--", "--rendererOnly"],
       "cwd": "app",
-      "port": 5174
+      "port": 5174,
+      "autoPort": true
     }
   ]
 }
