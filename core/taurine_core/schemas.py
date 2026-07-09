@@ -1,9 +1,12 @@
 """Pydantic models: ws protocol, REST payloads, and cross-unit data shapes."""
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from taurine_core.retrieval.types import EvidencePack
 
 
 # ── transcript ─────────────────────────────────────────────────────────
@@ -104,6 +107,123 @@ class RetrievalResult(BaseModel):
     hits: list[Hit]
     expansions: list[Expansion]
     extracted: list[str] = []      # GLiNER spans that served as query heads
+
+
+class RetrievalDecisionPayload(BaseModel):
+    accepted: bool
+    confidence: float
+    reason: str
+    accepted_heads: list[str] = []
+    rejected_heads: list[str] = []
+
+
+class EvidencePassagePayload(BaseModel):
+    evidence_id: str
+    passage_id: str
+    note_id: str
+    title: str
+    source: str
+    text: str
+    char_start: int
+    char_end: int
+    created: float
+    modified: float
+    retrieval_score: float
+    rerank_score: float
+    path_ids: list[str] = []
+
+
+class EvidenceFactPayload(BaseModel):
+    fact_ref: str
+    fact_ids: list[str]
+    subject: str
+    predicate: str
+    object: str
+    direction: str
+    status: str
+    observed_at: float
+    valid_from: Optional[float] = None
+    valid_to: Optional[float] = None
+    confidence: float
+    source_evidence_ids: list[str] = []
+
+
+class EvidencePathPayload(BaseModel):
+    path_id: str
+    node_ids: list[str]
+    edge_kinds: list[str]
+    fact_ids: list[str]
+    weight: float
+    rendered: str
+
+
+class EvidenceNotePayload(BaseModel):
+    note_ref: str
+    note_id: str
+    title: str
+    source: str
+    modified: float
+    score: float
+    evidence_ids: list[str] = []
+
+
+class EvidencePackPayload(BaseModel):
+    decision: RetrievalDecisionPayload
+    passages: list[EvidencePassagePayload] = []
+    facts: list[EvidenceFactPayload] = []
+    paths: list[EvidencePathPayload] = []
+    notes: list[EvidenceNotePayload] = []
+
+    @classmethod
+    def from_domain(cls, pack: "EvidencePack") -> "EvidencePackPayload":
+        return cls(
+            decision=RetrievalDecisionPayload(
+                accepted=pack.decision.accepted,
+                confidence=pack.decision.confidence,
+                reason=pack.decision.reason,
+                accepted_heads=list(pack.decision.accepted_heads),
+                rejected_heads=list(pack.decision.rejected_heads),
+            ),
+            passages=[
+                EvidencePassagePayload(
+                    **{
+                        **row.__dict__,
+                        "path_ids": list(row.path_ids),
+                    }
+                )
+                for row in pack.passages
+            ],
+            facts=[
+                EvidenceFactPayload(
+                    **{
+                        **row.__dict__,
+                        "fact_ids": list(row.fact_ids),
+                        "source_evidence_ids": list(row.source_evidence_ids),
+                    }
+                )
+                for row in pack.facts
+            ],
+            paths=[
+                EvidencePathPayload(
+                    **{
+                        **row.__dict__,
+                        "node_ids": list(row.node_ids),
+                        "edge_kinds": list(row.edge_kinds),
+                        "fact_ids": list(row.fact_ids),
+                    }
+                )
+                for row in pack.paths
+            ],
+            notes=[
+                EvidenceNotePayload(
+                    **{
+                        **row.__dict__,
+                        "evidence_ids": list(row.evidence_ids),
+                    }
+                )
+                for row in pack.notes
+            ],
+        )
 
 
 # ── grounding / meeting summary (spec 2026-07-08) ──────────────────────

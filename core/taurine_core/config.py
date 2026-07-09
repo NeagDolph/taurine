@@ -153,12 +153,23 @@ GRAPH_KNN = 6
 GRAPH_MIN_SIM = 0.55                     # percentile-matched to Qwen3-Embedding cosines
                                          # (bge 0.60 = p93.6 of pairwise sims → 0.550)
 GRAPH_MIN_SHARED_W = 0.25
-GRAPH_MAX_DEGREE = 12
+PROJECTION_MAX_DEGREE = 12               # product map only; never retrieval
+GRAPH_MAX_DEGREE = PROJECTION_MAX_DEGREE # legacy alias until projection cutover
+
+# ── evidence-first passage/base graph ─────────────────────────────────
+PASSAGE_TARGET_TOKENS = 220
+PASSAGE_MAX_TOKENS = 300
+PASSAGE_OVERLAP_TOKENS = 40
+BASE_GRAPH_PASSAGE_K = 12
+FACT_REVERSE_WEIGHT_DEFAULT = 0.35
 
 # ── C2 retrieval ───────────────────────────────────────────────────────
 C2_THROTTLE_S = 8.0
 C2_WINDOW_CHUNKS = 3
 C2_WINDOW_MIN_S = 12.0
+LIVE_WINDOW_MIN_S = 12.0
+LIVE_WINDOW_MAX_S = 45.0
+LIVE_WINDOW_MAX_CHARS = 6000
 RRF_K = 60
 HEAD_TOP_K = 20
 C2_TOP_K = 8                             # match the search-lane quota (was 5: entity notes
@@ -206,6 +217,20 @@ CHAT_EMBED_QUERY_PROMPT = (
     "notes relevant to answering it\nQuery: "
 )
 CHAT_TITLE_MAX_WORDS = 6
+
+# ── shared retrieval, rerank, and evidence ────────────────────────────
+TRIPLE_RECALL_K = 20
+TRIPLE_SEED_K = 5
+PASSAGE_RESET_W = 1.0
+ENTITY_RESET_W = 1.0
+QUERY_ENTITY_RESET_W = 0.5
+SESSION_RESET_W = 0.35
+RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
+LIVE_RERANK_CANDIDATES = 30
+CHAT_RERANK_CANDIDATES = 60
+LIVE_EVIDENCE_PASSAGES = 8
+CHAT_EVIDENCE_PASSAGES = 12
+EVIDENCE_NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
 
 # ── grounding / graph traversal (latent retrieval, no LLM) ─────────────
 GROUNDING_TOP_K = 12                     # grounding-set size
@@ -317,8 +342,11 @@ GLINER_MAX_SPANS = 4
 
 # ── GLiNER ingestion (local entities + relations) ─────────────────────
 GLINER_INGEST_BATCH = 8                  # notes per forward batch
-GLINER_CHUNK_SIZE = 384                  # long-note window tokens
-GLINER_CHUNK_OVERLAP = 64                # long-note overlap tokens
+GLINER_LONG_CHUNK_TOKENS = 384
+GLINER_LONG_OVERLAP_TOKENS = 64
+GLINER_BATCH_TOKEN_BUDGET = 3072
+GLINER_CHUNK_SIZE = GLINER_LONG_CHUNK_TOKENS       # legacy alias until extractor cutover
+GLINER_CHUNK_OVERLAP = GLINER_LONG_OVERLAP_TOKENS # legacy alias until extractor cutover
 GLINER_ENTITY_MIN_CONF = 0.5             # calibration-pending entity floor
 GLINER_RELATION_MIN_CONF = 0.45          # calibration-pending relation floor
 # entities above this active-note df fraction are connective stopwords
