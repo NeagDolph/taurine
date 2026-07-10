@@ -6,7 +6,6 @@ from typing import Any
 import pytest
 
 from tests.conftest import make_note
-from taurine_core import config
 from taurine_core.connectors.email_common import (
     EmailMessage,
     EmailThread,

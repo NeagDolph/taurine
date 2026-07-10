@@ -356,3 +356,76 @@ def test_email_threads_to_records_isolates_per_thread_failures(monkeypatch):
 
     records = email_common.threads_to_records(threads, "gmail")
     assert records == [rendered]
+
+
+def test_extract_notes_times_out_hung_applescript_conversions(monkeypatch):
+    import time as time_module
+
+    from taurine_core.indexer import notes as notes_module
+
+    monkeypatch.setattr(notes_module, "NOTE_CONVERT_TIMEOUT_S", 0.2)
+
+    class Folder:
+        name = "Notes"
+
+    class GoodNote:
+        name = "Good"
+        id = "x-coredata://good"
+        body = "<div>Good body</div>"
+        folder = Folder()
+        modification_date = 200.0
+        creation_date = 100.0
+
+    class HangingNote:
+        name = "Hanging"
+        id = "x-coredata://hanging"
+        modification_date = 200.0
+        creation_date = 100.0
+
+        @property
+        def body(self):
+            time_module.sleep(5)  # emulate a blocked AppleEvent
+            return "<div>never</div>"
+
+    class Account:
+        notes = [HangingNote(), GoodNote()]
+
+    class App:
+        default_account = Account()
+
+    started = time_module.monotonic()
+    records = notes_module.extract_notes(App())
+    elapsed = time_module.monotonic() - started
+
+    assert [record.note_id for record in records] == ["x-coredata://good"]
+    assert elapsed < 4  # did not wait out the hung conversion
+
+
+def test_extract_notes_fails_loudly_on_wholesale_conversion_failure(monkeypatch):
+    from taurine_core.indexer import notes as notes_module
+    from taurine_core.indexer.notes import NotesAccessError
+
+    class BrokenNote:
+        modification_date = 200.0
+        creation_date = 100.0
+
+        @property
+        def body(self):
+            raise RuntimeError("connection is invalid")
+
+        @property
+        def name(self):
+            raise RuntimeError("connection is invalid")
+
+        @property
+        def id(self):
+            raise RuntimeError("connection is invalid")
+
+    class Account:
+        notes = [BrokenNote() for _ in range(20)]
+
+    class App:
+        default_account = Account()
+
+    with pytest.raises(NotesAccessError, match="Notes.app looks unavailable"):
+        notes_module.extract_notes(App())

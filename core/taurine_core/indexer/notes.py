@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
@@ -11,6 +13,18 @@ from typing import Any
 from taurine_core.schemas import NoteRecord
 
 _LOG = logging.getLogger("taurine.connectors.apple_notes")
+
+# One AppleEvent to Notes.app can block forever client-side even while the
+# app answers everyone else (observed with the noteGetContainer fallback on
+# shared-folder notes). Each conversion runs under a watchdog; a timed-out
+# worker thread is abandoned, which leaks one thread per poison note — an
+# accepted price for the sync always finishing.
+NOTE_CONVERT_TIMEOUT_S = 20.0
+
+# When conversions fail wholesale, Notes.app itself is broken (quit mid-sync,
+# revoked automation permission). Failing the connector keeps the previously
+# synced notes instead of silently shrinking the store to the few survivors.
+MAX_SKIPPED_FRACTION = 0.25
 
 
 class NotesAccessError(Exception):
@@ -38,19 +52,40 @@ def extract_notes(app: object | None = None) -> list[NoteRecord]:
     # whole account down.
     records: list[NoteRecord] = []
     skipped: list[str] = []
-    for raw_note in raw_notes:
-        try:
-            record = _record_from_raw(raw_note)
-        except Exception as exc:
-            skipped.append(f"{_safe_note_id(raw_note)}: {exc}")
-            continue
-        if record.note_id:
-            records.append(record)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="apple-note-convert")
+    try:
+        for position, raw_note in enumerate(raw_notes):
+            # error rendering runs inside the watchdog too: _safe_note_id is
+            # itself an AppleScript lookup and can block like any other
+            future = executor.submit(_convert_raw_note, raw_note)
+            try:
+                record, failure = future.result(timeout=NOTE_CONVERT_TIMEOUT_S)
+            except FutureTimeoutError:
+                skipped.append(f"note #{position + 1}: conversion timed out")
+                # The worker is stuck in a native AppleEvent and cannot be
+                # interrupted; abandon that executor and continue on a new one.
+                executor.shutdown(wait=False)
+                executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="apple-note-convert"
+                )
+                continue
+            if failure is not None:
+                skipped.append(failure)
+                continue
+            if record is not None and record.note_id:
+                records.append(record)
+    finally:
+        executor.shutdown(wait=False)
     if skipped:
         _LOG.warning(
             "apple notes: skipped %d unreadable notes: %s",
             len(skipped),
             "; ".join(skipped[:5]),
+        )
+    if raw_notes and len(skipped) > max(3.0, MAX_SKIPPED_FRACTION * len(raw_notes)):
+        raise NotesAccessError(
+            f"apple notes conversion failed for {len(skipped)} of {len(raw_notes)} "
+            "notes — Notes.app looks unavailable, keeping previously synced data"
         )
     return records
 
@@ -99,6 +134,13 @@ def _record_from_raw(raw_note: object) -> NoteRecord:
         content_hash=content_hash,
         text=text,
     )
+
+
+def _convert_raw_note(raw_note: object) -> tuple[NoteRecord | None, str | None]:
+    try:
+        return _record_from_raw(raw_note), None
+    except Exception as exc:
+        return None, f"{_safe_note_id(raw_note)}: {exc}"
 
 
 def _value(value: Any) -> Any:
