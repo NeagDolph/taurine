@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
@@ -62,6 +63,7 @@ from taurine_core.schemas import (
     ProfileGenerationStatus,
     ReenrichStatus,
     StartMsg,
+    StartupStatus,
     StatusEvent,
     StopMsg,
 )
@@ -178,52 +180,112 @@ class _MonotonicClock:
 def create_app(runtime: Runtime | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        active_runtime = runtime or build_runtime()
-        app.state.runtime = active_runtime
-        active_runtime.updates.bind_loop(asyncio.get_running_loop())
-        if active_runtime.chat_engine is None and active_runtime.make_chat_engine is not None:
-            active_runtime.chat_engine = active_runtime.make_chat_engine()
-        if (
-            active_runtime.profile_generator is None
-            and active_runtime.make_profile_generator is not None
-        ):
-            active_runtime.profile_generator = active_runtime.make_profile_generator()
-        if active_runtime.connector_registry is not None:
-            active_runtime.connector_registry.on_change = lambda: active_runtime.updates.publish(
-                "connectors"
+        # The port must bind immediately: building the runtime can involve a
+        # full source re-extraction and knowledge build (minutes to hours), so
+        # it runs on a daemon thread while /startup reports progress and every
+        # other endpoint answers 503.
+        app.state.runtime = None
+        app.state.startup = StartupStatus(started_at=time.time())
+        loop = asyncio.get_running_loop()
+        state: dict[str, Any] = {"runtime": None, "periodic_task": None}
+
+        def activate(active_runtime: Runtime, *, deferred: bool = False) -> None:
+            state["runtime"] = active_runtime
+            active_runtime.updates.bind_loop(loop)
+            if active_runtime.chat_engine is None and active_runtime.make_chat_engine is not None:
+                active_runtime.chat_engine = active_runtime.make_chat_engine()
+            if (
+                active_runtime.profile_generator is None
+                and active_runtime.make_profile_generator is not None
+            ):
+                active_runtime.profile_generator = active_runtime.make_profile_generator()
+            if active_runtime.connector_registry is not None:
+                active_runtime.connector_registry.on_change = lambda: active_runtime.updates.publish(
+                    "connectors"
+                )
+            if active_runtime.enable_periodic_sync:
+                state["periodic_task"] = asyncio.create_task(_periodic_sync(active_runtime))
+            app.state.runtime = active_runtime
+            app.state.startup = StartupStatus(
+                ready=True,
+                phase="ready",
+                started_at=app.state.startup.started_at,
             )
-        periodic_task: asyncio.Task[None] | None = None
-        if active_runtime.enable_periodic_sync:
-            periodic_task = asyncio.create_task(_periodic_sync(active_runtime))
+            if deferred:
+                # Clients that connected mid-startup hold stale (empty) state.
+                _bump_graph(active_runtime)
+                active_runtime.updates.publish("connectors")
+                active_runtime.updates.publish("chats")
+
+        if runtime is not None:
+            activate(runtime)
+        else:
+            started_at = app.state.startup.started_at
+
+            def report(phase: str, detail: str = "") -> None:
+                app.state.startup = StartupStatus(
+                    phase=phase, detail=detail, started_at=started_at
+                )
+
+            def build_in_thread() -> None:
+                try:
+                    built = build_runtime(progress=report)
+                except Exception as exc:  # surfaced via /startup, not a crash
+                    logging.getLogger("taurine.server").exception("runtime startup failed")
+                    app.state.startup = StartupStatus(
+                        phase="failed",
+                        error=str(exc)[:300] or type(exc).__name__,
+                        started_at=started_at,
+                    )
+                    return
+                try:
+                    loop.call_soon_threadsafe(
+                        lambda: activate(built, deferred=True)
+                    )
+                except RuntimeError:  # server shut down before startup finished
+                    pass
+
+            threading.Thread(
+                target=build_in_thread, name="taurine-startup", daemon=True
+            ).start()
         try:
             yield
         finally:
+            active_runtime = state["runtime"]
+            periodic_task = state["periodic_task"]
             if periodic_task is not None:
                 periodic_task.cancel()
                 await asyncio.gather(periodic_task, return_exceptions=True)
-            if active_runtime.reenrich_task is not None:
-                active_runtime.reenrich_task.cancel()
-                await asyncio.gather(active_runtime.reenrich_task, return_exceptions=True)
-            if active_runtime.profile_generation_task is not None:
-                active_runtime.profile_generation_task.cancel()
-                await asyncio.gather(
-                    active_runtime.profile_generation_task,
-                    return_exceptions=True,
+            # When active_runtime is None the startup thread is still
+            # building; it is a daemon thread, so the process exits without
+            # waiting for it. A partial build only leaves a temporary
+            # *.build-*.db file that the next build reuses or replaces.
+            if active_runtime is not None:
+                if active_runtime.reenrich_task is not None:
+                    active_runtime.reenrich_task.cancel()
+                    await asyncio.gather(active_runtime.reenrich_task, return_exceptions=True)
+                if active_runtime.profile_generation_task is not None:
+                    active_runtime.profile_generation_task.cancel()
+                    await asyncio.gather(
+                        active_runtime.profile_generation_task,
+                        return_exceptions=True,
+                    )
+                for task in tuple(active_runtime.connector_sync_tasks.values()):
+                    task.cancel()
+                if active_runtime.connector_sync_tasks:
+                    await asyncio.gather(
+                        *active_runtime.connector_sync_tasks.values(),
+                        return_exceptions=True,
+                    )
+                chat_logger = getattr(
+                    getattr(active_runtime, "chat_engine", None), "logger", None
                 )
-            for task in tuple(active_runtime.connector_sync_tasks.values()):
-                task.cancel()
-            if active_runtime.connector_sync_tasks:
-                await asyncio.gather(
-                    *active_runtime.connector_sync_tasks.values(),
-                    return_exceptions=True,
-                )
-            chat_logger = getattr(getattr(active_runtime, "chat_engine", None), "logger", None)
-            close = getattr(chat_logger, "close", None)
-            if callable(close):
-                close()
-            close_knowledge = getattr(active_runtime.knowledge_runtime, "close", None)
-            if callable(close_knowledge):
-                close_knowledge()
+                close = getattr(chat_logger, "close", None)
+                if callable(close):
+                    close()
+                close_knowledge = getattr(active_runtime.knowledge_runtime, "close", None)
+                if callable(close_knowledge):
+                    close_knowledge()
 
     app = FastAPI(lifespan=lifespan)
     # localhost-bound service consumed by the Electron renderer (vite origin
@@ -235,16 +297,25 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.get("/startup")
+    async def startup_status() -> StartupStatus:
+        status: StartupStatus = app.state.startup
+        if status.ready or status.started_at is None:
+            return status
+        return status.model_copy(
+            update={"elapsed_s": max(0.0, time.time() - status.started_at)}
+        )
+
     @app.get("/graph")
     async def graph() -> GraphResponse:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         if active_runtime.knowledge_runtime is None:
             return active_runtime.index.graph()
         return _knowledge_graph(active_runtime.knowledge_runtime)
 
     @app.post("/index/sync")
     async def index_sync() -> Any:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         sync = active_runtime.sync_all_enabled or active_runtime.sync_once
         report = await asyncio.to_thread(sync)
         if active_runtime.regenerate_knowledge is not None:
@@ -254,13 +325,13 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.get("/connectors")
     async def connectors() -> list[ConnectorInfo]:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
         return registry.list_info(active_runtime.index)
 
     @app.post("/connectors/{connector_id}/enable")
     async def connector_enable(connector_id: str) -> ConnectorInfo:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
         try:
             registry.set_enabled(active_runtime.index, connector_id, True)
@@ -273,7 +344,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/connectors/{connector_id}/disable")
     async def connector_disable(connector_id: str) -> ConnectorInfo:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
         try:
             registry.set_enabled(active_runtime.index, connector_id, False)
@@ -286,7 +357,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/connectors/{connector_id}/data/delete")
     async def connector_delete_data(connector_id: str) -> ConnectorInfo:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
         if connector_id in registry.syncing:
             raise HTTPException(status_code=409, detail="connector sync running — wait for it to finish")
@@ -304,7 +375,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/connectors/{connector_id}/sync", status_code=202)
     async def connector_sync(connector_id: str) -> dict[str, str]:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
         _connector_info(active_runtime, connector_id)
         task = active_runtime.connector_sync_tasks.get(connector_id)
@@ -325,7 +396,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         connector_id: str,
         payload: Any = Body(...),
     ) -> ConnectorInfo:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
         config_payload = _flat_config(payload)
         try:
@@ -336,7 +407,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.get("/notes/{note_id:path}")
     async def note_preview(note_id: str) -> NotePreview:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         preview = (
             _knowledge_note_preview(active_runtime.knowledge_runtime, note_id)
             if active_runtime.knowledge_runtime is not None
@@ -348,7 +419,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/index/reenrich", status_code=202)
     async def index_reenrich(source: str | None = None) -> ReenrichStatus:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         if (
             active_runtime.reenrich_status.running
             or active_runtime.reenrich_task is not None
@@ -375,17 +446,17 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.get("/index/reenrich")
     async def index_reenrich_status() -> ReenrichStatus:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         return active_runtime.reenrich_status
 
     @app.get("/profile")
     async def get_profile() -> dict[str, Any]:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         return _profile_payload(active_runtime)
 
     @app.post("/profile/generate", status_code=202)
     async def generate_profile() -> dict[str, Any]:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         if (
             active_runtime.profile_generation.running
             or active_runtime.profile_generation_task is not None
@@ -408,7 +479,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.get("/summary")
     async def get_summary() -> MeetingSummary:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         if active_runtime.make_live_session is None:
             raise HTTPException(status_code=404, detail="live session unavailable")
         live = active_runtime.active_live_session
@@ -418,19 +489,19 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.get("/chats")
     async def chats() -> list[Any]:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         return active_runtime.index.chats()
 
     @app.post("/chats")
     async def create_chat() -> Any:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         chat = active_runtime.index.create_chat(_new_chat_id(active_runtime.index), now=time.time())
         active_runtime.updates.publish("chats")
         return chat
 
     @app.get("/chats/{chat_id}")
     async def chat_detail(chat_id: str) -> dict[str, Any]:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         chat = active_runtime.index.chat(chat_id)
         if chat is None:
             raise HTTPException(status_code=404, detail="chat not found")
@@ -438,7 +509,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.patch("/chats/{chat_id}")
     async def rename_chat(chat_id: str, payload: Any = Body(...)) -> Any:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         if active_runtime.index.chat(chat_id) is None:
             raise HTTPException(status_code=404, detail="chat not found")
         if not isinstance(payload, dict) or not isinstance(payload.get("title"), str):
@@ -449,7 +520,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.delete("/chats/{chat_id}")
     async def delete_chat(chat_id: str) -> dict[str, bool]:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         if active_runtime.index.chat(chat_id) is None:
             raise HTTPException(status_code=404, detail="chat not found")
         active_runtime.index.delete_chat(chat_id)
@@ -458,7 +529,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.put("/profile")
     async def put_profile(payload: Any = Body(...)) -> dict[str, Any]:
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = _ready_runtime(app)
         card = payload.get("card") if isinstance(payload, dict) else None
         if not isinstance(card, str) or not card.strip():
             raise HTTPException(status_code=422, detail="card must be a non-empty string")
@@ -482,7 +553,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.websocket("/updates")
     async def updates(websocket: WebSocket) -> None:
         await websocket.accept()
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = await _ready_runtime_ws(app, websocket)
+        if active_runtime is None:
+            return
         queue = active_runtime.updates.subscribe()
 
         async def pump() -> None:
@@ -511,7 +584,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.websocket("/session")
     async def session(websocket: WebSocket) -> None:
         await websocket.accept()
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = await _ready_runtime_ws(app, websocket)
+        if active_runtime is None:
+            return
         logger = active_runtime.make_session_logger()
         session_started = False
         events: asyncio.Queue[Event | StatusEvent] = asyncio.Queue()
@@ -589,7 +664,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.websocket("/chat")
     async def chat(websocket: WebSocket) -> None:
         await websocket.accept()
-        active_runtime: Runtime = app.state.runtime
+        active_runtime = await _ready_runtime_ws(app, websocket)
+        if active_runtime is None:
+            return
         engine = _chat_engine(active_runtime)
         send_lock = asyncio.Lock()
         tasks: set[asyncio.Task[Any]] = set()
@@ -656,11 +733,16 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     return app
 
 
-def build_runtime() -> Runtime:
+def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime:
+    def report(phase: str, detail: str = "") -> None:
+        if progress is not None:
+            progress(phase, detail)
+
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     secrets = required_secrets()
     index = Index(Path("taurine.db"))
     llm = OpenRouterClient(secrets["OPEN_ROUTER_API_KEY"])
+    report("loading_models", "span extraction model")
     span_extractor = Gliner2SpanExtractor()
     connector_registry = ConnectorRegistry()
     connector_registry.reconcile_ledger(index)
@@ -695,6 +777,7 @@ def build_runtime() -> Runtime:
             )
         )
 
+    report("loading_models", "passage tokenizer")
     knowledge_builder = BuildCoordinator(
         BuildDependencies(
             tokenizer=passage_tokenizer(),
@@ -705,14 +788,22 @@ def build_runtime() -> Runtime:
     )
     knowledge_database = Path("taurine-knowledge.db")
     try:
+        report("opening_index", "loading knowledge index")
         knowledge_runtime = RetrievalRuntime(knowledge_database)
     except (FileNotFoundError, ValueError, KnowledgeSchemaError):
+        report("extracting_sources", "reading enabled sources")
         knowledge_builder.build(
-            connector_registry.extract_all_enabled(index),
+            connector_registry.extract_all_enabled(
+                index,
+                progress=lambda connector_id: report("extracting_sources", connector_id),
+            ),
             knowledge_database,
             replace_derived=True,
+            on_stage=lambda stage: report("building_index", stage),
         )
+        report("opening_index", "loading knowledge index")
         knowledge_runtime = RetrievalRuntime(knowledge_database)
+    report("finalizing", "")
 
     def regenerate_knowledge() -> Any:
         records = connector_registry.extract_all_enabled(index)
@@ -1231,6 +1322,26 @@ def _index_status(runtime: Runtime) -> IndexStatus:
 
 def _status_error(runtime: Runtime, detail: str) -> StatusEvent:
     return StatusEvent(asr="error", index=_index_status(runtime), detail=detail)
+
+
+def _ready_runtime(app: FastAPI) -> Runtime:
+    runtime: Runtime | None = app.state.runtime
+    if runtime is None:
+        status: StartupStatus = app.state.startup
+        if status.error:
+            detail = f"server startup failed: {status.error}"
+        else:
+            detail = f"server is starting ({status.phase})"
+        raise HTTPException(status_code=503, detail=detail)
+    return runtime
+
+
+async def _ready_runtime_ws(app: FastAPI, websocket: WebSocket) -> Runtime | None:
+    """Close pre-ready websockets with 1013 so clients retry after startup."""
+    runtime: Runtime | None = app.state.runtime
+    if runtime is None:
+        await websocket.close(code=1013)
+    return runtime
 
 
 def _connector_registry(runtime: Runtime) -> Any:

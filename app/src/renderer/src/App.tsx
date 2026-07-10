@@ -8,6 +8,7 @@ import { TriggerInspector } from './components/TriggerInspector'
 import { PcmAudioCapture } from './lib/audio'
 import {
   SidecarClient,
+  fetchStartupStatus,
   type Actionable,
   type AsrState,
   type ConnectorInfo,
@@ -16,6 +17,7 @@ import {
   type RetrievalEvent,
   type LiveGroundingEvent,
   type SidecarConnectionState,
+  type StartupStatus,
   type SummaryEvent,
   type TriggerEvent,
   type TranscriptEvent
@@ -46,6 +48,7 @@ function App(): React.JSX.Element {
   const [profile, setProfile] = useState<ProfileState | undefined>(undefined)
   const [connection, setConnection] = useState<SidecarConnectionState>('disconnected')
   const [retryInMs, setRetryInMs] = useState<number | undefined>()
+  const [startup, setStartup] = useState<StartupStatus | null>(null)
   const [asr, setAsr] = useState<AsrState>('disconnected')
   const [index, setIndex] = useState<IndexStatus>({ notes: 0, last_sync: null })
   const [statusDetail, setStatusDetail] = useState('')
@@ -165,6 +168,37 @@ function App(): React.JSX.Element {
       updates.disconnect()
     }
   }, [])
+
+  // While the sidecar websocket is down, poll /startup so the banner can show
+  // build progress (model loading, source extraction, knowledge index build)
+  // instead of a bare reconnect countdown. A fetch failure means the server
+  // process has not bound the port yet.
+  useEffect(() => {
+    if (connection === 'connected') {
+      return
+    }
+
+    let cancelled = false
+    const poll = async (): Promise<void> => {
+      try {
+        const status = await fetchStartupStatus()
+        if (!cancelled) {
+          setStartup(status)
+        }
+      } catch {
+        if (!cancelled) {
+          setStartup(null)
+        }
+      }
+    }
+
+    void poll()
+    const timer = window.setInterval(() => void poll(), 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [connection])
 
   useEffect(() => {
     setTriggersBySeq((current) => pruneTriggersByChunks(current, chunks))
@@ -305,8 +339,7 @@ function App(): React.JSX.Element {
 
       {showDisconnectedBanner ? (
         <div className="disconnect-banner" role="status">
-          Sidecar {connection}
-          {retryInMs ? `, retrying in ${Math.ceil(retryInMs / 1000)}s` : ''}
+          {startupBannerText(connection, retryInMs, startup)}
         </div>
       ) : null}
 
@@ -393,6 +426,34 @@ function App(): React.JSX.Element {
       />
     </div>
   )
+}
+
+const STARTUP_PHASE_LABELS: Record<string, string> = {
+  starting: 'starting',
+  loading_models: 'loading models',
+  opening_index: 'opening knowledge index',
+  extracting_sources: 'reading sources',
+  building_index: 'building knowledge index',
+  finalizing: 'finalizing'
+}
+
+function startupBannerText(
+  connection: SidecarConnectionState,
+  retryInMs: number | undefined,
+  startup: StartupStatus | null
+): string {
+  if (startup && !startup.ready) {
+    if (startup.error) {
+      return `Core startup failed: ${startup.error}`
+    }
+    const label = STARTUP_PHASE_LABELS[startup.phase] ?? startup.phase
+    const detail = startup.detail ? ` (${startup.detail})` : ''
+    const elapsed = startup.elapsed_s >= 1 ? ` · ${Math.round(startup.elapsed_s)}s` : ''
+    return `Core starting — ${label}${detail}${elapsed}`
+  }
+
+  const retry = retryInMs ? `, retrying in ${Math.ceil(retryInMs / 1000)}s` : ''
+  return `Sidecar ${connection}${retry}`
 }
 
 const MAX_FINAL_CHUNKS = 500

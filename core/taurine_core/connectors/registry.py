@@ -166,7 +166,12 @@ class ConnectorRegistry:
                 reports.append(self.sync_connector(connector.connector_id, index, llm))
         return reports
 
-    def extract_all_enabled(self, index: object) -> list[NoteRecord]:
+    def extract_all_enabled(
+        self,
+        index: object,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> list[NoteRecord]:
         """Read one clean source snapshot without writing derived index state."""
 
         records: list[NoteRecord] = []
@@ -179,6 +184,8 @@ class ConnectorRegistry:
                 raise ConnectorError(
                     detail or f"connector {connector.connector_id} is unavailable"
                 )
+            if progress is not None:
+                progress(connector.connector_id)
             records.extend(connector.extract(self._config(connector, state)))
         return sorted(records, key=lambda row: (row.source, row.note_id))
 

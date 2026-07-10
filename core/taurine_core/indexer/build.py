@@ -92,9 +92,11 @@ class BuildCoordinator:
         target: str | Path,
         *,
         replace_derived: bool,
+        on_stage: Callable[[str], None] | None = None,
     ) -> BuildReport:
         if not replace_derived:
             raise BuildError("--replace-derived is required for a clean knowledge build")
+        announce = on_stage or (lambda stage: None)
         target_path = Path(target)
         calibration = load_calibration(
             Path(__file__).resolve().parents[2]
@@ -144,6 +146,7 @@ class BuildCoordinator:
             stage_started = now
 
         try:
+            announce("source")
             store = KnowledgeStore(temporary)
             store.begin_build(
                 build_id,
@@ -154,6 +157,7 @@ class BuildCoordinator:
                 started_at=self.dependencies.now(),
             )
             stage_done("source")
+            announce("passages")
             passage_rows = []
             for note in ordered:
                 store.write_note(note, build_id=build_id, extraction_status="pending")
@@ -173,7 +177,8 @@ class BuildCoordinator:
             stage_done("passages")
 
             embedded_by_id = {}
-            for note in ordered:
+            for position, note in enumerate(ordered):
+                announce(f"embeddings {position + 1}/{len(ordered)}")
                 drafts = tuple(draft for source, draft in passage_rows if source.note_id == note.note_id)
                 embedded = embed_passages(
                     drafts,
@@ -187,12 +192,14 @@ class BuildCoordinator:
                 store.write_passage_embeddings(embedded)
                 embedded_by_id.update({row.passage_id: row for row in embedded})
             stage_done("embeddings")
+            announce(f"extraction ({len(ordered)} notes)")
             extractions = (
                 self.dependencies.extractor(ordered, tokenizer=self.dependencies.tokenizer)
                 if self.dependencies.extractor is not None
                 else {}
             )
             stage_done("extraction")
+            announce("entities")
             mention_inputs = []
             passage_by_note = {
                 note.note_id: [draft for source, draft in passage_rows if source.note_id == note.note_id]
@@ -223,6 +230,7 @@ class BuildCoordinator:
                 m = row.mention
                 store.insert_mention(mention_id=row.mention_id, entity_id=row.entity_id, passage_id=row.passage_id, note_id=row.note_id, surface=m.surface, etype=m.etype, char_start=m.char_start, char_end=m.char_end, confidence=m.confidence, extractor=m.extractor, schema_id=m.schema_id, build_id=build_id)
             stage_done("entities")
+            announce("relation_completion")
             resolved_by_note_span = {(row.note_id, row.mention.char_start, row.mention.char_end, row.mention.surface.casefold()): row for row in resolution.mentions}
             fact_rows = []
             for note in ordered:
@@ -289,11 +297,13 @@ class BuildCoordinator:
             for proposal in proposals:
                 store.insert_predicate_proposal(proposal)
             stage_done("relation_completion")
+            announce("facts")
             fact_rows = list(reconcile_temporal_facts(fact_rows))
             for fact in fact_rows:
                 store.insert_fact(fact)
             stage_done("facts")
 
+            announce("base_graph")
             graph_passages = tuple(
                 PassageGraphInput(
                     passage_id=draft.passage_id,
@@ -353,6 +363,7 @@ class BuildCoordinator:
                 build_id=build_id,
             )
             stage_done("base_graph")
+            announce("projection")
             projection = build_projection(
                 base_graph,
                 tuple(
@@ -364,6 +375,7 @@ class BuildCoordinator:
             )
             store.write_projection(projection, build_id=build_id)
             stage_done("projection")
+            announce("ranks")
             quality_ranks, value_scores = _compute_note_ranks(
                 ordered,
                 projection,
@@ -375,6 +387,7 @@ class BuildCoordinator:
                 build_id=build_id,
             )
             stage_done("ranks")
+            announce("fact_embeddings")
             fact_embeddings = embed_facts(
                 store.fact_contexts(),
                 embedder=self.dependencies.embedder,
@@ -384,6 +397,7 @@ class BuildCoordinator:
             )
             store.write_fact_embeddings(fact_embeddings)
             stage_done("fact_embeddings")
+            announce("validation")
             integrity = store.validate_invariants()
             if not integrity.ok:
                 raise BuildError(f"knowledge invariant failure: {integrity}")

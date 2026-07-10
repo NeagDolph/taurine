@@ -36,6 +36,17 @@ export interface ProfileState {
   generation: ProfileGenerationStatus
 }
 
+// /startup payload: build progress of the sidecar runtime after the port
+// binds but before the other endpoints are available (they 503 until ready).
+export interface StartupStatus {
+  ready: boolean
+  phase: string
+  detail: string
+  error: string
+  started_at: number | null
+  elapsed_s: number
+}
+
 export interface TranscriptEvent {
   type: 'transcript'
   channel: number
@@ -1451,6 +1462,32 @@ export function parseProfileState(value: unknown): ProfileState | null {
       error: generation.error
     }
   }
+}
+
+export function parseStartupStatus(value: unknown): StartupStatus | null {
+  const record = asRecord(value)
+  if (!record || typeof record.ready !== 'boolean') {
+    return null
+  }
+  return {
+    ready: record.ready,
+    phase: typeof record.phase === 'string' ? record.phase : '',
+    detail: typeof record.detail === 'string' ? record.detail : '',
+    error: typeof record.error === 'string' ? record.error : '',
+    started_at: typeof record.started_at === 'number' ? record.started_at : null,
+    elapsed_s: numberOr(record.elapsed_s)
+  }
+}
+
+export async function fetchStartupStatus(
+  options: SidecarRequestOptions = {}
+): Promise<StartupStatus> {
+  const payload = await requestSidecarJson('/startup', { method: 'GET' }, options)
+  const status = parseStartupStatus(payload)
+  if (!status) {
+    throw new Error('Invalid startup status response')
+  }
+  return status
 }
 
 export async function fetchProfile(options: SidecarRequestOptions = {}): Promise<ProfileState> {

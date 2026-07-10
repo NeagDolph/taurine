@@ -516,6 +516,17 @@ class ReenrichStatus(BaseModel):
     total: int = 0
 
 
+class StartupStatus(BaseModel):
+    """Progress of the deferred runtime build that runs after the port binds."""
+
+    ready: bool = False
+    phase: str = "starting"
+    detail: str = ""
+    error: str = ""
+    started_at: Optional[float] = None
+    elapsed_s: float = 0.0
+
+
 class ProfileGenerationStatus(BaseModel):
     running: bool = False
     phase: Literal[
