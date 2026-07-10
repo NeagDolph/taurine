@@ -273,6 +273,21 @@ function App(): React.JSX.Element {
     }
   }, [index.sync?.running, syncing])
 
+  const cancelSync = useCallback(async () => {
+    const client = clientRef.current
+    if (!client || !index.sync?.running) {
+      return
+    }
+    try {
+      const status = await client.cancelSync()
+      if (status) {
+        setIndex((current) => ({ ...current, sync: status }))
+      }
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Cancel failed')
+    }
+  }, [index.sync?.running])
+
   const showDisconnectedBanner = connection !== 'connected'
 
   return (
@@ -368,6 +383,7 @@ function App(): React.JSX.Element {
           <ConnectorsView
             connectors={connectors}
             onSync={syncIndex}
+            onCancelSync={cancelSync}
             syncing={isSyncing}
             syncStatus={index.sync ?? null}
             syncError={syncError}

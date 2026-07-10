@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -26,7 +28,8 @@ from taurine_core.chat.engine import ChatEngine
 from taurine_core.chat.retrieval import ChatRetriever
 from taurine_core.connectors.registry import ConnectorRegistry
 from taurine_core.indexer.notes import open_note
-from taurine_core.indexer.build import BuildCoordinator, BuildDependencies
+from taurine_core.indexer.build import BuildCancelled, BuildCoordinator, BuildDependencies
+from taurine_core.indexer.build_cache import BuildCache
 from taurine_core.indexer.embed import embed_texts
 from taurine_core.indexer.extract import extract_notes
 from taurine_core.indexer.facts import PREDICATES
@@ -156,7 +159,12 @@ class Runtime:
     connector_sync_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
     sync_status: SyncStatus = field(default_factory=SyncStatus)
     sync_task: asyncio.Task[Any] | None = None
+    sync_cancel: threading.Event | None = None
     sync_last_emit_s: float = 0.0
+    # True when the graph no longer matches the enabled sources (a source was
+    # enabled, disabled, or deleted); cleared by a successful sync.
+    index_stale: bool = False
+    build_cache: Any = None
     status_sinks: set[Callable[[], Awaitable[None]]] = field(default_factory=set)
     updates: UpdateBus = field(default_factory=UpdateBus)
     graph_version: int = 0
@@ -187,6 +195,20 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         # other endpoint answers 503.
         app.state.runtime = None
         app.state.startup = StartupStatus(started_at=time.time())
+        try:  # `kill -USR1 <pid>` dumps all thread stacks for hang diagnosis
+            faulthandler.register(signal.SIGUSR1, all_threads=True)
+        except (AttributeError, ValueError, OSError):  # unsupported platform/thread
+            pass
+        # Surface taurine.* INFO logs (sync/build stage progress) on the
+        # console; the root logger only prints warnings by default.
+        taurine_logger = logging.getLogger("taurine")
+        if not taurine_logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s", "%H:%M:%S")
+            )
+            taurine_logger.addHandler(handler)
+            taurine_logger.setLevel(logging.INFO)
         loop = asyncio.get_running_loop()
         state: dict[str, Any] = {"runtime": None, "periodic_task": None}
 
@@ -287,6 +309,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 close_knowledge = getattr(active_runtime.knowledge_runtime, "close", None)
                 if callable(close_knowledge):
                     close_knowledge()
+                close_cache = getattr(active_runtime.build_cache, "close", None)
+                if callable(close_cache):
+                    close_cache()
 
     app = FastAPI(lifespan=lifespan)
     # localhost-bound service consumed by the Electron renderer (vite origin
@@ -323,18 +348,31 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             and not active_runtime.sync_task.done()
         ):
             raise HTTPException(status_code=409, detail="sync already running")
+        active_runtime.sync_cancel = threading.Event()
         _set_sync_status(
             active_runtime,
             SyncStatus(running=True, phase="syncing"),
             force_emit=True,
         )
         active_runtime.sync_task = asyncio.create_task(_run_global_sync(active_runtime))
-        return active_runtime.sync_status
+        return _sync_status_payload(active_runtime)
 
     @app.get("/index/sync")
     async def index_sync_status() -> SyncStatus:
         active_runtime = _ready_runtime(app)
-        return active_runtime.sync_status
+        return _sync_status_payload(active_runtime)
+
+    @app.post("/index/sync/cancel")
+    async def index_sync_cancel() -> SyncStatus:
+        active_runtime = _ready_runtime(app)
+        if active_runtime.sync_status.running and active_runtime.sync_cancel is not None:
+            active_runtime.sync_cancel.set()
+            _set_sync_status(
+                active_runtime,
+                active_runtime.sync_status.model_copy(update={"detail": "cancelling"}),
+                force_emit=True,
+            )
+        return _sync_status_payload(active_runtime)
 
     @app.get("/connectors")
     async def connectors() -> list[ConnectorInfo]:
@@ -344,25 +382,31 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/connectors/{connector_id}/enable")
     async def connector_enable(connector_id: str) -> ConnectorInfo:
-        # Enable/disable are pure flags: no source is read and nothing is
-        # indexed until the user presses sync.
+        # Enabling only marks the source and flags the graph stale; nothing is
+        # read or indexed until the user presses sync.
         active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
         try:
             registry.set_enabled(active_runtime.index, connector_id, True)
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
+        _mark_index_stale(active_runtime)
         active_runtime.updates.publish("connectors")
         return _connector_info(active_runtime, connector_id)
 
     @app.post("/connectors/{connector_id}/disable")
     async def connector_disable(connector_id: str) -> ConnectorInfo:
+        # Disabling surgically removes the source's rows from the derived
+        # index (instant, no re-extraction); weights of the surviving graph
+        # stay as-built until the next sync rebuilds cleanly.
         active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
         try:
             registry.set_enabled(active_runtime.index, connector_id, False)
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
+        await _remove_source_from_knowledge(active_runtime, connector_id)
+        _mark_index_stale(active_runtime)
         active_runtime.updates.publish("connectors")
         return _connector_info(active_runtime, connector_id)
 
@@ -379,24 +423,16 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         ):
             raise HTTPException(status_code=409, detail="sync running — wait for it to finish")
         try:
-            # Deletion is a privacy boundary: keep the source disabled so the
-            # clean rebuild cannot immediately re-extract the deleted records.
+            # Deletion is a privacy boundary: disable the source and cut its
+            # rows out of both the source store and the derived index right
+            # now — no re-extraction, no background indexing.
             registry.set_enabled(active_runtime.index, connector_id, False)
             await asyncio.to_thread(registry.purge_data, active_runtime.index, connector_id)
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
-        if active_runtime.regenerate_knowledge is not None:
-            # The derived knowledge index must also drop the purged records;
-            # rebuilding it from the remaining enabled sources is the one
-            # indexing job that runs without the sync button.
-            _set_sync_status(
-                active_runtime,
-                SyncStatus(running=True, phase="indexing", detail="removing deleted data"),
-                force_emit=True,
-            )
-            active_runtime.sync_task = asyncio.create_task(
-                _run_global_sync(active_runtime, sync_sources=False)
-            )
+        await _remove_source_from_knowledge(active_runtime, connector_id)
+        _mark_index_stale(active_runtime)
+        active_runtime.updates.publish("connectors")
         return _connector_info(active_runtime, connector_id)
 
     @app.post("/connectors/{connector_id}/sync", status_code=202)
@@ -772,11 +808,14 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
         )
 
     report("loading_models", "passage tokenizer")
+    # Embeddings and extractions are content-keyed, so repeat syncs only pay
+    # for notes that actually changed.
+    build_cache = BuildCache(Path("taurine-cache.db"))
     knowledge_builder = BuildCoordinator(
         BuildDependencies(
             tokenizer=passage_tokenizer(),
-            embedder=embed_texts,
-            extractor=extract_notes,
+            embedder=build_cache.caching_embedder(config.EMBED_MODEL, embed_texts),
+            extractor=build_cache.caching_extractor(extract_notes),
             relation_completer=complete_relations,
         )
     )
@@ -894,6 +933,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
         ),
         knowledge_runtime=knowledge_runtime,
         regenerate_knowledge=regenerate_knowledge,
+        build_cache=build_cache,
     )
 
 
@@ -1119,39 +1159,59 @@ async def _run_connector_sync(runtime: Runtime, connector_id: str) -> None:
         await _emit_index_status(runtime)
 
 
-async def _run_global_sync(runtime: Runtime, *, sync_sources: bool = True) -> None:
-    """The single user-triggered job: sync enabled sources, then reindex.
-
-    With sync_sources=False only the clean reindex runs (used after a data
-    delete, where fetching new source data is not part of the user's intent).
-    """
+async def _run_global_sync(runtime: Runtime) -> None:
+    """The single user-triggered job: sync enabled sources, then reindex."""
+    log = logging.getLogger("taurine.sync")
+    cancel = runtime.sync_cancel
     error = ""
-    try:
-        if sync_sources:
-            _set_sync_status(
-                runtime,
-                SyncStatus(running=True, phase="syncing", detail="reading enabled sources"),
-            )
-            sync = runtime.sync_all_enabled or runtime.sync_once
-            await asyncio.to_thread(sync)
-        if runtime.regenerate_knowledge is not None:
-            _set_sync_status(runtime, SyncStatus(running=True, phase="indexing"))
-            await asyncio.to_thread(
-                runtime.regenerate_knowledge,
-                lambda detail: _set_sync_status(
-                    runtime,
-                    SyncStatus(running=True, phase="indexing", detail=detail),
-                ),
-            )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logging.getLogger("taurine.session").exception("global sync failed")
-        error = str(exc)[:300] or type(exc).__name__
-    finally:
+    cancelled = False
+    started = time.monotonic()
+
+    def check_cancel() -> None:
+        if cancel is not None and cancel.is_set():
+            raise BuildCancelled("sync cancelled")
+
+    def indexing_progress(detail: str) -> None:
+        check_cancel()
         _set_sync_status(
             runtime,
-            SyncStatus(running=False, phase="idle", error=error),
+            SyncStatus(running=True, phase="indexing", detail=detail),
+        )
+
+    try:
+        log.info("sync started")
+        _set_sync_status(
+            runtime,
+            SyncStatus(running=True, phase="syncing", detail="reading enabled sources"),
+        )
+        sync = runtime.sync_all_enabled or runtime.sync_once
+        await asyncio.to_thread(sync)
+        check_cancel()
+        if runtime.regenerate_knowledge is not None:
+            _set_sync_status(runtime, SyncStatus(running=True, phase="indexing"))
+            await asyncio.to_thread(runtime.regenerate_knowledge, indexing_progress)
+        runtime.index_stale = False
+        log.info("sync complete in %.1f s", time.monotonic() - started)
+    except asyncio.CancelledError:
+        raise
+    except BuildCancelled:
+        cancelled = True
+        runtime.index_stale = True  # sources may have advanced past the index
+        log.info("sync cancelled after %.1f s", time.monotonic() - started)
+    except Exception as exc:
+        log.exception("sync failed after %.1f s", time.monotonic() - started)
+        error = str(exc)[:300] or type(exc).__name__
+        runtime.index_stale = True
+    finally:
+        runtime.sync_cancel = None
+        _set_sync_status(
+            runtime,
+            SyncStatus(
+                running=False,
+                phase="idle",
+                detail="cancelled" if cancelled else "",
+                error=error,
+            ),
             force_emit=True,
         )
         _bump_graph(runtime)
@@ -1219,19 +1279,31 @@ def _profile_payload(runtime: Runtime) -> dict[str, Any]:
     }
 
 
+def _stage_token(detail: str) -> str:
+    return detail.split(" ", 1)[0] if detail else ""
+
+
 def _set_sync_status(
     runtime: Runtime,
     status: SyncStatus,
     *,
     force_emit: bool = False,
 ) -> None:
-    """Throttled status fan-out; safe from worker threads (indexing progress
-    callbacks run inside asyncio.to_thread)."""
+    """Status fan-out; safe from worker threads (indexing progress callbacks
+    run inside asyncio.to_thread).
+
+    Same-stage ticks (embeddings 12/463 → 13/463) are throttled to one emit
+    per 2s, but phase and stage transitions always emit — otherwise the last
+    tick before a long silent stage lingers on screen and reads as a hang.
+    """
+    previous = runtime.sync_status
     runtime.sync_status = status
     now = time.monotonic()
     should_emit = (
         force_emit
         or not status.running
+        or status.phase != previous.phase
+        or _stage_token(status.detail) != _stage_token(previous.detail)
         or now - runtime.sync_last_emit_s >= 2.0
     )
     if not should_emit:
@@ -1246,6 +1318,27 @@ def _set_sync_status(
             asyncio.run_coroutine_threadsafe(_emit_index_status(runtime), loop)
         return
     loop.create_task(_emit_index_status(runtime))
+
+
+def _sync_status_payload(runtime: Runtime) -> SyncStatus:
+    return runtime.sync_status.model_copy(update={"stale": runtime.index_stale})
+
+
+def _mark_index_stale(runtime: Runtime) -> None:
+    runtime.index_stale = True
+    runtime.updates.publish("sync")
+
+
+async def _remove_source_from_knowledge(runtime: Runtime, connector_id: str) -> None:
+    remove = getattr(runtime.knowledge_runtime, "remove_source", None)
+    if not callable(remove):
+        return
+    removed = await asyncio.to_thread(remove, connector_id)
+    if removed:
+        logging.getLogger("taurine.sync").info(
+            "removed %d %s notes from the knowledge index", removed, connector_id
+        )
+        _bump_graph(runtime)
 
 
 def _bump_graph(runtime: Runtime) -> None:
@@ -1275,7 +1368,7 @@ async def _send_updates(
     if "sync" in kinds:
         await websocket.send_text(
             json.dumps(
-                {"type": "sync", "status": runtime.sync_status.model_dump()}
+                {"type": "sync", "status": _sync_status_payload(runtime).model_dump()}
             )
         )
     if "graph" in kinds:
@@ -1315,7 +1408,7 @@ def _index_status(runtime: Runtime) -> IndexStatus:
     return IndexStatus(
         notes=notes,
         last_sync=last_sync,
-        sync=runtime.sync_status,
+        sync=_sync_status_payload(runtime),
     )
 
 

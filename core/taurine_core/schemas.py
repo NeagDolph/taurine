@@ -510,12 +510,17 @@ class NotePreview(BaseModel):
 
 
 class SyncStatus(BaseModel):
-    """Progress of the single user-triggered sync-and-index job."""
+    """Progress of the single user-triggered sync-and-index job.
+
+    stale means the graph no longer matches the enabled sources (a source was
+    enabled, disabled, or deleted) and a sync is recommended.
+    """
 
     running: bool = False
     phase: Literal["idle", "syncing", "indexing"] = "idle"
     detail: str = ""
     error: str = ""
+    stale: bool = False
 
 
 class StartupStatus(BaseModel):

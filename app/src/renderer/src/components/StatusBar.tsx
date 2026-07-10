@@ -19,7 +19,9 @@ export function StatusBar({
   syncError,
   onSync
 }: StatusBarProps): React.JSX.Element {
-  const detailText = syncError || index.sync?.error || syncDetail(index) || detail
+  const failure = index.sync?.error ? `Last sync failed: ${index.sync.error}` : ''
+  const stale = !index.sync?.running && index.sync?.stale ? 'Graph out of date — press Sync' : ''
+  const detailText = syncError || failure || syncDetail(index) || stale || detail
   const controlsDisabled = isSyncing
 
   return (

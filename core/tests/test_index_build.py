@@ -186,6 +186,123 @@ def test_build_finalizes_extracted_entities_mentions_and_directed_facts(tmp_path
         store.close()
 
 
+def test_degenerate_facts_are_skipped_not_fatal(tmp_path: Path) -> None:
+    """A relation whose endpoints merge into one entity costs one fact, not the build."""
+    note = make_note("n1", "Meet", "Maya Chen met Maya Chen.")
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {
+            "n1": Extraction(
+                mentions=[
+                    ExtractedMention(surface="Maya Chen", etype="person", confidence=0.95, char_start=0, char_end=9, extractor="fake", schema_id="s1"),
+                    ExtractedMention(surface="Maya Chen", etype="person", confidence=0.9, char_start=14, char_end=23, extractor="fake", schema_id="s1"),
+                ],
+                fact_candidates=[
+                    ExtractedRelation(head="Maya Chen", predicate="met_with", tail="Maya Chen", confidence=0.9, subject_start=0, subject_end=9, object_start=14, object_end=23, assertion_start=0, assertion_end=24, extraction_method="fake", schema_id="s1", status="active")
+                ],
+                schema_id="s1",
+            )
+        }
+
+    deps = BuildDependencies(
+        tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+    )
+    target = tmp_path / "knowledge.db"
+
+    report = BuildCoordinator(deps).build([note], target, replace_derived=True)
+
+    assert report.degenerate_fact_count == 1
+    assert report.degenerate_facts[0][0] == "n1"
+    assert report.fact_count == 0
+    assert target.exists()
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        assert store.counts()["facts"] == 0
+        assert store.counts()["entities"] == 1
+    finally:
+        store.close()
+
+
+def test_failed_build_is_kept_when_env_flag_set(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TAURINE_KEEP_FAILED_BUILD", "1")
+    target = tmp_path / "knowledge.db"
+    deps = BuildDependencies(
+        tokenizer=Tokenizer(),
+        embedder=lambda _texts: (_ for _ in ()).throw(RuntimeError("embedding failed")),
+        embedding_dim=16,
+    )
+
+    with pytest.raises(BuildError, match="embedding failed"):
+        BuildCoordinator(deps).build(
+            [make_note("a", "Alpha", "body")], target, replace_derived=True
+        )
+
+    kept = list(tmp_path.glob("knowledge.build-*.failed"))
+    assert len(kept) == 1
+    assert not target.exists()
+
+
+def test_remove_source_surgically_prunes_notes_entities_and_facts(tmp_path: Path) -> None:
+    note_a = make_note("a1", "Alpha", "Maya owns Launch.").model_copy(update={"source": "src_a"})
+    note_b = make_note("b1", "Beta", "Rex uses Tools.").model_copy(update={"source": "src_b"})
+
+    def extractor(notes, *, tokenizer):
+        del tokenizer
+        results = {}
+        for note in notes:
+            if note.note_id == "a1":
+                results["a1"] = Extraction(
+                    mentions=[
+                        ExtractedMention(surface="Maya", etype="person", confidence=0.95, char_start=0, char_end=4, extractor="fake", schema_id="s1"),
+                        ExtractedMention(surface="Launch", etype="project", confidence=0.9, char_start=10, char_end=16, extractor="fake", schema_id="s1"),
+                    ],
+                    fact_candidates=[
+                        ExtractedRelation(head="Maya", predicate="owns_or_has", tail="Launch", confidence=0.9, subject_start=0, subject_end=4, object_start=10, object_end=16, assertion_start=0, assertion_end=17, extraction_method="fake", schema_id="s1", status="active")
+                    ],
+                    schema_id="s1",
+                )
+            else:
+                results["b1"] = Extraction(
+                    mentions=[
+                        ExtractedMention(surface="Rex", etype="person", confidence=0.95, char_start=0, char_end=3, extractor="fake", schema_id="s1"),
+                        ExtractedMention(surface="Tools", etype="project", confidence=0.9, char_start=9, char_end=14, extractor="fake", schema_id="s1"),
+                    ],
+                    fact_candidates=[
+                        ExtractedRelation(head="Rex", predicate="uses", tail="Tools", confidence=0.9, subject_start=0, subject_end=3, object_start=9, object_end=14, assertion_start=0, assertion_end=15, extraction_method="fake", schema_id="s1", status="active")
+                    ],
+                    schema_id="s1",
+                )
+        return results
+
+    target = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+        )
+    ).build([note_a, note_b], target, replace_derived=True)
+
+    store = KnowledgeStore(target)
+    try:
+        assert store.counts()["notes"] == 2
+        assert store.counts()["entities"] == 4
+        removed = store.remove_source("src_a")
+        assert removed == 1
+        counts = store.counts()
+        assert counts["notes"] == 1
+        assert counts["passages"] == 1
+        assert counts["entities"] == 2
+        assert counts["facts"] == 1
+        assert counts["fact_embeddings"] == 1
+        assert store.validate_invariants().ok
+    finally:
+        store.close()
+
+    snapshot = load_index_snapshot(target)
+    assert snapshot.passage_matrix.shape[0] == 1
+    assert all("a1" not in edge.src_note_id for edge in snapshot.projection)
+
+
 def test_build_preserves_extracted_observed_and_valid_time(tmp_path: Path) -> None:
     note = make_note("n1", "Launch", "Maya owns Launch.")
 

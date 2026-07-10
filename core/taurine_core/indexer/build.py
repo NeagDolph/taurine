@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -36,8 +38,15 @@ from taurine_core.models_local import passage_tokenizer
 from taurine_core.schemas import NoteRecord
 
 
+_LOG = logging.getLogger("taurine.build")
+
+
 class BuildError(RuntimeError):
     pass
+
+
+class BuildCancelled(BuildError):
+    """Raised from a progress callback to abort a build cooperatively."""
 
 
 @dataclass(frozen=True)
@@ -67,6 +76,8 @@ class BuildReport:
     projection_edge_count: int
     extraction_failure_count: int
     failed_notes: tuple[tuple[str, str], ...]
+    degenerate_fact_count: int
+    degenerate_facts: tuple[tuple[str, str], ...]
     component_count: int
     dangling_node_count: int
     hub_exclusions: tuple[tuple[str, str], ...]
@@ -144,6 +155,9 @@ class BuildCoordinator:
             stages.append(name)
             stage_timings_ms[name] = (now - stage_started) * 1000.0
             stage_started = now
+            _LOG.info(
+                "build %s: stage %s done in %.0f ms", build_id, name, stage_timings_ms[name]
+            )
 
         try:
             announce("source")
@@ -192,9 +206,16 @@ class BuildCoordinator:
                 store.write_passage_embeddings(embedded)
                 embedded_by_id.update({row.passage_id: row for row in embedded})
             stage_done("embeddings")
-            announce(f"extraction ({len(ordered)} notes)")
+            announce(f"extraction 0/{len(ordered)}")
+            extractor_kwargs: dict[str, Any] = {"tokenizer": self.dependencies.tokenizer}
+            if self.dependencies.extractor is not None and _accepts_kwarg(
+                self.dependencies.extractor, "progress"
+            ):
+                extractor_kwargs["progress"] = lambda done, total: announce(
+                    f"extraction {done}/{total}"
+                )
             extractions = (
-                self.dependencies.extractor(ordered, tokenizer=self.dependencies.tokenizer)
+                self.dependencies.extractor(ordered, **extractor_kwargs)
                 if self.dependencies.extractor is not None
                 else {}
             )
@@ -233,6 +254,7 @@ class BuildCoordinator:
             announce("relation_completion")
             resolved_by_note_span = {(row.note_id, row.mention.char_start, row.mention.char_end, row.mention.surface.casefold()): row for row in resolution.mentions}
             fact_rows = []
+            degenerate_facts: list[tuple[str, str]] = []
             for note in ordered:
                 extraction = extractions.get(note.note_id)
                 if extraction is None:
@@ -242,7 +264,22 @@ class BuildCoordinator:
                     object_ = resolved_by_note_span.get((note.note_id, candidate.object_start, candidate.object_end, candidate.tail.casefold()))
                     passage = next((p for p in passage_by_note[note.note_id] if p.char_start <= candidate.assertion_start and candidate.assertion_end <= p.char_end), None)
                     if subject and object_ and passage:
+                        # Entity resolution can merge distinct surfaces ("Neil",
+                        # "Neil Pathangay") into one entity; a relation whose
+                        # endpoints collapse together is dropped, never fatal.
+                        if subject.entity_id == object_.entity_id:
+                            degenerate_facts.append(
+                                (note.note_id, f"{candidate.head} {candidate.predicate} {candidate.tail}")
+                            )
+                            continue
                         fact_rows.append(promote_fact(candidate, subject_entity_id=subject.entity_id, object_entity_id=object_.entity_id, source_passage_id=passage.passage_id, source_note_id=note.note_id, observed_at=(candidate.observed_at if candidate.observed_at is not None else note.modified), valid_from=candidate.valid_from, valid_to=candidate.valid_to, build_id=build_id))
+            if degenerate_facts:
+                _LOG.warning(
+                    "build %s: skipped %d degenerate facts (endpoints merged to one entity): %s",
+                    build_id,
+                    len(degenerate_facts),
+                    "; ".join(f"{note_id}: {text}" for note_id, text in degenerate_facts[:10]),
+                )
             proposals: tuple[Any, ...] = ()
             completion_rejected = 0
             completion_error = ""
@@ -447,6 +484,18 @@ class BuildCoordinator:
             store = None
             os.replace(temporary, target_path)
             stage_done("activation")
+            _LOG.info(
+                "build %s complete: %d notes, %d passages, %d entities, %d facts, "
+                "%d extraction failures, %d degenerate facts skipped, health=%s",
+                build_id,
+                len(ordered),
+                len(passage_rows),
+                len(resolution.entities),
+                len(fact_rows),
+                len(failed_notes),
+                len(degenerate_facts),
+                health,
+            )
             return BuildReport(
                 build_id=build_id,
                 target=target_path,
@@ -462,6 +511,8 @@ class BuildCoordinator:
                 projection_edge_count=len(projection),
                 extraction_failure_count=len(failed_notes),
                 failed_notes=failed_notes,
+                degenerate_fact_count=len(degenerate_facts),
+                degenerate_facts=tuple(degenerate_facts),
                 component_count=component_count,
                 dangling_node_count=len(base_graph.dangling_rows),
                 hub_exclusions=hub_exclusions,
@@ -482,7 +533,20 @@ class BuildCoordinator:
             if store is not None:
                 store.close()
             if temporary.exists():
-                temporary.unlink()
+                # TAURINE_KEEP_FAILED_BUILD=1 keeps the partial build on disk
+                # for post-mortems; cancellations always clean up.
+                if _keep_failed_builds() and not isinstance(exc, BuildCancelled):
+                    failed_path = temporary.with_name(temporary.name + ".failed")
+                    if failed_path.exists():
+                        failed_path.unlink()
+                    os.replace(temporary, failed_path)
+                    _LOG.warning("build failed; partial build kept at %s", failed_path)
+                else:
+                    temporary.unlink()
+            if isinstance(exc, BuildCancelled):
+                _LOG.info("build cancelled")
+                raise
+            _LOG.exception("build failed")
             if isinstance(exc, BuildError):
                 raise
             raise BuildError(str(exc)) from exc
@@ -527,6 +591,20 @@ def main(
     )
     print(json.dumps({**report.__dict__, "target": str(report.target)}, sort_keys=True))
     return 0
+
+
+def _keep_failed_builds() -> bool:
+    return os.environ.get("TAURINE_KEEP_FAILED_BUILD", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _accepts_kwarg(func: Callable[..., Any], name: str) -> bool:
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 def _source_snapshot(records: Sequence[NoteRecord]) -> str:

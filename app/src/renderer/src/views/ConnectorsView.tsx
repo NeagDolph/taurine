@@ -8,6 +8,7 @@ interface ConnectorsViewProps {
   syncStatus: SyncStatus | null
   syncError: string
   onSync: () => void
+  onCancelSync: () => void
 }
 
 export function ConnectorsView({
@@ -16,7 +17,8 @@ export function ConnectorsView({
   syncing,
   syncStatus,
   syncError,
-  onSync
+  onSync,
+  onCancelSync
 }: ConnectorsViewProps): React.JSX.Element {
   return (
     <div className="page connectors-page" aria-label="Connectors" aria-hidden={!visible}>
@@ -34,6 +36,7 @@ export function ConnectorsView({
         syncStatus={syncStatus}
         syncError={syncError}
         onSync={onSync}
+        onCancelSync={onCancelSync}
       />
     </div>
   )

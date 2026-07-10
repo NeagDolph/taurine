@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +81,7 @@ def extract_notes(
     notes: list[NoteRecord],
     *,
     tokenizer: OffsetTokenizerPort | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Extraction]:
     """Extract notes in bounded source-family batches with isolated failures."""
     if not notes:
@@ -96,6 +98,11 @@ def extract_notes(
         grouped.setdefault(_source_family(note.source), []).append(note)
 
     results: dict[str, Extraction] = {}
+
+    def report_progress() -> None:
+        if progress is not None:
+            progress(len(results), len(notes))
+
     for family, family_notes in grouped.items():
         try:
             bundle = _build_schema(model, family)
@@ -106,8 +113,9 @@ def extract_notes(
                     failed=True,
                     error="schema build failed",
                 )
+            report_progress()
             continue
-        _extract_family(model, bundle, family_notes, tokenizer, results)
+        _extract_family(model, bundle, family_notes, tokenizer, results, report_progress)
 
     return {note.note_id: results[note.note_id] for note in notes}
 
@@ -137,7 +145,12 @@ def _extract_family(
     notes: list[NoteRecord],
     tokenizer: OffsetTokenizerPort | None,
     results: dict[str, Extraction],
+    report_progress: Callable[[], None] | None = None,
 ) -> None:
+    def progressed() -> None:
+        if report_progress is not None:
+            report_progress()
+
     short_batch: list[_Pending] = []
     batch_tokens = 0
     for note in notes:
@@ -151,12 +164,14 @@ def _extract_family(
                 failed=True,
                 error="tokenization failed",
             )
+            progressed()
             continue
 
         if _is_long(offsets):
             _flush_short_batch(model, bundle, short_batch, results)
             short_batch = []
             batch_tokens = 0
+            progressed()
             results[note.note_id] = _extract_long(
                 model,
                 bundle,
@@ -164,6 +179,7 @@ def _extract_family(
                 text,
                 offsets,
             )
+            progressed()
             continue
 
         pending = _Pending(note=note, text=text, offsets=offsets)
@@ -176,9 +192,11 @@ def _extract_family(
             _flush_short_batch(model, bundle, short_batch, results)
             short_batch = []
             batch_tokens = 0
+            progressed()
         short_batch.append(pending)
         batch_tokens += token_count
     _flush_short_batch(model, bundle, short_batch, results)
+    progressed()
 
 
 def _flush_short_batch(

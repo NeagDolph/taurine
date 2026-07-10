@@ -178,6 +178,25 @@ class RetrievalRuntime:
             self._snapshot = snapshot
         return snapshot
 
+    def remove_source(self, source: str) -> int:
+        """Surgically drop one source from the active index and republish.
+
+        Instant path for disable/delete: no source is re-read and nothing is
+        re-embedded. Surviving rows keep pre-removal weights until the next
+        sync rebuilds cleanly. Existing session stores share the same SQLite
+        file, so they observe the deletes immediately.
+        """
+        from taurine_core.indexer.knowledge_store import KnowledgeStore
+
+        store = KnowledgeStore(self.knowledge_database)
+        try:
+            removed = store.remove_source(source)
+        finally:
+            store.close()
+        if removed:
+            self.activate_from_disk()
+        return removed
+
     def _validate_snapshot(self, snapshot: IndexSnapshot) -> None:
         if snapshot.calibration_hash != self.artifact.hash:
             raise ValueError(

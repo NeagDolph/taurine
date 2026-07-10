@@ -1168,6 +1168,33 @@ class KnowledgeStore:
             self._conn.execute("DELETE FROM notes WHERE note_id = ?", (note_id,))
         self.prune_orphan_entities()
 
+    def remove_source(self, source: str) -> int:
+        """Cut one source out of the derived index in place.
+
+        FK cascades drop the source's passages, embeddings, mentions, facts
+        and edges; entities left without mentions are pruned (cascading their
+        aliases and remaining facts). Rank/df weights of surviving rows go
+        stale until the next clean build — an accepted trade for instant
+        removal without re-extracting other sources.
+        """
+        self._writable()
+        with self._conn:
+            count = int(
+                self._conn.execute(
+                    "SELECT count(*) FROM notes WHERE source = ?", (source,)
+                ).fetchone()[0]
+            )
+            if count:
+                self._conn.execute(
+                    "DELETE FROM passages_fts WHERE note_id IN"
+                    " (SELECT note_id FROM notes WHERE source = ?)",
+                    (source,),
+                )
+                self._conn.execute("DELETE FROM notes WHERE source = ?", (source,))
+        if count:
+            self.prune_orphan_entities()
+        return count
+
     def counts(self) -> dict[str, int]:
         names = (
             "notes",

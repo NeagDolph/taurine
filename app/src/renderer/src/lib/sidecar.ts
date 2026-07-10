@@ -250,11 +250,13 @@ export interface TriggerEvent {
 }
 
 // Progress of the single global sync-and-index job (POST /index/sync).
+// stale = the graph no longer matches the enabled sources; sync recommended.
 export interface SyncStatus {
   running: boolean
   phase: SyncPhase
   detail: string
   error: string
+  stale: boolean
 }
 
 export interface IndexStatus {
@@ -426,9 +428,19 @@ export class SidecarClient {
         running: true,
         phase: 'syncing',
         detail: '',
-        error: ''
+        error: '',
+        stale: false
       }
     )
+  }
+
+  async cancelSync(): Promise<SyncStatus | null> {
+    const payload = await requestSidecarJson(
+      '/index/sync/cancel',
+      { method: 'POST' },
+      { baseUrl: this.restBaseUrl }
+    )
+    return parseSyncStatus(payload)
   }
 
   onTranscript(callback: Callback<TranscriptEvent>): Unsubscribe {
@@ -1319,7 +1331,8 @@ export function parseSyncStatus(value: unknown): SyncStatus | null {
     running: record.running,
     phase: record.phase,
     detail: typeof record.detail === 'string' ? record.detail : '',
-    error: typeof record.error === 'string' ? record.error : ''
+    error: typeof record.error === 'string' ? record.error : '',
+    stale: record.stale === true
   }
 }
 

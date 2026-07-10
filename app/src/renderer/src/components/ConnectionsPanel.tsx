@@ -15,6 +15,7 @@ interface ConnectionsPanelProps {
   syncStatus: SyncStatus | null
   syncError: string
   onSync: () => void
+  onCancelSync: () => void
 }
 
 type PendingAction = 'enable' | 'disable' | 'delete' | 'config'
@@ -28,7 +29,8 @@ export function ConnectionsPanel({
   syncing,
   syncStatus,
   syncError,
-  onSync
+  onSync,
+  onCancelSync
 }: ConnectionsPanelProps): React.JSX.Element {
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({})
   const [pendingById, setPendingById] = useState<Record<string, PendingAction | undefined>>({})
@@ -140,6 +142,7 @@ export function ConnectionsPanel({
     [sortedConnectors]
   )
   const syncRunning = syncing || sortedConnectors.some((c) => c.syncing)
+  const staleIdle = !syncRunning && syncStatus?.stale === true
 
   return (
     <section className="connections-panel" aria-label="Connections">
@@ -153,8 +156,18 @@ export function ConnectionsPanel({
           ) : null}
         </div>
         <div className="panel-card-actions">
+          {syncRunning ? (
+            <button
+              className="secondary-button compact"
+              type="button"
+              onClick={onCancelSync}
+              title="Stop the running sync; the previous index stays active"
+            >
+              Cancel
+            </button>
+          ) : null}
           <button
-            className="secondary-button compact"
+            className={`secondary-button compact${staleIdle ? ' sync-stale' : ''}`}
             type="button"
             disabled={syncRunning}
             onClick={onSync}
@@ -168,7 +181,13 @@ export function ConnectionsPanel({
 
       {syncError || syncStatus?.error ? (
         <div className="connections-panel-error" role="alert">
-          {syncError || syncStatus?.error}
+          {syncError || (syncStatus?.error ? `Last sync failed: ${syncStatus.error}` : '')}
+        </div>
+      ) : null}
+
+      {staleIdle ? (
+        <div className="connections-panel-hint" role="status">
+          Graph is out of date with the enabled sources — press Sync to rebuild.
         </div>
       ) : null}
 

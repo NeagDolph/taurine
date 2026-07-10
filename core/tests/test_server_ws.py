@@ -282,6 +282,7 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
             "phase": "idle",
             "detail": "",
             "error": "",
+            "stale": False,
         }
     assert sync_calls == [True]
 
@@ -347,14 +348,14 @@ def test_connector_rest_endpoints_and_single_flight_sync() -> None:
         assert client.post("/connectors/fake/enable").status_code == 200
         assert client.post("/connectors/fake/disable").status_code == 200
         assert registry.enabled_calls == [("fake", True), ("fake", False)]
-        # enable/disable are pure flags now: nothing is reindexed
-        assert regenerations == []
         assert client.post("/connectors/fake/data/delete").status_code == 200
         assert registry.enabled_calls[-1] == ("fake", False)
         assert registry.purge_calls == ["fake"]
-        # deleting data reindexes in the background to drop derived records
-        _wait_for_sync_idle(client)
-        assert regenerations == ["regenerated"]
+        # connector actions never reindex; they only flag the graph stale
+        assert regenerations == []
+        status = client.get("/index/sync").json()
+        assert status["running"] is False
+        assert status["stale"] is True
 
         assert client.put("/connectors/fake/config", json={"path": "/tmp/new"}).status_code == 200
         assert registry.config_calls == [("fake", {"path": "/tmp/new"})]
@@ -460,8 +461,86 @@ def test_sync_endpoint_is_single_flight_and_runs_indexing() -> None:
         release.set()
         final = _wait_for_sync_idle(client)
         assert final["error"] == ""
+        assert final["stale"] is False
     assert regenerate_details == ["regenerated"]
     assert runtime.graph_version == 1
+
+
+def test_sync_cancel_endpoint_stops_the_indexing_job() -> None:
+    started = threading.Event()
+
+    def regenerate(progress: Any = None) -> None:
+        # emulate a long build that reports progress between stages
+        for tick in range(200):
+            started.set()
+            if progress is not None:
+                progress(f"embeddings {tick}/200")
+            time.sleep(0.02)
+
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+        regenerate_knowledge=regenerate,
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.post("/index/sync").status_code == 202
+        assert started.wait(timeout=5)
+        cancelled = client.post("/index/sync/cancel").json()
+        assert cancelled["running"] is True
+        final = _wait_for_sync_idle(client)
+        assert final["detail"] == "cancelled"
+        assert final["error"] == ""
+        assert final["stale"] is True
+
+
+def test_connector_disable_removes_source_from_knowledge_index() -> None:
+    class FakeKnowledgeRuntime:
+        def __init__(self) -> None:
+            self.removed: list[str] = []
+
+        def remove_source(self, source: str) -> int:
+            self.removed.append(source)
+            return 3
+
+    registry = FakeConnectorRegistry()
+    knowledge = FakeKnowledgeRuntime()
+    runtime = Runtime(
+        index=GraphIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+        connector_registry=registry,
+        connector_llm=object(),
+        knowledge_runtime=knowledge,
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        assert client.post("/connectors/fake/disable").status_code == 200
+        assert knowledge.removed == ["fake"]
+        assert runtime.graph_version == 1
+        assert client.get("/index/sync").json()["stale"] is True
+
+        # enabling flags stale but touches nothing
+        assert client.post("/connectors/fake/enable").status_code == 200
+        assert knowledge.removed == ["fake"]
+
+        # deleting data purges the source store and the derived index
+        assert client.post("/connectors/fake/data/delete").status_code == 200
+        assert registry.purge_calls == ["fake"]
+        assert knowledge.removed == ["fake", "fake"]
 
 
 def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
