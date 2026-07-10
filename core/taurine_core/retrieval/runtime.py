@@ -289,11 +289,30 @@ class RetrievalRuntime:
 
         snapshot = load_index_snapshot(self.knowledge_database)
         self._validate_snapshot(snapshot)
+        with self._lock:
+            previous_build_id = self._snapshot.build_id
+        if snapshot.build_id != previous_build_id:
+            # Only fresh installs are hash-verified: remove_source republishes
+            # the same build after in-place row deletion, which legitimately
+            # diverges from the recorded hash until the next clean build.
+            self._verify_installed_hash(snapshot.build_id)
         communities = projection_communities(snapshot.projection)
         with self._lock:
             self._snapshot = snapshot
             self._communities = communities
         return snapshot
+
+    def _verify_installed_hash(self, build_id: str) -> None:
+        from taurine_core.indexer.knowledge_store import KnowledgeStore
+
+        store = KnowledgeStore(self.knowledge_database)
+        try:
+            if not store.verify_graph_hash(build_id):
+                raise ValueError(
+                    "installed knowledge build failed graph-hash verification"
+                )
+        finally:
+            store.close()
 
     def remove_source(self, source: str) -> int:
         """Surgically drop one source from the active index and republish.

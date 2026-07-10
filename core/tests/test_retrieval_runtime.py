@@ -69,6 +69,49 @@ def test_runtime_checks_manifests_and_publishes_new_complete_build(
     runtime.close()
 
 
+def test_activation_rejects_tampered_installed_build(tmp_path, monkeypatch) -> None:
+    """A fresh install whose stored rows no longer reproduce the recorded
+    graph hash must not activate (L24 activation-time verification)."""
+    import sqlite3
+
+    import pytest
+
+    database = tmp_path / "knowledge.db"
+    builder = BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=_embed, embedding_dim=16)
+    )
+    builder.build(
+        [make_note("n1", "One", "first source passage")],
+        database,
+        replace_derived=True,
+    )
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_pair_reranker",
+        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
+    )
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_nli_scorer",
+        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
+    )
+    runtime = RetrievalRuntime(database)
+
+    second = builder.build(
+        [make_note("n2", "Two", "second source passage")],
+        database,
+        replace_derived=True,
+    )
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            "UPDATE index_builds SET graph_hash = 'tampered' WHERE build_id = ?",
+            (second.build_id,),
+        )
+
+    with pytest.raises(ValueError, match="graph-hash verification"):
+        runtime.activate_from_disk()
+    assert runtime.snapshot.build_id != second.build_id
+    runtime.close()
+
+
 def test_entity_resolver_output_flows_through_query_entity_head(
     tmp_path, monkeypatch
 ) -> None:
