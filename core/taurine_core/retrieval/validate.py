@@ -31,6 +31,20 @@ _CONVERSATIONAL = re.compile(
     r"I can help|let me know|no new evidence)\b",
     flags=re.IGNORECASE,
 )
+# Absence-of-evidence statements ("couldn't find a return date", "no record
+# of X") assert nothing positive from the knowledge base; entailment cannot
+# prove an absence from a passage, so validating them only shreds honest
+# "not found" answers into the excerpt fallback.
+_ABSENCE = re.compile(
+    r"(?:\b(?:couldn't|can't|cannot|could not|did not|didn't|do not|don't|doesn't|was unable to)\s+"
+    r"(?:find|locate|see|surface)\b"
+    r"|\bfound\s+no\b"
+    r"|\b(?:no|not any|none of the|nothing in)\b"
+    r".{0,60}?\b(?:evidence|record(?:s|ed)?|mention(?:s|ed)?|information|"
+    r"date(?:s)?|detail(?:s)?|reference(?:s)?|indication|answer|passage(?:s)?|note(?:s)?)\b"
+    r"|\b(?:is|are|was|were)n?(?:'t| not)\s+(?:recorded|mentioned|documented|available|stated)\b)",
+    flags=re.IGNORECASE,
+)
 _INACTIVE_FACT_STATUSES = frozenset(
     {"historical", "superseded", "conflicted", "candidate"}
 )
@@ -297,10 +311,14 @@ def _is_factual(claim: str, *, is_heading: bool, _depth: int = 0) -> bool:
         return False
     if not re.search(r"[A-Za-z0-9]", claim):
         return False
+    # short structural labels ("What's in the record:") frame, not claim
+    if claim.endswith(":") and len(claim.split()) <= 8:
+        return False
     match = (
         _CONVERSATIONAL.search(claim)
         or _UNCERTAINTY.search(claim)
         or _MAY_HEDGE.search(claim)
+        or _ABSENCE.search(claim)
     )
     if match is None:
         return True

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from pathlib import Path
 from threading import RLock
 from typing import Any, Sequence
@@ -167,14 +169,26 @@ class RetrievalRuntime:
             self.artifact = _conservative_artifact(declared)
             self.calibration_status = "calibration_mismatch"
         self._validate_snapshot(self._snapshot)
+        log = logging.getLogger("taurine.retrieval")
         try:
             self.pair_scorer: Any = local_pair_reranker()
-        except LocalModelUnavailable:
+        except LocalModelUnavailable as exc:
             self.pair_scorer = _UnavailablePairScorer()
+            log.warning(
+                "local reranker unavailable (%s) — rerank quality degraded; "
+                "run: uv run python -m taurine_core.download_models",
+                exc,
+            )
         try:
             self.nli_scorer: Any | None = local_nli_scorer()
-        except LocalModelUnavailable:
+        except LocalModelUnavailable as exc:
             self.nli_scorer = None
+            log.warning(
+                "local NLI model unavailable (%s) — synthesized answers cannot "
+                "be validated and will fall back to raw excerpts; "
+                "run: uv run python -m taurine_core.download_models",
+                exc,
+            )
 
     def make_engine(
         self,

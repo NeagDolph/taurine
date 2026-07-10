@@ -27,6 +27,46 @@ _PAIR_RERANKERS: dict[str, "PairScorer"] = {}
 _NLI_SCORERS: dict[str, "EntailmentScorer"] = {}
 
 
+def _inference_device() -> str:
+    """Prefer Apple-GPU inference; local models on CPU peg every core."""
+    import torch
+
+    _configure_torch_threads(torch)
+    try:
+        if torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+_TORCH_THREADS_SET = False
+
+
+def _configure_torch_threads(torch: Any) -> None:
+    """Leave headroom for the event loop and UI when inference runs on CPU."""
+    global _TORCH_THREADS_SET
+    if _TORCH_THREADS_SET:
+        return
+    _TORCH_THREADS_SET = True
+    try:
+        import os as os_module
+
+        torch.set_num_threads(max(2, (os_module.cpu_count() or 8) // 2))
+    except Exception:
+        pass
+
+
+def _to_inference_device(model: Any) -> Any:
+    device = _inference_device()
+    if device == "cpu":
+        return model
+    try:
+        return model.to(device)
+    except Exception:
+        return model
+
+
 class LocalModelUnavailable(RuntimeError):
     """A required bundled model is absent or cannot be loaded offline."""
 
@@ -103,6 +143,7 @@ class _QwenYesNoPairScorer:
                 torch_dtype="auto",
             )
             self._model.eval()
+            self._model = _to_inference_device(self._model)
             self._yes_id = self._single_token_id("yes")
             self._no_id = self._single_token_id("no")
         except Exception as exc:
@@ -210,6 +251,7 @@ class _DebertaEntailmentScorer:
                 local_files_only=True,
             )
             self._model.eval()
+            self._model = _to_inference_device(self._model)
             self._entailment_id = _entailment_label_id(self._model.config)
         except LocalModelUnavailable:
             raise

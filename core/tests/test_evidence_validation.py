@@ -260,7 +260,7 @@ def test_download_manifest_includes_nli_model(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         download_models,
         "snapshot_download",
-        lambda repo_id, *, local_dir: downloaded.append(repo_id),
+        lambda repo_id, *, local_dir, ignore_patterns=(): downloaded.append(repo_id),
     )
 
     assert download_models.main() == 0
@@ -370,3 +370,40 @@ def _read_passage(text: str) -> EvidenceRegistry:
     registry.register("passage", "p1", {"text": text})
     registry.mark_read("E1")
     return registry
+
+
+def test_absence_claims_and_structural_headers_bypass_validation() -> None:
+    """Honest "not found" answers must survive: entailment cannot prove an
+    absence from a passage, and framing labels are not claims."""
+    from taurine_core.retrieval.validate import _is_factual
+
+    absences = (
+        "I can't find any evidence stating when Brevinh is coming back.",
+        "So there's no supported date for Brevinh's return in the available evidence.",
+        "The note lists LA activities, but gives no return date",
+        "The tab notes are expense tallies, with no travel dates",
+        "That isn't recorded in your knowledge base.",
+        "I found no mention of the trip.",
+    )
+    for claim in absences:
+        assert _is_factual(claim, is_heading=False) is False, claim
+
+    assert _is_factual("What's in the record:", is_heading=False) is False
+
+    # positive claims still validate
+    positives = (
+        "Brevinh returns on the 25th",
+        "Maya lives in Paris",
+        "The meeting is scheduled for Friday",
+    )
+    for claim in positives:
+        assert _is_factual(claim, is_heading=False) is True, claim
+
+    # M12 guard intact: an absence prefix cannot smuggle a factual tail
+    assert (
+        _is_factual(
+            "I found no mention of the trip: Brevinh returns on the 25th",
+            is_heading=False,
+        )
+        is True
+    )

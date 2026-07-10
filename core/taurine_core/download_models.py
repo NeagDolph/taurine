@@ -16,7 +16,11 @@ def main() -> int:
     ):
         target = MODELS_DIR / repo_id.split("/")[-1]
         print(f"downloading {repo_id} -> {target}", flush=True)
-        snapshot_download(repo_id, local_dir=str(target))
+        snapshot_download(
+            repo_id,
+            local_dir=str(target),
+            ignore_patterns=["onnx/*", "openvino/*", "*.onnx", "pytorch_model.bin", "tf_model.h5"],
+        )
     print("done", flush=True)
     return 0
 
