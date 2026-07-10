@@ -22,7 +22,7 @@ from taurine_core.indexer.base_graph import BaseGraphBuilder, EntityGraphInput, 
 from taurine_core.indexer.embed import embed_facts, embed_passages, embed_texts
 from taurine_core.indexer.entities import EntityResolver, MentionInput
 from taurine_core.indexer.extract import extract_notes
-from taurine_core.indexer.facts import promote_fact, reconcile_temporal_facts
+from taurine_core.indexer.facts import PREDICATES, promote_fact, reconcile_temporal_facts
 from taurine_core.indexer.knowledge_store import KnowledgeStore
 from taurine_core.indexer.passages import TokenizerPort, build_passages
 from taurine_core.indexer.projection import ProjectionPassage, build_projection
@@ -237,11 +237,21 @@ class BuildCoordinator:
                 if extraction is None or extraction.failed:
                     continue
                 for mention in extraction.mentions:
+                    if mention.char_start < 0 or mention.char_end <= mention.char_start:
+                        continue  # would violate the mention span CHECK constraint
                     passage = next((p for p in passage_by_note[note.note_id] if p.char_start <= mention.char_start and mention.char_end <= p.char_end), None)
                     if passage is None:
                         continue
                     identity = f"{note.note_id}\x1f{mention.etype}\x1f{mention.char_start}\x1f{mention.char_end}"
                     mention_inputs.append(MentionInput("mention-" + hashlib.sha256(identity.encode()).hexdigest()[:24], note.note_id, passage.passage_id, mention))
+            # mention identity is (note, etype, span) — surface excluded — so an
+            # extractor repeating a span must not become a PK violation
+            unique_mentions: dict[str, MentionInput] = {}
+            for row in mention_inputs:
+                current = unique_mentions.get(row.mention_id)
+                if current is None or row.mention.confidence > current.mention.confidence:
+                    unique_mentions[row.mention_id] = row
+            mention_inputs = list(unique_mentions.values())
             resolution = EntityResolver(total_notes=max(1, len(ordered))).resolve_mentions(mention_inputs)
             for entity in resolution.entities:
                 store.insert_entity(entity_id=entity.entity_id, canonical=entity.canonical, normalized=entity.normalized, etype=entity.etype, df=entity.df, traversal_eligible=entity.traversal_eligible, ambiguity_key=entity.ambiguity_key, build_id=build_id)
@@ -255,11 +265,21 @@ class BuildCoordinator:
             resolved_by_note_span = {(row.note_id, row.mention.char_start, row.mention.char_end, row.mention.surface.casefold()): row for row in resolution.mentions}
             fact_rows = []
             degenerate_facts: list[tuple[str, str]] = []
+            invalid_candidates = 0
             for note in ordered:
                 extraction = extractions.get(note.note_id)
                 if extraction is None:
                     continue
                 for candidate in extraction.fact_candidates:
+                    # A stale extraction cache can hold retired predicates or
+                    # malformed spans; either would violate DB constraints.
+                    if (
+                        candidate.predicate not in PREDICATES
+                        or candidate.assertion_start < 0
+                        or candidate.assertion_end <= candidate.assertion_start
+                    ):
+                        invalid_candidates += 1
+                        continue
                     subject = resolved_by_note_span.get((note.note_id, candidate.subject_start, candidate.subject_end, candidate.head.casefold()))
                     object_ = resolved_by_note_span.get((note.note_id, candidate.object_start, candidate.object_end, candidate.tail.casefold()))
                     passage = next((p for p in passage_by_note[note.note_id] if p.char_start <= candidate.assertion_start and candidate.assertion_end <= p.char_end), None)
@@ -273,6 +293,12 @@ class BuildCoordinator:
                             )
                             continue
                         fact_rows.append(promote_fact(candidate, subject_entity_id=subject.entity_id, object_entity_id=object_.entity_id, source_passage_id=passage.passage_id, source_note_id=note.note_id, observed_at=(candidate.observed_at if candidate.observed_at is not None else note.modified), valid_from=candidate.valid_from, valid_to=candidate.valid_to, build_id=build_id))
+            if invalid_candidates:
+                _LOG.warning(
+                    "build %s: skipped %d fact candidates with unregistered predicates or invalid spans",
+                    build_id,
+                    invalid_candidates,
+                )
             if degenerate_facts:
                 _LOG.warning(
                     "build %s: skipped %d degenerate facts (endpoints merged to one entity): %s",
@@ -331,13 +357,22 @@ class BuildCoordinator:
                         fact_rows.extend(completed.facts)
                         proposals = completed.proposals
                         completion_rejected = completed.rejected
-            for proposal in proposals:
+            for proposal in {row.proposal_id: row for row in proposals}.values():
                 store.insert_predicate_proposal(proposal)
             stage_done("relation_completion")
             announce("facts")
-            fact_rows = list(reconcile_temporal_facts(fact_rows))
-            for fact in fact_rows:
-                store.insert_fact(fact)
+            # The same relation can arrive twice (extractor repeats, or the
+            # LLM completion re-derives an extracted fact — extraction_method
+            # is not part of the identity), so dedupe before reconciling.
+            unique_facts = {fact.fact_id: fact for fact in fact_rows}
+            if len(unique_facts) != len(fact_rows):
+                _LOG.info(
+                    "build %s: dropped %d duplicate facts",
+                    build_id,
+                    len(fact_rows) - len(unique_facts),
+                )
+            fact_rows = list(reconcile_temporal_facts(tuple(unique_facts.values())))
+            store.insert_facts(fact_rows)
             stage_done("facts")
 
             announce("base_graph")

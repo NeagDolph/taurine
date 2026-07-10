@@ -224,6 +224,88 @@ def test_degenerate_facts_are_skipped_not_fatal(tmp_path: Path) -> None:
         store.close()
 
 
+def test_supersession_across_notes_survives_insert_order(tmp_path: Path) -> None:
+    """Exclusive predicates produce superseded_by links; the build must insert them safely."""
+    note_old = make_note("n1", "Old", "Maya lives-in Paris today.", modified=10.0)
+    note_new = make_note("n2", "New", "Maya lives-in London today.", modified=20.0)
+
+    def extractor(notes, *, tokenizer):
+        del tokenizer
+        results = {}
+        for note in notes:
+            place = "Paris" if note.note_id == "n1" else "London"
+            results[note.note_id] = Extraction(
+                mentions=[
+                    ExtractedMention(surface="Maya", etype="person", confidence=0.95, char_start=0, char_end=4, extractor="fake", schema_id="s1"),
+                    ExtractedMention(surface=place, etype="place", confidence=0.9, char_start=14, char_end=14 + len(place), extractor="fake", schema_id="s1"),
+                ],
+                fact_candidates=[
+                    ExtractedRelation(head="Maya", predicate="located_at", tail=place, confidence=0.9, subject_start=0, subject_end=4, object_start=14, object_end=14 + len(place), assertion_start=0, assertion_end=14 + len(place), extraction_method="fake", schema_id="s1", status="active")
+                ],
+                schema_id="s1",
+            )
+        return results
+
+    target = tmp_path / "knowledge.db"
+    report = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+        )
+    ).build([note_old, note_new], target, replace_derived=True)
+
+    assert report.fact_count == 2
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        rows = list(
+            store._conn.execute("SELECT status, superseded_by FROM facts ORDER BY observed_at")
+        )
+        assert rows[0][0] == "superseded"
+        assert rows[0][1] is not None
+        assert rows[1][0] == "active"
+        assert store.validate_invariants().ok
+    finally:
+        store.close()
+
+
+def test_duplicate_relations_and_mentions_are_deduped(tmp_path: Path) -> None:
+    note = make_note("n1", "Launch", "Maya owns Launch.")
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        mention_a = ExtractedMention(surface="Maya", etype="person", confidence=0.95, char_start=0, char_end=4, extractor="fake", schema_id="s1")
+        mention_dup = ExtractedMention(surface="MAYA", etype="person", confidence=0.5, char_start=0, char_end=4, extractor="fake", schema_id="s2")
+        mention_b = ExtractedMention(surface="Launch", etype="project", confidence=0.9, char_start=10, char_end=16, extractor="fake", schema_id="s1")
+        relation = ExtractedRelation(head="Maya", predicate="owns_or_has", tail="Launch", confidence=0.9, subject_start=0, subject_end=4, object_start=10, object_end=16, assertion_start=0, assertion_end=17, extraction_method="fake", schema_id="s1", status="active")
+        return {
+            "n1": Extraction(
+                mentions=[mention_a, mention_dup, mention_b],
+                fact_candidates=[relation, relation.model_copy()],
+                schema_id="s1",
+            )
+        }
+
+    target = tmp_path / "knowledge.db"
+    report = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+        )
+    ).build([note], target, replace_derived=True)
+
+    assert report.fact_count == 1
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        counts = store.counts()
+        assert counts["facts"] == 1
+        assert counts["entity_mentions"] == 2  # the duplicate span kept once
+        # the higher-confidence duplicate wins
+        surface = store._conn.execute(
+            "SELECT surface FROM entity_mentions WHERE char_start = 0"
+        ).fetchone()[0]
+        assert surface == "Maya"
+    finally:
+        store.close()
+
+
 def test_failed_build_is_kept_when_env_flag_set(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("TAURINE_KEEP_FAILED_BUILD", "1")
     target = tmp_path / "knowledge.db"

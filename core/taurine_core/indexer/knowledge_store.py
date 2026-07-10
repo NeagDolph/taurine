@@ -962,17 +962,42 @@ class KnowledgeStore:
     def insert_fact(self, fact: FactRecord) -> None:
         self._writable()
         with self._conn:
-            self._conn.execute(
-                """INSERT INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    fact.fact_id, fact.subject_entity_id, fact.predicate, fact.object_entity_id,
-                    fact.source_passage_id, fact.source_note_id, fact.assertion_start,
-                    fact.assertion_end, fact.subject_start, fact.subject_end, fact.object_start,
-                    fact.object_end, fact.confidence, fact.extraction_method, fact.schema_id,
-                    fact.observed_at, fact.valid_from, fact.valid_to, fact.invalidated_at,
-                    fact.superseded_by, fact.status, fact.build_id,
-                ),
-            )
+            self._insert_fact_row(fact, superseded_by=fact.superseded_by)
+
+    def insert_facts(self, facts: Sequence[FactRecord]) -> None:
+        """Insert a batch order-independently.
+
+        superseded_by is a self-referencing FK, so links are applied in a
+        second pass after every row exists — reconciliation output is sorted
+        by fact_id, which bears no relation to the supersession direction.
+        """
+        self._writable()
+        known = {fact.fact_id for fact in facts}
+        with self._conn:
+            for fact in facts:
+                self._insert_fact_row(fact, superseded_by=None)
+            for fact in facts:
+                if fact.superseded_by is None:
+                    continue
+                if fact.superseded_by not in known:
+                    continue  # dangling link: keep the fact, drop the pointer
+                self._conn.execute(
+                    "UPDATE facts SET superseded_by = ? WHERE fact_id = ?",
+                    (fact.superseded_by, fact.fact_id),
+                )
+
+    def _insert_fact_row(self, fact: FactRecord, *, superseded_by: str | None) -> None:
+        self._conn.execute(
+            """INSERT INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                fact.fact_id, fact.subject_entity_id, fact.predicate, fact.object_entity_id,
+                fact.source_passage_id, fact.source_note_id, fact.assertion_start,
+                fact.assertion_end, fact.subject_start, fact.subject_end, fact.object_start,
+                fact.object_end, fact.confidence, fact.extraction_method, fact.schema_id,
+                fact.observed_at, fact.valid_from, fact.valid_to, fact.invalidated_at,
+                superseded_by, fact.status, fact.build_id,
+            ),
+        )
 
     def insert_predicate_proposal(self, proposal: Any) -> None:
         self._writable()

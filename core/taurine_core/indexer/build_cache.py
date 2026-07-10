@@ -21,6 +21,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from taurine_core import config
+from taurine_core.indexer.facts import PREDICATES
 from taurine_core.schemas import Extraction, NoteRecord
 
 _EXTRACTION_CACHE_VERSION = "extraction-cache-v1"
@@ -221,8 +222,14 @@ def _embedding_key(model_id: str, text: str) -> str:
 
 
 def _schema_fingerprint() -> str:
+    """Entity types and predicates drive extraction output; changing either
+    must invalidate cached extractions."""
+    payload = {
+        "entities": dict(config.INGEST_ENTITY_TYPES),
+        "predicates": {name: spec.description for name, spec in sorted(PREDICATES.items())},
+    }
     return hashlib.sha256(
-        json.dumps(dict(config.INGEST_ENTITY_TYPES), sort_keys=True).encode("utf-8")
+        json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
 
 

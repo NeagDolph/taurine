@@ -103,6 +103,81 @@ def test_note_delete_cascades_derived_rows_and_prunes_orphan_entity(
         store.close()
 
 
+def test_insert_facts_applies_supersession_links_order_independently(
+    tmp_path: Path,
+) -> None:
+    """superseded_by is a self-FK; batch insert must not depend on row order."""
+    from taurine_core.indexer.facts import FactRecord
+
+    store = KnowledgeStore(tmp_path / "knowledge.db")
+    try:
+        note = _note()
+        store.write_note(note, build_id="build-1", extraction_status="complete")
+        store.write_passages(
+            note.note_id,
+            (_passage(),),
+            created=note.created,
+            modified=note.modified,
+            build_id="build-1",
+        )
+        for entity_id, name in (("e-subj", "Maya"), ("e-old", "Paris"), ("e-new", "London")):
+            store.insert_entity(
+                entity_id=entity_id,
+                canonical=name,
+                normalized=name.lower(),
+                etype="person" if entity_id == "e-subj" else "place",
+                df=1,
+                traversal_eligible=True,
+                ambiguity_key=name.lower(),
+                build_id="build-1",
+            )
+
+        def fact(fact_id: str, object_id: str, status: str, superseded_by: str | None) -> FactRecord:
+            return FactRecord(
+                fact_id=fact_id,
+                subject_entity_id="e-subj",
+                subject="Maya",
+                predicate="located_at",
+                object_entity_id=object_id,
+                object="somewhere",
+                source_passage_id="passage-1",
+                source_note_id=note.note_id,
+                assertion_start=0,
+                assertion_end=10,
+                subject_start=0,
+                subject_end=4,
+                object_start=5,
+                object_end=10,
+                confidence=0.9,
+                extraction_method="fake",
+                schema_id="s1",
+                observed_at=10.0,
+                valid_from=None,
+                valid_to=None,
+                invalidated_at=None,
+                superseded_by=superseded_by,
+                status=status,
+                build_id="build-1",
+            )
+
+        # superseded row sorts (and is inserted) before its winner
+        store.insert_facts(
+            [
+                fact("fact-aaa", "e-old", "superseded", "fact-zzz"),
+                fact("fact-mmm", "e-old", "superseded", "fact-gone"),  # dangling
+                fact("fact-zzz", "e-new", "active", None),
+            ]
+        )
+
+        rows = {
+            row[0]: row[1]
+            for row in store._conn.execute("SELECT fact_id, superseded_by FROM facts")
+        }
+        assert rows == {"fact-aaa": "fact-zzz", "fact-mmm": None, "fact-zzz": None}
+    finally:
+        store.close()
+
+
 def test_invariants_report_orphan_entities_and_prune_repairs_them(tmp_path: Path) -> None:
     store = KnowledgeStore(tmp_path / "knowledge.db")
     try:
