@@ -447,7 +447,10 @@ class ChatEngine:
                 text,
                 history_for_rewrite,
             )
-            context_pack = retriever.context_pack(
+            # Retrieval is CPU-bound (embedding, reranker, graph paths); it
+            # must never run on the event loop or every websocket freezes.
+            context_pack = await asyncio.to_thread(
+                retriever.context_pack,
                 text,
                 now=wall_now,
                 conversation_context=history_for_rewrite,
@@ -576,7 +579,9 @@ class ChatEngine:
                         )
                     )
                     started = time.monotonic()
-                    result_json, done_step = execute_tool(
+                    # Tool execution is retrieval work — keep it off the loop.
+                    result_json, done_step = await asyncio.to_thread(
+                        execute_tool,
                         str(call.get("name") or ""),
                         call.get("arguments") if isinstance(call.get("arguments"), dict) else {},
                         retriever,

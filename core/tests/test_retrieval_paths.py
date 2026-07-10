@@ -70,3 +70,47 @@ def _graph(edges: tuple[BaseEdge, ...]):
         node_kinds=tuple("passage" if node.startswith("p") else "entity" for node in nodes),
         edges=edges,
     )
+
+
+def test_paths_expansion_budget_bounds_unreachable_target_search() -> None:
+    """A dense graph with an unreachable target must not be exhaustively
+    enumerated — the expansion budget caps the search deterministically."""
+    import itertools
+    import time
+
+    layer_names = [[f"e{layer}x{i}" for i in range(12)] for layer in range(4)]
+    edges = []
+    for left_layer, right_layer in itertools.pairwise(layer_names):
+        for left in left_layer:
+            for right in right_layer:
+                edges.append(
+                    BaseEdge(
+                        src_id=left,
+                        dst_id=right,
+                        kind="semantic",
+                        direction="symmetric",
+                        weight=0.5,
+                        fact_ids=(),
+                        metadata={},
+                    )
+                )
+    # target exists in the graph but has no edges into it
+    nodes = tuple(sorted({n for e in edges for n in (e.src_id, e.dst_id)})) + ("p-target",)
+    graph = materialize_base_graph(
+        build_id="build-1",
+        node_ids=nodes,
+        node_kinds=tuple("passage" if n.startswith("p") else "entity" for n in nodes),
+        edges=tuple(edges),
+    )
+    finder = EvidencePathFinder(graph, fact_status={})
+
+    started = time.monotonic()
+    result = finder.find(
+        seed_ids=tuple(layer_names[0]),
+        target_id="p-target",
+        max_expansions=2000,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result == ()
+    assert elapsed < 2.0

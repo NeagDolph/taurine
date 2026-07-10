@@ -58,7 +58,14 @@ class EvidencePathFinder:
         target_id: str,
         max_edges: int = 4,
         max_paths: int = 2,
+        max_expansions: int = 4000,
     ) -> tuple[PathCandidate, ...]:
+        """Uniform-cost search hard-bounded by max_expansions heap pops.
+
+        Without the budget, an unreachable target exhausts every ≤max_edges
+        path in its neighborhood — combinatorial on a dense graph (observed:
+        one find() pinning the process for minutes).
+        """
         if max_edges < 1 or max_paths < 1 or target_id not in self.graph.row_by_id:
             return ()
         heap: list[
@@ -78,7 +85,11 @@ class EvidencePathFinder:
 
         results: list[PathCandidate] = []
         explanations: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        expansions = 0
         while heap and len(results) < max_paths:
+            expansions += 1
+            if expansions > max_expansions:
+                break
             cost, nodes, edge_kinds, fact_ids, passage_notes = heapq.heappop(heap)
             current = nodes[-1]
             if current == target_id:

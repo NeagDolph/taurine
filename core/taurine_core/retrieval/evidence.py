@@ -202,6 +202,11 @@ def empty_pack(query: RetrievalQuery, decision: RetrievalDecision) -> EvidencePa
     )
 
 
+# Hard wall-clock cap on the evidence-path phase of one retrieval; path
+# discovery is supplementary and must never dominate query latency.
+_PATH_PHASE_BUDGET_S = 3.0
+
+
 class SharedRetrievalEngine:
     """One immutable-snapshot retrieval pipeline shared by live, chat, and tools."""
 
@@ -507,6 +512,10 @@ class SharedRetrievalEngine:
         for passage_id in ppr_passages:
             if passage_id in direct_passages:
                 continue
+            # Paths are supplementary evidence: the whole phase gets a hard
+            # wall-clock budget so one dense query cannot stall retrieval.
+            if monotonic() - path_started > _PATH_PHASE_BUDGET_S:
+                break
             found = path_finder.find(seed_ids=seed_ids, target_id=passage_id)
             if found:
                 paths_by_target[passage_id] = found
