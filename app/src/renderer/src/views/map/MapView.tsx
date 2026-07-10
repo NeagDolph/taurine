@@ -1587,6 +1587,22 @@ export function MapView({
             setSelectedNodeId(null)
           }}
           onBackgroundRightClick={() => setMenuTarget(null)}
+          onLinkClick={(_link, event) => {
+            // edge hitboxes cover most of the space between nodes, so a click
+            // landing on a link must deselect just like a background click
+            setMenuTarget(null)
+            if (!selectedNodeId) {
+              return
+            }
+            const down = pointerDownPosRef.current
+            if (
+              down &&
+              Math.hypot(event.clientX - down.x, event.clientY - down.y) > CLICK_MOVE_TOLERANCE_PX
+            ) {
+              return // pan gesture, not a deselect click
+            }
+            setSelectedNodeId(null)
+          }}
           onLinkHover={(link) => {
             // while a node is selected, only its incident edges are hoverable
             if (link && selectedNodeId) {
