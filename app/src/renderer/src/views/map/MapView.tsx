@@ -970,8 +970,9 @@ export function MapView({
   )
 
   // drag is only enabled while a node is selected; the selected node drags
-  // elastically (rubber-band inside the attach radius, 1:1 once detached)
-  // and any other node is held in place and fully restored on release
+  // elastically (rubber-band inside the attach radius, 1:1 once detached),
+  // every other node drags 1:1 and pins on release, and the Now anchor is
+  // held in place and fully restored
   const handleNodeDrag = useCallback(
     (node: GraphNodeObject, translate: { x: number; y: number }) => {
       if (typeof node.x !== 'number' || typeof node.y !== 'number') {
@@ -993,16 +994,20 @@ export function MapView({
           originalFx: init?.fx,
           originalFy: init?.fy,
           detached: false,
-          restore: id !== selectedNodeId
+          restore: id === NOW_NODE_ID
         }
         dragStateRef.current = drag
       }
 
       if (drag.restore) {
-        // not the selected node: pin it back every event so it never moves
+        // the Now anchor never moves: pin it back every event
         node.fx = node.x = drag.origin.x
         node.fy = node.y = drag.origin.y
         return
+      }
+
+      if (id !== selectedNodeId) {
+        return // other nodes follow the cursor 1:1 (pinned on release)
       }
 
       if (drag.detached) {
@@ -1035,7 +1040,7 @@ export function MapView({
     const id = String(node.id)
 
     if (drag && drag.nodeId === id && drag.restore) {
-      // non-selected node: put it back exactly where it was, never pin it
+      // the Now anchor: put it back exactly where it was, never pin it
       node.x = drag.origin.x
       node.y = drag.origin.y
       const pin = pinsRef.current[id]
@@ -1172,6 +1177,8 @@ export function MapView({
       const fillColor = isNow ? '#f5c518' : nodeFillColor(node)
       const isHoverNeighbor =
         !isNow && !isHovered && hoverNodeId !== null && hoverNeighborhood?.has(id) === true
+      const isSelectedNeighbor =
+        !isNow && selectedNodeId !== null && selectedNeighborhood?.has(id) === true
 
       if (isSelected && !isNow) {
         ctx.beginPath()
@@ -1219,8 +1226,9 @@ export function MapView({
         ctx.stroke()
       }
 
+      // the selected node's 1-hop titles stay fully readable while selected
       const alpha =
-        isNow || isHovered || isSelected || isQueryMatch
+        isNow || isHovered || isSelected || isSelectedNeighbor || isQueryMatch
           ? 1
           : labelAlpha(globalScale, node.degree >= hubDegree)
       if (alpha > 0.02) {
@@ -1262,17 +1270,21 @@ export function MapView({
       const isHovered = link.id === hoverLinkId
       const srcId = endpointId(link.source)
       const dstId = endpointId(link.target)
-      // hover highlights (never dims): incident edges go bright white and
-      // punch through any selection dim
+      // hover highlights (never dims): incident edges go bright white — but
+      // while a node is selected, only edges incident to the SELECTED node may
+      // brighten (hovering other nodes lights the nodes only, never new edges)
       const hoverIncident = hoverNodeId !== null && (srcId === hoverNodeId || dstId === hoverNodeId)
-      const bright = isHovered || hoverIncident
+      const selectedIncident =
+        selectedNodeId !== null && (srcId === selectedNodeId || dstId === selectedNodeId)
+      const bright = selectedNodeId
+        ? (isHovered || hoverIncident) && selectedIncident
+        : isHovered || hoverIncident
       const baseOpacity = isStatic ? staticLinkOpacity(link.weight) : liveLinkOpacity(link)
       let opacity: number
       if (bright) {
         opacity = Math.max(baseOpacity, 0.9)
       } else if (selectedNodeId && selectedNeighborhood) {
         // selection dim: only edges incident to the selected node stay lit
-        const selectedIncident = srcId === selectedNodeId || dstId === selectedNodeId
         opacity = selectedIncident ? Math.max(baseOpacity, 0.5) : DIM_OPACITY * baseOpacity * 6
       } else {
         opacity = linkOpacityFor(
@@ -1320,13 +1332,17 @@ export function MapView({
   // nodes paint after links on the shadow canvas, so nodes win over edges
   const paintNodePointerArea = useCallback(
     (node: GraphNodeObject, paintColor: string, ctx: CanvasRenderingContext2D) => {
-      const radius = (String(node.id) === NOW_NODE_ID ? 14 : nodeRadius(node.degree)) + 2
+      const id = String(node.id)
+      // the selected node and its 1-hop neighbors get an extra-large pointer
+      // area so they stay easy to grab/hover over nearby dimmed geometry
+      const pad = selectedNeighborhood?.has(id) === true ? 6 : 2
+      const radius = (id === NOW_NODE_ID ? 14 : nodeRadius(node.degree)) + pad
       ctx.beginPath()
       ctx.arc(node.x ?? 0, node.y ?? 0, radius, 0, Math.PI * 2)
       ctx.fillStyle = paintColor
       ctx.fill()
     },
-    []
+    [selectedNeighborhood]
   )
 
   // ── layout forces ──────────────────────────────────────────────────────
@@ -1529,6 +1545,15 @@ export function MapView({
           }}
           onBackgroundRightClick={() => setMenuTarget(null)}
           onLinkHover={(link) => {
+            // while a node is selected, only its incident edges are hoverable
+            if (link && selectedNodeId) {
+              const srcId = endpointId(link.source)
+              const dstId = endpointId(link.target)
+              if (srcId !== selectedNodeId && dstId !== selectedNodeId) {
+                setHoverLink(null)
+                return
+              }
+            }
             setHoverLink(link ?? null)
             if (link) {
               setHoverNode(null)
