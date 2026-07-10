@@ -26,11 +26,21 @@ class MinimalIndex:
 class StubChatEngine:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.seeded: list[tuple[str, tuple[str, ...]]] = []
         self.cancelled: list[str] = []
         self.regenerated: list[str] = []
 
-    async def send(self, chat_id: str, text: str, emit: Any) -> None:
+    async def send(
+        self,
+        chat_id: str,
+        text: str,
+        emit: Any,
+        *,
+        seed_note_ids: tuple[str, ...] = (),
+    ) -> None:
         self.sent.append((chat_id, text))
+        if seed_note_ids:
+            self.seeded.append((chat_id, tuple(seed_note_ids)))
         await emit(ChatAckEvent(chat_id="chat-stub", message_id=2, user_message_id=1))
         await emit(
             ChatDoneEvent(
@@ -91,6 +101,66 @@ def test_chat_websocket_relays_stubbed_engine_events_and_ignores_bad_controls() 
     assert engine.sent == [("", "hello")]
     assert engine.cancelled == ["chat-stub"]
     assert engine.regenerated == ["chat-stub"]
+
+
+def test_chat_send_seed_note_ids_reach_the_engine() -> None:
+    engine = StubChatEngine()
+    runtime = Runtime(
+        index=MinimalIndex(),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=None,
+        make_asr_client=lambda on_chunk, on_status, index_status: None,
+        make_chat_engine=lambda: engine,
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/chat") as ws:
+            ws.send_json(
+                {
+                    "type": "chat_send",
+                    "chat_id": "",
+                    "text": "tell me about this note",
+                    "seed_note_ids": ["n1", "n2"],
+                }
+            )
+            assert ws.receive_json()["type"] == "chat_ack"
+            assert ws.receive_json()["type"] == "chat_done"
+
+    assert engine.sent == [("", "tell me about this note")]
+    assert engine.seeded == [("", ("n1", "n2"))]
+
+
+def test_post_chats_accepts_optional_seed_note_ids(store: Any) -> None:
+    class SeedingChatEngine(StubChatEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seed_calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def seed_chat(self, chat_id: str, note_ids: Any) -> None:
+            self.seed_calls.append((chat_id, tuple(note_ids)))
+
+    engine = SeedingChatEngine()
+    runtime = Runtime(
+        index=store,
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=None,
+        make_asr_client=lambda on_chunk, on_status, index_status: None,
+        make_chat_engine=lambda: engine,
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        created = client.post(
+            "/chats", json={"seed_note_ids": ["n1", "n1", "  ", "n2"]}
+        ).json()
+        assert created["chat_id"].startswith("chat-")
+        assert engine.seed_calls == [(created["chat_id"], ("n1", "n2"))]
+
+        # no body and non-list payloads leave seeding untouched
+        assert client.post("/chats").status_code == 200
+        assert client.post("/chats", json={"seed_note_ids": "n1"}).status_code == 200
+        assert len(engine.seed_calls) == 1
 
 
 def test_chat_websocket_logs_unexpected_task_exception(caplog: pytest.LogCaptureFixture) -> None:

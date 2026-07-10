@@ -10,6 +10,7 @@ from typing import Any, Sequence
 from rapidfuzz.distance import Levenshtein
 
 from taurine_core.evaluation.graph_retrieval import CalibrationArtifact, load_calibration
+from taurine_core.indexer.communities import projection_communities
 from taurine_core.indexer.embed import embed_queries
 from taurine_core.models_local import (
     LocalModelUnavailable,
@@ -66,6 +67,9 @@ class RetrievalRuntime:
         self.knowledge_database = Path(knowledge_database)
         self._lock = RLock()
         self._snapshot: IndexSnapshot = load_index_snapshot(self.knowledge_database)
+        self._communities: dict[str, int] = projection_communities(
+            self._snapshot.projection
+        )
         self._stores: dict[str, Any] = {}
         self.artifact: CalibrationArtifact = load_calibration(calibration_path)
         self._validate_snapshot(self._snapshot)
@@ -169,13 +173,29 @@ class RetrievalRuntime:
         with self._lock:
             return self._snapshot
 
+    def community_labels(self, snapshot: IndexSnapshot | None = None) -> dict[str, int]:
+        """Cached label-propagation communities for the active snapshot.
+
+        Computed once per snapshot activation. Passing an older snapshot (a
+        reader that raced a swap) recomputes for exactly that generation, so
+        node ids and community ids never mix across builds.
+        """
+        with self._lock:
+            current = self._snapshot
+            cached = self._communities
+        if snapshot is None or snapshot is current:
+            return cached
+        return projection_communities(snapshot.projection)
+
     def activate_from_disk(self) -> IndexSnapshot:
         """Atomically publish a newly completed clean build for future sessions."""
 
         snapshot = load_index_snapshot(self.knowledge_database)
         self._validate_snapshot(snapshot)
+        communities = projection_communities(snapshot.projection)
         with self._lock:
             self._snapshot = snapshot
+            self._communities = communities
         return snapshot
 
     def remove_source(self, source: str) -> int:

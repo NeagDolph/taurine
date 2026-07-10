@@ -1795,6 +1795,29 @@ class Index:
             self._ensure_notes_created_column()
             self._ensure_notes_quality_rank_column()
             self._ensure_notes_value_columns()
+            self._ensure_chat_messages_columns()
+
+    def _ensure_chat_messages_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(chat_messages)").fetchall()
+        }
+        required: tuple[tuple[str, str], ...] = (
+            ("evidence_json", "TEXT NOT NULL DEFAULT 'null'"),
+            ("retrieved_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("consulted_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("cited_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("original_query", "TEXT NOT NULL DEFAULT ''"),
+            ("rewritten_query", "TEXT NOT NULL DEFAULT ''"),
+            ("retrieval_decision", "TEXT NOT NULL DEFAULT ''"),
+            ("retrieval_confidence", "REAL NOT NULL DEFAULT 0"),
+            ("active_build_id", "TEXT NOT NULL DEFAULT ''"),
+        )
+        for name, definition in required:
+            if name not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE chat_messages ADD COLUMN {name} {definition}"
+                )
 
     def _ensure_notes_created_column(self) -> None:
         columns = {

@@ -52,3 +52,45 @@ def test_label_propagation_empty_graph_returns_empty_mapping() -> None:
     from taurine_core.indexer.communities import label_propagation
 
     assert label_propagation(_matrix([], [])) == {}
+
+
+def _projection_edge(src: str, dst: str):
+    from taurine_core.indexer.projection import ProjectionEdge
+
+    return ProjectionEdge(
+        src_note_id=src,
+        dst_note_id=dst,
+        edge_type="semantic",
+        weight=0.8,
+        shared=(),
+        fact_ids=(),
+        mechanisms={"semantic": 0.8},
+    )
+
+
+def test_projection_communities_split_clusters_deterministically() -> None:
+    from taurine_core.indexer.communities import projection_communities
+
+    left = [f"left-{index}" for index in range(4)]
+    right = [f"right-{index}" for index in range(4)]
+    edges = tuple(
+        _projection_edge(group[i], group[j])
+        for group in (left, right)
+        for i in range(len(group))
+        for j in range(i + 1, len(group))
+    )
+
+    first = projection_communities(edges)
+    second = projection_communities(edges)
+
+    assert first == second
+    assert set(first) == set(left) | set(right)  # only projected notes get labels
+    assert len({first[note_id] for note_id in left}) == 1
+    assert len({first[note_id] for note_id in right}) == 1
+    assert first[left[0]] != first[right[0]]
+
+
+def test_projection_communities_empty_projection_returns_empty_mapping() -> None:
+    from taurine_core.indexer.communities import projection_communities
+
+    assert projection_communities(()) == {}

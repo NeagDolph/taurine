@@ -55,6 +55,7 @@ class StoredNote:
     created: float
     modified: float
     display_line: str
+    value_score: float
     extraction_status: str
     extraction_error: str
     build_id: str
@@ -364,6 +365,7 @@ class KnowledgeStore:
                 created=float(row["created"]),
                 modified=float(row["modified"]),
                 display_line=row["display_line"],
+                value_score=float(row["value_score"]),
                 extraction_status=row["extraction_status"],
                 extraction_error=row["extraction_error"],
                 build_id=row["build_id"],
@@ -897,6 +899,41 @@ class KnowledgeStore:
             )
             for row in rows
         )
+
+    def note_entities(
+        self,
+        *,
+        limit: int = 8,
+        build_id: str | None = None,
+    ) -> dict[str, tuple[str, ...]]:
+        """Top traversal-eligible canonical entity labels per note, by mention count."""
+
+        capped = max(0, int(limit))
+        if capped == 0:
+            return {}
+        clauses = ["e.traversal_eligible = 1"]
+        parameters: list[Any] = []
+        if build_id is not None:
+            clauses.append("m.build_id = ?")
+            parameters.append(build_id)
+        rows = self._conn.execute(
+            f"""
+            SELECT m.note_id, e.canonical, count(*) AS mentions
+            FROM entity_mentions m
+            JOIN entities e ON e.entity_id = m.entity_id
+            WHERE {' AND '.join(clauses)}
+            GROUP BY m.note_id, e.entity_id
+            ORDER BY m.note_id, mentions DESC, e.canonical, e.entity_id
+            """,
+            tuple(parameters),
+        ).fetchall()
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            labels = grouped.setdefault(str(row["note_id"]), [])
+            canonical = str(row["canonical"])
+            if len(labels) < capped and canonical not in labels:
+                labels.append(canonical)
+        return {note_id: tuple(labels) for note_id, labels in grouped.items()}
 
     def passage_ids_for_entities(
         self,

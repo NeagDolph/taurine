@@ -70,6 +70,9 @@ class ChatRetriever:
         self._accepted_turn = _integer(
             initial.get("accepted_turn") if isinstance(initial, dict) else None
         )
+        self._seed_reset = _float_map(
+            initial.get("seed_reset") if isinstance(initial, dict) else None
+        )
         pre_turn = persisted.get("pre_turn") if isinstance(persisted, dict) else None
         self._persisted_pre_turn = pre_turn if isinstance(pre_turn, dict) else None
         self._pre_turn: dict[str, object] | None = None
@@ -104,10 +107,14 @@ class ChatRetriever:
             conversation_context=context,
             temporal_intent=TemporalIntent("any"),
         )
+        session_reset = dict(self._seed_reset)
+        if dependent and self._accepted_reset:
+            for passage_id, score in self._accepted_reset.items():
+                session_reset[passage_id] = max(session_reset.get(passage_id, 0.0), score)
         pack = self.engine.retrieve(
             query,
             entity_spans=self._entity_spans(message),
-            session_reset=self._accepted_reset if dependent and self._accepted_reset else None,
+            session_reset=session_reset or None,
         )
         public_query = replace(query, text=message)
         pack = replace(
@@ -129,7 +136,23 @@ class ChatRetriever:
         elif not dependent:
             self._accepted_reset = {}
         self._accepted_turn += 1
+        self._seed_reset = {}  # graph-handoff seeds bias exactly one turn
         return pack
+
+    def seed_notes(self, note_ids: Sequence[str]) -> None:
+        """Pre-populate the seed accumulator so the next turn is biased
+        toward these notes ("Ask about this" from the map). Unknown note ids
+        match no passages and are silently ignored."""
+
+        requested = {str(value) for value in note_ids if str(value).strip()}
+        if not requested:
+            return
+        for row in self.engine.store.passage_contexts(self.engine.snapshot.passage_ids):
+            if str(row.note_id) in requested:
+                passage_id = str(row.passage_id)
+                self._seed_reset[passage_id] = max(
+                    self._seed_reset.get(passage_id, 0.0), 1.0
+                )
 
     def is_dependent_query(self, message: str, context: Sequence[str]) -> bool:
         normalized = tuple(str(row) for row in context[-2:] if str(row).strip())
@@ -645,12 +668,14 @@ class ChatRetriever:
             "registry": self.registry.snapshot(),
             "accepted_reset": dict(sorted(self._accepted_reset.items())),
             "accepted_turn": self._accepted_turn,
+            "seed_reset": dict(sorted(self._seed_reset.items())),
         }
 
     def restore(self, state: Mapping[str, object]) -> None:
         self.registry = _restore_registry(state)
         self._accepted_reset = _float_map(state.get("accepted_reset"))
         self._accepted_turn = _integer(state.get("accepted_turn"))
+        self._seed_reset = _float_map(state.get("seed_reset"))
         self.engine = self._engine_factory(self.registry)
         self._tool_engine = None
         self._turn_base = None

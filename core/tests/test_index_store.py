@@ -247,6 +247,74 @@ def test_store_migrates_existing_notes_without_source_column(tmp_path):
     assert index.note_count_by_source() == {"apple_notes": 1}
 
 
+def test_store_migrates_legacy_chat_messages_columns(tmp_path):
+    db_path = tmp_path / "legacy-chats.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE chats (
+            chat_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            created REAL NOT NULL,
+            updated REAL NOT NULL,
+            registry_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+            role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+            content TEXT NOT NULL,
+            thinking TEXT NOT NULL DEFAULT '',
+            sources_json TEXT NOT NULL DEFAULT '[]',
+            facts_json TEXT NOT NULL DEFAULT '[]',
+            activity_json TEXT NOT NULL DEFAULT '[]',
+            usage_json TEXT NOT NULL DEFAULT '{}',
+            cancelled INTEGER NOT NULL DEFAULT 0,
+            created REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO chats(chat_id, created, updated) VALUES ('chat-legacy', 1.0, 1.0)"
+    )
+    conn.execute(
+        """
+        INSERT INTO chat_messages(chat_id, role, content, created)
+        VALUES ('chat-legacy', 'user', 'hello', 1.0)
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    from taurine_core.indexer.store import Index
+
+    index = Index(db_path)
+
+    columns = {
+        row["name"]
+        for row in index._conn.execute("PRAGMA table_info(chat_messages)").fetchall()
+    }
+    assert {
+        "evidence_json",
+        "retrieved_ids_json",
+        "consulted_ids_json",
+        "cited_ids_json",
+        "original_query",
+        "rewritten_query",
+        "retrieval_decision",
+        "retrieval_confidence",
+        "active_build_id",
+    } <= columns
+    messages = index.chat_messages("chat-legacy")
+    assert len(messages) == 1
+    assert messages[0].content == "hello"
+    assert messages[0].evidence is None
+
+
 def test_preview_resolves_neighbors_sorted_by_weight(store):
     alpha = make_note("alpha", "Alpha", "Alpha body").model_copy(update={"source": "obsidian"})
     beta = make_note("beta", "Beta", "Beta body").model_copy(update={"source": "apple_notes"})

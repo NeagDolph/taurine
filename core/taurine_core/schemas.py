@@ -108,6 +108,7 @@ class GraphEdge(BaseModel):
     fact: str = ""                 # LLM-written one-sentence relationship (adjudicated edges)
     fact_provenance: str = ""      # "llm" or "gliner" when fact is populated
     fact_ids: list[str] = []        # directed fact provenance in the fresh projection
+    mechanisms: dict[str, float] = {}  # {"semantic": w, "entity": w, "fact": w}
 
 
 class GraphNode(BaseModel):
@@ -116,11 +117,42 @@ class GraphNode(BaseModel):
     degree: int
     source: str = "apple_notes"
     gist: str = ""                 # heuristic display line for map hover previews
+    created: float = 0.0           # unix seconds, 0 when unknown
+    modified: float = 0.0          # unix seconds, 0 when unknown
+    folder: str = ""
+    community: int = -1            # stable label-propagation community id, -1 = none
+    value_score: float = 0.0       # from notes.value_score
+    entities: list[str] = []       # top ≤8 traversal-eligible canonical labels, by mention count
 
 
 class GraphResponse(BaseModel):
     nodes: list[GraphNode]
     edges: list[GraphEdge]
+
+
+class LocalGraphResponse(BaseModel):
+    """BFS neighborhood of one note over the projection (GET /graph/local)."""
+
+    center: str
+    depth: int
+    nodes: list[GraphNode]
+    edges: list[GraphEdge]         # included iff both endpoints are in nodes
+
+
+class FactPayload(BaseModel):
+    """One resolved fact row for edge provenance drill-down (GET /facts)."""
+
+    fact_id: str
+    subject: str                   # canonical subject entity label
+    predicate: str
+    object: str                    # canonical object entity label
+    source_note_id: str
+    confidence: float
+    observed_at: float
+
+
+class FactsResponse(BaseModel):
+    facts: list[FactPayload]
 
 
 # ── retrieval ──────────────────────────────────────────────────────────
@@ -701,6 +733,7 @@ class ChatSendMsg(BaseModel):
     type: Literal["chat_send"]
     chat_id: str = ""              # "" → server creates the chat
     text: str
+    seed_note_ids: list[str] = []  # graph handoff: bias the first turn toward these notes
 
 
 class ChatCancelMsg(BaseModel):

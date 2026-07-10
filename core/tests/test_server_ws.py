@@ -250,6 +250,7 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
     )
 
     with TestClient(create_app(runtime)) as client:
+        # the legacy fallback path serves the extended schema with defaults
         assert client.get("/graph").json() == {
             "nodes": [
                 {
@@ -258,6 +259,12 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
                     "degree": 1,
                     "source": "apple_notes",
                     "gist": "",
+                    "created": 0.0,
+                    "modified": 0.0,
+                    "folder": "",
+                    "community": -1,
+                    "value_score": 0.0,
+                    "entities": [],
                 }
             ],
             "edges": [
@@ -270,6 +277,7 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
                         "fact": "",
                         "fact_provenance": "",
                         "fact_ids": [],
+                        "mechanisms": {},
                 }
             ],
         }
@@ -285,6 +293,50 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
             "stale": False,
         }
     assert sync_calls == [True]
+
+
+def test_graph_local_bfs_over_legacy_fallback_graph() -> None:
+    chain = GraphResponse(
+        nodes=[
+            GraphNode(note_id=note_id, title=note_id.upper(), degree=0)
+            for note_id in ("a", "b", "c", "d", "e")
+        ],
+        edges=[
+            GraphEdge(src="a", dst="b", type="semantic", weight=0.9),
+            GraphEdge(src="b", dst="c", type="semantic", weight=0.8),
+            GraphEdge(src="c", dst="d", type="semantic", weight=0.7),
+        ],
+    )
+    runtime = Runtime(
+        index=GraphIndex(graph_response=chain),
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=lambda emit, logger: EchoLiveSession(emit),
+        make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
+            on_chunk,
+            on_status,
+            index_status,
+        ),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        depth_one = client.get("/graph/local", params={"center": "a", "depth": 1}).json()
+        assert depth_one["center"] == "a"
+        assert depth_one["depth"] == 1
+        assert [node["note_id"] for node in depth_one["nodes"]] == ["a", "b"]
+        assert [(edge["src"], edge["dst"]) for edge in depth_one["edges"]] == [("a", "b")]
+        # new node fields default on the legacy path
+        assert depth_one["nodes"][0]["community"] == -1
+        assert depth_one["nodes"][0]["entities"] == []
+
+        default_depth = client.get("/graph/local", params={"center": "a"}).json()
+        assert default_depth["depth"] == 2
+        assert [node["note_id"] for node in default_depth["nodes"]] == ["a", "b", "c"]
+
+        deep = client.get("/graph/local", params={"center": "a", "depth": 3}).json()
+        assert [node["note_id"] for node in deep["nodes"]] == ["a", "b", "c", "d"]
+
+        assert client.get("/graph/local", params={"center": "zzz"}).status_code == 404
 
 
 def test_index_sync_uses_enabled_connector_sync_callable() -> None:

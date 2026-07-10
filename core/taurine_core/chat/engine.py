@@ -27,7 +27,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Sequence
 from uuid import uuid4
 
 from .. import config
@@ -121,7 +121,14 @@ class ChatEngine:
         self._active: dict[str, asyncio.Task[Any]] = {}
         self._active_count = 0
 
-    async def send(self, chat_id: str, text: str, emit: EmitFn) -> None:
+    async def send(
+        self,
+        chat_id: str,
+        text: str,
+        emit: EmitFn,
+        *,
+        seed_note_ids: Sequence[str] = (),
+    ) -> None:
         """Handle chat_send ("" chat_id → create). Runs the full turn;
         busy/limit violations emit chat_error(code="busy") and return."""
         reservation = await self._reserve(chat_id)
@@ -137,9 +144,23 @@ class ChatEngine:
                 emit,
                 created_meta=reservation.created,
                 persist_user=True,
+                seed_note_ids=tuple(seed_note_ids),
             )
         finally:
             await self._release(reservation.chat_id)
+
+    def seed_chat(self, chat_id: str, note_ids: Sequence[str]) -> None:
+        """Persist graph-handoff seeds (POST /chats seed_note_ids) so the
+        chat's first turn is biased toward those notes; unknown ids are
+        ignored inside the retriever."""
+        if self._retriever_factory is None or not note_ids:
+            return
+        retriever = self._retriever_factory(chat_id)
+        seed = getattr(retriever, "seed_notes", None)
+        if not callable(seed):
+            return
+        seed(note_ids)
+        retriever.save()
 
     async def cancel(self, chat_id: str) -> None:
         async with self._lock:
@@ -217,6 +238,7 @@ class ChatEngine:
         persist_user: bool,
         user_message_id: int | None = None,
         restore_pre_turn: bool = False,
+        seed_note_ids: Sequence[str] = (),
     ) -> None:
         turn_started = time.monotonic()
         wall_now = time.time()
@@ -248,6 +270,10 @@ class ChatEngine:
             restore = getattr(retriever, "restore_pre_turn", None)
             if callable(restore):
                 restore()
+        if seed_note_ids:
+            seed = getattr(retriever, "seed_notes", None)
+            if callable(seed):
+                seed(seed_note_ids)
         context_pack: EvidencePack | None = None
         content_parts: list[str] = []
         thinking_parts: list[str] = []

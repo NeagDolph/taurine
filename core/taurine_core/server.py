@@ -31,6 +31,7 @@ from taurine_core.indexer.notes import open_note
 from taurine_core.indexer.build import BuildCancelled, BuildCoordinator, BuildDependencies
 from taurine_core.indexer.build_cache import BuildCache
 from taurine_core.indexer.embed import embed_texts
+from taurine_core.indexer.communities import projection_communities
 from taurine_core.indexer.extract import extract_notes
 from taurine_core.indexer.facts import PREDICATES
 from taurine_core.indexer.knowledge_store import KnowledgeSchemaError
@@ -55,10 +56,13 @@ from taurine_core.schemas import (
     ChatRegenerateMsg,
     ChatSendMsg,
     ConnectorInfo,
+    FactPayload,
+    FactsResponse,
     GraphEdge,
     GraphNode,
     GraphResponse,
     IndexStatus,
+    LocalGraphResponse,
     MeetingSummary,
     NeighborRef,
     NotePreview,
@@ -335,9 +339,45 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.get("/graph")
     async def graph() -> GraphResponse:
         active_runtime = _ready_runtime(app)
-        if active_runtime.knowledge_runtime is None:
-            return active_runtime.index.graph()
-        return _knowledge_graph(active_runtime.knowledge_runtime)
+        return _full_graph(active_runtime)
+
+    @app.get("/graph/local")
+    async def graph_local(center: str, depth: int = 2) -> LocalGraphResponse:
+        active_runtime = _ready_runtime(app)
+        return _local_graph(
+            _full_graph(active_runtime),
+            center=center,
+            depth=min(3, max(1, int(depth))),
+        )
+
+    @app.get("/facts")
+    async def facts(ids: str = "") -> FactsResponse:
+        active_runtime = _ready_runtime(app)
+        requested = tuple(
+            dict.fromkeys(part.strip() for part in ids.split(",") if part.strip())
+        )[:50]
+        if not requested or active_runtime.knowledge_runtime is None:
+            return FactsResponse(facts=[])
+        snapshot = active_runtime.knowledge_runtime.snapshot
+        store = snapshot.open_knowledge_store()
+        try:
+            rows = store.fact_contexts(requested)
+        finally:
+            store.close()
+        return FactsResponse(
+            facts=[
+                FactPayload(
+                    fact_id=row.fact_id,
+                    subject=row.subject,
+                    predicate=row.predicate,
+                    object=row.object,
+                    source_note_id=row.source_note_id,
+                    confidence=row.confidence,
+                    observed_at=row.observed_at,
+                )
+                for row in rows
+            ]
+        )
 
     @app.post("/index/sync", status_code=202)
     async def index_sync() -> SyncStatus:
@@ -523,9 +563,18 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         return active_runtime.index.chats()
 
     @app.post("/chats")
-    async def create_chat() -> Any:
+    async def create_chat(payload: Any = Body(None)) -> Any:
         active_runtime = _ready_runtime(app)
         chat = active_runtime.index.create_chat(_new_chat_id(active_runtime.index), now=time.time())
+        seed_note_ids = _seed_note_ids(payload)
+        if seed_note_ids and (
+            active_runtime.chat_engine is not None
+            or active_runtime.make_chat_engine is not None
+        ):
+            engine = _chat_engine(active_runtime)
+            seed = getattr(engine, "seed_chat", None)
+            if callable(seed):
+                await asyncio.to_thread(seed, chat.chat_id, seed_note_ids)
         active_runtime.updates.publish("chats")
         return chat
 
@@ -747,7 +796,19 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 except (json.JSONDecodeError, ValidationError, ValueError):
                     continue
                 if isinstance(control, ChatSendMsg):
-                    track(asyncio.create_task(engine.send(control.chat_id, control.text, emit)))
+                    if control.seed_note_ids:
+                        track(
+                            asyncio.create_task(
+                                engine.send(
+                                    control.chat_id,
+                                    control.text,
+                                    emit,
+                                    seed_note_ids=control.seed_note_ids,
+                                )
+                            )
+                        )
+                    else:
+                        track(asyncio.create_task(engine.send(control.chat_id, control.text, emit)))
                 elif isinstance(control, ChatCancelMsg):
                     await engine.cancel(control.chat_id)
                 elif isinstance(control, ChatRegenerateMsg):
@@ -948,13 +1009,86 @@ def required_secrets(env: Mapping[str, str | None] | None = None) -> dict[str, s
     return secrets
 
 
+def _full_graph(runtime: Runtime) -> GraphResponse:
+    if runtime.knowledge_runtime is None:
+        legacy = runtime.index.graph()
+        return (
+            legacy
+            if isinstance(legacy, GraphResponse)
+            else GraphResponse.model_validate(legacy)
+        )
+    return _knowledge_graph(runtime.knowledge_runtime)
+
+
+def _local_graph(
+    graph: GraphResponse,
+    *,
+    center: str,
+    depth: int,
+) -> LocalGraphResponse:
+    """BFS over the (undirected) projection adjacency from center."""
+
+    node_ids = {node.note_id for node in graph.nodes}
+    if center not in node_ids:
+        raise HTTPException(status_code=404, detail="note not found")
+    adjacency: dict[str, set[str]] = {}
+    for edge in graph.edges:
+        if edge.src in node_ids and edge.dst in node_ids:
+            adjacency.setdefault(edge.src, set()).add(edge.dst)
+            adjacency.setdefault(edge.dst, set()).add(edge.src)
+    visited = {center}
+    frontier = [center]
+    for _hop in range(depth):
+        frontier = sorted(
+            {
+                neighbor
+                for node in frontier
+                for neighbor in adjacency.get(node, ())
+                if neighbor not in visited
+            }
+        )
+        if not frontier:
+            break
+        visited.update(frontier)
+    return LocalGraphResponse(
+        center=center,
+        depth=depth,
+        nodes=[node for node in graph.nodes if node.note_id in visited],
+        edges=[
+            edge
+            for edge in graph.edges
+            if edge.src in visited and edge.dst in visited
+        ],
+    )
+
+
+def _seed_note_ids(payload: Any) -> tuple[str, ...]:
+    if not isinstance(payload, dict):
+        return ()
+    values = payload.get("seed_note_ids")
+    if not isinstance(values, list):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(value).strip() for value in values if str(value).strip()
+        )
+    )
+
+
 def _knowledge_graph(knowledge_runtime: RetrievalRuntime) -> GraphResponse:
     snapshot = knowledge_runtime.snapshot
     store = snapshot.open_knowledge_store()
     try:
         notes = {row.note_id: row for row in store.source_notes()}
+        note_entities = store.note_entities()
     finally:
         store.close()
+    labels_fn = getattr(knowledge_runtime, "community_labels", None)
+    communities: Mapping[str, int] = (
+        labels_fn(snapshot)
+        if callable(labels_fn)
+        else projection_communities(snapshot.projection)
+    )
     degree = {note_id: 0 for note_id in notes}
     edges: list[GraphEdge] = []
     for row in snapshot.projection:
@@ -973,6 +1107,7 @@ def _knowledge_graph(knowledge_runtime: RetrievalRuntime) -> GraphResponse:
                 fact_provenance=(
                     "directed_facts" if row.fact_ids else ""
                 ),
+                mechanisms=dict(row.mechanisms),
             )
         )
     return GraphResponse(
@@ -983,6 +1118,12 @@ def _knowledge_graph(knowledge_runtime: RetrievalRuntime) -> GraphResponse:
                 degree=degree[note.note_id],
                 source=note.source,
                 gist=note.display_line,
+                created=note.created,
+                modified=note.modified,
+                folder=note.folder,
+                community=communities.get(note.note_id, -1),
+                value_score=note.value_score,
+                entities=list(note_entities.get(note.note_id, ())),
             )
             for note in notes.values()
         ],

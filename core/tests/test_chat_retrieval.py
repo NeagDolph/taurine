@@ -163,6 +163,65 @@ def test_explicit_what_about_topic_pivot_drops_previous_topic() -> None:
     assert engines[-1].calls[-1][1] is None
 
 
+def test_seed_notes_bias_exactly_one_turn_and_ignore_unknown_ids() -> None:
+    retriever, engines = _make(FakeIndex())
+    retriever.seed_notes(["n1", "missing-note", " "])
+
+    retriever.context_pack("Tell me about the roadmap", now=100.0)
+    assert engines[-1].calls[0][1] == {"p1": 1.0, "p2": 1.0}
+
+    pack = retriever.context_pack(
+        "What is the garden plan?",
+        now=101.0,
+        conversation_context=("Tell me about the roadmap",),
+    )
+    assert pack.trace.rewritten_query == "What is the garden plan?"
+    assert engines[-1].calls[-1][1] is None  # seeds cleared after the first turn
+
+
+def test_seed_notes_persist_via_registry_until_the_first_turn() -> None:
+    index = FakeIndex()
+    seeded, _ = _make(index)
+    seeded.seed_notes(["n2"])
+    seeded.save()
+
+    restored, engines = _make(index)
+    restored.context_pack("Roadmap", now=100.0)
+
+    assert engines[-1].calls[0][1] == {"p3": 1.0}
+    restored.save()
+    fresh, fresh_engines = _make(index)
+    fresh.context_pack("Roadmap", now=101.0)
+    assert fresh_engines[-1].calls[0][1] is None
+
+
+def test_chat_engine_seed_chat_writes_seed_reset_for_the_first_turn() -> None:
+    from taurine_core.chat.engine import ChatEngine
+
+    index = FakeIndex()
+    engines: list[FakeEngine] = []
+
+    def engine_factory(registry: EvidenceRegistry) -> FakeEngine:
+        engine = FakeEngine(registry)
+        engines.append(engine)
+        return engine
+
+    def retriever_factory(chat_id: str) -> ChatRetriever:
+        return ChatRetriever(
+            index,
+            chat_id,
+            engine_factory=engine_factory,
+            tool_engine_factory=engine_factory,
+        )  # type: ignore[arg-type]
+
+    chat_engine = ChatEngine(index, None, None, retriever_factory=retriever_factory)
+    chat_engine.seed_chat("chat-seeded", ["n1", "missing"])
+
+    first_turn = retriever_factory("chat-seeded")
+    first_turn.context_pack("Roadmap", now=100.0)
+    assert engines[-1].calls[0][1] == {"p1": 1.0, "p2": 1.0}
+
+
 def test_tool_search_uses_tool_mode_without_advancing_accepted_turn_state() -> None:
     retriever, engines = _make(FakeIndex())
     retriever.context_pack("Roadmap", now=100.0)
