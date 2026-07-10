@@ -1315,16 +1315,16 @@ export function MapView({
       const hoverIncident = hoverNodeId !== null && (srcId === hoverNodeId || dstId === hoverNodeId)
       const selectedIncident =
         selectedNodeId !== null && (srcId === selectedNodeId || dstId === selectedNodeId)
-      const bright = selectedNodeId
-        ? (isHovered || hoverIncident) && selectedIncident
-        : isHovered || hoverIncident
+      // while a node is selected its incident edges render white like the
+      // hover effect; everything else stays dim regardless of hover
+      const bright = selectedNodeId ? selectedIncident : isHovered || hoverIncident
       const baseOpacity = isStatic ? staticLinkOpacity(link.weight) : liveLinkOpacity(link)
       let opacity: number
       if (bright) {
         opacity = Math.max(baseOpacity, 0.9)
       } else if (selectedNodeId && selectedNeighborhood) {
-        // selection dim: only edges incident to the selected node stay lit
-        opacity = selectedIncident ? Math.max(baseOpacity, 0.5) : DIM_OPACITY * baseOpacity * 6
+        // selection dim: every edge not incident to the selected node fades
+        opacity = DIM_OPACITY * baseOpacity * 6
       } else {
         opacity = linkOpacityFor(
           link,
