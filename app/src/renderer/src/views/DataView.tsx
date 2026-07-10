@@ -67,8 +67,14 @@ export function DataView({
   }, [mapHeight])
 
   return (
-    <div className="page data-page" aria-label="Data">
-      <section className="panel-card map-panel" style={{ height: mapHeight }}>
+    <div
+      className="flex h-full min-h-0 flex-col gap-2.5 overflow-y-auto px-px pb-4 pt-px"
+      aria-label="Data"
+    >
+      <section
+        className="map-panel flex min-h-0 flex-col overflow-hidden rounded-[10px] border border-white/[0.08] bg-surface-1/60"
+        style={{ height: mapHeight }}
+      >
         <MapView
           latestFinalText={latestFinalText}
           groundedNoteIds={groundedNoteIds}
@@ -79,7 +85,7 @@ export function DataView({
       </section>
 
       <div
-        className="resize-handle"
+        className="group flex flex-none cursor-row-resize touch-none select-none items-center justify-center py-0.5"
         role="separator"
         aria-orientation="horizontal"
         aria-label="Resize map"
@@ -89,7 +95,10 @@ export function DataView({
         onPointerUp={onDragEnd}
         onPointerCancel={onDragEnd}
       >
-        <span className="resize-grip" aria-hidden="true" />
+        <span
+          className="block h-1 w-16 rounded-full bg-white/15 transition-colors group-hover:bg-accent/60 group-active:bg-accent/60"
+          aria-hidden="true"
+        />
       </div>
 
       <UserSummary profile={profile} onProfileChange={onProfileChange} />

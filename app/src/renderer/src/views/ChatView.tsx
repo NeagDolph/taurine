@@ -406,7 +406,7 @@ export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Elem
   const emptyThread = messages.length === 0 && !streaming && state.pendingSend === null
 
   return (
-    <div className="page chat-page">
+    <div className="grid h-full min-h-0 grid-cols-[clamp(200px,20vw,280px)_minmax(0,1fr)] overflow-hidden px-px">
       <ChatSidebar
         chats={state.chats}
         activeChatId={activeChatId}
@@ -417,22 +417,29 @@ export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Elem
         onDelete={removeChat}
       />
 
-      <div className="chat-main">
+      <div className="relative flex min-h-0 flex-col">
         {connection !== 'connected' && everVisible ? (
-          <div className="disconnect-banner" role="status">
+          <div
+            className="rounded-[10px] border border-accent/50 bg-accent/10 px-3.5 py-2 text-xs font-medium text-accent-hi"
+            role="status"
+          >
             Chat {connection}
           </div>
         ) : null}
 
-        <div className="chat-thread" ref={threadRef} onScroll={handleScroll}>
+        <div
+          className="relative flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto px-4 pb-2 pt-4"
+          ref={threadRef}
+          onScroll={handleScroll}
+        >
           {emptyThread ? (
-            <div className="chat-empty">
-              <h2>Ask your notes anything</h2>
-              <div className="chat-examples">
+            <div className="flex flex-1 flex-col items-center justify-center gap-4">
+              <h2 className="text-base font-semibold text-fg/65">Ask your notes anything</h2>
+              <div className="flex flex-col gap-2">
                 {EXAMPLE_PROMPTS.map((prompt) => (
                   <button
                     key={prompt}
-                    className="chat-example"
+                    className="cursor-pointer rounded-[10px] border border-white/10 bg-surface-2/70 px-3.5 py-2.5 text-left text-xs text-fg transition-colors hover:border-accent/60"
                     type="button"
                     onClick={() => sendMessage(prompt)}
                   >
@@ -471,7 +478,11 @@ export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Elem
             </>
           )}
           {showJump ? (
-            <button className="jump-to-latest" type="button" onClick={jumpToLatest}>
+            <button
+              className="sticky bottom-3 left-1/2 w-fit -translate-x-1/2 cursor-pointer rounded-full border border-white/15 bg-surface-2/90 px-3.5 py-1.5 text-xs text-fg shadow-[0_16px_40px_rgba(0,0,0,0.4)] backdrop-blur-md"
+              type="button"
+              onClick={jumpToLatest}
+            >
               ↓ Jump to latest
             </button>
           ) : null}
@@ -486,7 +497,10 @@ export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Elem
         />
 
         {toast ? (
-          <div className="chat-toast" role="status">
+          <div
+            className="absolute bottom-[70px] left-1/2 -translate-x-1/2 rounded-full border border-white/15 bg-surface-2/90 px-4 py-1.5 text-xs text-fg shadow-[0_16px_40px_rgba(0,0,0,0.4)] backdrop-blur-md"
+            role="status"
+          >
             {toast}
           </div>
         ) : null}
@@ -504,11 +518,17 @@ function UserBubble({ text }: { text: string }): React.JSX.Element {
     })
   }
   return (
-    <div className="user-bubble-row">
-      <button className="turn-action bubble-copy" type="button" onClick={copy}>
+    <div className="group flex items-center justify-end gap-2">
+      <button
+        className="turn-action opacity-0 transition-opacity group-hover:opacity-100"
+        type="button"
+        onClick={copy}
+      >
         {copied ? 'Copied' : 'Copy'}
       </button>
-      <div className="user-bubble">{text}</div>
+      <div className="max-w-[72%] whitespace-pre-wrap break-words rounded-[14px_14px_4px_14px] bg-accent/20 px-3.5 py-2.5 text-[13px] leading-normal text-fg">
+        {text}
+      </div>
     </div>
   )
 }

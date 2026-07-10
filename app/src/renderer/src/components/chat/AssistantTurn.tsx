@@ -80,9 +80,9 @@ export function AssistantTurn({
   }, [streaming, message])
 
   return (
-    <article className="assistant-turn">
+    <article className="flex max-w-[88%] flex-col gap-2">
       {phase === 'retrieving' ? (
-        <div className="turn-status shimmer">Searching your notes…</div>
+        <div className="shimmer text-xs">Searching your notes…</div>
       ) : null}
 
       {thinking ? (
@@ -90,21 +90,23 @@ export function AssistantTurn({
       ) : null}
 
       {activity.length > 0 ? (
-        <ol className="activity-steps">
+        <ol className="m-0 flex list-none flex-col gap-1 p-0">
           {activity.map((step, index) => (
-            <li key={index} className={`activity-step ${step.status}`}>
-              <span className="activity-icon" aria-hidden="true">
+            <li key={index} className="flex items-center gap-1.5 text-xs text-fg/65">
+              <span className="text-[11px]" aria-hidden="true">
                 {step.kind === 'search' ? '🔍' : step.kind === 'read' ? '📄' : '🕸'}
               </span>
               <button
-                className="activity-label"
+                className="cursor-pointer border-0 bg-transparent p-0 text-left text-xs text-fg/65 enabled:hover:text-fg enabled:hover:underline disabled:cursor-default"
                 type="button"
                 disabled={step.note_ids.length === 0}
                 onClick={() => step.note_ids[0] && onOpenNote(step.note_ids[0])}
               >
                 {step.label}
               </button>
-              {step.status === 'running' ? <span className="activity-spinner" /> : null}
+              {step.status === 'running' ? (
+                <span className="h-2.5 w-2.5 animate-spin rounded-full border-2 border-white/15 border-t-accent" />
+              ) : null}
             </li>
           ))}
         </ol>
@@ -120,7 +122,7 @@ export function AssistantTurn({
       ) : null}
 
       {phase === 'error' ? (
-        <div className="turn-error">
+        <div className="flex items-center justify-between gap-2.5 rounded-[10px] border border-bad/40 px-3 py-2 text-xs text-bad">
           <span>{streaming?.error || 'Something went wrong'}</span>
           {onRetry ? (
             <button className="secondary-button" type="button" onClick={onRetry}>
@@ -130,7 +132,9 @@ export function AssistantTurn({
         </div>
       ) : null}
 
-      {message?.cancelled ? <div className="turn-stopped">stopped</div> : null}
+      {message?.cancelled ? (
+        <div className="text-[11px] italic text-fg/65">stopped</div>
+      ) : null}
 
       {!isStreaming && message ? (
         <TurnFooter
@@ -160,9 +164,11 @@ function ThinkingAccordion({
   const open = live || expanded
 
   return (
-    <div className={`thinking-accordion${live ? ' live' : ''}`}>
+    <div className="border-l-2 border-white/15 pl-2.5">
       <button
-        className="thinking-header"
+        className={`flex gap-1.5 border-0 bg-transparent p-0 py-0.5 text-xs font-medium text-fg/65 ${
+          live ? 'cursor-default' : 'cursor-pointer'
+        }`}
         type="button"
         aria-expanded={open}
         onClick={() => !live && setExpanded((current) => !current)}
@@ -172,10 +178,13 @@ function ThinkingAccordion({
         ) : (
           <span>Thought{seconds ? ` for ${seconds}s` : ''}</span>
         )}
-        {!live ? <span className="thinking-caret">{expanded ? '▾' : '▸'}</span> : null}
+        {!live ? <span className="text-[10px]">{expanded ? '▾' : '▸'}</span> : null}
       </button>
       {open ? (
-        <div className="thinking-body" ref={live ? autoScrollRef : undefined}>
+        <div
+          className="mt-1 max-h-44 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-normal text-fg/65"
+          ref={live ? autoScrollRef : undefined}
+        >
           {text}
         </div>
       ) : null}
@@ -239,8 +248,8 @@ function TurnFooter({
   const seconds = message.usage.total_ms / 1000
 
   return (
-    <div className="turn-footer">
-      <div className="turn-actions">
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center gap-2.5">
         <button className="turn-action" type="button" onClick={copy}>
           {copied ? 'Copied' : 'Copy'}
         </button>
@@ -250,27 +259,27 @@ function TurnFooter({
           </button>
         ) : null}
         {totalTokens > 0 ? (
-          <span className="turn-meta">
+          <span className="text-[11px] text-fg/60">
             {formatTokens(totalTokens)} tok · {seconds >= 1 ? `${seconds.toFixed(0)}s` : '<1s'}
           </span>
         ) : null}
       </div>
       {allVisible.length > 0 ? (
-        <div className="turn-sources">
+        <div className="flex flex-wrap gap-1.5">
           {visibleSources.map((item) => (
             <button
               key={item.note_id}
-              className="source-pill"
+              className="inline-flex max-w-[320px] cursor-pointer items-center gap-1.5 rounded-full border border-white/15 bg-surface-2/70 py-1 pl-1 pr-2.5 transition-colors hover:border-accent/60"
               type="button"
               title={item.title}
               onClick={() => onOpenNote(item.note_id)}
             >
               <span className="citation-chip citation-note">{item.note_ref}</span>
-              <span className="source-pill-title">{item.title}</span>
+              <span className="truncate text-[11.5px] text-fg">{item.title}</span>
               <span className={`source-chip source-${item.source}`}>
                 {sourceLabel(item.source)}
               </span>
-              <span className="source-state">
+              <span className="text-[11px] text-fg/45">
                 {sourceNotes.includes(item) ? 'source' : 'consulted'}
               </span>
             </button>

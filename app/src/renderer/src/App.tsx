@@ -291,18 +291,30 @@ function App(): React.JSX.Element {
   const showDisconnectedBanner = connection !== 'connected'
 
   return (
-    <div className="app-shell">
-      <header className="app-header">
-        <div className="brand-block">
-          <h1>Taurine</h1>
-          <span>Live meeting copilot</span>
+    <div className="relative flex h-screen flex-col gap-2.5 p-3">
+      <header className="flex min-h-[52px] flex-none items-center justify-between gap-4 rounded-[10px] border border-white/[0.08] bg-surface-1/70 px-3.5 py-2 backdrop-blur-md">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <h1 className="text-[15px] font-bold leading-none tracking-tight text-fg before:mr-2 before:inline-block before:h-3.5 before:w-1 before:translate-y-px before:rounded-sm before:bg-accent before:content-['']">
+            Taurine
+          </h1>
+          <span className="whitespace-nowrap text-[11px] font-medium text-fg/40">
+            Live meeting copilot
+          </span>
         </div>
 
-        <nav className="app-tabs" role="tablist" aria-label="Main view">
+        <nav
+          className="flex items-center gap-0.5 rounded-full border border-white/[0.08] bg-white/[0.03] p-0.5"
+          role="tablist"
+          aria-label="Main view"
+        >
           {MAIN_TABS.map((tab) => (
             <button
               key={tab.id}
-              className={activeTab === tab.id ? 'active' : ''}
+              className={`h-6 min-w-[76px] rounded-full border-0 px-3.5 text-xs transition-colors ${
+                activeTab === tab.id
+                  ? 'bg-accent font-semibold text-accent-ink'
+                  : 'bg-transparent font-medium text-fg/55 hover:text-fg'
+              }`}
               type="button"
               role="tab"
               aria-selected={activeTab === tab.id}
@@ -322,15 +334,18 @@ function App(): React.JSX.Element {
       </header>
 
       {showDisconnectedBanner ? (
-        <div className="disconnect-banner" role="status">
+        <div
+          className="flex-none rounded-[10px] border border-accent/50 bg-accent/10 px-3.5 py-2 text-xs font-medium text-accent-hi backdrop-blur-md"
+          role="status"
+        >
           {startupBannerText(connection, retryInMs, startup)}
         </div>
       ) : null}
 
-      <div className="workspace-stack" style={viewStackStyle}>
+      <div className="min-h-0 flex-1" style={viewStackStyle}>
         <div aria-hidden={activeTab !== 'live'} style={viewLayerStyle(activeTab === 'live')}>
-          <div className="page live-page">
-            <div className="summary-row">
+          <div className="flex h-full min-h-0 flex-col gap-2.5 overflow-hidden px-px pb-1 pt-px">
+            <div className="grid max-h-[42vh] min-h-0 flex-none grid-cols-[minmax(0,3fr)_minmax(280px,2fr)] gap-2.5">
               <SummaryPanel summary={summary} onOpenNote={openNote} />
               <ActionableRail
                 actionables={actionables}
@@ -339,8 +354,8 @@ function App(): React.JSX.Element {
                 onOpenNote={openNote}
               />
             </div>
-            <div className="workspace">
-              <main className="main-pane live-main">
+            <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_clamp(280px,26vw,340px)] gap-2.5">
+              <main className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)] overflow-hidden rounded-[10px] border border-white/[0.08] bg-surface-1/60">
                 <FeedView
                   chunks={chunks}
                   interims={interims}

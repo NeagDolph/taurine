@@ -30,7 +30,7 @@ export function MessageMarkdown({
   const processed = useMemo(() => citationsToLinks(markdown), [markdown])
 
   return (
-    <div className={`markdown-body message-markdown${streaming ? ' streaming' : ''}`}>
+    <div className="markdown-body text-[13px] leading-relaxed text-fg">
       <ReactMarkdown
         components={{
           a: ({ href, children }) => {
@@ -60,7 +60,12 @@ export function MessageMarkdown({
       >
         {processed}
       </ReactMarkdown>
-      {streaming ? <span className="stream-cursor" aria-hidden="true" /> : null}
+      {streaming ? (
+        <span
+          className="ml-0.5 inline-block h-3.5 w-[7px] animate-pulse bg-accent align-text-bottom"
+          aria-hidden="true"
+        />
+      ) : null}
     </div>
   )
 }
@@ -78,8 +83,12 @@ function CodeBlock({ children }: { children?: ReactNode }): React.JSX.Element {
   }
 
   return (
-    <div className="code-block">
-      <button className="code-copy" type="button" onClick={copy}>
+    <div className="group relative">
+      <button
+        className="absolute right-2 top-3 cursor-pointer rounded border-0 bg-white/[0.07] px-2 py-0.5 text-[10px] text-fg/65 opacity-0 transition-opacity hover:text-fg group-hover:opacity-100"
+        type="button"
+        onClick={copy}
+      >
         {copied ? 'Copied' : 'Copy'}
       </button>
       <pre>{children}</pre>

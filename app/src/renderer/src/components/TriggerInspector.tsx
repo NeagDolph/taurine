@@ -31,11 +31,17 @@ export function TriggerInspector({
   const latency = objectRows(trace.latency_ms)
 
   return (
-    <aside className="trigger-inspector" role="dialog" aria-label="Retrieval inspector">
-      <div className="trigger-inspector-header">
+    <aside
+      className="fixed bottom-[68px] right-3 top-24 z-30 grid w-[min(440px,calc(100vw-28px))] grid-rows-[auto_auto_auto_minmax(0,1fr)_auto] gap-3 rounded-[10px] border border-white/15 bg-surface-1/90 p-4 text-fg shadow-[0_28px_80px_rgba(0,0,0,0.6)] backdrop-blur-xl"
+      role="dialog"
+      aria-label="Retrieval inspector"
+    >
+      <div className="flex items-start justify-between gap-3">
         <div>
           <span className="section-label">Retrieval trace</span>
-          <h2>{grounding.decision.accepted ? 'Evidence accepted' : 'Retrieval abstained'}</h2>
+          <h2 className="mt-1 text-[15px] font-bold leading-snug text-fg">
+            {grounding.decision.accepted ? 'Evidence accepted' : 'Retrieval abstained'}
+          </h2>
         </div>
         <button
           className="icon-button"
@@ -47,7 +53,7 @@ export function TriggerInspector({
         </button>
       </div>
 
-      <div className="trigger-inspector-badges">
+      <div className="flex flex-wrap gap-1.5">
         <span
           className={`trigger-action-badge trigger-action-${grounding.decision.accepted ? 'grounded' : 'none'}`}
         >
@@ -73,21 +79,21 @@ export function TriggerInspector({
       />
       <TraceSection title="Stage latency" rows={latency} />
 
-      <div className="trigger-match-table-wrap">
-        <table className="trigger-match-table">
+      <div className="min-h-0 overflow-auto">
+        <table className="w-full border-collapse">
           <thead>
             <tr>
-              <th>Evidence</th>
-              <th>Source note</th>
-              <th />
+              <th className={MATCH_TH}>Evidence</th>
+              <th className={MATCH_TH}>Source note</th>
+              <th className={MATCH_TH} />
             </tr>
           </thead>
           <tbody>
             {grounding.passages.map((passage) => (
               <tr key={passage.evidence_id}>
-                <td>{passage.evidence_id}</td>
-                <td>{passage.title}</td>
-                <td>
+                <td className={MATCH_TD}>{passage.evidence_id}</td>
+                <td className={MATCH_TD}>{passage.title}</td>
+                <td className={MATCH_TD}>
                   <button
                     className="secondary-button compact"
                     type="button"
@@ -102,13 +108,21 @@ export function TriggerInspector({
         </table>
       </div>
 
-      <footer className="trigger-inspector-footer">
-        <code>{String(trace.active_build_id ?? '')}</code>
-        <code>{String(trace.calibration_hash ?? '')}</code>
+      <footer className="grid gap-1 border-t border-white/[0.08] pt-2.5">
+        <code className="truncate font-mono text-[11px] text-fg/45">
+          {String(trace.active_build_id ?? '')}
+        </code>
+        <code className="truncate font-mono text-[11px] text-fg/45">
+          {String(trace.calibration_hash ?? '')}
+        </code>
       </footer>
     </aside>
   )
 }
+
+const MATCH_TH =
+  'border-b border-white/[0.08] px-1.5 py-2 text-left align-top text-[11px] font-bold uppercase tracking-wide text-fg/45'
+const MATCH_TD = 'border-b border-white/[0.08] px-1.5 py-2 text-left align-top text-xs'
 
 function TraceSection({
   title,
@@ -119,12 +133,14 @@ function TraceSection({
 }): React.JSX.Element | null {
   if (rows.length === 0) return null
   return (
-    <section className="retrieval-trace-section">
-      <h3>{title}</h3>
-      <ul>
+    <section className="border-t border-white/[0.08] pt-2.5">
+      <h3 className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-fg/65">
+        {title}
+      </h3>
+      <ul className="m-0 grid list-none gap-1 p-0">
         {rows.slice(0, 20).map((row, index) => (
           <li key={`${title}-${index}`}>
-            <code>{row}</code>
+            <code className="font-mono text-[10px] text-fg/45 [overflow-wrap:anywhere]">{row}</code>
           </li>
         ))}
       </ul>
