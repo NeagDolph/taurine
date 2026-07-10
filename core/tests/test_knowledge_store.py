@@ -353,3 +353,94 @@ def test_verify_graph_hash_detects_missing_or_wrong_hash(tmp_path: Path) -> None
         assert store.verify_graph_hash("build-1") is True
     finally:
         store.close()
+
+
+def test_fact_contexts_accepts_assertions_straddling_passages(tmp_path: Path) -> None:
+    """Spec §6.4: straddling assertions live on the earlier passage; the
+    context reader must return the full assertion from the note text."""
+    from taurine_core.indexer.facts import FactRecord
+
+    store = KnowledgeStore(tmp_path / "knowledge.db")
+    try:
+        text = "Maya lives in Paris. She moves to London next year for work."
+        note = NoteRecord(
+            note_id="note-1",
+            title="Move",
+            source="apple_notes",
+            created=1.0,
+            modified=2.0,
+            content_hash="hash",
+            text=text,
+        )
+        store.write_note(note, build_id="build-1", extraction_status="complete")
+        first = PassageDraft(
+            passage_id="passage-1",
+            ordinal=0,
+            char_start=0,
+            char_end=20,
+            token_count=4,
+            text=text[0:20],
+            content_hash="p1",
+        )
+        second = PassageDraft(
+            passage_id="passage-2",
+            ordinal=1,
+            char_start=20,
+            char_end=len(text),
+            token_count=8,
+            text=text[20:],
+            content_hash="p2",
+        )
+        store.write_passages(
+            note.note_id,
+            (first, second),
+            created=note.created,
+            modified=note.modified,
+            build_id="build-1",
+        )
+        for entity_id, name, etype in (("e-maya", "Maya", "person"), ("e-london", "London", "place")):
+            store.insert_entity(
+                entity_id=entity_id,
+                canonical=name,
+                normalized=name.lower(),
+                etype=etype,
+                df=1,
+                traversal_eligible=True,
+                ambiguity_key=name.lower(),
+                build_id="build-1",
+            )
+        # assertion [5, 47) starts in passage-1 and ends inside passage-2
+        store.insert_fact(
+            FactRecord(
+                fact_id="fact-straddle",
+                subject_entity_id="e-maya",
+                subject="Maya",
+                predicate="located_at",
+                object_entity_id="e-london",
+                object="London",
+                source_passage_id="passage-1",
+                source_note_id=note.note_id,
+                assertion_start=5,
+                assertion_end=47,
+                subject_start=5,
+                subject_end=9,
+                object_start=34,
+                object_end=40,
+                confidence=0.9,
+                extraction_method="fake",
+                schema_id="s1",
+                observed_at=10.0,
+                valid_from=None,
+                valid_to=None,
+                invalidated_at=None,
+                superseded_by=None,
+                status="active",
+                build_id="build-1",
+            )
+        )
+
+        contexts = store.fact_contexts()
+        assert len(contexts) == 1
+        assert contexts[0].assertion == text[5:47]
+    finally:
+        store.close()

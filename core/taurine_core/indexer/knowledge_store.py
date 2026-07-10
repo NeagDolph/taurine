@@ -1119,19 +1119,27 @@ class KnowledgeStore:
             end = int(row["assertion_end"])
             passage_start = int(row["passage_start"])
             passage_end = int(row["passage_end"])
-            if not passage_start <= start < end <= passage_end:
+            # Spec §6.4: an assertion may straddle adjacent passages and is
+            # kept on the earlier one, so require overlap — not containment —
+            # and verify the overlapping slice maps exactly.
+            overlap_start = max(start, passage_start)
+            overlap_end = min(end, passage_end)
+            if not (0 <= start < end) or overlap_start >= overlap_end:
                 raise ValueError(
-                    f"fact {row['fact_id']} assertion [{start}, {end}) is outside "
-                    f"passage [{passage_start}, {passage_end})"
+                    f"fact {row['fact_id']} assertion [{start}, {end}) does not "
+                    f"overlap passage [{passage_start}, {passage_end})"
                 )
-            local_start = start - passage_start
-            local_end = end - passage_start
-            assertion = str(row["passage_text"])[local_start:local_end]
-            note_assertion = str(row["note_text"])[start:end]
-            if assertion != note_assertion:
+            note_text = str(row["note_text"])
+            passage_slice = str(row["passage_text"])[
+                overlap_start - passage_start : overlap_end - passage_start
+            ]
+            if passage_slice != note_text[overlap_start:overlap_end]:
                 raise ValueError(
                     f"fact {row['fact_id']} assertion does not map exactly from note to passage"
                 )
+            # The full assertion comes from the note text, which always
+            # contains it even when the span extends past the passage.
+            assertion = note_text[start:end]
             predicate = str(row["predicate"])
             spec = PREDICATES.get(predicate)
             if spec is None:
