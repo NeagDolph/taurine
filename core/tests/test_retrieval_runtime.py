@@ -67,3 +67,64 @@ def test_runtime_checks_manifests_and_publishes_new_complete_build(
     assert runtime.snapshot.build_id == second.build_id
     assert engine.snapshot.build_id == first.build_id
     runtime.close()
+
+
+def test_entity_resolver_output_flows_through_query_entity_head(
+    tmp_path, monkeypatch
+) -> None:
+    """Regression: chat/live died with 'RawHeadCandidate' has no 'entity_id'.
+
+    The runtime resolver must return the plain-sequence shape that
+    heads._resolution_candidates passes through untouched.
+    """
+    from taurine_core.retrieval.heads import QueryEntityHead, RawHeadCandidate
+    from taurine_core.schemas import ExtractedMention, Extraction
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {
+            "n1": Extraction(
+                mentions=[
+                    ExtractedMention(
+                        surface="Maya",
+                        etype="person",
+                        confidence=0.95,
+                        char_start=0,
+                        char_end=4,
+                        extractor="fake",
+                        schema_id="s1",
+                    )
+                ],
+                schema_id="s1",
+            )
+        }
+
+    database = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=_embed, embedding_dim=16, extractor=extractor
+        )
+    ).build([make_note("n1", "Maya", "Maya owns the launch.")], database, replace_derived=True)
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_pair_reranker",
+        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
+    )
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_nli_scorer",
+        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
+    )
+
+    runtime = RetrievalRuntime(database)
+    for mode in ("chat", "live"):
+        engine = runtime.make_engine(mode, EvidenceRegistry())
+        resolution = engine.entity_resolver("Maya", "person", "who is maya?")
+        assert isinstance(resolution, tuple)
+        assert all(isinstance(row, RawHeadCandidate) for row in resolution)
+        assert len(resolution) == 1
+        assert resolution[0].raw_score == 1.0
+
+        result = QueryEntityHead(engine.entity_resolver, engine.calibrator).search(
+            "who is maya?", (("Maya", "person"), ("Unknown Widget", None))
+        )
+        hits = list(result.accepted) + list(result.rejected)
+        assert [hit.target_id for hit in hits] == [resolution[0].target_id]

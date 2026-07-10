@@ -305,7 +305,9 @@ def _resolution_candidates(
     status = getattr(resolution, "status", "missing")
     source_candidates = getattr(resolution, "candidates", ())
     candidates = tuple(
-        RawHeadCandidate(
+        candidate
+        if isinstance(candidate, RawHeadCandidate)
+        else RawHeadCandidate(
             target_kind="entity",
             target_id=str(candidate.entity_id),
             raw_score=float(candidate.score),

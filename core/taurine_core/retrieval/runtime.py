@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Any, Sequence
@@ -47,12 +46,6 @@ class _UnavailablePairScorer:
     ) -> Sequence[float]:
         del query, documents, instruction, deadline_at
         raise LocalModelUnavailable("bundled local reranker is unavailable")
-
-
-@dataclass(frozen=True)
-class _EntityResolution:
-    candidates: tuple[RawHeadCandidate, ...]
-    ambiguous: bool
 
 
 class RetrievalRuntime:
@@ -234,7 +227,10 @@ class RetrievalRuntime:
         surface: str,
         etype: str | None,
         query: str,
-    ) -> _EntityResolution:
+    ) -> tuple[RawHeadCandidate, ...]:
+        # Returns a plain sequence: heads._resolution_candidates treats a
+        # sequence as ready-made RawHeadCandidates and derives ambiguity from
+        # len != 1, which matches this resolver's semantics exactly.
         del query
         normalized = surface.strip().casefold()
         ids = tuple(snapshot.alias_index.get(normalized, ()))
@@ -266,7 +262,7 @@ class RetrievalRuntime:
                 if entity_id in contexts
                 and contexts[entity_id].etype.casefold().replace("-", "_") == requested
             )
-        candidates = tuple(
+        return tuple(
             RawHeadCandidate(
                 "entity",
                 entity_id,
@@ -276,7 +272,6 @@ class RetrievalRuntime:
             for entity_id in ids
             if entity_id in contexts
         )
-        return _EntityResolution(candidates, len(candidates) != 1)
 
 
 def _fuzzy_alias_allowed(surface: str, alias: str) -> bool:
