@@ -242,12 +242,25 @@ const EXAMPLE_PROMPTS = [
   'Who owns SMS compliance and what is still open?'
 ]
 
+export interface ChatSeedRequest {
+  noteId: string
+  title: string
+  nonce: number
+}
+
 interface ChatViewProps {
   visible: boolean
   onOpenNote: (noteId: string) => void
+  onShowInMap: (noteId: string) => void
+  seedRequest: ChatSeedRequest | null
 }
 
-export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Element {
+export function ChatView({
+  visible,
+  onOpenNote,
+  onShowInMap,
+  seedRequest
+}: ChatViewProps): React.JSX.Element {
   const clientRef = useRef<ChatClient | null>(null)
   const [state, dispatch] = useReducer(reducer, {
     chats: [],
@@ -263,11 +276,28 @@ export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Elem
   const threadRef = useRef<HTMLDivElement | null>(null)
   const pinnedToBottom = useRef(true)
   const [showJump, setShowJump] = useState(false)
+  // "Ask about this" from the map: seed ids applied to the next new-chat send
+  const seedIdsRef = useRef<string[]>([])
+  const processedSeedNonceRef = useRef(0)
+  const [composerDraft, setComposerDraft] = useState<{ text: string; nonce: number } | null>(null)
 
   // one-way latch, adjusted during render (no effect needed)
   if (visible && !everVisible) {
     setEverVisible(true)
   }
+
+  useEffect(() => {
+    if (!seedRequest || seedRequest.nonce === processedSeedNonceRef.current) {
+      return
+    }
+    processedSeedNonceRef.current = seedRequest.nonce
+    seedIdsRef.current = [seedRequest.noteId]
+    dispatch({ kind: 'select', chatId: null })
+    setComposerDraft({
+      text: `Tell me about "${seedRequest.title}"`,
+      nonce: seedRequest.nonce
+    })
+  }, [seedRequest])
 
   // lazy ws + chat list on first tab focus; connection persists afterwards
   useEffect(() => {
@@ -346,12 +376,14 @@ export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Elem
         }
         dispatch({ kind: 'local_user_message', chatId: activeChatId, text })
       } else {
-        if (!client.send('', text)) {
+        // a new chat opened from the map carries seed_note_ids on its first turn
+        if (!client.send('', text, seedIdsRef.current)) {
           setToast('Not connected')
           return
         }
         dispatch({ kind: 'pending_send', text })
       }
+      seedIdsRef.current = []
     },
     [activeChatId]
   )
@@ -411,8 +443,14 @@ export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Elem
         chats={state.chats}
         activeChatId={activeChatId}
         streamingChatIds={streamingChatIds}
-        onSelect={(chatId) => dispatch({ kind: 'select', chatId })}
-        onNewChat={() => dispatch({ kind: 'select', chatId: null })}
+        onSelect={(chatId) => {
+          seedIdsRef.current = []
+          dispatch({ kind: 'select', chatId })
+        }}
+        onNewChat={() => {
+          seedIdsRef.current = []
+          dispatch({ kind: 'select', chatId: null })
+        }}
         onRename={renameChat}
         onDelete={removeChat}
       />
@@ -455,6 +493,7 @@ export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Elem
                     message={message}
                     isLast={message.id === lastAssistantId}
                     onOpenNote={onOpenNote}
+                    onShowInMap={onShowInMap}
                     onRegenerate={regenerate}
                   />
                 )
@@ -464,6 +503,7 @@ export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Elem
                   streaming={streaming}
                   isLast={false}
                   onOpenNote={onOpenNote}
+                  onShowInMap={onShowInMap}
                   onRegenerate={regenerate}
                   onRetry={regenerate}
                 />
@@ -483,6 +523,7 @@ export function ChatView({ visible, onOpenNote }: ChatViewProps): React.JSX.Elem
           onSend={sendMessage}
           onStop={stopStreaming}
           focusKey={activeChatId}
+          draft={composerDraft}
         />
 
         {toast ? (

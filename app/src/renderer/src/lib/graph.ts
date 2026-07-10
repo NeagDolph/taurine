@@ -2,8 +2,11 @@ import { SIDECAR_PORT, type RetrievalEvent } from './sidecar'
 
 export const NOW_NODE_ID = '__taurine_now__'
 export const SIDECAR_GRAPH_URL = `http://127.0.0.1:${SIDECAR_PORT}/graph`
+export const SIDECAR_GRAPH_LOCAL_URL = `http://127.0.0.1:${SIDECAR_PORT}/graph/local`
+export const SIDECAR_FACTS_URL = `http://127.0.0.1:${SIDECAR_PORT}/facts`
 export const LIVE_EDGE_FADE_MS = 3000
 export const TOUCH_FLASH_MS = 1800
+export const FACTS_FETCH_CAP = 50
 
 export type GraphEdgeType = 'semantic' | 'topic' | 'entity' | 'mixed'
 
@@ -13,6 +16,16 @@ export interface GraphNode {
   degree: number
   source: string
   gist: string
+  /** unix seconds, 0 when unknown */
+  created: number
+  /** unix seconds, 0 when unknown */
+  modified: number
+  folder: string
+  /** stable label-propagation community id, -1 = none */
+  community: number
+  value_score: number
+  /** top traversal-eligible canonical entity labels */
+  entities: string[]
 }
 
 export interface GraphEdge {
@@ -22,11 +35,30 @@ export interface GraphEdge {
   weight: number
   shared: string[]
   fact: string
+  fact_provenance: string
+  fact_ids: string[]
+  /** {"semantic": w, "entity": w, "fact": w} */
+  mechanisms: Record<string, number>
 }
 
 export interface GraphResponse {
   nodes: GraphNode[]
   edges: GraphEdge[]
+}
+
+export interface LocalGraphResponse extends GraphResponse {
+  center: string
+  depth: number
+}
+
+export interface FactRecord {
+  fact_id: string
+  subject: string
+  predicate: string
+  object: string
+  source_note_id: string
+  confidence: number
+  observed_at: number
 }
 
 export type MapNodeKind = 'note' | 'now'
@@ -39,6 +71,12 @@ export interface MapNode {
   degree: number
   source: string
   gist: string
+  created: number
+  modified: number
+  folder: string
+  community: number
+  value_score: number
+  entities: string[]
   kind: MapNodeKind
   val: number
   fx?: number
@@ -58,6 +96,9 @@ export interface StaticGraphLink {
   weight: number
   shared: string[]
   fact: string
+  factProvenance: string
+  factIds: string[]
+  mechanisms: Record<string, number>
 }
 
 export interface LiveRankLink {
@@ -111,21 +152,107 @@ export function parseGraphResponse(value: unknown): GraphResponse {
   return { nodes, edges }
 }
 
-export function graphResponseToMapData(response: GraphResponse, nowLabel: string): MapGraphData {
+export async function fetchLocalGraph(
+  center: string,
+  depth: number,
+  url: string = SIDECAR_GRAPH_LOCAL_URL,
+  fetcher: typeof fetch = globalThis.fetch
+): Promise<LocalGraphResponse> {
+  const boundedDepth = Math.max(1, Math.min(3, Math.round(depth)))
+  const response = await fetcher(
+    `${url}?center=${encodeURIComponent(center)}&depth=${boundedDepth}`
+  )
+  if (!response.ok) {
+    throw new Error(`Local graph fetch failed with HTTP ${response.status}`)
+  }
+
+  return parseLocalGraphResponse(await response.json(), center, boundedDepth)
+}
+
+export function parseLocalGraphResponse(
+  value: unknown,
+  fallbackCenter: string,
+  fallbackDepth: number
+): LocalGraphResponse {
+  const record = asRecord(value)
+  const graph = parseGraphResponse(value)
+  return {
+    ...graph,
+    center: typeof record?.center === 'string' ? record.center : fallbackCenter,
+    depth: typeof record?.depth === 'number' ? record.depth : fallbackDepth
+  }
+}
+
+export async function fetchFacts(
+  ids: string[],
+  url: string = SIDECAR_FACTS_URL,
+  fetcher: typeof fetch = globalThis.fetch
+): Promise<FactRecord[]> {
+  const unique = [...new Set(ids.filter((id) => id.length > 0))].slice(0, FACTS_FETCH_CAP)
+  if (unique.length === 0) {
+    return []
+  }
+
+  const response = await fetcher(`${url}?ids=${encodeURIComponent(unique.join(','))}`)
+  if (!response.ok) {
+    throw new Error(`Facts fetch failed with HTTP ${response.status}`)
+  }
+
+  return parseFactsResponse(await response.json())
+}
+
+export function parseFactsResponse(value: unknown): FactRecord[] {
+  const record = asRecord(value)
+  if (!record || !Array.isArray(record.facts)) {
+    return []
+  }
+
+  const facts: FactRecord[] = []
+  for (const row of record.facts) {
+    const fact = parseFactRecord(row)
+    if (fact) {
+      facts.push(fact)
+    }
+  }
+  return facts
+}
+
+export interface GraphToMapOptions {
+  /** include the pinned live "Now" node (global map); ego graphs omit it */
+  includeNow?: boolean
+}
+
+export function graphResponseToMapData(
+  response: GraphResponse,
+  nowLabel: string,
+  options: GraphToMapOptions = {}
+): MapGraphData {
+  const includeNow = options.includeNow !== false
   const nodeIds = new Set(response.nodes.map((node) => node.note_id))
+  const nowNodes: MapNode[] = includeNow
+    ? [
+        {
+          id: NOW_NODE_ID,
+          title: 'Now',
+          label: nowLabel || 'Now',
+          degree: 0,
+          source: 'live',
+          gist: '',
+          created: 0,
+          modified: 0,
+          folder: '',
+          community: -1,
+          value_score: 0,
+          entities: [],
+          kind: 'now',
+          val: nodeRadius(9),
+          fx: 0,
+          fy: -90
+        }
+      ]
+    : []
   const nodes: MapNode[] = [
-    {
-      id: NOW_NODE_ID,
-      title: 'Now',
-      label: nowLabel || 'Now',
-      degree: 0,
-      source: 'live',
-      gist: '',
-      kind: 'now',
-      val: nodeRadius(9),
-      fx: 0,
-      fy: -90
-    },
+    ...nowNodes,
     ...response.nodes.map((node) => ({
       id: node.note_id,
       note_id: node.note_id,
@@ -134,6 +261,12 @@ export function graphResponseToMapData(response: GraphResponse, nowLabel: string
       degree: node.degree,
       source: node.source,
       gist: node.gist,
+      created: node.created,
+      modified: node.modified,
+      folder: node.folder,
+      community: node.community,
+      value_score: node.value_score,
+      entities: [...node.entities],
       kind: 'note' as const,
       val: nodeRadius(node.degree)
     }))
@@ -149,10 +282,86 @@ export function graphResponseToMapData(response: GraphResponse, nowLabel: string
       edgeType: edge.type,
       weight: edge.weight,
       shared: [...edge.shared],
-      fact: edge.fact
+      fact: edge.fact,
+      factProvenance: edge.fact_provenance,
+      factIds: [...edge.fact_ids],
+      mechanisms: { ...edge.mechanisms }
     }))
 
   return { nodes, links }
+}
+
+/**
+ * Client-side BFS fallback for ego mode: builds a local subgraph from the
+ * already-loaded global map when GET /graph/local is unavailable (older
+ * backend). Node objects are cloned so ego-layout simulation does not disturb
+ * the global layout; positions are copied as starting seeds.
+ */
+export function localSubgraphFromMapData(
+  data: MapGraphData,
+  center: string,
+  depth: number
+): MapGraphData {
+  const adjacency = new Map<string, Set<string>>()
+  const staticLinks = data.links.filter((link): link is StaticGraphLink => link.kind === 'static')
+  for (const link of staticLinks) {
+    const src = linkEndpointId(link.source)
+    const dst = linkEndpointId(link.target)
+    if (!src || !dst) continue
+    if (!adjacency.has(src)) adjacency.set(src, new Set())
+    if (!adjacency.has(dst)) adjacency.set(dst, new Set())
+    adjacency.get(src)?.add(dst)
+    adjacency.get(dst)?.add(src)
+  }
+
+  const included = new Set<string>([center])
+  let frontier = [center]
+  for (let hop = 0; hop < depth; hop += 1) {
+    const next: string[] = []
+    for (const nodeId of frontier) {
+      for (const neighbor of adjacency.get(nodeId) ?? []) {
+        if (!included.has(neighbor)) {
+          included.add(neighbor)
+          next.push(neighbor)
+        }
+      }
+    }
+    frontier = next
+  }
+
+  const nodes = data.nodes
+    .filter((node) => node.kind === 'note' && included.has(node.id))
+    .map((node) => ({ ...node }))
+  const links: StaticGraphLink[] = []
+  for (const link of staticLinks) {
+    const src = linkEndpointId(link.source)
+    const dst = linkEndpointId(link.target)
+    if (!src || !dst || !included.has(src) || !included.has(dst)) {
+      continue
+    }
+    links.push({
+      ...link,
+      source: src,
+      target: dst,
+      shared: [...link.shared],
+      factIds: [...link.factIds],
+      mechanisms: { ...link.mechanisms }
+    })
+  }
+
+  return { nodes, links }
+}
+
+/** Endpoint id from a link source/target that force-graph may have objectified. */
+export function linkEndpointId(value: unknown): string | null {
+  if (typeof value === 'string' || typeof value === 'number') {
+    return String(value)
+  }
+  const record = asRecord(value)
+  if (!record || record.id === undefined) {
+    return null
+  }
+  return String(record.id as string | number)
 }
 
 /**
@@ -259,6 +468,48 @@ export function rankColor(rank: number, totalRanks: number): string {
   return mixHex('#ffd75e', '#5f7690', t)
 }
 
+export function communityColor(community: number): string {
+  if (community < 0) {
+    return COMMUNITY_NONE_COLOR
+  }
+
+  return COMMUNITY_PALETTE[community % COMMUNITY_PALETTE.length]
+}
+
+/** Recency lens: warm (recent) → cool (old). Unknown timestamps are neutral gray. */
+export function recencyColor(timestamp: number, minTs: number, maxTs: number): string {
+  if (timestamp <= 0 || maxTs <= minTs) {
+    return RECENCY_UNKNOWN_COLOR
+  }
+
+  const t = clamp((timestamp - minTs) / (maxTs - minTs), 0, 1)
+  return mixHex(RECENCY_OLD_COLOR, RECENCY_NEW_COLOR, t)
+}
+
+export const RECENCY_OLD_COLOR = '#48628a'
+export const RECENCY_NEW_COLOR = '#ffb454'
+export const RECENCY_UNKNOWN_COLOR = '#55585f'
+
+const COMMUNITY_NONE_COLOR = '#5a5e66'
+const COMMUNITY_PALETTE = [
+  '#7aa7ff',
+  '#5fd18d',
+  '#f0a35e',
+  '#c99cff',
+  '#6dd6d6',
+  '#ff8da1',
+  '#e4d96f',
+  '#8edfd2',
+  '#ff9d6b',
+  '#9cc7d8',
+  '#b7e07a',
+  '#d98cd6',
+  '#7fc4ff',
+  '#f2b8c6',
+  '#a3a8f0',
+  '#8fd6a8'
+]
+
 export function sourceColor(source: string): string {
   const knownSourceColor = SOURCE_COLORS[source]
   if (knownSourceColor) {
@@ -313,7 +564,13 @@ function parseGraphNode(value: unknown): GraphNode {
     title: record.title,
     degree: record.degree,
     source: typeof record.source === 'string' ? record.source : 'apple_notes',
-    gist: typeof record.gist === 'string' ? record.gist : ''
+    gist: typeof record.gist === 'string' ? record.gist : '',
+    created: typeof record.created === 'number' ? record.created : 0,
+    modified: typeof record.modified === 'number' ? record.modified : 0,
+    folder: typeof record.folder === 'string' ? record.folder : '',
+    community: typeof record.community === 'number' ? Math.trunc(record.community) : -1,
+    value_score: typeof record.value_score === 'number' ? record.value_score : 0,
+    entities: stringArray(record.entities)
   }
 }
 
@@ -337,8 +594,49 @@ function parseGraphEdge(value: unknown): GraphEdge {
     type: record.type,
     weight: record.weight,
     shared: record.shared,
-    fact: typeof record.fact === 'string' ? record.fact : ''
+    fact: typeof record.fact === 'string' ? record.fact : '',
+    fact_provenance: typeof record.fact_provenance === 'string' ? record.fact_provenance : '',
+    fact_ids: stringArray(record.fact_ids),
+    mechanisms: numberRecord(record.mechanisms)
   }
+}
+
+function parseFactRecord(value: unknown): FactRecord | null {
+  const record = asRecord(value)
+  if (!record || typeof record.fact_id !== 'string') {
+    return null
+  }
+
+  return {
+    fact_id: record.fact_id,
+    subject: typeof record.subject === 'string' ? record.subject : '',
+    predicate: typeof record.predicate === 'string' ? record.predicate : '',
+    object: typeof record.object === 'string' ? record.object : '',
+    source_note_id: typeof record.source_note_id === 'string' ? record.source_note_id : '',
+    confidence: typeof record.confidence === 'number' ? record.confidence : 0,
+    observed_at: typeof record.observed_at === 'number' ? record.observed_at : 0
+  }
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : []
+}
+
+function numberRecord(value: unknown): Record<string, number> {
+  const record = asRecord(value)
+  if (!record) {
+    return {}
+  }
+
+  const result: Record<string, number> = {}
+  for (const [key, entry] of Object.entries(record)) {
+    if (typeof entry === 'number') {
+      result[key] = entry
+    }
+  }
+  return result
 }
 
 function isGraphEdgeType(value: unknown): value is GraphEdgeType {

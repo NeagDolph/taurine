@@ -25,6 +25,7 @@ interface AssistantTurnProps {
   streaming?: StreamingTurn // in-flight form
   isLast: boolean
   onOpenNote: (noteId: string) => void
+  onShowInMap?: (noteId: string) => void
   onRegenerate: () => void
   onRetry?: () => void
 }
@@ -34,6 +35,7 @@ export function AssistantTurn({
   streaming,
   isLast,
   onOpenNote,
+  onShowInMap,
   onRegenerate,
   onRetry
 }: AssistantTurnProps): React.JSX.Element {
@@ -140,6 +142,7 @@ export function AssistantTurn({
           consultedIds={consultedIds.length > 0 ? consultedIds : retrievedIds}
           isLast={isLast}
           onOpenNote={onOpenNote}
+          onShowInMap={onShowInMap}
           onRegenerate={onRegenerate}
         />
       ) : null}
@@ -196,6 +199,7 @@ function TurnFooter({
   consultedIds,
   isLast,
   onOpenNote,
+  onShowInMap,
   onRegenerate
 }: {
   message: ChatMessage
@@ -204,6 +208,7 @@ function TurnFooter({
   consultedIds: string[]
   isLast: boolean
   onOpenNote: (noteId: string) => void
+  onShowInMap?: (noteId: string) => void
   onRegenerate: () => void
 }): React.JSX.Element {
   const [copied, setCopied] = useState(false)
@@ -258,22 +263,34 @@ function TurnFooter({
       {allVisible.length > 0 ? (
         <div className="turn-sources">
           {visibleSources.map((item) => (
-            <button
-              key={item.note_id}
-              className="source-pill"
-              type="button"
-              title={item.title}
-              onClick={() => onOpenNote(item.note_id)}
-            >
-              <span className="citation-chip citation-note">{item.note_ref}</span>
-              <span className="source-pill-title">{item.title}</span>
-              <span className={`source-chip source-${item.source}`}>
-                {sourceLabel(item.source)}
-              </span>
-              <span className="source-state">
-                {sourceNotes.includes(item) ? 'source' : 'consulted'}
-              </span>
-            </button>
+            <span className="map-pill-wrap" key={item.note_id}>
+              <button
+                className="source-pill"
+                type="button"
+                title={item.title}
+                onClick={() => onOpenNote(item.note_id)}
+              >
+                <span className="citation-chip citation-note">{item.note_ref}</span>
+                <span className="source-pill-title">{item.title}</span>
+                <span className={`source-chip source-${item.source}`}>
+                  {sourceLabel(item.source)}
+                </span>
+                <span className="source-state">
+                  {sourceNotes.includes(item) ? 'source' : 'consulted'}
+                </span>
+              </button>
+              {onShowInMap ? (
+                <button
+                  className="map-cite-btn"
+                  type="button"
+                  title="Show in map"
+                  aria-label={`Show ${item.title} in map`}
+                  onClick={() => onShowInMap(item.note_id)}
+                >
+                  ⌖
+                </button>
+              ) : null}
+            </span>
           ))}
           {allVisible.length > 4 && !sourcesExpanded ? (
             <button className="turn-action" type="button" onClick={() => setSourcesExpanded(true)}>

@@ -23,16 +23,18 @@ import {
   type TranscriptEvent
 } from './lib/sidecar'
 import { UpdatesClient } from './lib/updates'
-import { ChatView } from './views/ChatView'
+import { ChatView, type ChatSeedRequest } from './views/ChatView'
 import { ConnectorsView } from './views/ConnectorsView'
 import { DataView } from './views/DataView'
 import { FeedView, type FeedTranscript } from './views/FeedView'
+import { MapView, type MapFocusRequest } from './views/map/MapView'
 
-type MainTab = 'live' | 'chat' | 'data' | 'connectors'
+type MainTab = 'live' | 'chat' | 'map' | 'data' | 'connectors'
 
 const MAIN_TABS: Array<{ id: MainTab; label: string }> = [
   { id: 'live', label: 'Live' },
   { id: 'chat', label: 'Chat' },
+  { id: 'map', label: 'Map' },
   { id: 'data', label: 'Data' },
   { id: 'connectors', label: 'Connectors' }
 ]
@@ -65,6 +67,8 @@ function App(): React.JSX.Element {
   const [actionables, setActionables] = useState<Actionable[]>([])
   const [groundedNoteIds, setGroundedNoteIds] = useState<string[]>([])
   const [lastRetrieval, setLastRetrieval] = useState<RetrievalEvent | null>(null)
+  const [mapFocus, setMapFocus] = useState<MapFocusRequest | null>(null)
+  const [chatSeed, setChatSeed] = useState<ChatSeedRequest | null>(null)
 
   useEffect(() => {
     const client = new SidecarClient()
@@ -253,6 +257,18 @@ function App(): React.JSX.Element {
     clientRef.current?.openNote(noteId)
   }, [])
 
+  // citation chips / chat source pills → center + pulse that node on the map
+  const showInMap = useCallback((noteId: string) => {
+    setMapFocus((current) => ({ noteId, nonce: (current?.nonce ?? 0) + 1 }))
+    setActiveTab('map')
+  }, [])
+
+  // map "Ask about this" → new chat seeded with the note, composer prefilled
+  const askAboutNote = useCallback((noteId: string, title: string) => {
+    setChatSeed((current) => ({ noteId, title, nonce: (current?.nonce ?? 0) + 1 }))
+    setActiveTab('chat')
+  }, [])
+
   // The single global sync action: the POST returns 202 immediately and
   // progress streams back over /updates and status events.
   const syncIndex = useCallback(async () => {
@@ -331,7 +347,7 @@ function App(): React.JSX.Element {
         <div aria-hidden={activeTab !== 'live'} style={viewLayerStyle(activeTab === 'live')}>
           <div className="page live-page">
             <div className="summary-row">
-              <SummaryPanel summary={summary} onOpenNote={openNote} />
+              <SummaryPanel summary={summary} onOpenNote={openNote} onShowInMap={showInMap} />
               <ActionableRail
                 actionables={actionables}
                 evidence={summary?.evidence ?? null}
@@ -361,19 +377,29 @@ function App(): React.JSX.Element {
         </div>
 
         <div aria-hidden={activeTab !== 'chat'} style={viewLayerStyle(activeTab === 'chat')}>
-          <ChatView visible={activeTab === 'chat'} onOpenNote={openNote} />
+          <ChatView
+            visible={activeTab === 'chat'}
+            onOpenNote={openNote}
+            onShowInMap={showInMap}
+            seedRequest={chatSeed}
+          />
+        </div>
+
+        <div aria-hidden={activeTab !== 'map'} style={viewLayerStyle(activeTab === 'map')}>
+          <MapView
+            latestFinalText={latestFinalText}
+            groundedNoteIds={groundedNoteIds}
+            refreshKey={graphVersion}
+            retrieval={lastRetrieval}
+            visible={activeTab === 'map'}
+            focusRequest={mapFocus}
+            onOpenNote={openNote}
+            onAskAbout={askAboutNote}
+          />
         </div>
 
         <div aria-hidden={activeTab !== 'data'} style={viewLayerStyle(activeTab === 'data')}>
-          <DataView
-            latestFinalText={latestFinalText}
-            groundedNoteIds={groundedNoteIds}
-            profile={profile}
-            onProfileChange={setProfile}
-            refreshKey={graphVersion}
-            retrieval={lastRetrieval}
-            visible={activeTab === 'data'}
-          />
+          <DataView profile={profile} onProfileChange={setProfile} />
         </div>
 
         <div

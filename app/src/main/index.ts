@@ -3,8 +3,6 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 
-let previewWindow: BrowserWindow | null = null
-
 if (is.dev) {
   // dev-only: lets tooling attach to the real renderer for debugging
   app.commandLine.appendSwitch('remote-debugging-port', '9223')
@@ -13,10 +11,10 @@ if (is.dev) {
 function createWindow(): void {
   // Create the browser window.
   const mainWindow = new BrowserWindow({
-    width: 1360,
-    height: 860,
-    minWidth: 980,
-    minHeight: 640,
+    width: 1500,
+    height: 950,
+    minWidth: 1180,
+    minHeight: 760,
     show: false,
     autoHideMenuBar: true,
     ...(process.platform === 'linux' ? { icon } : {}),
@@ -38,60 +36,13 @@ function createWindow(): void {
   loadRenderer(mainWindow)
 }
 
-function openPreviewWindow(noteId: string): void {
-  const hash = `/preview/${encodeURIComponent(noteId)}`
-
-  if (previewWindow && !previewWindow.isDestroyed()) {
-    loadRenderer(previewWindow, hash)
-    if (previewWindow.isMinimized()) {
-      previewWindow.restore()
-    }
-    previewWindow.show()
-    previewWindow.focus()
-    return
-  }
-
-  previewWindow = new BrowserWindow({
-    width: 520,
-    height: 680,
-    minWidth: 420,
-    minHeight: 520,
-    show: false,
-    autoHideMenuBar: true,
-    backgroundColor: '#0b0b0c',
-    ...(process.platform === 'linux' ? { icon } : {}),
-    webPreferences: {
-      preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
-    }
-  })
-
-  previewWindow.on('ready-to-show', () => {
-    previewWindow?.show()
-  })
-
-  previewWindow.on('closed', () => {
-    previewWindow = null
-  })
-
-  previewWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
-    return { action: 'deny' }
-  })
-
-  loadRenderer(previewWindow, hash)
-}
-
-function loadRenderer(window: BrowserWindow, hash?: string): void {
+function loadRenderer(window: BrowserWindow): void {
   // HMR for renderer base on electron-vite cli.
   // Load the remote URL for development or the local html file for production.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    const rendererUrl = hash
-      ? `${process.env['ELECTRON_RENDERER_URL']}#${hash}`
-      : process.env['ELECTRON_RENDERER_URL']
-    window.loadURL(rendererUrl)
+    window.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
-    window.loadFile(join(__dirname, '../renderer/index.html'), hash ? { hash } : undefined)
+    window.loadFile(join(__dirname, '../renderer/index.html'))
   }
 }
 
@@ -124,14 +75,6 @@ app.whenReady().then(() => {
       : await dialog.showOpenDialog(options)
     return result.canceled ? null : (result.filePaths[0] ?? null)
   })
-  ipcMain.handle('preview:open', (_event, noteId: unknown) => {
-    if (typeof noteId !== 'string' || noteId.length === 0) {
-      throw new Error('Invalid preview note id')
-    }
-
-    openPreviewWindow(noteId)
-  })
-
   createWindow()
 
   app.on('activate', function () {

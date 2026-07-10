@@ -3,7 +3,6 @@ import { electronAPI } from '@electron-toolkit/preload'
 
 // Custom APIs for renderer
 const api = {
-  openPreview: (noteId: string): Promise<void> => ipcRenderer.invoke('preview:open', noteId),
   chooseDirectory: (): Promise<string | null> => ipcRenderer.invoke('dialog:choose-directory')
 }
 

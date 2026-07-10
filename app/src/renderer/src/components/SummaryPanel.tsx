@@ -5,6 +5,7 @@ import type { SummaryEvent } from '../lib/sidecar'
 interface SummaryPanelProps {
   summary: SummaryEvent | null
   onOpenNote: (noteId: string) => void
+  onShowInMap?: (noteId: string) => void
 }
 
 const CITATION_RE = /\[((?:N|E|F|P|T)\d+)\]/g
@@ -15,7 +16,11 @@ function citationsToLinks(md: string): string {
   return md.replace(CITATION_RE, (_match, id: string) => `[${id}](citation:${id})`)
 }
 
-export function SummaryPanel({ summary, onOpenNote }: SummaryPanelProps): React.JSX.Element {
+export function SummaryPanel({
+  summary,
+  onOpenNote,
+  onShowInMap
+}: SummaryPanelProps): React.JSX.Element {
   const byShortId = useMemo(() => {
     const map = new Map<string, { title: string; noteId: string }>()
     if (!summary) {
@@ -64,15 +69,29 @@ export function SummaryPanel({ summary, onOpenNote }: SummaryPanelProps): React.
                   const id = href.slice('citation:'.length)
                   const target = byShortId.get(id)
                   const kind = id.startsWith('F') ? 'fact' : id.startsWith('E') ? 'passage' : 'note'
+                  const noteId = target?.noteId ?? ''
                   return (
-                    <button
-                      className={`citation-chip citation-${kind}`}
-                      type="button"
-                      title={target?.title ?? id}
-                      onClick={() => target?.noteId && onOpenNote(target.noteId)}
-                    >
-                      {id}
-                    </button>
+                    <span className="map-cite-wrap">
+                      <button
+                        className={`citation-chip citation-${kind}`}
+                        type="button"
+                        title={target?.title ?? id}
+                        onClick={() => noteId && onOpenNote(noteId)}
+                      >
+                        {id}
+                      </button>
+                      {onShowInMap && noteId ? (
+                        <button
+                          className="map-cite-btn"
+                          type="button"
+                          title="Show in map"
+                          aria-label={`Show ${target?.title ?? id} in map`}
+                          onClick={() => onShowInMap(noteId)}
+                        >
+                          ⌖
+                        </button>
+                      ) : null}
+                    </span>
                   )
                 }
                 return (

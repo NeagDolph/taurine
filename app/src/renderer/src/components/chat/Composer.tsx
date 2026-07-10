@@ -6,6 +6,7 @@ interface ComposerProps {
   onSend: (text: string) => void
   onStop: () => void
   focusKey: string | null // refocus when the active chat changes
+  draft?: { text: string; nonce: number } | null // prefill (e.g. map "Ask about this")
 }
 
 export function Composer({
@@ -13,14 +14,37 @@ export function Composer({
   streaming,
   onSend,
   onStop,
-  focusKey
+  focusKey,
+  draft
 }: ComposerProps): React.JSX.Element {
   const [text, setText] = useState('')
+  const [appliedDraftNonce, setAppliedDraftNonce] = useState(0)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+
+  // draft prefill (e.g. map "Ask about this") — applied during render, like a
+  // derived-state latch, so the textarea carries the text on this commit
+  if (draft && draft.nonce !== appliedDraftNonce) {
+    setAppliedDraftNonce(draft.nonce)
+    setText(draft.text)
+  }
 
   useEffect(() => {
     textareaRef.current?.focus()
   }, [focusKey])
+
+  // resize/focus once the prefilled value has been committed to the DOM
+  useEffect(() => {
+    if (appliedDraftNonce === 0) {
+      return
+    }
+    const node = textareaRef.current
+    if (node) {
+      node.style.height = 'auto'
+      node.style.height = `${Math.min(node.scrollHeight, 8 * 24 + 16)}px`
+      node.focus()
+      node.setSelectionRange(node.value.length, node.value.length)
+    }
+  }, [appliedDraftNonce])
 
   const submit = (): void => {
     const trimmed = text.trim()
