@@ -509,11 +509,13 @@ class NotePreview(BaseModel):
     neighbors: list[NeighborRef] = []
 
 
-class ReenrichStatus(BaseModel):
-    running: bool
-    phase: Literal["idle", "notes", "finalizing", "clean_build"] = "idle"
-    done: int = 0
-    total: int = 0
+class SyncStatus(BaseModel):
+    """Progress of the single user-triggered sync-and-index job."""
+
+    running: bool = False
+    phase: Literal["idle", "syncing", "indexing"] = "idle"
+    detail: str = ""
+    error: str = ""
 
 
 class StartupStatus(BaseModel):
@@ -549,7 +551,7 @@ class ProfileGenerationStatus(BaseModel):
 class IndexStatus(BaseModel):
     notes: int
     last_sync: Optional[float] = None
-    reenrich: Optional[ReenrichStatus] = None
+    sync: Optional[SyncStatus] = None
 
 
 class StatusEvent(BaseModel):

@@ -2,24 +2,22 @@ import {
   deleteConnectorData,
   disableConnector,
   enableConnector,
-  syncAllConnectors,
-  syncConnector,
   updateConnectorConfig,
-  type ConnectorInfo
+  type ConnectorInfo,
+  type SyncStatus
 } from '../lib/sidecar'
 import { sourceColor } from '../lib/graph'
 import { useCallback, useMemo, useState } from 'react'
 
 interface ConnectionsPanelProps {
   connectors: ConnectorInfo[] | null
-  reenriching: boolean
-  reenrichError: string
-  reenrichDisabled: boolean
-  reenrichTarget: string | null
-  onReenrich: (source?: string) => void
+  syncing: boolean
+  syncStatus: SyncStatus | null
+  syncError: string
+  onSync: () => void
 }
 
-type PendingAction = 'enable' | 'disable' | 'delete' | 'sync' | 'config' | 'sync-all'
+type PendingAction = 'enable' | 'disable' | 'delete' | 'config'
 type ConnectorStatus = 'syncing' | 'attention' | 'active' | 'off'
 
 const APPLE_NOTES_CONNECTOR_ID = 'apple_notes'
@@ -27,19 +25,16 @@ const FOLDERS_CONNECTOR_ID = 'local_folders'
 
 export function ConnectionsPanel({
   connectors,
-  reenriching,
-  reenrichError,
-  reenrichDisabled,
-  reenrichTarget,
-  onReenrich
+  syncing,
+  syncStatus,
+  syncError,
+  onSync
 }: ConnectionsPanelProps): React.JSX.Element {
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({})
   const [pendingById, setPendingById] = useState<Record<string, PendingAction | undefined>>({})
   const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set())
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [configDrafts, setConfigDrafts] = useState<Record<string, Record<string, string>>>({})
-  const [syncAllPending, setSyncAllPending] = useState(false)
-  const [panelError, setPanelError] = useState('')
 
   const setRowError = useCallback((connectorId: string, message: string) => {
     setRowErrors((current) => ({ ...current, [connectorId]: message }))
@@ -124,18 +119,6 @@ export function ConnectionsPanel({
     [runConnectorAction]
   )
 
-  const runSyncAll = useCallback(async () => {
-    setSyncAllPending(true)
-    setPanelError('')
-    try {
-      await syncAllConnectors()
-    } catch (error) {
-      setPanelError(error instanceof Error ? error.message : 'Sync failed')
-    } finally {
-      setSyncAllPending(false)
-    }
-  }, [])
-
   const sortedConnectors = useMemo(() => {
     return [...(connectors ?? [])].sort((left, right) => {
       if (left.connector_id === APPLE_NOTES_CONNECTOR_ID) {
@@ -156,7 +139,7 @@ export function ConnectionsPanel({
     () => sortedConnectors.reduce((sum, c) => sum + Math.max(0, c.docs), 0),
     [sortedConnectors]
   )
-  const anySyncing = sortedConnectors.some((c) => c.syncing)
+  const syncRunning = syncing || sortedConnectors.some((c) => c.syncing)
 
   return (
     <section className="connections-panel" aria-label="Connections">
@@ -173,33 +156,19 @@ export function ConnectionsPanel({
           <button
             className="secondary-button compact"
             type="button"
-            disabled={syncAllPending || anySyncing}
-            onClick={() => void runSyncAll()}
-            title="Sync every enabled connector now"
+            disabled={syncRunning}
+            onClick={onSync}
+            title="Import every enabled source and rebuild the knowledge index"
           >
-            {syncAllPending || anySyncing ? (
-              <span className="inline-spinner" aria-hidden="true" />
-            ) : null}
-            {syncAllPending || anySyncing ? 'Syncing' : 'Sync all'}
-          </button>
-          <button
-            className="secondary-button compact"
-            type="button"
-            disabled={reenrichDisabled}
-            onClick={() => onReenrich()}
-            title="Regenerate and atomically replace the complete knowledge graph"
-          >
-            {reenriching && reenrichTarget === 'all' ? (
-              <span className="inline-spinner" aria-hidden="true" />
-            ) : null}
-            {reenriching && reenrichTarget === 'all' ? 'Rebuilding knowledge' : 'Rebuild knowledge'}
+            {syncRunning ? <span className="inline-spinner" aria-hidden="true" /> : null}
+            {syncRunning ? globalSyncLabel(syncStatus) : 'Sync'}
           </button>
         </div>
       </div>
 
-      {reenrichError || panelError ? (
+      {syncError || syncStatus?.error ? (
         <div className="connections-panel-error" role="alert">
-          {reenrichError || panelError}
+          {syncError || syncStatus?.error}
         </div>
       ) : null}
 
@@ -228,8 +197,6 @@ export function ConnectionsPanel({
               expanded={expandedIds.has(connector.connector_id)}
               key={connector.connector_id}
               pendingAction={pendingById[connector.connector_id]}
-              reenrichDisabled={reenrichDisabled}
-              reenriching={reenriching && reenrichTarget === connector.connector_id}
               onCancelDelete={() => setConfirmDeleteId(null)}
               onConfirmDelete={() =>
                 void runConnectorAction(connector.connector_id, 'delete', () =>
@@ -239,11 +206,6 @@ export function ConnectionsPanel({
               onRequestDelete={() => setConfirmDeleteId(connector.connector_id)}
               onSaveConfig={() => void saveConfig(connector)}
               onSaveFolders={(folders) => void saveFolders(connector, folders)}
-              onSync={() =>
-                void runConnectorAction(connector.connector_id, 'sync', async () => {
-                  await syncConnector(connector.connector_id)
-                })
-              }
               onToggle={() =>
                 void runConnectorAction(
                   connector.connector_id,
@@ -255,7 +217,6 @@ export function ConnectionsPanel({
                 )
               }
               onToggleExpanded={() => toggleExpanded(connector.connector_id)}
-              onReenrich={() => onReenrich(connector.connector_id)}
               onUpdateConfig={(key, value) => updateConfigDraft(connector.connector_id, key, value)}
             />
           ))}
@@ -272,18 +233,14 @@ function ConnectorRow({
   expanded,
   configDrafts,
   confirmDelete,
-  reenriching,
-  reenrichDisabled,
   onToggle,
   onToggleExpanded,
   onRequestDelete,
   onConfirmDelete,
   onCancelDelete,
-  onSync,
   onUpdateConfig,
   onSaveConfig,
-  onSaveFolders,
-  onReenrich
+  onSaveFolders
 }: {
   connector: ConnectorInfo
   pendingAction?: PendingAction
@@ -291,24 +248,18 @@ function ConnectorRow({
   expanded: boolean
   configDrafts: Record<string, string>
   confirmDelete: boolean
-  reenriching: boolean
-  reenrichDisabled: boolean
   onToggle: () => void
   onToggleExpanded: () => void
   onRequestDelete: () => void
   onConfirmDelete: () => void
   onCancelDelete: () => void
-  onSync: () => void
   onUpdateConfig: (key: string, value: string) => void
   onSaveConfig: () => void
   onSaveFolders: (folders: string[]) => void
-  onReenrich: () => void
 }): React.JSX.Element {
   const status = connectorStatus(connector)
   const signInRequired = connector.kind === 'oauth' && !connector.available
   const isFolders = connector.connector_id === FOLDERS_CONNECTOR_ID
-  const syncRunning = connector.syncing || pendingAction === 'sync'
-  const syncDisabled = syncRunning || !connector.available || !connector.enabled
   const toggleDisabled = pendingAction === 'enable' || pendingAction === 'disable'
   const deleteDisabled = pendingAction === 'delete' || connector.syncing || connector.docs === 0
   const configKeys = Object.keys(connector.config).filter(
@@ -370,8 +321,8 @@ function ConnectorRow({
             disabled={toggleDisabled}
             title={
               connector.enabled
-                ? 'Disable — keeps stored data, removes it from the graph and retrieval'
-                : 'Enable — stored data rejoins the graph and retrieval'
+                ? 'Disable — keeps stored data; the next sync drops it from the graph and retrieval'
+                : 'Enable — the next sync imports and indexes this source'
             }
             onClick={(event) => {
               event.stopPropagation()
@@ -467,25 +418,6 @@ function ConnectorRow({
           ) : null}
 
           <div className="connector-detail-actions">
-            <button
-              className="secondary-button compact"
-              type="button"
-              disabled={syncDisabled}
-              onClick={onSync}
-            >
-              {syncRunning ? <span className="inline-spinner" aria-hidden="true" /> : null}
-              {syncRunning ? syncProgressLabel(connector) : 'Sync now'}
-            </button>
-            <button
-              className="secondary-button compact"
-              type="button"
-              disabled={reenrichDisabled || !connector.enabled || connector.docs === 0}
-              onClick={onReenrich}
-              title="Regenerate and atomically replace the complete knowledge graph"
-            >
-              {reenriching ? <span className="inline-spinner" aria-hidden="true" /> : null}
-              {reenriching ? 'Rebuilding' : 'Rebuild knowledge'}
-            </button>
             <span className="connector-detail-spacer" />
             <button
               className="secondary-button compact danger"
@@ -873,6 +805,16 @@ function formatRelativeTime(epoch: number | null | undefined): string {
   }
 
   return 'just now'
+}
+
+function globalSyncLabel(status: SyncStatus | null): string {
+  if (status?.phase === 'indexing') {
+    return status.detail ? `Indexing — ${status.detail}` : 'Indexing'
+  }
+  if (status?.detail) {
+    return `Syncing — ${status.detail}`
+  }
+  return 'Syncing'
 }
 
 function syncProgressLabel(connector: ConnectorInfo): string {

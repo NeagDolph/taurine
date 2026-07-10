@@ -56,9 +56,6 @@ function App(): React.JSX.Element {
   const [micError, setMicError] = useState('')
   const [syncing, setSyncing] = useState(false)
   const [syncError, setSyncError] = useState('')
-  const [reenriching, setReenriching] = useState(false)
-  const [reenrichError, setReenrichError] = useState('')
-  const [reenrichTarget, setReenrichTarget] = useState<string | null>(null)
   const [chunks, setChunks] = useState<FeedTranscript[]>([])
   const [interimsByChannel, setInterimsByChannel] = useState<Record<number, TranscriptEvent>>({})
   const [triggersBySeq, setTriggersBySeq] = useState<Map<number, TriggerEvent[]>>(new Map())
@@ -144,8 +141,8 @@ function App(): React.JSX.Element {
         case 'connectors':
           setConnectors(event.connectors)
           break
-        case 'reenrich':
-          setIndex((current) => ({ ...current, reenrich: event.status }))
+        case 'sync':
+          setIndex((current) => ({ ...current, sync: event.status }))
           break
         case 'graph':
           setGraphVersion(event.version)
@@ -204,15 +201,9 @@ function App(): React.JSX.Element {
     setTriggersBySeq((current) => pruneTriggersByChunks(current, chunks))
   }, [chunks])
 
-  useEffect(() => {
-    if (!index.reenrich?.running && !reenriching) {
-      setReenrichTarget(null)
-    }
-  }, [index.reenrich?.running, reenriching])
-
   const interims = useMemo(() => Object.values(interimsByChannel), [interimsByChannel])
   const latestFinalText = chunks.length > 0 ? chunks[chunks.length - 1].text : ''
-  const isReenriching = reenriching || Boolean(index.reenrich?.running)
+  const isSyncing = syncing || Boolean(index.sync?.running)
 
   const startListening = useCallback(async () => {
     const client = clientRef.current
@@ -262,47 +253,25 @@ function App(): React.JSX.Element {
     clientRef.current?.openNote(noteId)
   }, [])
 
+  // The single global sync action: the POST returns 202 immediately and
+  // progress streams back over /updates and status events.
   const syncIndex = useCallback(async () => {
     const client = clientRef.current
-    if (!client || syncing || index.reenrich?.running) {
+    if (!client || syncing || index.sync?.running) {
       return
     }
 
     setSyncing(true)
     setSyncError('')
     try {
-      await client.syncIndex()
+      const status = await client.syncIndex()
+      setIndex((current) => ({ ...current, sync: status }))
     } catch (error) {
-      setSyncError(error instanceof Error ? error.message : 'Index sync failed')
+      setSyncError(error instanceof Error ? error.message : 'Sync failed')
     } finally {
       setSyncing(false)
     }
-  }, [index.reenrich?.running, syncing])
-
-  const reenrichIndex = useCallback(
-    async (source?: string) => {
-      const client = clientRef.current
-      if (!client || reenriching || syncing || index.reenrich?.running) {
-        return
-      }
-
-      setReenriching(true)
-      setReenrichTarget(source ?? 'all')
-      setReenrichError('')
-      try {
-        const status = await client.reenrichIndex(source)
-        setIndex((current) => ({
-          ...current,
-          reenrich: status
-        }))
-      } catch (error) {
-        setReenrichError(error instanceof Error ? error.message : 'Knowledge rebuild failed')
-      } finally {
-        setReenriching(false)
-      }
-    },
-    [index.reenrich?.running, reenriching, syncing]
-  )
+  }, [index.sync?.running, syncing])
 
   const showDisconnectedBanner = connection !== 'connected'
 
@@ -398,11 +367,10 @@ function App(): React.JSX.Element {
         >
           <ConnectorsView
             connectors={connectors}
-            onReenrich={reenrichIndex}
-            reenrichTarget={reenrichTarget}
-            reenrichDisabled={syncing || isReenriching}
-            reenrichError={reenrichError}
-            reenriching={isReenriching}
+            onSync={syncIndex}
+            syncing={isSyncing}
+            syncStatus={index.sync ?? null}
+            syncError={syncError}
             visible={activeTab === 'connectors'}
           />
         </div>
@@ -419,8 +387,7 @@ function App(): React.JSX.Element {
         connection={connection}
         detail={statusDetail}
         index={index}
-        isSyncing={syncing}
-        isReenriching={isReenriching}
+        isSyncing={isSyncing}
         syncError={syncError}
         onSync={syncIndex}
       />

@@ -6,7 +6,6 @@ interface StatusBarProps {
   detail: string
   index: IndexStatus
   isSyncing: boolean
-  isReenriching: boolean
   syncError: string
   onSync: () => void
 }
@@ -17,12 +16,11 @@ export function StatusBar({
   detail,
   index,
   isSyncing,
-  isReenriching,
   syncError,
   onSync
 }: StatusBarProps): React.JSX.Element {
-  const detailText = syncError || reenrichDetail(index) || detail
-  const controlsDisabled = isSyncing || isReenriching
+  const detailText = syncError || index.sync?.error || syncDetail(index) || detail
+  const controlsDisabled = isSyncing
 
   return (
     <footer className="status-bar">
@@ -84,14 +82,12 @@ function formatLastSync(lastSync: number | null | undefined): string {
   }).format(new Date(millis))
 }
 
-function reenrichDetail(index: IndexStatus): string {
-  const status = index.reenrich
+function syncDetail(index: IndexStatus): string {
+  const status = index.sync
   if (!status?.running) {
     return ''
   }
 
-  if (status.total > 0) {
-    return `Rebuilding knowledge ${status.done}/${status.total} (${status.phase})`
-  }
-  return `Rebuilding knowledge (${status.phase})`
+  const phase = status.phase === 'indexing' ? 'Indexing' : 'Syncing sources'
+  return status.detail ? `${phase} — ${status.detail}` : phase
 }

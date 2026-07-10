@@ -61,9 +61,9 @@ from taurine_core.schemas import (
     NotePreview,
     OpenNoteMsg,
     ProfileGenerationStatus,
-    ReenrichStatus,
     StartMsg,
     StartupStatus,
+    SyncStatus,
     StatusEvent,
     StopMsg,
 )
@@ -102,7 +102,7 @@ class UpdateBus:
     payloads when it drains its queue, so bursts coalesce naturally.
     """
 
-    KINDS = ("connectors", "reenrich", "graph", "profile", "chats")
+    KINDS = ("connectors", "sync", "graph", "profile", "chats")
 
     def __init__(self) -> None:
         self._subscribers: set[asyncio.Queue[str]] = set()
@@ -110,6 +110,10 @@ class UpdateBus:
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop | None:
+        return self._loop
 
     def subscribe(self) -> asyncio.Queue[str]:
         queue: asyncio.Queue[str] = asyncio.Queue()
@@ -150,12 +154,9 @@ class Runtime:
     connector_registry: Any = None
     connector_llm: Any = None
     connector_sync_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
-    reenrich_all: Callable[..., Awaitable[Any]] | None = None
-    reenrich_status: ReenrichStatus = field(
-        default_factory=lambda: ReenrichStatus(running=False)
-    )
-    reenrich_task: asyncio.Task[Any] | None = None
-    reenrich_last_emit_s: float = 0.0
+    sync_status: SyncStatus = field(default_factory=SyncStatus)
+    sync_task: asyncio.Task[Any] | None = None
+    sync_last_emit_s: float = 0.0
     status_sinks: set[Callable[[], Awaitable[None]]] = field(default_factory=set)
     updates: UpdateBus = field(default_factory=UpdateBus)
     graph_version: int = 0
@@ -169,7 +170,7 @@ class Runtime:
     )
     profile_generation_task: asyncio.Task[Any] | None = None
     knowledge_runtime: Any = None
-    regenerate_knowledge: Callable[[], Any] | None = None
+    regenerate_knowledge: Callable[..., Any] | None = None
 
 
 class _MonotonicClock:
@@ -261,9 +262,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             # waiting for it. A partial build only leaves a temporary
             # *.build-*.db file that the next build reuses or replaces.
             if active_runtime is not None:
-                if active_runtime.reenrich_task is not None:
-                    active_runtime.reenrich_task.cancel()
-                    await asyncio.gather(active_runtime.reenrich_task, return_exceptions=True)
+                if active_runtime.sync_task is not None:
+                    active_runtime.sync_task.cancel()
+                    await asyncio.gather(active_runtime.sync_task, return_exceptions=True)
                 if active_runtime.profile_generation_task is not None:
                     active_runtime.profile_generation_task.cancel()
                     await asyncio.gather(
@@ -313,15 +314,27 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             return active_runtime.index.graph()
         return _knowledge_graph(active_runtime.knowledge_runtime)
 
-    @app.post("/index/sync")
-    async def index_sync() -> Any:
+    @app.post("/index/sync", status_code=202)
+    async def index_sync() -> SyncStatus:
         active_runtime = _ready_runtime(app)
-        sync = active_runtime.sync_all_enabled or active_runtime.sync_once
-        report = await asyncio.to_thread(sync)
-        if active_runtime.regenerate_knowledge is not None:
-            await asyncio.to_thread(active_runtime.regenerate_knowledge)
-        _bump_graph(active_runtime)
-        return _report_payload(report)
+        if (
+            active_runtime.sync_status.running
+            or active_runtime.sync_task is not None
+            and not active_runtime.sync_task.done()
+        ):
+            raise HTTPException(status_code=409, detail="sync already running")
+        _set_sync_status(
+            active_runtime,
+            SyncStatus(running=True, phase="syncing"),
+            force_emit=True,
+        )
+        active_runtime.sync_task = asyncio.create_task(_run_global_sync(active_runtime))
+        return active_runtime.sync_status
+
+    @app.get("/index/sync")
+    async def index_sync_status() -> SyncStatus:
+        active_runtime = _ready_runtime(app)
+        return active_runtime.sync_status
 
     @app.get("/connectors")
     async def connectors() -> list[ConnectorInfo]:
@@ -331,15 +344,15 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/connectors/{connector_id}/enable")
     async def connector_enable(connector_id: str) -> ConnectorInfo:
+        # Enable/disable are pure flags: no source is read and nothing is
+        # indexed until the user presses sync.
         active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
         try:
             registry.set_enabled(active_runtime.index, connector_id, True)
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
-        if active_runtime.regenerate_knowledge is not None:
-            await asyncio.to_thread(active_runtime.regenerate_knowledge)
-        _bump_graph(active_runtime)
+        active_runtime.updates.publish("connectors")
         return _connector_info(active_runtime, connector_id)
 
     @app.post("/connectors/{connector_id}/disable")
@@ -350,9 +363,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             registry.set_enabled(active_runtime.index, connector_id, False)
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
-        if active_runtime.regenerate_knowledge is not None:
-            await asyncio.to_thread(active_runtime.regenerate_knowledge)
-        _bump_graph(active_runtime)
+        active_runtime.updates.publish("connectors")
         return _connector_info(active_runtime, connector_id)
 
     @app.post("/connectors/{connector_id}/data/delete")
@@ -361,6 +372,12 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         registry = _connector_registry(active_runtime)
         if connector_id in registry.syncing:
             raise HTTPException(status_code=409, detail="connector sync running — wait for it to finish")
+        if (
+            active_runtime.sync_status.running
+            or active_runtime.sync_task is not None
+            and not active_runtime.sync_task.done()
+        ):
+            raise HTTPException(status_code=409, detail="sync running — wait for it to finish")
         try:
             # Deletion is a privacy boundary: keep the source disabled so the
             # clean rebuild cannot immediately re-extract the deleted records.
@@ -369,8 +386,17 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
         if active_runtime.regenerate_knowledge is not None:
-            await asyncio.to_thread(active_runtime.regenerate_knowledge)
-        _bump_graph(active_runtime)
+            # The derived knowledge index must also drop the purged records;
+            # rebuilding it from the remaining enabled sources is the one
+            # indexing job that runs without the sync button.
+            _set_sync_status(
+                active_runtime,
+                SyncStatus(running=True, phase="indexing", detail="removing deleted data"),
+                force_emit=True,
+            )
+            active_runtime.sync_task = asyncio.create_task(
+                _run_global_sync(active_runtime, sync_sources=False)
+            )
         return _connector_info(active_runtime, connector_id)
 
     @app.post("/connectors/{connector_id}/sync", status_code=202)
@@ -416,38 +442,6 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if preview is None:
             raise HTTPException(status_code=404, detail="note not found")
         return preview
-
-    @app.post("/index/reenrich", status_code=202)
-    async def index_reenrich(source: str | None = None) -> ReenrichStatus:
-        active_runtime = _ready_runtime(app)
-        if (
-            active_runtime.reenrich_status.running
-            or active_runtime.reenrich_task is not None
-            and not active_runtime.reenrich_task.done()
-        ):
-            raise HTTPException(status_code=409, detail="re-enrich already running")
-        if active_runtime.reenrich_all is None:
-            raise HTTPException(status_code=503, detail="re-enrich unavailable")
-
-        _set_reenrich_status(
-            active_runtime,
-            ReenrichStatus(
-                running=True,
-                phase="notes",
-                done=0,
-                total=0,
-            ),
-            force_emit=True,
-        )
-        active_runtime.reenrich_task = asyncio.create_task(
-            _run_reenrich(active_runtime, source)
-        )
-        return active_runtime.reenrich_status
-
-    @app.get("/index/reenrich")
-    async def index_reenrich_status() -> ReenrichStatus:
-        active_runtime = _ready_runtime(app)
-        return active_runtime.reenrich_status
 
     @app.get("/profile")
     async def get_profile() -> dict[str, Any]:
@@ -791,36 +785,32 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
         report("opening_index", "loading knowledge index")
         knowledge_runtime = RetrievalRuntime(knowledge_database)
     except (FileNotFoundError, ValueError, KnowledgeSchemaError):
-        report("extracting_sources", "reading enabled sources")
-        knowledge_builder.build(
-            connector_registry.extract_all_enabled(
-                index,
-                progress=lambda connector_id: report("extracting_sources", connector_id),
-            ),
-            knowledge_database,
-            replace_derived=True,
-            on_stage=lambda stage: report("building_index", stage),
-        )
-        report("opening_index", "loading knowledge index")
+        # Startup never reads sources or indexes user data: bootstrap an
+        # empty (but valid) knowledge index so retrieval components load.
+        # Real data enters only through the user-triggered sync.
+        report("opening_index", "creating empty knowledge index")
+        knowledge_builder.build((), knowledge_database, replace_derived=True)
         knowledge_runtime = RetrievalRuntime(knowledge_database)
     report("finalizing", "")
 
-    def regenerate_knowledge() -> Any:
-        records = connector_registry.extract_all_enabled(index)
-        report = knowledge_builder.build(
+    def regenerate_knowledge(progress: Callable[[str], None] | None = None) -> Any:
+        def note(detail: str) -> None:
+            if progress is not None:
+                progress(detail)
+
+        note("reading enabled sources")
+        records = connector_registry.extract_all_enabled(
+            index,
+            progress=lambda connector_id: note(f"reading {connector_id}"),
+        )
+        build_report = knowledge_builder.build(
             records,
             knowledge_runtime.knowledge_database,
             replace_derived=True,
+            on_stage=note,
         )
         knowledge_runtime.activate_from_disk()
-        return report
-
-    async def rebuild_knowledge(progress: Any, source: str | None = None) -> Any:
-        del source  # Graph finalization is intentionally global and deterministic.
-        progress(ReenrichStatus(running=True, phase="clean_build", done=0, total=1))
-        report = await asyncio.to_thread(regenerate_knowledge)
-        progress(ReenrichStatus(running=False, phase="idle", done=1, total=1))
-        return report
+        return build_report
 
     def make_live_session(emit: EventSink, logger: SessionLogger) -> LiveSession:
         clock = _MonotonicClock()
@@ -864,10 +854,11 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
         make_live_session=make_live_session,
         make_asr_client=make_asr_client,
         make_session_logger=lambda: SessionLogger.create(session_log.SESSIONS_DIR),
-        enable_periodic_sync=True,
+        # Autosync is intentionally off: indexing only runs on user intent
+        # (the sync button or a data delete).
+        enable_periodic_sync=False,
         connector_registry=connector_registry,
         connector_llm=llm,
-        reenrich_all=rebuild_knowledge,
         make_chat_engine=lambda: ChatEngine(
             index,
             llm,
@@ -1128,45 +1119,44 @@ async def _run_connector_sync(runtime: Runtime, connector_id: str) -> None:
         await _emit_index_status(runtime)
 
 
-async def _run_reenrich(runtime: Runtime, source: str | None = None) -> None:
-    assert runtime.reenrich_all is not None
+async def _run_global_sync(runtime: Runtime, *, sync_sources: bool = True) -> None:
+    """The single user-triggered job: sync enabled sources, then reindex.
+
+    With sync_sources=False only the clean reindex runs (used after a data
+    delete, where fetching new source data is not part of the user's intent).
+    """
+    error = ""
     try:
-        await runtime.reenrich_all(
-            lambda status: _set_reenrich_status(runtime, status),
-            source,
-        )
+        if sync_sources:
+            _set_sync_status(
+                runtime,
+                SyncStatus(running=True, phase="syncing", detail="reading enabled sources"),
+            )
+            sync = runtime.sync_all_enabled or runtime.sync_once
+            await asyncio.to_thread(sync)
+        if runtime.regenerate_knowledge is not None:
+            _set_sync_status(runtime, SyncStatus(running=True, phase="indexing"))
+            await asyncio.to_thread(
+                runtime.regenerate_knowledge,
+                lambda detail: _set_sync_status(
+                    runtime,
+                    SyncStatus(running=True, phase="indexing", detail=detail),
+                ),
+            )
     except asyncio.CancelledError:
         raise
-    except Exception:
-        current = runtime.reenrich_status
-        _set_reenrich_status(
+    except Exception as exc:
+        logging.getLogger("taurine.session").exception("global sync failed")
+        error = str(exc)[:300] or type(exc).__name__
+    finally:
+        _set_sync_status(
             runtime,
-            ReenrichStatus(
-                running=False,
-                phase="idle",
-                done=current.done,
-                total=current.total,
-            ),
+            SyncStatus(running=False, phase="idle", error=error),
             force_emit=True,
         )
-    finally:
-        if runtime.reenrich_status.running:
-            current = runtime.reenrich_status
-            _set_reenrich_status(
-                runtime,
-                ReenrichStatus(
-                    running=False,
-                    phase="idle",
-                    done=current.done,
-                    total=current.total,
-                ),
-                force_emit=True,
-            )
-        else:
-            await _emit_index_status(runtime)
-        # The compatibility endpoint now performs one complete clean build.
         _bump_graph(runtime)
         runtime.updates.publish("connectors")
+        await _emit_index_status(runtime)
 
 
 async def _run_profile_generation(runtime: Runtime) -> None:
@@ -1229,24 +1219,33 @@ def _profile_payload(runtime: Runtime) -> dict[str, Any]:
     }
 
 
-def _set_reenrich_status(
+def _set_sync_status(
     runtime: Runtime,
-    status: ReenrichStatus,
+    status: SyncStatus,
     *,
     force_emit: bool = False,
 ) -> None:
-    runtime.reenrich_status = status
+    """Throttled status fan-out; safe from worker threads (indexing progress
+    callbacks run inside asyncio.to_thread)."""
+    runtime.sync_status = status
     now = time.monotonic()
     should_emit = (
         force_emit
         or not status.running
-        or now - runtime.reenrich_last_emit_s >= 2.0
+        or now - runtime.sync_last_emit_s >= 2.0
     )
     if not should_emit:
         return
-    runtime.reenrich_last_emit_s = now
-    runtime.updates.publish("reenrich")
-    asyncio.create_task(_emit_index_status(runtime))
+    runtime.sync_last_emit_s = now
+    runtime.updates.publish("sync")
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = runtime.updates.loop
+        if loop is not None and not loop.is_closed():
+            asyncio.run_coroutine_threadsafe(_emit_index_status(runtime), loop)
+        return
+    loop.create_task(_emit_index_status(runtime))
 
 
 def _bump_graph(runtime: Runtime) -> None:
@@ -1273,10 +1272,10 @@ async def _send_updates(
                 }
             )
         )
-    if "reenrich" in kinds:
+    if "sync" in kinds:
         await websocket.send_text(
             json.dumps(
-                {"type": "reenrich", "status": runtime.reenrich_status.model_dump()}
+                {"type": "sync", "status": runtime.sync_status.model_dump()}
             )
         )
     if "graph" in kinds:
@@ -1316,7 +1315,7 @@ def _index_status(runtime: Runtime) -> IndexStatus:
     return IndexStatus(
         notes=notes,
         last_sync=last_sync,
-        reenrich=runtime.reenrich_status,
+        sync=runtime.sync_status,
     )
 
 

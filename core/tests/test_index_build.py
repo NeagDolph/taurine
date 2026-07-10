@@ -89,6 +89,23 @@ def test_clean_build_is_atomic_deterministic_and_order_independent(tmp_path: Pat
     assert snapshot.fact_matrix.shape == (0, 16)
 
 
+def test_empty_build_bootstraps_a_loadable_snapshot(tmp_path: Path) -> None:
+    """Startup creates an empty index when none exists — no sources are read."""
+    deps = BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+    target = tmp_path / "knowledge.db"
+
+    report = BuildCoordinator(deps).build((), target, replace_derived=True)
+
+    assert report.note_count == 0
+    assert report.passage_count == 0
+    assert report.extraction_failure_count == 0
+    assert target.exists()
+    snapshot = load_index_snapshot(target)
+    assert snapshot.passage_matrix.shape[0] == 0
+    assert snapshot.fact_matrix.shape[0] == 0
+    assert len(snapshot.projection) == 0
+
+
 def test_failed_build_never_replaces_active_target(tmp_path: Path) -> None:
     target = tmp_path / "active.db"
     target.write_bytes(b"known-active-snapshot")

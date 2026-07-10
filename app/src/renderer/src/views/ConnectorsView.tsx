@@ -1,42 +1,39 @@
 import { ConnectionsPanel } from '../components/ConnectionsPanel'
-import type { ConnectorInfo } from '../lib/sidecar'
+import type { ConnectorInfo, SyncStatus } from '../lib/sidecar'
 
 interface ConnectorsViewProps {
   visible: boolean
   connectors: ConnectorInfo[] | null
-  reenriching: boolean
-  reenrichError: string
-  reenrichDisabled: boolean
-  reenrichTarget: string | null
-  onReenrich: (source?: string) => void
+  syncing: boolean
+  syncStatus: SyncStatus | null
+  syncError: string
+  onSync: () => void
 }
 
 export function ConnectorsView({
   visible,
   connectors,
-  reenriching,
-  reenrichError,
-  reenrichDisabled,
-  reenrichTarget,
-  onReenrich
+  syncing,
+  syncStatus,
+  syncError,
+  onSync
 }: ConnectorsViewProps): React.JSX.Element {
   return (
     <div className="page connectors-page" aria-label="Connectors" aria-hidden={!visible}>
       <header className="page-intro">
         <h2>Connectors</h2>
         <p>
-          Local sources feeding the index. Every enabled source flows through the same pipeline —
-          enrichment, retrieval, and the map treat all documents alike. Disabling keeps the data
-          stored but drops it from the graph until re-enabled.
+          Local sources for the index. Enabling a source only marks it for import — nothing is read
+          or indexed until you press Sync, which imports every enabled source and rebuilds the
+          knowledge index in one pass.
         </p>
       </header>
       <ConnectionsPanel
         connectors={connectors}
-        onReenrich={onReenrich}
-        reenrichDisabled={reenrichDisabled}
-        reenrichError={reenrichError}
-        reenriching={reenriching}
-        reenrichTarget={reenrichTarget}
+        syncing={syncing}
+        syncStatus={syncStatus}
+        syncError={syncError}
+        onSync={onSync}
       />
     </div>
   )

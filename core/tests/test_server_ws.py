@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,8 +28,8 @@ from taurine_core.schemas import (
     MeetingSummary,
     NeighborRef,
     NotePreview,
-    ReenrichStatus,
     SummaryEvent,
+    SyncStatus,
     TranscriptEvent,
 )
 from taurine_core.server import Runtime, create_app, required_secrets, run_sync_once_safely
@@ -223,6 +224,16 @@ class FakeConnectorRegistry:
         return ConnectorSyncReport(connector_id=connector_id, added=1)
 
 
+def _wait_for_sync_idle(client: TestClient, timeout_s: float = 5.0) -> dict[str, Any]:
+    deadline = time.time() + timeout_s
+    status = client.get("/index/sync").json()
+    while status["running"] and time.time() < deadline:
+        time.sleep(0.01)
+        status = client.get("/index/sync").json()
+    assert not status["running"], "sync never finished"
+    return status
+
+
 def test_graph_and_sync_endpoints_use_runtime_services() -> None:
     sync_calls: list[bool] = []
     runtime = Runtime(
@@ -262,22 +273,21 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
                 }
             ],
         }
-        assert client.post("/index/sync").json() == {
-            "added": 1,
-            "changed": 2,
-            "removed": 3,
-            "enrich_failures": 4,
-        }
-        assert client.get("/index/reenrich").json() == {
+        response = client.post("/index/sync")
+        assert response.status_code == 202
+        assert response.json()["running"] is True
+        status = _wait_for_sync_idle(client)
+        assert status == {
             "running": False,
             "phase": "idle",
-            "done": 0,
-            "total": 0,
+            "detail": "",
+            "error": "",
         }
     assert sync_calls == [True]
 
 
 def test_index_sync_uses_enabled_connector_sync_callable() -> None:
+    sync_all_calls: list[bool] = []
     runtime = Runtime(
         index=GraphIndex(),
         sync_once=lambda: SyncReport(0, 0, 0, 0),
@@ -288,22 +298,14 @@ def test_index_sync_uses_enabled_connector_sync_callable() -> None:
             on_status,
             index_status,
         ),
-        sync_all_enabled=lambda: [
-            ConnectorSyncReport(connector_id="fake", added=1, changed=0, removed=0)
-        ],
+        sync_all_enabled=lambda: sync_all_calls.append(True)
+        or [ConnectorSyncReport(connector_id="fake", added=1, changed=0, removed=0)],
     )
 
     with TestClient(create_app(runtime)) as client:
-        assert client.post("/index/sync").json() == [
-            {
-                "connector_id": "fake",
-                "added": 1,
-                "changed": 0,
-                "removed": 0,
-                "enrich_failures": 0,
-                "error": "",
-            }
-        ]
+        assert client.post("/index/sync").status_code == 202
+        _wait_for_sync_idle(client)
+    assert sync_all_calls == [True]
 
 
 def test_connector_rest_endpoints_and_single_flight_sync() -> None:
@@ -321,7 +323,7 @@ def test_connector_rest_endpoints_and_single_flight_sync() -> None:
         ),
         connector_registry=registry,
         connector_llm=object(),
-        regenerate_knowledge=lambda: regenerations.append("regenerated"),
+        regenerate_knowledge=lambda progress=None: regenerations.append("regenerated"),
     )
 
     with TestClient(create_app(runtime)) as client:
@@ -345,10 +347,14 @@ def test_connector_rest_endpoints_and_single_flight_sync() -> None:
         assert client.post("/connectors/fake/enable").status_code == 200
         assert client.post("/connectors/fake/disable").status_code == 200
         assert registry.enabled_calls == [("fake", True), ("fake", False)]
+        # enable/disable are pure flags now: nothing is reindexed
+        assert regenerations == []
         assert client.post("/connectors/fake/data/delete").status_code == 200
         assert registry.enabled_calls[-1] == ("fake", False)
         assert registry.purge_calls == ["fake"]
-        assert regenerations == ["regenerated", "regenerated", "regenerated"]
+        # deleting data reindexes in the background to drop derived records
+        _wait_for_sync_idle(client)
+        assert regenerations == ["regenerated"]
 
         assert client.put("/connectors/fake/config", json={"path": "/tmp/new"}).status_code == 200
         assert registry.config_calls == [("fake", {"path": "/tmp/new"})]
@@ -418,17 +424,23 @@ def test_note_preview_route_handles_url_encoded_note_ids() -> None:
     ]
 
 
-def test_reenrich_endpoint_is_single_flight_and_exposes_status() -> None:
-    async def slow_reenrich(progress: Any, source: Any = None) -> dict[str, int]:
-        del source
-        await asyncio.sleep(0.2)
-        progress(ReenrichStatus(running=True, phase="notes", done=0, total=1))
-        progress(ReenrichStatus(running=False, phase="idle", done=1, total=1))
-        return {"total": 1}
+def test_sync_endpoint_is_single_flight_and_runs_indexing() -> None:
+    release = threading.Event()
+    regenerate_details: list[str] = []
+
+    def slow_sync() -> SyncReport:
+        assert release.wait(timeout=5)
+        return SyncReport(0, 0, 0, 0)
+
+    def regenerate(progress: Any = None) -> dict[str, int]:
+        if progress is not None:
+            progress("passages")
+        regenerate_details.append("regenerated")
+        return {"ok": 1}
 
     runtime = Runtime(
         index=GraphIndex(),
-        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        sync_once=slow_sync,
         open_note=lambda note_id: None,
         make_live_session=lambda emit, logger: EchoLiveSession(emit),
         make_asr_client=lambda on_chunk, on_status, index_status: FakeASRClient(
@@ -436,20 +448,20 @@ def test_reenrich_endpoint_is_single_flight_and_exposes_status() -> None:
             on_status,
             index_status,
         ),
-        reenrich_all=slow_reenrich,
+        regenerate_knowledge=regenerate,
     )
 
     with TestClient(create_app(runtime)) as client:
-        assert client.post("/index/reenrich").status_code == 202
-        assert client.post("/index/reenrich").status_code == 409
-        status = client.get("/index/reenrich").json()
-
-    assert status == {
-        "running": True,
-        "phase": "notes",
-        "done": 0,
-        "total": 0,
-    }
+        assert client.post("/index/sync").status_code == 202
+        assert client.post("/index/sync").status_code == 409
+        status = client.get("/index/sync").json()
+        assert status["running"] is True
+        assert status["phase"] == "syncing"
+        release.set()
+        final = _wait_for_sync_idle(client)
+        assert final["error"] == ""
+    assert regenerate_details == ["regenerated"]
+    assert runtime.graph_version == 1
 
 
 def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
@@ -561,7 +573,7 @@ def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
     assert asr_clients[0].index_status() == IndexStatus(
         notes=1,
         last_sync=123.0,
-        reenrich=ReenrichStatus(running=False),
+        sync=SyncStatus(),
     )
 
 
@@ -834,20 +846,21 @@ def test_updates_websocket_sends_snapshot_and_change_events() -> None:
             for _ in range(5):
                 message = websocket.receive_json()
                 snapshot[message["type"]] = message
-            assert set(snapshot) == {"connectors", "reenrich", "graph", "profile", "chats"}
+            assert set(snapshot) == {"connectors", "sync", "graph", "profile", "chats"}
             assert snapshot["connectors"]["connectors"][0]["connector_id"] == "fake"
-            assert snapshot["reenrich"]["status"]["running"] is False
+            assert snapshot["sync"]["status"]["running"] is False
             assert snapshot["graph"]["version"] == 0
             assert snapshot["profile"]["card"] is None
             assert snapshot["profile"]["generation"]["phase"] == "idle"
             assert snapshot["chats"]["chats"] == []
 
-            # a state change publishes fresh events over the socket
+            # a state change publishes fresh events over the socket; disabling
+            # no longer reindexes, so only the connectors payload refreshes
             assert client.post("/connectors/fake/disable").status_code == 200
             kinds = set()
-            while "graph" not in kinds:
+            while "connectors" not in kinds:
                 kinds.add(websocket.receive_json()["type"])
-            assert runtime.graph_version == 1
+            assert runtime.graph_version == 0
 
 
 def test_updates_websocket_streams_profile_generation_progress_and_result() -> None:

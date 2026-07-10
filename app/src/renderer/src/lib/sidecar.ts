@@ -9,7 +9,7 @@ export type TriggerAction = 'grounded' | 'none'
 export type TriggerKind = 'exact' | 'search'
 export type ActionableStatus = 'open' | 'confirmed' | 'dismissed'
 export type ActionableOp = 'new' | 'update' | 'dismiss'
-export type ReenrichPhase = 'idle' | 'notes' | 'finalizing' | 'clean_build'
+export type SyncPhase = 'idle' | 'syncing' | 'indexing'
 export type ConnectorKind = 'local' | 'oauth'
 export type ProfileGenerationPhase =
   | 'idle'
@@ -249,17 +249,18 @@ export interface TriggerEvent {
   action: TriggerAction
 }
 
-export interface ReenrichStatus {
+// Progress of the single global sync-and-index job (POST /index/sync).
+export interface SyncStatus {
   running: boolean
-  phase: ReenrichPhase
-  done: number
-  total: number
+  phase: SyncPhase
+  detail: string
+  error: string
 }
 
 export interface IndexStatus {
   notes: number
   last_sync?: number | null
-  reenrich?: ReenrichStatus | null
+  sync?: SyncStatus | null
 }
 
 export interface ConnectorInfo {
@@ -412,23 +413,20 @@ export class SidecarClient {
     return true
   }
 
-  async syncIndex(): Promise<void> {
-    await requestSidecar('/index/sync', { method: 'POST' }, { baseUrl: this.restBaseUrl })
-  }
-
-  async reenrichIndex(source?: string): Promise<ReenrichStatus> {
-    const path = source ? `/index/reenrich?source=${encodeURIComponent(source)}` : '/index/reenrich'
+  // Kicks off the background sync-and-index job (202); progress arrives over
+  // the /updates websocket and in status events.
+  async syncIndex(): Promise<SyncStatus> {
     const payload = await requestSidecarJson(
-      path,
+      '/index/sync',
       { method: 'POST' },
       { baseUrl: this.restBaseUrl }
     )
     return (
-      parseReenrichStatus(payload) ?? {
+      parseSyncStatus(payload) ?? {
         running: true,
-        phase: 'notes',
-        done: 0,
-        total: 0
+        phase: 'syncing',
+        detail: '',
+        error: ''
       }
     )
   }
@@ -625,23 +623,6 @@ export async function deleteConnectorData(
     { method: 'POST' },
     options
   )
-}
-
-export async function syncConnector(
-  connectorId: string,
-  options: SidecarRequestOptions = {}
-): Promise<ConnectorSyncReport | null> {
-  const response = await requestSidecar(
-    `/connectors/${encodeURIComponent(connectorId)}/sync`,
-    { method: 'POST' },
-    options
-  )
-  const payload = await responseJsonOrNull(response)
-  return payload === null ? null : parseConnectorSyncReport(payload)
-}
-
-export async function syncAllConnectors(options: SidecarRequestOptions = {}): Promise<void> {
-  await requestSidecar('/index/sync', { method: 'POST' }, options)
 }
 
 export async function updateConnectorConfig(
@@ -1230,7 +1211,7 @@ function parseStatus(record: Record<string, unknown>): StatusEvent | null {
     return null
   }
 
-  const reenrich = parseReenrichStatus(index.reenrich)
+  const sync = parseSyncStatus(index.sync)
 
   return {
     type: 'status',
@@ -1238,7 +1219,7 @@ function parseStatus(record: Record<string, unknown>): StatusEvent | null {
     index: {
       notes: index.notes,
       last_sync: lastSync,
-      reenrich
+      sync
     },
     detail: typeof record.detail === 'string' ? record.detail : ''
   }
@@ -1276,22 +1257,6 @@ export function parseConnectorInfo(value: unknown): ConnectorInfo {
     sync_done: typeof record.sync_done === 'number' ? record.sync_done : 0,
     sync_total: typeof record.sync_total === 'number' ? record.sync_total : 0,
     config: asRecord(record.config) ?? {}
-  }
-}
-
-function parseConnectorSyncReport(value: unknown): ConnectorSyncReport {
-  const record = asRecord(value)
-  if (!record || typeof record.connector_id !== 'string') {
-    throw new Error('Invalid connector sync report')
-  }
-
-  return {
-    connector_id: record.connector_id,
-    added: typeof record.added === 'number' ? record.added : 0,
-    changed: typeof record.changed === 'number' ? record.changed : 0,
-    removed: typeof record.removed === 'number' ? record.removed : 0,
-    enrich_failures: typeof record.enrich_failures === 'number' ? record.enrich_failures : 0,
-    error: typeof record.error === 'string' ? record.error : ''
   }
 }
 
@@ -1340,27 +1305,21 @@ function parseNeighborRef(value: unknown): NeighborRef {
   }
 }
 
-export function parseReenrichStatus(value: unknown): ReenrichStatus | null {
+export function parseSyncStatus(value: unknown): SyncStatus | null {
   if (value === undefined || value === null) {
     return null
   }
 
   const record = asRecord(value)
-  if (
-    !record ||
-    typeof record.running !== 'boolean' ||
-    !isReenrichPhase(record.phase) ||
-    typeof record.done !== 'number' ||
-    typeof record.total !== 'number'
-  ) {
+  if (!record || typeof record.running !== 'boolean' || !isSyncPhase(record.phase)) {
     return null
   }
 
   return {
     running: record.running,
     phase: record.phase,
-    done: record.done,
-    total: record.total
+    detail: typeof record.detail === 'string' ? record.detail : '',
+    error: typeof record.error === 'string' ? record.error : ''
   }
 }
 
@@ -1380,8 +1339,8 @@ function isActionableOp(value: unknown): value is ActionableOp {
   return value === 'new' || value === 'update' || value === 'dismiss'
 }
 
-function isReenrichPhase(value: unknown): value is ReenrichPhase {
-  return value === 'idle' || value === 'notes' || value === 'finalizing' || value === 'clean_build'
+function isSyncPhase(value: unknown): value is SyncPhase {
+  return value === 'idle' || value === 'syncing' || value === 'indexing'
 }
 
 function isProfileGenerationPhase(value: unknown): value is ProfileGenerationPhase {
