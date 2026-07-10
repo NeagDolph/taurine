@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -59,6 +60,8 @@ class StoredNote:
     extraction_status: str
     extraction_error: str
     build_id: str
+    ingest_salience: float = 1.0
+    salience: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,7 @@ class EntityContext:
     etype: str
     traversal_eligible: bool
     build_id: str
+    traversal_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -307,9 +311,12 @@ class KnowledgeStore:
         note: NoteRecord,
         *,
         build_id: str,
-        extraction_status: Literal["pending", "complete", "failed"],
+        extraction_status: Literal[
+            "pending", "complete", "failed", "skipped_low_salience"
+        ],
         extraction_error: str = "",
         ingest_salience: float = 1.0,
+        salience: float = 1.0,
         quality_rank: float = 0.0,
         value_score: float = 0.0,
     ) -> None:
@@ -320,15 +327,16 @@ class KnowledgeStore:
                 """
                 INSERT INTO notes(
                     note_id, source, title, folder, text, content_hash,
-                    created, modified, display_line, ingest_salience,
+                    created, modified, display_line, ingest_salience, salience,
                     quality_rank, value_score, extraction_status,
                     extraction_error, build_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(note_id) DO UPDATE SET
                     source=excluded.source, title=excluded.title, folder=excluded.folder,
                     text=excluded.text, content_hash=excluded.content_hash,
                     created=excluded.created, modified=excluded.modified,
                     display_line=excluded.display_line, ingest_salience=excluded.ingest_salience,
+                    salience=excluded.salience,
                     quality_rank=excluded.quality_rank, value_score=excluded.value_score,
                     extraction_status=excluded.extraction_status,
                     extraction_error=excluded.extraction_error, build_id=excluded.build_id
@@ -344,6 +352,7 @@ class KnowledgeStore:
                     float(note.modified),
                     display_line,
                     float(ingest_salience),
+                    float(salience),
                     float(quality_rank),
                     float(value_score),
                     extraction_status,
@@ -369,6 +378,8 @@ class KnowledgeStore:
                 extraction_status=row["extraction_status"],
                 extraction_error=row["extraction_error"],
                 build_id=row["build_id"],
+                ingest_salience=float(row["ingest_salience"]),
+                salience=float(row["salience"]),
             )
             for row in rows
         )
@@ -805,6 +816,7 @@ class KnowledgeStore:
         traversal_eligible: bool,
         ambiguity_key: str,
         build_id: str,
+        traversal_reason: str = "",
     ) -> None:
         self._writable()
         with self._conn:
@@ -812,8 +824,8 @@ class KnowledgeStore:
                 """
                 INSERT INTO entities(
                     entity_id, canonical, normalized, etype, df,
-                    traversal_eligible, ambiguity_key, build_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    traversal_eligible, traversal_reason, ambiguity_key, build_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entity_id,
@@ -822,6 +834,7 @@ class KnowledgeStore:
                     etype,
                     int(df),
                     int(traversal_eligible),
+                    traversal_reason,
                     ambiguity_key,
                     build_id,
                 ),
@@ -885,7 +898,7 @@ class KnowledgeStore:
             clauses.append("build_id = ?")
             parameters.append(build_id)
         rows = self._conn.execute(
-            "SELECT entity_id, canonical, etype, traversal_eligible, build_id "
+            "SELECT entity_id, canonical, etype, traversal_eligible, traversal_reason, build_id "
             f"FROM entities WHERE {' AND '.join(clauses)} ORDER BY entity_id",
             tuple(parameters),
         ).fetchall()
@@ -896,6 +909,7 @@ class KnowledgeStore:
                 etype=str(row["etype"]),
                 traversal_eligible=bool(row["traversal_eligible"]),
                 build_id=str(row["build_id"]),
+                traversal_reason=str(row["traversal_reason"]),
             )
             for row in rows
         )
@@ -1223,6 +1237,23 @@ class KnowledgeStore:
             edges=edges,
         )
 
+    def recompute_graph_hash(self, build_id: str) -> str:
+        """Recompute the graph hash from stored rows (L24).
+
+        The build compares this round-trip hash against the in-memory hash
+        before ``complete_build``; the runtime can call ``verify_graph_hash``
+        at activation to detect on-disk drift of a completed generation.
+        """
+        return compute_graph_hash(self.base_graph(build_id), self.projection(build_id))
+
+    def verify_graph_hash(self, build_id: str) -> bool:
+        """True when stored rows still reproduce the recorded ``graph_hash``."""
+
+        record = self.build(build_id)
+        if record is None or not record.graph_hash:
+            return False
+        return self.recompute_graph_hash(build_id) == record.graph_hash
+
     def delete_note(self, note_id: str) -> None:
         self._writable()
         with self._conn:
@@ -1347,6 +1378,7 @@ class KnowledgeStore:
             "modified",
             "display_line",
             "ingest_salience",
+            "salience",
             "quality_rank",
             "value_score",
             "extraction_status",
@@ -1403,9 +1435,10 @@ CREATE TABLE notes (
     modified REAL NOT NULL,
     display_line TEXT NOT NULL,
     ingest_salience REAL NOT NULL DEFAULT 1.0,
+    salience REAL NOT NULL DEFAULT 1.0,
     quality_rank REAL NOT NULL DEFAULT 0.0,
     value_score REAL NOT NULL DEFAULT 0.0,
-    extraction_status TEXT NOT NULL CHECK (extraction_status IN ('pending', 'complete', 'failed')),
+    extraction_status TEXT NOT NULL CHECK (extraction_status IN ('pending', 'complete', 'failed', 'skipped_low_salience')),
     extraction_error TEXT NOT NULL DEFAULT '',
     build_id TEXT NOT NULL
 );
@@ -1450,6 +1483,7 @@ CREATE TABLE entities (
     etype TEXT NOT NULL,
     df INTEGER NOT NULL,
     traversal_eligible INTEGER NOT NULL,
+    traversal_reason TEXT NOT NULL DEFAULT '',
     ambiguity_key TEXT NOT NULL,
     build_id TEXT NOT NULL,
     UNIQUE(etype, normalized, ambiguity_key)
@@ -1591,6 +1625,39 @@ CREATE TABLE index_builds (
     error TEXT NOT NULL DEFAULT ''
 );
 """
+
+
+def compute_graph_hash(base_graph: Any, projection: Sequence[Any]) -> str:
+    """Deterministic content hash over base-graph edges and the projection."""
+
+    payload = {
+        "nodes": list(base_graph.node_ids),
+        "edges": [
+            (
+                edge.src_id,
+                edge.dst_id,
+                edge.kind,
+                edge.direction,
+                round(edge.weight, 12),
+                edge.fact_ids,
+            )
+            for edge in base_graph.edges
+        ],
+        "projection": [
+            (
+                edge.src_note_id,
+                edge.dst_note_id,
+                edge.edge_type,
+                round(edge.weight, 12),
+                edge.shared,
+                edge.fact_ids,
+            )
+            for edge in projection
+        ],
+    }
+    return "sha256:" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _display_line(text: str) -> str:

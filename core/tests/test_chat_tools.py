@@ -111,6 +111,41 @@ def test_expand_evidence_preserves_direction_and_registered_paths() -> None:
     assert step.kind == "expand"
 
 
+def test_search_evidence_fallback_rows_are_marked_low_confidence() -> None:
+    """§0.1: fallback pack rows carry low_confidence and an honest label."""
+
+    class FallbackRetriever(ToolRetriever):
+        def search_evidence(self, query: str, *, k: int, temporal: str, now: float) -> EvidencePack:
+            pack = super().search_evidence(query, k=k, temporal=temporal, now=now)
+            from dataclasses import replace
+
+            return replace(
+                pack,
+                decision=RetrievalDecision(
+                    False, .44, "fallback_low_confidence", fallback=True
+                ),
+                facts=(),
+                paths=(),
+            )
+
+    result_json, step = execute_tool(
+        "search_evidence", {"query": "roadmap"}, FallbackRetriever(), now=10.0,
+    )
+
+    payload = json.loads(result_json)
+    assert payload["decision"]["accepted"] is False
+    assert payload["decision"]["fallback"] is True
+    assert all(row["low_confidence"] is True for row in payload["passages"])
+    assert "low-confidence" in step.label
+
+    accepted_json, _step = execute_tool(
+        "search_evidence", {"query": "roadmap"}, ToolRetriever(), now=10.0,
+    )
+    accepted = json.loads(accepted_json)
+    assert accepted["decision"]["fallback"] is False
+    assert all(row["low_confidence"] is False for row in accepted["passages"])
+
+
 def test_tool_errors_are_model_visible_and_do_not_raise() -> None:
     retriever = ToolRetriever()
 

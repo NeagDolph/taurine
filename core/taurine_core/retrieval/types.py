@@ -44,6 +44,9 @@ class RetrievalDecision:
     reason: str
     accepted_heads: tuple[str, ...] = ()
     rejected_heads: tuple[str, ...] = ()
+    # Chat/tool fallback lane (§0.1): True only on a best-effort low-confidence
+    # pack assembled after an abstention. Never True together with accepted.
+    fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,10 @@ class EvidencePassage:
     char_end: int
     created: float
     modified: float
+    # The calibrated head probability for direct head hits; otherwise the
+    # rerank-input tier score (triple recognition score for fact-support
+    # passages, PPR mass / path weight for graph expansions). Tier scores are
+    # not comparable across tiers; compare rerank_score instead.
     retrieval_score: float
     rerank_score: float
     path_ids: tuple[str, ...] = ()

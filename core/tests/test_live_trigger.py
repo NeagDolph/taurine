@@ -129,6 +129,58 @@ def test_rejected_pass_records_min_interval_without_accepting_or_backoff(clock: 
     assert trigger.offer(update, None, 5) == (True, "jaccard")
 
 
+def test_cold_start_without_any_accepted_retrieval_fires_first_summary(
+    clock: FakeClock,
+) -> None:
+    trigger = SummaryTrigger(clock.now)
+    empty = _update([], revision=0)
+
+    assert trigger.offer(empty, None, 5) == (True, "first_summary")
+
+
+def test_cold_start_staleness_measures_from_session_start(clock: FakeClock) -> None:
+    trigger = SummaryTrigger(clock.now)
+    empty = _update([], revision=0)
+
+    clock.advance(60.1)
+    assert trigger.offer(empty, None, 5) == (True, "staleness")
+
+
+def test_filler_only_session_backs_off_then_retries_first_summary(
+    clock: FakeClock,
+) -> None:
+    trigger = SummaryTrigger(clock.now)
+    empty = _update([], revision=0)
+
+    assert trigger.offer(empty, None, 5) == (True, "first_summary")
+    trigger.note_summary(empty, no_update=True)
+
+    clock.advance(10.1)
+    assert trigger.offer(empty, None, 5) == (False, "empty_backoff")
+
+    clock.advance(40.0)
+    assert trigger.offer(empty, None, 5) == (True, "first_summary")
+
+
+def test_min_new_chars_still_gates_the_first_summary(clock: FakeClock) -> None:
+    trigger = SummaryTrigger(clock.now)
+
+    assert trigger.offer(_update([], revision=0), None, 4) == (False, "min_new_chars")
+
+
+def test_first_summary_arm_turns_off_after_an_accepted_summary(
+    clock: FakeClock,
+) -> None:
+    trigger = SummaryTrigger(clock.now)
+    empty = _update([], revision=0)
+
+    assert trigger.offer(empty, None, 5)[0]
+    trigger.note_summary(empty, no_update=False)
+
+    clock.advance(10.1)
+    assert trigger.offer(empty, None, 5) == (False, "no_change")
+
+
 def _update(note_ids: list[str], *, revision: int) -> GroundingUpdate:
     passages = tuple(
         EvidencePassage(

@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from tests.conftest import make_note
+from taurine_core import config
+from taurine_core.indexer import build as build_module
+from taurine_core.indexer import build_cache as build_cache_module
+from taurine_core.indexer import extract as extract_module
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies
 from taurine_core.indexer.build_cache import BuildCache
-from taurine_core.schemas import Extraction, ExtractedMention
+from taurine_core.indexer.passages import PassageDraft
+from taurine_core.schemas import Extraction, ExtractedMention, ExtractedRelation
 
 
 class Tokenizer:
@@ -136,6 +143,178 @@ def test_caching_extractor_never_caches_failures(tmp_path: Path) -> None:
         assert count == 0
     finally:
         cache.close()
+
+
+def test_extraction_cache_key_covers_schema_thresholds_and_chunking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H5: every real extraction input must be part of the cache key."""
+    note = make_note("a", "Alpha", "Maya was here.")
+
+    def key() -> str:
+        return build_cache_module._extraction_key(
+            note, build_cache_module._schema_fingerprint()
+        )
+
+    baseline = key()
+    assert key() == baseline  # deterministic
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            config,
+            "INGEST_RELATION_TYPES",
+            {**config.INGEST_RELATION_TYPES, "works_at": "{head} is employed by {tail}"},
+        )
+        assert key() != baseline
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            config,
+            "INGEST_ENTITY_TYPES",
+            {**config.INGEST_ENTITY_TYPES, "person": "changed description"},
+        )
+        assert key() != baseline
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(config, "GLINER_CHUNK_SIZE", 123)
+        assert key() != baseline
+
+    artifact = extract_module._calibration()
+    updated = artifact.model_copy(
+        update={
+            "extraction": artifact.extraction.model_copy(
+                update={
+                    "promotion_thresholds": {
+                        **artifact.extraction.promotion_thresholds,
+                        "works_at": 0.99,
+                    }
+                }
+            )
+        }
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(extract_module, "_calibration", lambda: updated)
+        assert key() != baseline
+
+
+def test_corrupt_extraction_cache_row_degrades_to_miss(tmp_path: Path) -> None:
+    """L8: one bad row costs one recompute, never the build."""
+    calls: list[list[str]] = []
+
+    def inner(notes, *, tokenizer=None, progress=None):
+        del tokenizer, progress
+        calls.append([note.note_id for note in notes])
+        return {note.note_id: Extraction(schema_id="s1") for note in notes}
+
+    note_a = make_note("a", "Alpha", "Maya was here.")
+    note_b = make_note("b", "Beta", "Maya was there.")
+    cache = BuildCache(tmp_path / "cache.db")
+    try:
+        extract = cache.caching_extractor(inner)
+        extract([note_a, note_b])
+        assert calls == [["a", "b"]]
+
+        cache._conn.execute(
+            "UPDATE extraction_cache SET payload = '{not json' WHERE note_id = 'a'"
+        )
+        cache._conn.commit()
+
+        result = extract([note_a, note_b])
+        assert calls[-1] == ["a"]  # only the corrupt row recomputes
+        assert set(result) == {"a", "b"}
+        assert cache.stats["cache_corrupt"] == 1
+
+        extract([note_a, note_b])
+        assert calls[-1] == ["a"]  # repaired row is a hit again
+        assert cache.stats["cache_corrupt"] == 1
+    finally:
+        cache.close()
+
+
+def test_corrupt_embedding_cache_row_degrades_to_miss(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def inner(texts: list[str]) -> np.ndarray:
+        calls.append(list(texts))
+        return _embed(texts)
+
+    cache = BuildCache(tmp_path / "cache.db")
+    try:
+        embed = cache.caching_embedder("model-x", inner)
+        first = embed(["alpha", "beta"])
+        cache._conn.execute(
+            "UPDATE embedding_cache SET vec = X'00' WHERE rowid = 1"
+        )
+        cache._conn.commit()
+
+        second = embed(["alpha", "beta"])
+        assert cache.stats["cache_corrupt"] == 1
+        assert len(calls) == 2 and len(calls[-1]) == 1  # only the bad row re-embeds
+        np.testing.assert_allclose(first, second)
+    finally:
+        cache.close()
+
+
+def test_passage_for_span_accepts_adjacent_overlapping_pair() -> None:
+    """L5: a span straddling two adjacent overlapping passages keeps its
+    evidence, recorded against the earlier passage."""
+
+    def draft(passage_id: str, ordinal: int, start: int, end: int) -> PassageDraft:
+        return PassageDraft(
+            passage_id=passage_id,
+            ordinal=ordinal,
+            char_start=start,
+            char_end=end,
+            token_count=10,
+            text="x" * (end - start),
+            content_hash="h",
+        )
+
+    drafts = [draft("p0", 0, 0, 100), draft("p1", 1, 80, 200), draft("p3", 3, 300, 400)]
+
+    assert build_module._passage_for_span(drafts, 10, 50) == (drafts[0], False)
+    # p1 alone covers 80-200; a span crossing 80 while ending past 100 needs the pair
+    assert build_module._passage_for_span(drafts, 70, 150) == (drafts[0], True)
+    assert build_module._passage_for_span(drafts, 150, 350) == (None, False)
+    assert build_module._passage_for_span(drafts, 70, 250) == (None, False)
+
+
+def test_same_span_dual_etype_endpoint_binds_deterministically(tmp_path: Path) -> None:
+    """L6: named types outrank concept; remaining ties break alphabetically."""
+    note = make_note("n1", "Work", "Jane works at Acme today.")
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {
+            "n1": Extraction(
+                mentions=[
+                    ExtractedMention(surface="Jane", etype="person", confidence=0.95, char_start=0, char_end=4, extractor="fake", schema_id="s1"),
+                    ExtractedMention(surface="Acme", etype="concept", confidence=0.95, char_start=14, char_end=18, extractor="fake", schema_id="s1"),
+                    ExtractedMention(surface="Acme", etype="product", confidence=0.9, char_start=14, char_end=18, extractor="fake", schema_id="s1"),
+                ],
+                fact_candidates=[
+                    ExtractedRelation(head="Jane", predicate="works_at", tail="Acme", confidence=0.9, subject_start=0, subject_end=4, object_start=14, object_end=18, assertion_start=0, assertion_end=25, extraction_method="fake", schema_id="s1", status="active")
+                ],
+                schema_id="s1",
+            )
+        }
+
+    target = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=_embed, embedding_dim=16, extractor=extractor
+        )
+    ).build([note], target, replace_derived=True)
+
+    conn = sqlite3.connect(target)
+    try:
+        rows = conn.execute(
+            "SELECT e.etype FROM facts f JOIN entities e"
+            " ON e.entity_id = f.object_entity_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [("product",)]
 
 
 def test_second_clean_build_reuses_cached_embeddings(tmp_path: Path) -> None:

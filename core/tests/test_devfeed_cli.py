@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from taurine_core.devfeed import run_devfeed
-from taurine_core.indexer.sync import SyncReport
+from taurine_core.schemas import SyncReport
 from taurine_core.schemas import Chunk, TranscriptEvent
 from taurine_core.server import Runtime
 

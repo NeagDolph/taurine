@@ -97,14 +97,20 @@ def execute_tool(
                 temporal=temporal,  # type: ignore[arg-type]
                 now=now,
             )
+            # §0.1: fallback packs carry decision.fallback=True and every
+            # passage row is marked low_confidence in the payload.
             payload = EvidencePackPayload.from_domain(pack).model_dump(mode="json")
+            if pack.decision.accepted:
+                label = f'Searched "{query}" → {len(pack.passages)} passages'
+            elif getattr(pack.decision, "fallback", False):
+                label = (
+                    f'Searched "{query}" → {len(pack.passages)} low-confidence passages'
+                )
+            else:
+                label = f'Searched "{query}" → no supported evidence'
             return _json(payload), ChatActivityStep(
                 kind="search",
-                label=(
-                    f'Searched "{query}" → {len(pack.passages)} passages'
-                    if pack.decision.accepted
-                    else f'Searched "{query}" → no supported evidence'
-                ),
+                label=label,
                 note_ids=[row.note_id for row in pack.notes],
             )
 

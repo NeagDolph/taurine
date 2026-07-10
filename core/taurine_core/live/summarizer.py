@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -81,6 +82,12 @@ class Summarizer:
         self.llm = llm
         self.index = index
         self.validator = validator
+        # Accepted-evidence ledger (C3a): refs cited by the last ACCEPTED
+        # summary stay citeable on later passes (they were validated at
+        # acceptance and their payload text lets NLI re-check them). Pruned
+        # wholesale to the current accepted summary's citations on each
+        # acceptance; never contains unvalidated refs.
+        self._accepted_citation_refs: set[str] = set()
 
     async def summarize(
         self,
@@ -130,8 +137,12 @@ class Summarizer:
             )
 
         valid_ids = _valid_evidence_ids(transcript, update)
+        # C3a: refs cited by the previous ACCEPTED summary stay available so
+        # the rolling update may retain its sentences. supplied_ids remains
+        # the current pass only — nothing unvalidated becomes citeable.
+        available_ids = valid_ids | self._resolvable_accepted_refs()
         actionables = _validated_actionables(
-            raw.get("actionables"), transcript, valid_ids
+            raw.get("actionables"), transcript, available_ids
         )
         summary_md = str(raw.get("summary_md") or "").strip()
         validation_text = _validation_text(summary_md, actionables)
@@ -139,7 +150,7 @@ class Summarizer:
             validation_text,
             mode="live",
             supplied_ids=valid_ids,
-            available_ids=valid_ids,
+            available_ids=available_ids,
         )
         citation_stats = {
             "total": float(len(validation.cited_ids)),
@@ -161,12 +172,20 @@ class Summarizer:
         new_actionables, updated_actionables, merged_actionables = _merge_actionables(
             actionables, open_actionables
         )
+        highlights = self._supported_highlights(
+            raw.get("highlights"),
+            supplied_ids=valid_ids,
+            available_ids=available_ids,
+        )
+        self._note_accepted(
+            validation.cited_ids, (row.fact_id for row in highlights)
+        )
         next_rev = (state.rev if state is not None else 0) + 1
         evidence = _evidence_payload(update)
         summary = MeetingSummary(
             rev=next_rev,
             summary_md=summary_md,
-            highlights=_validated_highlights(raw.get("highlights"), valid_ids),
+            highlights=highlights,
             actionables=merged_actionables,
             evidence=evidence,
             updated_at=time.time(),
@@ -181,6 +200,79 @@ class Summarizer:
             citation_stats=citation_stats,
             validation=validation,
         )
+
+    def _resolvable_accepted_refs(self) -> set[str]:
+        """Previously-accepted citation refs that still resolve with payload
+        text, so NLI can re-check any sentence that keeps citing them."""
+
+        registry = self.validator.registry
+        kept: set[str] = set()
+        for ref in self._accepted_citation_refs:
+            record = registry.resolve(ref)
+            if record is None:
+                continue
+            if record.kind in {"passage", "transcript"} and not _record_text(record):
+                continue
+            kept.add(ref)
+        return kept
+
+    def _note_accepted(
+        self,
+        cited_ids: Iterable[str],
+        highlight_fact_ids: Iterable[str] = (),
+    ) -> None:
+        """Prune the accepted-evidence ledger to the current accepted summary.
+
+        Fact sources ride along so grandfathered fact citations keep passing
+        provenance checks (they were validated as available at acceptance).
+        """
+
+        registry = self.validator.registry
+        refs = set(cited_ids) | set(highlight_fact_ids)
+        for ref in tuple(refs):
+            record = registry.resolve(ref)
+            if record is None:
+                refs.discard(ref)
+                continue
+            if record.kind == "fact":
+                sources = record.payload.get("source_evidence_ids")
+                if isinstance(sources, (list, tuple)):
+                    refs.update(str(source) for source in sources)
+        self._accepted_citation_refs = refs
+
+    def _supported_highlights(
+        self,
+        rows: Any,
+        *,
+        supplied_ids: set[str],
+        available_ids: set[str],
+    ) -> list[SummaryHighlight]:
+        """NLI-gate each highlight's ``why`` text individually (L17): a
+        highlight failing validation drops the highlight, not the summary."""
+
+        kept: list[SummaryHighlight] = []
+        for row in _validated_highlights(rows, available_ids):
+            why = row.why.strip()
+            if not why:
+                kept.append(row)
+                continue
+            result = self.validator.validate(
+                f"{why.rstrip('.')}. [{row.fact_id}]",
+                mode="live",
+                supplied_ids=supplied_ids,
+                available_ids=available_ids,
+            )
+            if result.accepted:
+                kept.append(row)
+        return kept
+
+
+def _record_text(record: Any) -> str:
+    for key in ("text", "body", "transcript", "content", "quote"):
+        value = record.payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def _build_user_prompt(
@@ -242,6 +334,7 @@ def _open_actionables_block(rows: list[Actionable]) -> str:
                 "status": row.status,
                 "assignee": row.assignee,
                 "due": row.due,
+                "grounding": list(row.grounding),
             }
             for row in rows
         ],

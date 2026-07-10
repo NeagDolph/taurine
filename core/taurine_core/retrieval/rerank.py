@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Literal, Sequence
@@ -14,6 +15,8 @@ from taurine_core.models_local import (
 )
 from taurine_core.retrieval.types import RetrievalMode
 
+
+logger = logging.getLogger(__name__)
 
 PASSAGE_RERANK_INSTRUCTION = (
     "Determine whether the exact source passage contains evidence relevant to "
@@ -28,8 +31,16 @@ class PassageRerankCandidate:
     title: str
     source: str
     text: str
+    # The candidate's rerank-input tier score (calibrated head score for
+    # direct hits, recognition score for triple support, PPR mass / path
+    # weight for expansions). Kept separate from the component scores below,
+    # which are never max()-mixed across families (H6).
     recall_score: float
     hint: str = ""
+    fused_score: float = 0.0
+    ppr_mass: float = 0.0
+    triple_support: float = 0.0
+    path_weight: float = 0.0
 
     @property
     def rerank_document(self) -> str:
@@ -107,6 +118,9 @@ class LocalPassageReranker:
         except LocalModelUnavailable:
             return _degraded(bounded, "local_reranker_unavailable")
         except Exception:
+            # Fail-closed to the degraded state, but keep a debug trail so a
+            # programming error cannot masquerade as "reranker unavailable".
+            logger.debug("passage reranker raised", exc_info=True)
             return _degraded(bounded, "local_reranker_unavailable")
         if len(scores) != len(bounded) or any(not math.isfinite(score) for score in scores):
             return _degraded(bounded, "local_reranker_invalid_output")

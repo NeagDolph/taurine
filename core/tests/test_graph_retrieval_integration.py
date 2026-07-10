@@ -111,3 +111,250 @@ def test_clean_records_build_to_citeable_pack_and_null_abstention(tmp_path: Path
     assert abstained.passages == ()
     assert abstained.facts == ()
     store.close()
+
+
+class OneHotEmbedder:
+    """Deterministic orthogonal embeddings so dense cosine is controllable."""
+
+    def __init__(self, dim: int = 16) -> None:
+        self.dim = dim
+        self.assigned: dict[str, int] = {}
+
+    def __call__(self, texts: list[str]) -> np.ndarray:
+        rows = []
+        for text in texts:
+            index = self.assigned.setdefault(text, len(self.assigned) % self.dim)
+            row = np.zeros(self.dim, dtype=np.float32)
+            row[index] = 1.0
+            rows.append(row)
+        return np.vstack(rows)
+
+
+def _real_engine(
+    snapshot,
+    store,
+    registry: EvidenceRegistry,
+    *,
+    mode: str = "chat",
+    query_vector: np.ndarray,
+    entity_resolver=None,
+    fallback_on_abstain: bool = False,
+) -> SharedRetrievalEngine:
+    artifact = load_calibration(
+        Path(__file__).resolve().parents[1]
+        / "evals"
+        / "graph_retrieval"
+        / "calibration-v1.json"
+    )
+    calibrator = HeadCalibrator(
+        artifact,
+        mode=mode,  # type: ignore[arg-type]
+        artifact_hash=artifact.hash,
+        config_hash=artifact.config_hash,
+        model_manifest=artifact.model_manifest,
+    )
+    return SharedRetrievalEngine(
+        snapshot,
+        store,
+        calibrator,
+        AbstentionPolicy(artifact, mode=mode),  # type: ignore[arg-type]
+        query_embedder=lambda _text: query_vector,
+        registry=registry,
+        reranker=LocalPassageReranker(
+            RelevantScorer(),  # type: ignore[arg-type]
+            mode=mode,  # type: ignore[arg-type]
+            acceptance_floor=(
+                artifact.rerank.live_floor if mode == "live" else artifact.rerank.chat_floor
+            ),
+        ),
+        entity_resolver=entity_resolver,
+        fallback_on_abstain=fallback_on_abstain,
+    )
+
+
+def test_real_store_with_broken_fts_degrades_instead_of_crashing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database = tmp_path / "taurine-knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+    ).build(
+        [make_note("launch", "Launch plan", "The launch is scheduled for July 18.")],
+        database,
+        replace_derived=True,
+    )
+    snapshot = load_index_snapshot(database)
+    store = snapshot.open_knowledge_store()
+    try:
+        def broken_bm25(query: str, k: int):
+            raise RuntimeError("fts index corrupted")
+
+        monkeypatch.setattr(store, "search_passages_bm25", broken_bm25)
+        registry = EvidenceRegistry()
+        engine = _real_engine(
+            snapshot, store, registry, query_vector=snapshot.passage_matrix[0]
+        )
+
+        pack = engine.retrieve(RetrievalQuery("When is the launch?", "chat", 2.0))
+
+        assert pack.decision.accepted
+        assert pack.passages[0].text == "The launch is scheduled for July 18."
+        assert "bm25" in pack.trace.debug["unavailable_heads"]
+        assert registry.refs("read")
+    finally:
+        store.close()
+
+
+def test_hub_seeded_date_entity_traverses_on_a_real_build(tmp_path: Path) -> None:
+    from taurine_core.schemas import ExtractedMention, Extraction
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {
+            "dates": Extraction(
+                mentions=[
+                    ExtractedMention(
+                        surface="July 18",
+                        etype="date_or_deadline",
+                        confidence=0.95,
+                        char_start=7,
+                        char_end=14,
+                        extractor="fake",
+                        schema_id="s1",
+                    )
+                ],
+                schema_id="s1",
+            ),
+            "plan": Extraction(mentions=[], schema_id="s1"),
+        }
+
+    database = tmp_path / "taurine-knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(),
+            embedder=OneHotEmbedder(),
+            embedding_dim=16,
+            extractor=extractor,
+        )
+    ).build(
+        [
+            make_note("dates", "Dates", "Due on July 18 for sure."),
+            make_note("plan", "Plan", "Completely unrelated gardening tips."),
+        ],
+        database,
+        replace_derived=True,
+    )
+    snapshot = load_index_snapshot(database)
+    store = snapshot.open_knowledge_store()
+    try:
+        entity_ids = tuple(
+            node_id
+            for node_id, kind in zip(
+                snapshot.base_graph.node_ids, snapshot.base_graph.node_kinds, strict=True
+            )
+            if kind == "entity"
+        )
+        assert len(entity_ids) == 1
+        date_entity = entity_ids[0]
+        rows = store.entity_contexts(entity_ids, build_id=snapshot.build_id)
+        assert rows and rows[0].traversal_eligible is False
+
+        from taurine_core.retrieval.heads import RawHeadCandidate
+
+        registry = EvidenceRegistry()
+        engine = _real_engine(
+            snapshot,
+            store,
+            registry,
+            query_vector=np.zeros(16, dtype=np.float32),
+            entity_resolver=lambda surface, etype, query: (
+                RawHeadCandidate("entity", date_entity, 1.0, "july 18"),
+            ),
+        )
+
+        seeded = engine.retrieve(
+            RetrievalQuery("What is due?", "chat", 2.0),
+            entity_spans=(("July 18", "date_or_deadline"),),
+        )
+
+        assert seeded.decision.accepted
+        date_passage = next(
+            row.passage_id for row in seeded.passages if row.note_id == "dates"
+        )
+        # The hub was temporarily enabled: PPR mass actually traversed the
+        # synthesized contains edges rather than the passage merely being a
+        # mention-derived direct candidate.
+        assert any(
+            node_id == date_passage and score > 0.0
+            for node_id, score in seeded.trace.ppr["top_passages"]
+        )
+
+        unseeded = engine.retrieve(RetrievalQuery("What is due?", "chat", 2.0))
+        assert not unseeded.decision.accepted
+        assert unseeded.passages == ()
+    finally:
+        store.close()
+
+
+def test_chat_fallback_pack_on_a_real_build(tmp_path: Path) -> None:
+    database = tmp_path / "taurine-knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=OneHotEmbedder(), embedding_dim=16)
+    ).build(
+        [
+            make_note("alpha", "Alpha", "Alpha subject matter."),
+            make_note("beta", "Beta", "Beta subject matter."),
+            make_note("gamma", "Gamma", "Gamma subject matter."),
+        ],
+        database,
+        replace_derived=True,
+    )
+    snapshot = load_index_snapshot(database)
+    store = snapshot.open_knowledge_store()
+    try:
+        # Equidistant from every passage: cosine 1/sqrt(3) ≈ 0.577 calibrates
+        # below the chat dense floor but above the 0.75 × floor fallback floor.
+        blended = snapshot.passage_matrix.sum(axis=0)
+        blended = blended / np.linalg.norm(blended)
+
+        registry = EvidenceRegistry()
+        chat_engine = _real_engine(
+            snapshot,
+            store,
+            registry,
+            query_vector=blended,
+            fallback_on_abstain=True,
+        )
+        pack = chat_engine.retrieve(
+            RetrievalQuery("loosely reminiscent of it all", "chat", 2.0)
+        )
+
+        assert not pack.decision.accepted
+        assert pack.decision.fallback is True
+        assert pack.decision.reason == "fallback_low_confidence"
+        assert 1 <= len(pack.passages) <= 4
+        assert pack.facts == () and pack.paths == ()
+        assert all(
+            registry.resolve(row.evidence_id) is not None
+            and "read" in registry.resolve(row.evidence_id).states
+            for row in pack.passages
+        )
+
+        live_registry = EvidenceRegistry()
+        live_engine = _real_engine(
+            snapshot,
+            store,
+            live_registry,
+            mode="live",
+            query_vector=blended,
+            fallback_on_abstain=False,
+        )
+        live_pack = live_engine.retrieve(
+            RetrievalQuery("loosely reminiscent of it all", "live", 2.0)
+        )
+        assert not live_pack.decision.accepted
+        assert live_pack.decision.fallback is False
+        assert live_pack.passages == ()
+        assert live_registry.refs("read") == ()
+    finally:
+        store.close()

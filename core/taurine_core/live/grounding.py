@@ -38,6 +38,9 @@ class GroundingUpdate:
     support_facts: tuple[EvidenceFact, ...] = ()
     support_paths: tuple[EvidencePath, ...] = ()
     support_notes: tuple[EvidenceNote, ...] = ()
+    # Display entries that survive only from prior passes (incumbents not in
+    # the current pack's support). Presentation state, never summary support.
+    prior_context_ids: tuple[str, ...] = ()
 
 
 class GroundingEngine:
@@ -61,6 +64,9 @@ class GroundingEngine:
         self._facts: dict[str, EvidenceFact] = {}
         self._paths: dict[str, EvidencePath] = {}
         self._notes: dict[str, EvidenceNote] = {}
+        # Accumulated session mass per passage evidence ref (spec §13.3):
+        # decayed per accepted pass, capped per note, pruned below epsilon.
+        self._accum: dict[str, float] = {}
         self._display_ids: tuple[str, ...] = ()
         self._revision = 0
         self._trace: RetrievalTrace | None = None
@@ -97,6 +103,7 @@ class GroundingEngine:
             self._paths[row.path_id] = row
         for row in pack.notes:
             self._notes[row.note_ref] = row
+        self._advance_accumulator(pack.passages)
         new_support_ids = _ordered_refs(set(self._support_ids()) - prior_support)
 
         self._display_ids = self._select_display(pack.passages)
@@ -115,13 +122,45 @@ class GroundingEngine:
         )
 
     def session_reset(self) -> dict[str, float]:
-        """Passage-node reset mass for the next shared retrieval pass."""
+        """Post-decay accumulated passage mass for the next retrieval pass."""
 
         return {
-            row.passage_id: max(0.0, float(row.rerank_score))
-            for row in self._ordered_passages()
-            if row.rerank_score > 0.0
+            self._passages[ref].passage_id: mass
+            for ref, mass in sorted(self._accum.items())
+            if mass > 0.0 and ref in self._passages
         }
+
+    def _advance_accumulator(self, current: tuple[EvidencePassage, ...]) -> None:
+        """Decay, add current accepted scores, cap per note, prune (§13.3).
+
+        Runs only on accepted passes — abstention neither adds nor decays.
+        """
+
+        decay = float(config.LIVE_ACCUM_DECAY)
+        for ref in self._accum:
+            self._accum[ref] *= decay
+        for row in current:
+            self._accum[row.evidence_id] = self._accum.get(row.evidence_id, 0.0) + max(
+                0.0, float(row.rerank_score)
+            )
+        note_mass: dict[str, float] = {}
+        for ref, mass in self._accum.items():
+            passage = self._passages.get(ref)
+            if passage is not None:
+                note_mass[passage.note_id] = note_mass.get(passage.note_id, 0.0) + mass
+        cap = float(config.LIVE_ACCUM_NOTE_CAP)
+        for ref in self._accum:
+            passage = self._passages.get(ref)
+            if passage is None:
+                continue
+            total = note_mass.get(passage.note_id, 0.0)
+            if total > cap:
+                self._accum[ref] *= cap / total
+        epsilon = float(config.LIVE_ACCUM_EPSILON)
+        pruned = [ref for ref, mass in self._accum.items() if mass < epsilon]
+        for ref in pruned:
+            del self._accum[ref]
+            self._passages.pop(ref, None)
 
     def _validate_pack(self, pack: EvidencePack) -> None:
         rows = (
@@ -245,6 +284,16 @@ class GroundingEngine:
         )
         display_note_ids = {row.note_id for row in display_passages}
         display_notes = tuple(row for row in notes if row.note_id in display_note_ids)
+        current_pass_ids = (
+            {row.evidence_id for row in support.passages}
+            if support is not None
+            else set()
+        )
+        prior_context_ids = tuple(
+            row.evidence_id
+            for row in display_passages
+            if row.evidence_id not in current_pass_ids
+        )
         return GroundingUpdate(
             decision=decision,
             passages=passages,
@@ -261,6 +310,7 @@ class GroundingEngine:
             support_facts=support.facts if support is not None else (),
             support_paths=support.paths if support is not None else (),
             support_notes=support.notes if support is not None else (),
+            prior_context_ids=prior_context_ids,
         )
 
     def _support_ids(self) -> tuple[str, ...]:
@@ -271,6 +321,7 @@ class GroundingEngine:
         self._facts.clear()
         self._paths.clear()
         self._notes.clear()
+        self._accum.clear()
         self._display_ids = ()
 
 

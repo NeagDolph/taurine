@@ -1,6 +1,6 @@
 {
   "artifact_version": "1",
-  "hash": "sha256:initial-conservative-2026-07-09",
+  "hash": "sha256:e78d3d83e0969f15a4b57cd955086f684465c004caff1c854db982f6d619764f",
   "model_manifest": {
     "embedding": "Qwen/Qwen3-Embedding-0.6B",
     "reranker": "Qwen/Qwen3-Reranker-0.6B",
@@ -63,13 +63,134 @@
   "modes": {
     "live": {
       "heads": {
-        "dense": {"knots": [[-1.0, 0.0], [0.45, 0.05], [0.62, 0.55], [0.78, 0.95], [1.0, 1.0]], "acceptance_floor": 0.7, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "bm25": {"knots": [[0.0, 0.0], [2.0, 0.1], [6.0, 0.7], [20.0, 1.0]], "acceptance_floor": 0.75, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "exact": {"knots": [[0.0, 0.0], [0.5, 0.8], [1.0, 1.0]], "acceptance_floor": 0.9, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "entity": {"knots": [[0.0, 0.0], [0.6, 0.4], [0.85, 0.9], [1.0, 1.0]], "acceptance_floor": 0.85, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "triple": {"knots": [[-1.0, 0.0], [0.55, 0.1], [0.72, 0.75], [1.0, 1.0]], "acceptance_floor": 0.8, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}}
+        "dense": {
+          "knots": [
+            [
+              -1.0,
+              0.0
+            ],
+            [
+              0.45,
+              0.05
+            ],
+            [
+              0.62,
+              0.55
+            ],
+            [
+              0.78,
+              0.95
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.7,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "bm25": {
+          "knots": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              2.0,
+              0.1
+            ],
+            [
+              6.0,
+              0.7
+            ],
+            [
+              20.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.75,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "exact": {
+          "knots": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              0.5,
+              0.8
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.9,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "entity": {
+          "knots": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              0.6,
+              0.4
+            ],
+            [
+              0.85,
+              0.9
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.85,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "triple": {
+          "knots": [
+            [
+              -1.0,
+              0.0
+            ],
+            [
+              0.55,
+              0.1
+            ],
+            [
+              0.72,
+              0.75
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.8,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        }
       },
-      "head_weights": {"dense": 1.0, "bm25": 1.0, "exact": 1.0, "entity": 1.0, "triple": 1.0},
+      "head_weights": {
+        "dense": 1.0,
+        "bm25": 1.0,
+        "exact": 1.0,
+        "entity": 1.0,
+        "triple": 1.0
+      },
       "rrf_k": 60,
       "mmr_lambda": 0.2,
       "source_diversity_penalty": 0.05,
@@ -82,13 +203,134 @@
     },
     "chat": {
       "heads": {
-        "dense": {"knots": [[-1.0, 0.0], [0.4, 0.05], [0.58, 0.55], [0.76, 0.95], [1.0, 1.0]], "acceptance_floor": 0.62, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "bm25": {"knots": [[0.0, 0.0], [1.5, 0.1], [5.0, 0.7], [20.0, 1.0]], "acceptance_floor": 0.65, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "exact": {"knots": [[0.0, 0.0], [0.5, 0.8], [1.0, 1.0]], "acceptance_floor": 0.9, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "entity": {"knots": [[0.0, 0.0], [0.55, 0.4], [0.8, 0.9], [1.0, 1.0]], "acceptance_floor": 0.78, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "triple": {"knots": [[-1.0, 0.0], [0.5, 0.1], [0.68, 0.75], [1.0, 1.0]], "acceptance_floor": 0.72, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}}
+        "dense": {
+          "knots": [
+            [
+              -1.0,
+              0.0
+            ],
+            [
+              0.4,
+              0.05
+            ],
+            [
+              0.58,
+              0.55
+            ],
+            [
+              0.76,
+              0.95
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.62,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "bm25": {
+          "knots": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              1.5,
+              0.1
+            ],
+            [
+              5.0,
+              0.7
+            ],
+            [
+              20.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.65,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "exact": {
+          "knots": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              0.5,
+              0.8
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.9,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "entity": {
+          "knots": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              0.55,
+              0.4
+            ],
+            [
+              0.8,
+              0.9
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.78,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "triple": {
+          "knots": [
+            [
+              -1.0,
+              0.0
+            ],
+            [
+              0.5,
+              0.1
+            ],
+            [
+              0.68,
+              0.75
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.72,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        }
       },
-      "head_weights": {"dense": 1.0, "bm25": 1.0, "exact": 1.0, "entity": 1.0, "triple": 1.0},
+      "head_weights": {
+        "dense": 1.0,
+        "bm25": 1.0,
+        "exact": 1.0,
+        "entity": 1.0,
+        "triple": 1.0
+      },
       "rrf_k": 60,
       "mmr_lambda": 0.2,
       "source_diversity_penalty": 0.05,
@@ -101,13 +343,134 @@
     },
     "tool": {
       "heads": {
-        "dense": {"knots": [[-1.0, 0.0], [0.38, 0.05], [0.55, 0.55], [0.74, 0.95], [1.0, 1.0]], "acceptance_floor": 0.58, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "bm25": {"knots": [[0.0, 0.0], [1.0, 0.1], [4.0, 0.7], [20.0, 1.0]], "acceptance_floor": 0.6, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "exact": {"knots": [[0.0, 0.0], [0.5, 0.8], [1.0, 1.0]], "acceptance_floor": 0.9, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "entity": {"knots": [[0.0, 0.0], [0.5, 0.4], [0.78, 0.9], [1.0, 1.0]], "acceptance_floor": 0.75, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}},
-        "triple": {"knots": [[-1.0, 0.0], [0.48, 0.1], [0.65, 0.75], [1.0, 1.0]], "acceptance_floor": 0.7, "sample_count": 0, "trained_at": "2026-07-09", "held_out": {}}
+        "dense": {
+          "knots": [
+            [
+              -1.0,
+              0.0
+            ],
+            [
+              0.38,
+              0.05
+            ],
+            [
+              0.55,
+              0.55
+            ],
+            [
+              0.74,
+              0.95
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.58,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "bm25": {
+          "knots": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              1.0,
+              0.1
+            ],
+            [
+              4.0,
+              0.7
+            ],
+            [
+              20.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.6,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "exact": {
+          "knots": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              0.5,
+              0.8
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.9,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "entity": {
+          "knots": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              0.5,
+              0.4
+            ],
+            [
+              0.78,
+              0.9
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.75,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        },
+        "triple": {
+          "knots": [
+            [
+              -1.0,
+              0.0
+            ],
+            [
+              0.48,
+              0.1
+            ],
+            [
+              0.65,
+              0.75
+            ],
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "acceptance_floor": 0.7,
+          "sample_count": 0,
+          "trained_at": "2026-07-09",
+          "held_out": {}
+        }
       },
-      "head_weights": {"dense": 1.0, "bm25": 1.0, "exact": 1.0, "entity": 1.0, "triple": 1.0},
+      "head_weights": {
+        "dense": 1.0,
+        "bm25": 1.0,
+        "exact": 1.0,
+        "entity": 1.0,
+        "triple": 1.0
+      },
       "rrf_k": 60,
       "mmr_lambda": 0.2,
       "source_diversity_penalty": 0.05,
@@ -131,6 +494,14 @@
     "tool_ambiguity_low": 0.58,
     "tool_ambiguity_high": 0.82
   },
-  "rerank": {"live_floor": 0.76, "chat_floor": 0.66},
-  "nli": {"entailment_floor": 0.8}
+  "rerank": {
+    "live_floor": 0.76,
+    "chat_floor": 0.66
+  },
+  "nli": {
+    "entailment_floor": 0.8
+  },
+  "graph": {
+    "semantic_floor": 0.55
+  }
 }

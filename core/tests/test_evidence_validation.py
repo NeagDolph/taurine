@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -8,7 +10,11 @@ from taurine_core import config
 from taurine_core import download_models
 from taurine_core import models_local
 from taurine_core.retrieval.registry import EvidenceRegistry
-from taurine_core.retrieval.validate import EvidenceValidator
+from taurine_core.retrieval.validate import (
+    EvidenceValidator,
+    _sentences,
+    validate_evidence_output,
+)
 
 
 @dataclass
@@ -28,8 +34,12 @@ def test_rejects_unknown_and_unsupplied_citations_without_stripping_claim() -> N
     registry.register("passage", "p1", {"text": "Launch is July 18."})
     validator = EvidenceValidator(registry, FakeNLI({}), entailment_floor=0.8)
 
-    unknown = validator.validate("Launch is July 18. [E99]", mode="chat")
-    unsupplied = validator.validate("Launch is July 18. [E1]", mode="chat")
+    unknown = validator.validate(
+        "Launch is July 18. [E99]", mode="chat", available_ids=("E1",)
+    )
+    unsupplied = validator.validate(
+        "Launch is July 18. [E1]", mode="chat", available_ids=()
+    )
 
     assert not unknown.accepted
     assert unknown.accepted_output == ""
@@ -64,7 +74,9 @@ def test_factual_sentence_requires_e_f_or_t_coverage(citation: str) -> None:
 
     result = EvidenceValidator(
         registry, FakeNLI({}), entailment_floor=0.8
-    ).validate(f"Launch is July 18.{citation}", mode="chat")
+    ).validate(
+        f"Launch is July 18.{citation}", mode="chat", available_ids=("N1", "P1")
+    )
 
     assert not result.accepted
     assert result.unsupported_sentences == (f"Launch is July 18.{citation}",)
@@ -79,12 +91,12 @@ def test_entailed_passage_is_accepted_and_contradiction_requires_repair() -> Non
         registry,
         FakeNLI({(evidence, claim): 0.92}),
         entailment_floor=0.8,
-    ).validate(f"{claim} [E1]", mode="chat")
+    ).validate(f"{claim} [E1]", mode="chat", available_ids=("E1",))
     contradicted = EvidenceValidator(
         registry,
         FakeNLI({(evidence, claim): 0.1}),
         entailment_floor=0.8,
-    ).validate(f"{claim} [E1]", mode="chat")
+    ).validate(f"{claim} [E1]", mode="chat", available_ids=("E1",))
 
     assert entailed.accepted
     assert entailed.accepted_output == f"{claim} [E1]"
@@ -109,7 +121,7 @@ def test_fact_requires_supplied_passage_provenance_and_uses_it_for_nli() -> None
         registry,
         FakeNLI({(evidence, claim): 0.95}),
         entailment_floor=0.8,
-    ).validate(f"{claim} [F1]", mode="chat")
+    ).validate(f"{claim} [F1]", mode="chat", available_ids=("E1", "F1"))
 
     assert result.accepted
     assert result.cited_ids == ("F1",)
@@ -122,7 +134,7 @@ def test_fact_requires_supplied_passage_provenance_and_uses_it_for_nli() -> None
     )
     invalid = EvidenceValidator(
         broken, FakeNLI({}), entailment_floor=0.8
-    ).validate(f"{claim} [F1]", mode="chat")
+    ).validate(f"{claim} [F1]", mode="chat", available_ids=("F1",))
     assert not invalid.accepted
     assert "F1" in invalid.invalid_citations
 
@@ -141,7 +153,7 @@ def test_fact_support_group_needs_at_least_one_supplied_source_not_every_source(
         registry,
         FakeNLI({(evidence, "Maya owns Launch."): 0.95}),
         entailment_floor=0.8,
-    ).validate("Maya owns Launch. [F1]", mode="chat")
+    ).validate("Maya owns Launch. [F1]", mode="chat", available_ids=("E1", "F1"))
 
     assert result.accepted
 
@@ -162,9 +174,11 @@ def test_current_claim_cannot_rely_only_on_superseded_fact() -> None:
     )
     validator = EvidenceValidator(registry, nli, entailment_floor=0.8)
 
-    current = validator.validate("Maya works at Wink. [F1]", mode="chat")
+    current = validator.validate(
+        "Maya works at Wink. [F1]", mode="chat", available_ids=("E1", "F1")
+    )
     historical = validator.validate(
-        "Maya formerly worked at Wink. [F1]", mode="chat"
+        "Maya formerly worked at Wink. [F1]", mode="chat", available_ids=("E1", "F1")
     )
 
     assert not current.accepted
@@ -185,7 +199,7 @@ I might be mistaken about the schedule.
 """
     result = EvidenceValidator(
         EvidenceRegistry(), FakeNLI({}), entailment_floor=0.8
-    ).validate(output, mode="chat")
+    ).validate(output, mode="chat", available_ids=())
 
     assert result.accepted
     assert result.accepted_output == output
@@ -196,8 +210,12 @@ def test_missing_nli_fails_live_closed_and_requires_chat_evidence_excerpt() -> N
     registry = _read_passage("Launch is July 18.")
     validator = EvidenceValidator(registry, None, entailment_floor=0.8)
 
-    live = validator.validate("Launch is July 18. [E1]", mode="live")
-    chat = validator.validate("Launch is July 18. [E1]", mode="chat")
+    live = validator.validate(
+        "Launch is July 18. [E1]", mode="live", available_ids=("E1",)
+    )
+    chat = validator.validate(
+        "Launch is July 18. [E1]", mode="chat", available_ids=("E1",)
+    )
 
     assert not live.accepted
     assert live.accepted_output == ""
@@ -247,6 +265,104 @@ def test_download_manifest_includes_nli_model(monkeypatch, tmp_path) -> None:
 
     assert download_models.main() == 0
     assert config.EVIDENCE_NLI_MODEL in downloaded
+
+
+def test_available_ids_is_required_and_never_session_cumulative() -> None:
+    """L13: no default availability — callers must scope the citable set."""
+
+    registry = _read_passage("Launch is July 18.")
+    validator = EvidenceValidator(registry, FakeNLI({}), entailment_floor=0.8)
+
+    with pytest.raises(TypeError):
+        validator.validate("Launch is July 18. [E1]", mode="chat")  # type: ignore[call-arg]
+
+    with pytest.raises(TypeError):
+        validate_evidence_output(  # type: ignore[call-arg]
+            "Launch is July 18. [E1]",
+            registry,
+            mode="chat",
+            nli_scorer=FakeNLI({}),
+            entailment_floor=0.8,
+        )
+
+
+def test_validate_evidence_output_threads_available_ids() -> None:
+    evidence = "Launch is July 18."
+    registry = _read_passage(evidence)
+    nli = FakeNLI({(evidence, "Launch is July 18."): 0.95})
+
+    accepted = validate_evidence_output(
+        "Launch is July 18. [E1]",
+        registry,
+        mode="chat",
+        nli_scorer=nli,
+        entailment_floor=0.8,
+        available_ids=("E1",),
+    )
+    unavailable = validate_evidence_output(
+        "Launch is July 18. [E1]",
+        registry,
+        mode="chat",
+        nli_scorer=nli,
+        entailment_floor=0.8,
+        available_ids=(),
+    )
+
+    assert accepted.accepted
+    assert not unavailable.accepted
+    assert unavailable.invalid_citations == ("E1",)
+
+
+def test_unsupported_details_carry_per_sentence_reasons() -> None:
+    """L31: stripped claims persist with their rejection reason."""
+
+    evidence = "Launch is July 18."
+    registry = _read_passage(evidence)
+    result = EvidenceValidator(
+        registry,
+        FakeNLI({(evidence, "The launch is tomorrow."): 0.0}),
+        entailment_floor=0.8,
+    ).validate(
+        "The launch is tomorrow. [E1] The venue is unknown to me for now.",
+        mode="chat",
+        available_ids=("E1",),
+    )
+
+    assert not result.accepted
+    assert ("The launch is tomorrow. [E1]", "entailment_below_floor") in result.unsupported_details
+    assert (
+        "The venue is unknown to me for now.",
+        "citation_coverage",
+    ) in result.unsupported_details
+
+
+def _classify(text: str) -> bool:
+    sentences, _visible = _sentences(text)
+    assert len(sentences) == 1, text
+    return sentences[0].factual
+
+
+def test_sentence_classifier_fixture_accuracy_and_zero_bypass_exempts() -> None:
+    """M12: ≥0.95 accuracy on the labeled set; bypass phrasings are NEVER
+    exempted ("Here's what I found: <claim>" must classify factual)."""
+
+    fixture = Path(__file__).parent / "fixtures" / "sentence_classes.jsonl"
+    rows = [
+        json.loads(line)
+        for line in fixture.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) >= 40
+
+    correct = 0
+    for row in rows:
+        predicted = _classify(str(row["text"]))
+        if predicted == bool(row["factual"]):
+            correct += 1
+        if row.get("bypass"):
+            assert predicted is True, f"false exempt on bypass: {row['text']}"
+    accuracy = correct / len(rows)
+    assert accuracy >= 0.95, f"classifier accuracy {accuracy:.3f} below 0.95"
 
 
 def _read_passage(text: str) -> EvidenceRegistry:

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+from taurine_core import config
 from taurine_core.live.grounding import GroundingEngine
+from taurine_core.schemas import LiveGroundingEvent
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.retrieval.types import (
     EvidenceFact,
@@ -131,6 +133,96 @@ def test_rejects_accepted_pack_whose_evidence_was_not_registered_as_read() -> No
 
     with pytest.raises(ValueError, match="supplied/read"):
         GroundingEngine(registry).on_pack(pack)
+
+
+def test_accumulator_decays_adds_and_prunes_below_epsilon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "LIVE_ACCUM_DECAY", 0.5)
+    monkeypatch.setattr(config, "LIVE_ACCUM_NOTE_CAP", 10.0)
+    monkeypatch.setattr(config, "LIVE_ACCUM_EPSILON", 0.3)
+    registry = EvidenceRegistry()
+    engine = GroundingEngine(registry)
+
+    engine.on_pack(_pack(registry, "one", passages=(("p1", "n1", 1.0),)))
+    assert engine.session_reset() == {"p1": 1.0}
+
+    engine.on_pack(_pack(registry, "two", passages=(("p2", "n2", 1.0),)))
+    assert engine.session_reset() == {"p1": 0.5, "p2": 1.0}
+
+    # p1 decays to 0.25 < epsilon 0.3 → pruned from reset AND session state.
+    update = engine.on_pack(_pack(registry, "three", passages=(("p2", "n2", 1.0),)))
+    reset = engine.session_reset()
+    assert "p1" not in reset
+    assert reset["p2"] == pytest.approx(1.5)
+    assert all(row.evidence_id != "E1" for row in update.passages)
+
+
+def test_accumulator_caps_per_note_mass(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "LIVE_ACCUM_DECAY", 1.0)
+    monkeypatch.setattr(config, "LIVE_ACCUM_NOTE_CAP", 1.5)
+    monkeypatch.setattr(config, "LIVE_ACCUM_EPSILON", 0.02)
+    registry = EvidenceRegistry()
+    engine = GroundingEngine(registry)
+
+    for text in ("one", "two", "three"):
+        engine.on_pack(_pack(registry, text, passages=(("p1", "n1", 1.0),)))
+
+    assert engine.session_reset()["p1"] == pytest.approx(1.5)
+
+
+def test_abstained_pass_neither_adds_nor_decays_accumulated_mass() -> None:
+    registry = EvidenceRegistry()
+    engine = GroundingEngine(registry)
+    engine.on_pack(_pack(registry, "one", passages=(("p1", "n1", 0.9),)))
+    before = engine.session_reset()
+
+    engine.on_pack(
+        EvidencePack.abstained(RetrievalQuery("filler", "live", now=2.0), "below_live_floor")
+    )
+
+    assert engine.session_reset() == before
+
+
+def test_topic_shift_clears_accumulated_mass() -> None:
+    registry = EvidenceRegistry()
+    engine = GroundingEngine(registry)
+    engine.on_pack(_pack(registry, "one", passages=(("p1", "n1", 0.9),)))
+
+    engine.on_pack(
+        _pack(registry, "two", passages=(("p2", "n2", 0.85),)), topic_shift=True
+    )
+
+    assert engine.session_reset() == {"p2": pytest.approx(0.85)}
+
+
+def test_incumbent_display_entries_are_flagged_prior_context() -> None:
+    registry = EvidenceRegistry()
+    engine = GroundingEngine(registry, display_limit=2, hysteresis=1.15)
+    engine.on_pack(_pack(registry, "one", passages=(("p1", "n1", 0.9),)))
+    update = engine.on_pack(_pack(registry, "two", passages=(("p2", "n2", 0.95),)))
+
+    display_ids = {row.evidence_id for row in update.display_passages}
+    assert display_ids == {"E1", "E2"}
+    assert update.prior_context_ids == ("E1",)
+
+    event = LiveGroundingEvent.from_domain(update)
+    flags = {row.evidence_id: row.prior_context for row in event.display_passages}
+    assert flags == {"E1": True, "E2": False}
+    # accumulated (non-display) sections stay unflagged
+    assert all(not row.prior_context for row in event.passages)
+
+
+def test_abstained_pass_flags_every_display_entry_prior_context() -> None:
+    registry = EvidenceRegistry()
+    engine = GroundingEngine(registry)
+    engine.on_pack(_pack(registry, "one", passages=(("p1", "n1", 0.9),)))
+
+    update = engine.on_pack(
+        EvidencePack.abstained(RetrievalQuery("filler", "live", now=2.0), "below_live_floor")
+    )
+
+    assert update.prior_context_ids == ("E1",)
 
 
 def _pack(

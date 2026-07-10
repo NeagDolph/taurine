@@ -78,6 +78,15 @@ def build_projection(
             continue
         left_notes = sorted(entity_note_strength.get(edge.src_id, {}))
         right_notes = sorted(entity_note_strength.get(edge.dst_id, {}))
+        # L1: a traversal-ineligible endpoint (date/pronoun/hub) has no
+        # contains-derived notes; fall back to the fact's own provenance so
+        # the fact still connects its source notes to notes holding the OTHER
+        # (eligible) endpoint. Dates-only facts (both sides empty) stay out.
+        provenance = sorted(edge.metadata.get("source_note_ids", ()))
+        if left_notes and not right_notes:
+            right_notes = provenance
+        elif right_notes and not left_notes:
+            left_notes = provenance
         for left in left_notes:
             for right in right_notes:
                 if left == right:
@@ -147,11 +156,12 @@ def _select_edges(edges: list[ProjectionEdge], max_degree: int) -> list[Projecti
         degree[edge.src_note_id] += 1
         degree[edge.dst_note_id] += 1
 
+    # L2: the spanning-forest phase is pure — no degree cap — so a hub note
+    # bridging more components than max_degree still connects them all. The
+    # cap applies only to the fill phase below.
     for edge in edges:
         left_root, right_root = find(edge.src_note_id), find(edge.dst_note_id)
         if left_root == right_root:
-            continue
-        if degree[edge.src_note_id] >= max_degree or degree[edge.dst_note_id] >= max_degree:
             continue
         add(edge)
         parent[max(left_root, right_root)] = min(left_root, right_root)

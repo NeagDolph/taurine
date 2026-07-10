@@ -11,6 +11,12 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 from taurine_core.indexer.store import Index
 from taurine_core.ports import SpanExtractorPort
 from taurine_core.retrieval.evidence import SharedRetrievalEngine
+from taurine_core.retrieval.evidence_payloads import (
+    FACT_APPEND_FIELDS,
+    fact_group_payload,
+    fact_source_identity,
+    passage_payload,
+)
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.retrieval.rerank import PassageRerankCandidate
 from taurine_core.retrieval.types import (
@@ -41,6 +47,12 @@ _TOKEN = re.compile(r"[\w'-]+", re.UNICODE)
 _QUERY_STOPWORDS = frozenset(
     {"a", "an", "and", "about", "does", "how", "is", "me", "of", "the", "to", "what", "when", "where", "why", "who"}
 )
+
+# M6: fact-support exposure caps — at most one non-selected support passage
+# per fact and at most four extra passages per pack.
+_FACT_SUPPORT_PER_FACT = 1
+_FACT_SUPPORT_MAX_TOTAL = 4
+_FACT_SUPPORT_SNIPPET_CHARS = 200
 
 
 class ChatRetriever:
@@ -78,8 +90,12 @@ class ChatRetriever:
         self._pre_turn: dict[str, object] | None = None
         self._turn_base: EvidencePack | None = None
         self._turn_read_ids: list[str] = []
+        # H7: accumulator changes stay pending until the turn is finalized as
+        # accepted (commit_turn) — failed/cancelled turns never advance state.
+        self._pending_reset: dict[str, float] | None = None
         self.engine = engine_factory(self.registry)
         self._tool_engine: SharedRetrievalEngine | None = None
+        self._fact_variant_cache: dict[str, tuple[Any, ...]] | None = None
 
     def context_pack(
         self,
@@ -89,10 +105,11 @@ class ChatRetriever:
         conversation_context: Sequence[str] = (),
         rewritten_query: str | None = None,
     ) -> EvidencePack:
-        """Run Stage A and advance state exactly once for an accepted user turn."""
+        """Run Stage A; accumulator advancement stays pending until commit_turn."""
 
         self._pre_turn = self.snapshot()
         self._turn_read_ids = []
+        self._pending_reset = None
         context = tuple(str(row) for row in conversation_context[-2:] if str(row).strip())
         rewritten = (
             str(rewritten_query).strip()
@@ -129,15 +146,36 @@ class ChatRetriever:
         self._turn_base = pack
         self._record_turn_read(pack.trace.read_ids)
         if pack.decision.accepted:
-            self._accepted_reset = {
+            self._pending_reset = {
                 passage.passage_id: float(passage.rerank_score)
                 for passage in pack.passages
             }
         elif not dependent:
-            self._accepted_reset = {}
-        self._accepted_turn += 1
-        self._seed_reset = {}  # graph-handoff seeds bias exactly one turn
+            self._pending_reset = {}
         return pack
+
+    def commit_turn(self) -> None:
+        """Advance accepted-turn state after the turn finalized successfully.
+
+        Called by the engine only after an accepted (non-cancelled,
+        non-errored) finalization, per §14.5 accepted-turn keying (H7)."""
+
+        if self._turn_base is None:
+            return
+        if self._pending_reset is not None:
+            self._accepted_reset = self._pending_reset
+        self._accepted_turn += 1
+        self._seed_reset = {}  # graph-handoff seeds bias exactly one accepted turn
+        self._pending_reset = None
+
+    def discard_turn(self) -> None:
+        """Restore the pre-turn snapshot after a cancelled/errored turn (H7).
+
+        Same mechanism regeneration uses: the registry and accumulator return
+        exactly to their state before this turn's Stage A ran."""
+
+        if self._pre_turn is not None:
+            self.restore(self._pre_turn)
 
     def seed_notes(self, note_ids: Sequence[str]) -> None:
         """Pre-populate the seed accumulator so the next turn is biased
@@ -181,10 +219,17 @@ class ChatRetriever:
         )
         if self._tool_engine is None:
             self._tool_engine = self._tool_engine_factory(self.registry)
+        # Mid-turn tool queries see this turn's pending accepted reset (if
+        # Stage A accepted) without committing it (H7).
+        session_reset = (
+            self._pending_reset
+            if self._pending_reset is not None
+            else self._accepted_reset
+        )
         pack = self._tool_engine.retrieve(
             request,
             entity_spans=self._entity_spans(query),
-            session_reset=self._accepted_reset or None,
+            session_reset=session_reset or None,
             passage_limit=max(0, int(k)),
         )
         self._record_turn_read(pack.trace.read_ids)
@@ -343,14 +388,69 @@ class ChatRetriever:
                     weight=0.0,
                     rendered=str(payload.get("rendered") or " -> ".join(nodes)),
                 )
+        # M5: selected_ids stays the Stage A candidate set from the engine
+        # trace (retrieved); read_ids carries everything consulted this turn.
         return replace(
             base,
             passages=tuple(passages[ref] for ref in read_refs if ref in passages),
             facts=tuple(facts[ref] for ref in read_refs if ref in facts),
             paths=tuple(paths[ref] for ref in read_refs if ref in paths),
             notes=tuple(notes[ref] for ref in read_refs if ref in notes),
-            trace=replace(base.trace, selected_ids=read_refs, read_ids=read_refs),
+            trace=replace(base.trace, read_ids=read_refs),
         )
+
+    def expose_fact_support(
+        self, pack: EvidencePack
+    ) -> dict[str, tuple[str, str, str]]:
+        """M6: make non-selected fact-support passages citable.
+
+        For each pack fact, at most one support ref that is not already a
+        rendered passage is marked read (so citing it validates) and returned
+        as ``fact_ref → (support_ref, title, snippet)`` for prompt rendering.
+        Bounded to ``_FACT_SUPPORT_MAX_TOTAL`` extra passages per pack; only
+        refs whose registry payload carries text are exposed."""
+
+        rendered = {row.evidence_id for row in pack.passages}
+        exposed: dict[str, tuple[str, str, str]] = {}
+        used_refs: set[str] = set()
+        for fact in pack.facts:
+            if len(exposed) >= _FACT_SUPPORT_MAX_TOTAL:
+                break
+            per_fact = 0
+            for ref in fact.source_evidence_ids:
+                if per_fact >= _FACT_SUPPORT_PER_FACT:
+                    break
+                if ref in rendered or ref in used_refs:
+                    continue
+                record = self.registry.resolve(ref)
+                if record is None or record.kind != "passage":
+                    continue
+                text = str(record.payload.get("text") or "").strip()
+                if not text:
+                    continue
+                passage_id = str(record.payload.get("passage_id") or record.source_id)
+                rows = self.engine.store.passage_contexts((passage_id,))
+                title = str(rows[0].title) if rows else ""
+                self.registry.mark_read(ref)
+                self._record_turn_read((ref,))
+                exposed[fact.fact_ref] = (
+                    ref,
+                    title,
+                    text[:_FACT_SUPPORT_SNIPPET_CHARS],
+                )
+                used_refs.add(ref)
+                per_fact += 1
+        return exposed
+
+    def evidence_sufficient(self) -> bool:
+        """M11: True when some evidence set read this turn cleared its floor.
+
+        Stage A acceptance or an accepted tool pack (which promotes the turn
+        base) both count; fallback/abstained-only turns do not. Deterministic —
+        reuses the calibrated decisions already on the packs."""
+
+        base = self._turn_base
+        return base is not None and bool(base.decision.accepted)
 
     def read_note(
         self,
@@ -434,23 +534,28 @@ class ChatRetriever:
             absolute_start = int(row.char_start) + local_start
             absolute_end = absolute_start + len(text)
             partial = local_start > 0 or len(text) < len(full_text)
-            source_id = (
-                f"{row.passage_id}:excerpt:{absolute_start}:{absolute_end}"
-                if partial
-                else str(row.passage_id)
-            )
-            evidence_ref = self.registry.register(
-                "passage",
-                source_id,
-                {
-                    "passage_id": str(row.passage_id),
-                    "note_id": note_id,
-                    "text": text,
-                    "char_start": absolute_start,
-                    "char_end": absolute_end,
-                    "excerpt": partial,
-                },
-            )
+            if partial:
+                # Excerpts keep their own offset-suffixed identity and shape.
+                evidence_ref = self.registry.register(
+                    "passage",
+                    f"{row.passage_id}:excerpt:{absolute_start}:{absolute_end}",
+                    {
+                        "passage_id": str(row.passage_id),
+                        "note_id": note_id,
+                        "text": text,
+                        "char_start": absolute_start,
+                        "char_end": absolute_end,
+                        "excerpt": True,
+                    },
+                )
+            else:
+                # C2: a full passage shares the engine's identity — reuse the
+                # Stage A ref when present, else register the canonical payload.
+                evidence_ref = self.registry.ref_for("passage", str(row.passage_id))
+                if evidence_ref is None:
+                    evidence_ref = self.registry.register(
+                        "passage", str(row.passage_id), passage_payload(row)
+                    )
             self.registry.mark_read(note_ref)
             self.registry.mark_read(evidence_ref)
             self._record_turn_read((note_ref, evidence_ref))
@@ -578,89 +683,132 @@ class ChatRetriever:
                     break
         return {"from": ref, "results": results, "supporting_passages": list(supporting_passages.values()), "paths": paths}
 
+    def _fact_variant_groups(self) -> dict[str, tuple[Any, ...]]:
+        """fact_id → its variant's full provenance group, in the engine's
+        grouping order (logical key + status + validity, rows sorted by
+        fact_id). Built once per retriever from the snapshot fact index."""
+
+        if self._fact_variant_cache is None:
+            reader = getattr(self.engine.store, "fact_contexts", None)
+            contexts = reader() if callable(reader) else ()
+            grouped: dict[tuple[Any, ...], list[Any]] = {}
+            for context in contexts:
+                variant = (
+                    tuple(context.logical_key),
+                    str(context.status),
+                    getattr(context, "valid_from", None),
+                    getattr(context, "valid_to", None),
+                )
+                grouped.setdefault(variant, []).append(context)
+            cache: dict[str, tuple[Any, ...]] = {}
+            for rows in grouped.values():
+                ordered = tuple(sorted(rows, key=lambda row: str(row.fact_id)))
+                for row in ordered:
+                    cache[str(row.fact_id)] = ordered
+            self._fact_variant_cache = cache
+        return self._fact_variant_cache
+
     def _register_traversed_facts(
         self, fact_ids: Sequence[str]
     ) -> tuple[list[str], list[dict[str, object]], tuple[Any, ...]]:
-        reader = getattr(self.engine.store, "fact_contexts", None)
-        contexts = (
-            reader(tuple(sorted(set(fact_ids)))) if callable(reader) else ()
-        )
-        refs: list[str] = _fact_refs(self.registry, set(fact_ids))
+        """C2: register traversed facts under the engine's grouped identity.
+
+        The payload carries the full provenance group from the snapshot fact
+        index (all fact_ids of the logical variant, observed_at = max), built
+        by the same shared helpers the engine uses, so a fact the engine
+        already registered is reused via ref_for instead of conflicting."""
+
+        groups = self._fact_variant_groups()
+        traversed = list(dict.fromkeys(str(value) for value in fact_ids))
+        refs: list[str] = _fact_refs(self.registry, set(traversed))
         support: list[dict[str, object]] = []
-        for fact in contexts:
-            passage_rows = self.engine.store.passage_contexts(
-                (str(fact.source_passage_id),)
-            )
-            if not passage_rows:
+        contexts_out: list[Any] = []
+        registered_variants: set[tuple[Any, ...]] = set()
+        for fact_id in traversed:
+            group = groups.get(fact_id)
+            if group is None:
                 continue
-            passage = passage_rows[0]
-            evidence_ref = self.registry.register(
-                "passage",
-                str(passage.passage_id),
-                {
-                    "passage_id": str(passage.passage_id),
-                    "note_id": str(passage.note_id),
-                    "text": str(passage.text),
-                    "char_start": int(passage.char_start),
-                    "char_end": int(passage.char_end),
-                },
+            contexts_out.extend(
+                row for row in group if str(row.fact_id) == fact_id
             )
-            note_ref = self.registry.ref_for("note", str(passage.note_id))
-            if note_ref is None:
-                note_ref = self.registry.register(
-                    "note", str(passage.note_id), {"note_id": str(passage.note_id)}
+            first = group[0]
+            variant = (
+                tuple(first.logical_key),
+                str(first.status),
+                getattr(first, "valid_from", None),
+                getattr(first, "valid_to", None),
+            )
+            if variant in registered_variants:
+                continue
+            registered_variants.add(variant)
+            source_refs: list[str] = []
+            for row in group:
+                passage_rows = self.engine.store.passage_contexts(
+                    (str(row.source_passage_id),)
                 )
-            identity = "\x1f".join(
-                (
-                    self.engine.snapshot.build_id,
-                    *fact.logical_key,
-                    str(fact.status),
-                    repr(fact.valid_from),
-                    repr(fact.valid_to),
+                if not passage_rows:
+                    continue
+                passage = passage_rows[0]
+                evidence_ref = self.registry.ref_for(
+                    "passage", str(passage.passage_id)
                 )
+                if evidence_ref is None:
+                    evidence_ref = self.registry.register(
+                        "passage",
+                        str(passage.passage_id),
+                        passage_payload(passage),
+                    )
+                note_ref = self.registry.ref_for("note", str(passage.note_id))
+                if note_ref is None:
+                    note_ref = self.registry.register(
+                        "note", str(passage.note_id), {"note_id": str(passage.note_id)}
+                    )
+                source_refs.append(evidence_ref)
+                for current_ref in (note_ref, evidence_ref):
+                    self.registry.mark_read(current_ref)
+                self._record_turn_read((note_ref, evidence_ref))
+                support.append(
+                    {
+                        "evidence_id": evidence_ref,
+                        "note": note_ref,
+                        "title": str(passage.title),
+                        "source": str(passage.source),
+                        "text": str(passage.text),
+                    }
+                )
+            identity = fact_source_identity(
+                self.engine.snapshot.build_id,
+                first.logical_key,
+                str(first.status),
+                getattr(first, "valid_from", None),
+                getattr(first, "valid_to", None),
             )
-            fact_ref = self.registry.register(
-                "fact",
-                identity,
-                {
-                    "logical_key": list(fact.logical_key),
-                    "fact_ids": [str(fact.fact_id)],
-                    "subject_entity_id": str(fact.subject_entity_id),
-                    "object_entity_id": str(fact.object_entity_id),
-                    "subject": str(fact.subject),
-                    "predicate": str(fact.predicate),
-                    "object": str(fact.object),
-                    "direction": "forward",
-                    "status": str(fact.status),
-                    "observed_at": float(fact.observed_at),
-                    "valid_from": fact.valid_from,
-                    "valid_to": fact.valid_to,
-                    "source_evidence_ids": [evidence_ref],
-                },
-            )
+            fact_ref = self.registry.ref_for("fact", identity)
+            if fact_ref is None:
+                fact_ref = self.registry.register(
+                    "fact",
+                    identity,
+                    fact_group_payload(
+                        first.logical_key,
+                        str(first.status),
+                        getattr(first, "valid_from", None),
+                        getattr(first, "valid_to", None),
+                        group,
+                    ),
+                )
             self.registry.merge_payload(
                 fact_ref,
                 {
-                    "fact_ids": [str(fact.fact_id)],
-                    "source_evidence_ids": [evidence_ref],
+                    "fact_ids": [str(row.fact_id) for row in group],
+                    "source_evidence_ids": list(dict.fromkeys(source_refs)),
                 },
-                append_list_fields=frozenset({"fact_ids", "source_evidence_ids"}),
+                append_list_fields=FACT_APPEND_FIELDS,
             )
-            for current_ref in (note_ref, evidence_ref, fact_ref):
-                self.registry.mark_read(current_ref)
-            self._record_turn_read((note_ref, evidence_ref, fact_ref))
+            self.registry.mark_read(fact_ref)
+            self._record_turn_read((fact_ref,))
             if fact_ref not in refs:
                 refs.append(fact_ref)
-            support.append(
-                {
-                    "evidence_id": evidence_ref,
-                    "note": note_ref,
-                    "title": str(passage.title),
-                    "source": str(passage.source),
-                    "text": str(passage.text),
-                }
-            )
-        return refs, support, contexts
+        return refs, support, tuple(contexts_out)
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -680,6 +828,7 @@ class ChatRetriever:
         self._tool_engine = None
         self._turn_base = None
         self._turn_read_ids = []
+        self._pending_reset = None
 
     def restore_pre_turn(self) -> None:
         state = self._persisted_pre_turn

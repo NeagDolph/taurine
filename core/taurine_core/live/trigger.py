@@ -1,12 +1,19 @@
 """Summary trigger policy (spec §4.6).
 
-Fires the summarizer when the *evidence* changes, never on keywords:
+Fires the summarizer when the *evidence or transcript* changes, never on
+keywords:
 
     fire iff (jaccard(top-8 vs last summarized) < SUMMARY_CHANGE_JACCARD
               OR drift: cos(window_emb, topic_centroid) < SUMMARY_DRIFT_COSINE
-              OR forced: staleness > SUMMARY_MAX_STALENESS_S with new speech)
+              OR forced: staleness > SUMMARY_MAX_STALENESS_S with new speech
+              OR first accepted summary still pending)
          AND now - last_pass > SUMMARY_MIN_INTERVAL_S
          AND new final chars since last pass ≥ SUMMARY_MIN_NEW_CHARS
+
+No arm depends on retrieval acceptance: a session whose retrieval always
+abstains still produces transcript-only summaries (staleness measures from
+session start until a first pass runs, and the first-summary arm fires as
+soon as the min-interval/min-chars gates clear).
 
 Topic centroid = EMA (TOPIC_CENTROID_DECAY) of window embeddings; a drift
 firing resets it. A no_update reply applies SUMMARY_EMPTY_BACKOFF_S before
@@ -28,8 +35,10 @@ from .grounding import GroundingUpdate
 class SummaryTrigger:
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self.clock = clock
+        self._started_at = clock()
         self._last_pass_at: float | None = None
         self._last_summarized_ids: set[str] | None = None
+        self._has_accepted_summary = False
         self._empty_revision: int | None = None
         self._empty_backoff_until: float = -math.inf
         self._topic_centroid: np.ndarray | None = None
@@ -76,6 +85,7 @@ class SummaryTrigger:
             return
 
         self._last_summarized_ids = _top_ids(update)
+        self._has_accepted_summary = True
         self._empty_revision = None
         self._empty_backoff_until = -math.inf
 
@@ -96,11 +106,15 @@ class SummaryTrigger:
             return "jaccard"
         if drift_reason is not None:
             return drift_reason
-        if (
-            self._last_pass_at is not None
-            and now - self._last_pass_at > config.SUMMARY_MAX_STALENESS_S
-        ):
+        # Staleness is measured from session start until a first summarizer
+        # pass runs, so it never depends on retrieval acceptance.
+        stale_since = (
+            self._last_pass_at if self._last_pass_at is not None else self._started_at
+        )
+        if now - stale_since > config.SUMMARY_MAX_STALENESS_S:
             return "staleness"
+        if not self._has_accepted_summary:
+            return "first_summary"
         return None
 
     def _jaccard(self, top_ids: set[str]) -> float:

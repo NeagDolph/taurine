@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from time import monotonic
@@ -20,6 +21,8 @@ from taurine_core.retrieval.calibration import HeadCalibrator
 from taurine_core.retrieval.snapshot import IndexSnapshot
 from taurine_core.retrieval.types import RetrievalMode, RetrievalQuery, TemporalIntent
 
+
+logger = logging.getLogger(__name__)
 
 LogicalFactKey = tuple[str, str, str]
 TRIPLE_RECOGNITION_INSTRUCTION = (
@@ -62,6 +65,13 @@ class FactContext:
 
 @dataclass(frozen=True)
 class TripleRecognitionDecision:
+    """One logical triple's recognition outcome.
+
+    ``embedding_score`` holds the CALIBRATED embedding probability from fact
+    recall (not the raw cosine); ``recognition_score`` holds the local
+    reranker's recognition probability (0.0 when the fallback lane decided).
+    """
+
     logical_key: LogicalFactKey
     fact_ids: tuple[str, ...]
     embedding_score: float
@@ -324,6 +334,9 @@ class TripleRecognizer:
                 "local_reranker_unavailable_fallback",
             )
         except Exception:
+            # Fail-closed into the strict embedding fallback, but leave a
+            # trail so programming errors cannot hide as "reranker unavailable".
+            logger.debug("triple recognition scorer raised", exc_info=True)
             return self._fallback(
                 ordered_groups,
                 preliminary,
@@ -349,6 +362,7 @@ class TripleRecognizer:
                     )
                 )
             except Exception:
+                logger.debug("batched ambiguity acceptor raised", exc_info=True)
                 accepted_ids = set()
                 ambiguity_succeeded = False
             else:
@@ -513,6 +527,72 @@ def _entity_compatibility_reason(
     return None
 
 
+def fact_temporal_admission(
+    *,
+    status: str,
+    valid_from: float | None,
+    valid_to: float | None,
+    kind: str,
+    at: float | None,
+    now: float,
+    for_traversal: bool,
+) -> tuple[bool, float, str | None]:
+    """The one temporal-intent rule shared by recall, the PPR graph overlay,
+    and (via the graph's traversable-fact set) explanatory paths.
+
+    Returns ``(admitted, weight_multiplier, rejection_reason)``:
+
+    - ``any`` — active, historical, and superseded are all admitted;
+      historical/superseded carry the configured downweight.
+    - ``at_time`` (and ``historical`` with an explicit timestamp) — active,
+      historical, and superseded facts whose validity window covers the
+      timestamp.
+    - ``historical`` without a timestamp — historical/superseded at full
+      weight PLUS active facts whose validity covers the asked-about past
+      (downweighted); this fixes the active-fact blindness of pure
+      status filtering.
+    - ``current`` — active facts valid now.
+    - ``conflicted`` — never traversable (§8.3). For presentation
+      (``for_traversal=False``) a conflicted fact is admitted only under
+      ``historical`` intent; the both-endpoints-seeded presentation case is
+      the engine's responsibility because seeding is unknown here.
+    - ``candidate`` — never admitted.
+    """
+
+    downweight = float(config.TEMPORAL_HISTORY_DOWNWEIGHT)
+    if status == "candidate":
+        return (False, 0.0, "incompatible_fact_status")
+    if status == "conflicted":
+        if not for_traversal and kind == "historical":
+            return (True, downweight, None)
+        return (False, 0.0, "incompatible_fact_status")
+    if status not in {"active", "historical", "superseded"}:
+        return (False, 0.0, "incompatible_fact_status")
+    if kind == "any":
+        return (True, 1.0 if status == "active" else downweight, None)
+    if kind == "current":
+        if status != "active":
+            return (False, 0.0, "not_current")
+        if valid_from is not None and now < valid_from:
+            return (False, 0.0, "not_yet_valid")
+        if valid_to is not None and now >= valid_to:
+            return (False, 0.0, "no_longer_valid")
+        return (True, 1.0, None)
+    if kind == "at_time" or (kind == "historical" and at is not None):
+        point = at if at is not None else now
+        if valid_from is not None and point < valid_from:
+            return (False, 0.0, "not_yet_valid")
+        if valid_to is not None and point >= valid_to:
+            return (False, 0.0, "no_longer_valid")
+        return (True, 1.0, None)
+    # kind == "historical" without a timestamp.
+    if status in {"historical", "superseded"}:
+        return (True, 1.0, None)
+    if valid_from is not None and valid_from > now:
+        return (False, 0.0, "not_yet_valid")
+    return (True, downweight, None)
+
+
 def _temporal_status_reason(
     context: FactContext,
     intent: TemporalIntent | None,
@@ -520,28 +600,17 @@ def _temporal_status_reason(
     now: float,
 ) -> str | None:
     kind = intent.kind if intent is not None else "current"
-    if context.status == "candidate":
-        return "incompatible_fact_status"
-    if kind == "any":
-        return None
-    if context.status == "conflicted":
-        return "incompatible_fact_status"
-    if kind == "historical":
-        return None if context.status in {"historical", "superseded"} else "not_historical"
-    at = intent.at if intent is not None and intent.at is not None else now
-    if kind == "current" and context.status != "active":
-        return "not_current"
-    if kind == "at_time" and context.status not in {
-        "active",
-        "historical",
-        "superseded",
-    }:
-        return "not_valid_at_time"
-    if context.valid_from is not None and at < context.valid_from:
-        return "not_yet_valid"
-    if context.valid_to is not None and at >= context.valid_to:
-        return "no_longer_valid"
-    return None
+    at = intent.at if intent is not None else None
+    admitted, _weight, reason = fact_temporal_admission(
+        status=str(context.status),
+        valid_from=context.valid_from,
+        valid_to=context.valid_to,
+        kind=kind,
+        at=at,
+        now=now,
+        for_traversal=False,
+    )
+    return None if admitted else reason
 
 
 def _seed_weights(triples: Sequence[RecognizedTriple]) -> dict[str, float]:

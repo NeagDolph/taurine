@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix, diags
 
+from taurine_core import config
 from taurine_core.indexer.facts import FactRecord, PREDICATES
 
 
@@ -78,10 +79,12 @@ class BaseGraphBuilder:
         build_id: str,
         semantic_k: int,
         semantic_floor: float,
+        contains_scale: float = config.CONTAINS_WEIGHT_SCALE,
     ) -> None:
         self.build_id = build_id
         self.semantic_k = max(0, int(semantic_k))
         self.semantic_floor = float(semantic_floor)
+        self.contains_scale = max(1e-9, float(contains_scale))
 
     def build(
         self,
@@ -118,7 +121,10 @@ class BaseGraphBuilder:
                 continue
             idf = math.log((note_count + 1) / (max(0, edge.df) + 1)) + 1.0
             count_bonus = 1.0 + math.log(1.0 + min(max(1, edge.mentions), 3))
-            weight = _clip(idf * edge.confidence * count_bonus)
+            # H2: divide by the calibrated scale before clipping so idf rarity
+            # actually discriminates — without it every production edge
+            # saturates at exactly 1.0 and column normalization erases rarity.
+            weight = _clip(idf * edge.confidence * count_bonus / self.contains_scale)
             metadata = {"idf": idf, "mentions": edge.mentions}
             edges.extend(
                 (

@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from taurine_core.indexer.sync import SyncReport
+from taurine_core.schemas import SyncReport
 from taurine_core.schemas import ChatAckEvent, ChatDoneEvent, ChatMessage, ChatUsage
 from taurine_core.server import Runtime, create_app
 
@@ -161,6 +161,129 @@ def test_post_chats_accepts_optional_seed_note_ids(store: Any) -> None:
         assert client.post("/chats").status_code == 200
         assert client.post("/chats", json={"seed_note_ids": "n1"}).status_code == 200
         assert len(engine.seed_calls) == 1
+
+
+def test_ws_seeded_chat_biases_first_stage_a_teleport_one_turn_only(store: Any) -> None:
+    """seed_note_ids verification: a seeded chat's first Stage A teleport
+    includes the seed passages; the bias is gone on the second turn."""
+
+    from types import SimpleNamespace
+
+    from taurine_core.chat.engine import ChatEngine
+    from taurine_core.chat.retrieval import ChatRetriever
+    from taurine_core.llm import StreamEvent
+    from taurine_core.retrieval.registry import EvidenceRegistry
+    from taurine_core.retrieval.types import (
+        EvidenceNote,
+        EvidencePack,
+        EvidencePassage,
+        RetrievalDecision,
+        RetrievalQuery,
+        RetrievalTrace,
+    )
+
+    engines: list[Any] = []
+
+    class FakeEngine:
+        def __init__(self, registry: EvidenceRegistry) -> None:
+            self.registry = registry
+            self.snapshot = SimpleNamespace(passage_ids=("p1",), base_graph=SimpleNamespace(edges=()))
+            self.store = SimpleNamespace(
+                passage_contexts=lambda passage_ids: tuple(
+                    SimpleNamespace(
+                        passage_id="p1", note_id="n1", title="Roadmap", source="obsidian",
+                        text="The roadmap launches on July 18.", char_start=0, char_end=32,
+                        created=1.0, modified=2.0,
+                    )
+                    for passage_id in passage_ids
+                    if passage_id == "p1"
+                ),
+                note_contexts=lambda note_ids: (),
+            )
+            self.resets: list[dict[str, float] | None] = []
+            engines.append(self)
+
+        def retrieve(self, query: RetrievalQuery, *, session_reset=None, entity_spans=(), passage_limit=None, **_kwargs) -> EvidencePack:
+            del entity_spans, passage_limit
+            self.resets.append(dict(session_reset) if session_reset else None)
+            note_ref = self.registry.register("note", "n1", {"note_id": "n1"})
+            evidence_ref = self.registry.register(
+                "passage", "p1",
+                {"passage_id": "p1", "note_id": "n1", "text": "The roadmap launches on July 18.", "char_start": 0, "char_end": 32},
+            )
+            self.registry.mark_read(note_ref)
+            self.registry.mark_read(evidence_ref)
+            return EvidencePack(
+                decision=RetrievalDecision(True, .9, "accepted", ("dense",)),
+                query=query,
+                passages=(EvidencePassage(evidence_ref, "p1", "n1", "Roadmap", "obsidian", "The roadmap launches on July 18.", 0, 32, 1.0, 2.0, .8, .9),),
+                facts=(), paths=(),
+                notes=(EvidenceNote(note_ref, "n1", "Roadmap", "obsidian", 2.0, .9, (evidence_ref,)),),
+                trace=RetrievalTrace(
+                    original_query=query.text, rewritten_query=query.text,
+                    selected_ids=(note_ref, evidence_ref),
+                    read_ids=(note_ref, evidence_ref), active_build_id="build-ws",
+                ),
+            )
+
+    class SeedLLM:
+        async def stream_chat(self, model, messages, *, tools=None, reasoning=None, timeout_s):
+            del model, messages, tools, reasoning, timeout_s
+            yield StreamEvent(kind="content", text="ok")
+            yield StreamEvent(kind="done")
+
+        async def complete_json(self, model, system, user, timeout_s=None):
+            del model, system, user, timeout_s
+            return {"title": "Seeded"}
+
+    class NullLogger:
+        def log(self, kind: str, **payload: Any) -> None:
+            del kind, payload
+
+    class AcceptAll:
+        def validate(self, output: str, *, mode: str, supplied_ids=(), available_ids=()) -> Any:
+            del mode, supplied_ids, available_ids
+            from taurine_core.retrieval.validate import ValidationResult
+
+            return ValidationResult(True, output, (), (), False, (), "")
+
+    chat_engine = ChatEngine(
+        store,
+        SeedLLM(),
+        NullLogger(),
+        retriever_factory=lambda chat_id: ChatRetriever(
+            store, chat_id,
+            engine_factory=FakeEngine,  # type: ignore[arg-type]
+            tool_engine_factory=FakeEngine,  # type: ignore[arg-type]
+        ),
+        validator_factory=lambda registry: AcceptAll(),
+    )
+    runtime = Runtime(
+        index=store,
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=None,
+        make_asr_client=lambda on_chunk, on_status, index_status: None,
+        make_chat_engine=lambda: chat_engine,
+    )
+
+    def drain_until_done(ws: Any) -> None:
+        while True:
+            if ws.receive_json()["type"] == "chat_done":
+                return
+
+    with TestClient(create_app(runtime)) as client:
+        created = client.post("/chats", json={"seed_note_ids": ["n1", "unknown"]}).json()
+        chat_id = created["chat_id"]
+        with client.websocket_connect("/chat") as ws:
+            ws.send_json({"type": "chat_send", "chat_id": chat_id, "text": "first question"})
+            drain_until_done(ws)
+            ws.send_json({"type": "chat_send", "chat_id": chat_id, "text": "unrelated second question"})
+            drain_until_done(ws)
+
+    stage_a_resets = [reset for engine in engines for reset in engine.resets]
+    assert stage_a_resets[0] == {"p1": 1.0}  # seeded teleport on turn one
+    assert all(reset is None for reset in stage_a_resets[1:])  # one turn only
 
 
 def test_chat_websocket_logs_unexpected_task_exception(caplog: pytest.LogCaptureFixture) -> None:

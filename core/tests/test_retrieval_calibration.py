@@ -185,3 +185,36 @@ def _hit(
         head=head,
         reason="accepted",
     )
+
+
+def test_pre_ppr_requires_strict_floor_when_a_head_is_unavailable() -> None:
+    artifact = load_calibration(_ARTIFACT)
+    policy = AbstentionPolicy(artifact, mode="chat")
+
+    # Chat dense floor is 0.62 → degraded strict floor is 0.682.
+    marginal = (_hit("dense", "p1", 0.65, 1),)
+    strong = (_hit("dense", "p1", 0.70, 1),)
+
+    healthy = policy.pre_ppr(marginal)
+    degraded = policy.pre_ppr(marginal, unavailable_heads=("bm25",))
+    degraded_strong = policy.pre_ppr(strong, unavailable_heads=("bm25",))
+
+    assert healthy.accepted
+    assert not degraded.accepted
+    assert degraded.reason == "no_head_cleared_degraded_strict_floor"
+    assert degraded_strong.accepted
+
+
+def test_pre_ppr_strict_floor_is_capped_at_one() -> None:
+    artifact = load_calibration(_ARTIFACT)
+    policy = AbstentionPolicy(artifact, mode="chat")
+
+    # Exact floor is 0.9; 1.1 × 0.9 would be 0.99 < 1.0 so a perfect
+    # resolution still qualifies under degradation.
+    decision = policy.pre_ppr(
+        (_hit("exact", "e1", 1.0, 1, target_kind="entity"),),
+        unavailable_heads=("bm25",),
+    )
+
+    assert decision.accepted
+    assert decision.reason == "accepted_high_precision_head"

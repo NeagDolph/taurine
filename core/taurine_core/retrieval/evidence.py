@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from time import monotonic
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -11,6 +12,7 @@ import numpy as np
 
 from taurine_core import config
 from taurine_core.indexer.base_graph import (
+    BaseEdge,
     FactGraphInput,
     grouped_fact_edges,
     materialize_base_graph,
@@ -33,8 +35,17 @@ from taurine_core.retrieval.rerank import (
     PassageRerankCandidate,
     PassageRerankDecision,
 )
+from taurine_core.retrieval.evidence_payloads import (
+    FACT_APPEND_FIELDS,
+    fact_group_payload,
+    fact_source_identity,
+    passage_payload,
+)
 from taurine_core.retrieval.snapshot import IndexSnapshot
-from taurine_core.retrieval.triples import TripleRecognitionResult
+from taurine_core.retrieval.triples import (
+    TripleRecognitionResult,
+    fact_temporal_admission,
+)
 from taurine_core.retrieval.types import (
     EvidenceFact,
     EvidenceNote,
@@ -207,6 +218,8 @@ class SharedRetrievalEngine:
         entity_resolver: EntityResolver | None = None,
         triple_recognizer: TripleRecognizerPort | None = None,
         head_weights: Mapping[str, float] | None = None,
+        fallback_on_abstain: bool = False,
+        calibration_status: str = "verified",
     ) -> None:
         self.snapshot = snapshot
         self.store = store
@@ -218,6 +231,16 @@ class SharedRetrievalEngine:
         self.entity_resolver = entity_resolver
         self.triple_recognizer = triple_recognizer
         self.head_weights = dict(head_weights or calibrator.head_weights)
+        # §0.1 chat/tool fallback lane; live must always keep this False.
+        self.fallback_on_abstain = bool(fallback_on_abstain)
+        self.calibration_status = str(calibration_status)
+        self._hub_ids: frozenset[str] | None = None
+        # L29: materialized temporal graphs keyed by (snapshot, intent, time,
+        # activated hubs). The engine is bound to one immutable snapshot, so a
+        # snapshot swap always means a fresh engine and a fresh cache.
+        self._graph_cache: OrderedDict[tuple[Any, ...], tuple[Any, set[str]]] = (
+            OrderedDict()
+        )
 
     def retrieve(
         self,
@@ -235,23 +258,46 @@ class SharedRetrievalEngine:
         latency["query_embedding"] = _elapsed_ms(started)
 
         head_started = monotonic()
-        dense = DensePassageHead(self.snapshot, self.calibrator).search(
-            query_vector, k=len(self.snapshot.passage_ids)
+        head_errors: dict[str, str] = {}
+
+        def isolated(head: str, search: Callable[[], HeadResult]) -> HeadResult:
+            # §17.3: one broken head degrades retrieval instead of killing it.
+            try:
+                return search()
+            except Exception as exc:  # noqa: BLE001 - isolation is the point
+                head_errors[head] = _sanitized_error(exc)
+                return HeadResult((), (), status="unavailable", reason=head_errors[head])
+
+        dense = isolated(
+            "dense",
+            lambda: DensePassageHead(self.snapshot, self.calibrator).search(
+                query_vector, k=len(self.snapshot.passage_ids)
+            ),
         )
         candidate_cap = (
             config.LIVE_RERANK_CANDIDATES
             if query.mode == "live"
             else config.CHAT_RERANK_CANDIDATES
         )
-        bm25 = BM25PassageHead(self.store, self.calibrator).search(
-            query.text, k=candidate_cap
+        bm25 = isolated(
+            "bm25",
+            lambda: BM25PassageHead(self.store, self.calibrator).search(
+                query.text, k=candidate_cap
+            ),
         )
-        exact = ExactAliasHead(self.snapshot, self.calibrator).search(query.text)
+        exact = isolated(
+            "exact",
+            lambda: ExactAliasHead(self.snapshot, self.calibrator).search(query.text),
+        )
+        entity_head_enabled = self.entity_resolver is not None and bool(entity_spans)
         entity = (
-            QueryEntityHead(self.entity_resolver, self.calibrator).search(
-                query.text, entity_spans
+            isolated(
+                "entity",
+                lambda: QueryEntityHead(self.entity_resolver, self.calibrator).search(
+                    query.text, entity_spans
+                ),
             )
-            if self.entity_resolver is not None and entity_spans
+            if entity_head_enabled
             else HeadResult((), ())
         )
         resolved_entity_ids = {
@@ -262,17 +308,24 @@ class SharedRetrievalEngine:
         required_entity_ids = {
             hit.target_id for hit in entity.accepted if hit.target_kind == "entity"
         }
-        triple = (
-            self.triple_recognizer.recognize(
-                query,
-                query_vector,
-                resolved_entity_ids,
-                required_entity_ids,
-                deadline_at,
+        if self.triple_recognizer is not None:
+            try:
+                triple = self.triple_recognizer.recognize(
+                    query,
+                    query_vector,
+                    resolved_entity_ids,
+                    required_entity_ids,
+                    deadline_at,
+                )
+            except Exception as exc:  # noqa: BLE001 - isolation is the point
+                head_errors["triple"] = _sanitized_error(exc)
+                triple = TripleRecognitionResult(
+                    (), (), {}, True, "triple_recognizer_unavailable"
+                )
+        else:
+            triple = TripleRecognitionResult(
+                (), (), {}, False, "triple_recognizer_disabled"
             )
-            if self.triple_recognizer is not None
-            else TripleRecognitionResult((), (), {}, False, "triple_recognizer_disabled")
-        )
         triple_hits = _triple_head_hits(triple)
         accepted_hits = (
             *dense.accepted,
@@ -292,8 +345,50 @@ class SharedRetrievalEngine:
             rejected_hits, dense_limit=candidate_cap
         )
         latency["heads"] = _elapsed_ms(head_started)
-        pre_decision = self.abstention.pre_ppr(accepted_hits, rejected_hits)
+        ran_heads = {"dense", "bm25", "exact"}
+        if entity_head_enabled:
+            ran_heads.add("entity")
+        if self.triple_recognizer is not None:
+            ran_heads.add("triple")
+        unavailable_heads = tuple(sorted(head_errors))
+        base_debug: dict[str, object] = {
+            "dense_reset_considered": len(self.snapshot.passage_ids),
+            "calibration_status": self.calibration_status,
+        }
+        if head_errors:
+            base_debug["unavailable_heads"] = dict(sorted(head_errors.items()))
+        if set(head_errors) == ran_heads:
+            return _abstained_pack(
+                query,
+                RetrievalDecision(
+                    accepted=False,
+                    confidence=0.0,
+                    reason="all_heads_unavailable",
+                ),
+                accepted_hits,
+                trace_rejected_hits,
+                self.snapshot,
+                latency,
+                triple,
+                debug=base_debug,
+            )
+        pre_decision = self.abstention.pre_ppr(
+            accepted_hits, rejected_hits, unavailable_heads=unavailable_heads
+        )
         if not pre_decision.accepted:
+            fallback_pack = self._fallback_pack(
+                query,
+                pre_decision,
+                dense,
+                bm25,
+                accepted_hits,
+                trace_rejected_hits,
+                latency,
+                triple,
+                debug=base_debug,
+            )
+            if fallback_pack is not None:
+                return fallback_pack
             return _abstained_pack(
                 query,
                 pre_decision,
@@ -302,7 +397,7 @@ class SharedRetrievalEngine:
                 self.snapshot,
                 latency,
                 triple,
-                debug={"dense_reset_considered": len(self.snapshot.passage_ids)},
+                debug=base_debug,
             )
 
         fused = weighted_score_aware_rrf(
@@ -332,19 +427,18 @@ class SharedRetrievalEngine:
             if callable(entity_passages)
             else ()
         )
-        for passage_id in entity_passage_ids:
-            passage_reset[passage_id] = max(
-                passage_reset.get(passage_id, 0.0),
-                max(query_entity_reset.values(), default=0.0)
-                * config.QUERY_ENTITY_RESET_W,
-            )
+        # M7: resolved-entity mass enters the teleport only through
+        # query_entity_reset; mirroring it into passage_reset double-counted
+        # entity evidence and let weak entities inherit the strongest weight.
 
         passage_rows = self.store.passage_contexts(self.snapshot.passage_ids)
+        passage_by_id = {row.passage_id: row for row in passage_rows}
         fact_rows = self.store.fact_contexts()
-        retrieval_graph, traversable_fact_ids = _temporal_retrieval_graph(
-            self.snapshot,
-            fact_rows,
-            query,
+        hub_ids = self._hub_entity_ids()
+        activated_hubs = tuple(sorted(hub_ids & resolved_entity_ids))
+        hub_activation = self._hub_activation(activated_hubs, passage_by_id)
+        retrieval_graph, traversable_fact_ids = self._retrieval_graph(
+            query, fact_rows, hub_activation
         )
         ppr_started = monotonic()
         ppr = TypedPPR(retrieval_graph).run(
@@ -355,7 +449,6 @@ class SharedRetrievalEngine:
         )
         latency["ppr"] = _elapsed_ms(ppr_started)
 
-        passage_by_id = {row.passage_id: row for row in passage_rows}
         fact_status = {
             str(row.fact_id): (
                 "active" if str(row.fact_id) in traversable_fact_ids else str(row.status)
@@ -371,11 +464,12 @@ class SharedRetrievalEngine:
             if hit.target_kind == "passage"
         }
         direct_passages.update(entity_passage_ids)
-        support_scores = {
-            passage_id: triple_row.score
-            for triple_row in triple.triples
-            for passage_id in triple_row.source_passage_ids
-        }
+        triple_support: dict[str, float] = {}
+        for triple_row in triple.triples:
+            for passage_id in triple_row.source_passage_ids:
+                triple_support[passage_id] = max(
+                    triple_support.get(passage_id, 0.0), float(triple_row.score)
+                )
         ppr_passages = tuple(
             node_id
             for node_id, _score in sorted(
@@ -387,12 +481,16 @@ class SharedRetrievalEngine:
                 key=lambda row: (-row[1], row[0]),
             )[:candidate_cap]
         )
-        candidate_ids = set(direct_passages) | set(ppr_passages) | set(support_scores)
+        candidate_ids = set(direct_passages) | set(ppr_passages) | set(triple_support)
 
         path_started = monotonic()
+        # M15/§11.9: hub entities are penalized on paths. Hubs explicitly
+        # activated for this query (§10.5 temporary enablement) are exempt —
+        # they are the user's stated target, not a traversal shortcut.
         path_finder = EvidencePathFinder(
             retrieval_graph,
             fact_status=fact_status,
+            hub_entity_ids=frozenset(hub_ids - set(activated_hubs)),
             note_by_passage=note_by_passage,
         )
         recognized_endpoint_ids = {
@@ -404,6 +502,7 @@ class SharedRetrievalEngine:
             sorted(direct_passages | resolved_entity_ids | recognized_endpoint_ids)
         )
         paths_by_target: dict[str, tuple[PathCandidate, ...]] = {}
+        path_support: dict[str, float] = {}
         fact_by_id = {str(row.fact_id): row for row in fact_rows}
         for passage_id in ppr_passages:
             if passage_id in direct_passages:
@@ -421,30 +520,21 @@ class SharedRetrievalEngine:
                             continue
                         source_passage_id = str(context.source_passage_id)
                         candidate_ids.add(source_passage_id)
-                        support_scores[source_passage_id] = max(
-                            support_scores.get(source_passage_id, 0.0), path.weight
+                        path_support[source_passage_id] = max(
+                            path_support.get(source_passage_id, 0.0), path.weight
                         )
         latency["paths"] = _elapsed_ms(path_started)
 
-        recall_scores = _candidate_scores(
+        rerank_candidates = _order_rerank_candidates(
             candidate_ids,
+            passage_by_id,
+            accepted_hits,
             fused,
             ppr,
-            support_scores,
+            triple_support,
+            path_support,
             paths_by_target,
-        )
-        rerank_candidates = tuple(
-            PassageRerankCandidate(
-                passage_id=passage_id,
-                note_id=passage_by_id[passage_id].note_id,
-                title=passage_by_id[passage_id].title,
-                source=passage_by_id[passage_id].source,
-                text=passage_by_id[passage_id].text,
-                recall_score=recall_scores[passage_id],
-                hint=_candidate_hint(passage_id, support_scores, paths_by_target),
-            )
-            for passage_id in sorted(candidate_ids)
-            if passage_id in passage_by_id
+            cap=candidate_cap,
         )
         rerank_started = monotonic()
         reranked = self.reranker.rerank(
@@ -492,6 +582,19 @@ class SharedRetrievalEngine:
         )
         rerank_trace = _rerank_trace(reranked.decisions)
         if not post_decision.accepted:
+            fallback_pack = self._fallback_pack(
+                query,
+                post_decision,
+                dense,
+                bm25,
+                accepted_hits,
+                trace_rejected_hits,
+                latency,
+                triple,
+                debug=base_debug,
+            )
+            if fallback_pack is not None:
+                return fallback_pack
             return _abstained_pack(
                 query,
                 post_decision,
@@ -504,11 +607,32 @@ class SharedRetrievalEngine:
                 rerank=rerank_trace,
                 mmr_exclusions=exclusions,
                 debug={
-                    "dense_reset_considered": len(self.snapshot.passage_ids),
+                    **base_debug,
                     "rerank_degraded": reranked.degraded,
                     "rerank_fallback": fallback,
                 },
             )
+
+        # §8.3: conflicted facts never traverse, but they may be PRESENTED
+        # (flagged with their conflicted status) when the query's temporal
+        # intent is historical or the query independently seeds both
+        # endpoints of the conflicted pair.
+        intent_kind = (
+            query.temporal_intent.kind if query.temporal_intent is not None else "current"
+        )
+        presentable_conflicted = {
+            str(row.fact_id)
+            for row in fact_rows
+            if str(row.status) == "conflicted"
+            and (
+                intent_kind == "historical"
+                or (
+                    str(row.subject_entity_id) != str(row.object_entity_id)
+                    and {str(row.subject_entity_id), str(row.object_entity_id)}
+                    <= resolved_entity_ids
+                )
+            )
+        }
 
         pack_started = monotonic()
         pack = self._assemble_pack(
@@ -526,11 +650,12 @@ class SharedRetrievalEngine:
             exclusions,
             latency,
             debug={
-                "dense_reset_considered": len(self.snapshot.passage_ids),
+                **base_debug,
                 "rerank_degraded": reranked.degraded,
                 "rerank_fallback": fallback,
                 "pre_abstention": pre_decision.reason,
             },
+            extra_fact_ids=presentable_conflicted,
         )
         latency["pack"] = _elapsed_ms(pack_started)
         return replace(pack, trace=replace(pack.trace, latency_ms=dict(latency)))
@@ -551,6 +676,7 @@ class SharedRetrievalEngine:
         exclusions: tuple[Mapping[str, object], ...],
         latency: Mapping[str, float],
         debug: Mapping[str, object],
+        extra_fact_ids: set[str] = frozenset(),  # type: ignore[assignment]
     ) -> EvidencePack:
         selected_ids = {row.candidate.passage_id for row in selected}
         selected_paths = tuple(
@@ -608,13 +734,7 @@ class SharedRetrievalEngine:
             evidence_ref = self.registry.register(
                 "passage",
                 passage.passage_id,
-                {
-                    "passage_id": passage.passage_id,
-                    "note_id": passage.note_id,
-                    "text": passage.text,
-                    "char_start": passage.char_start,
-                    "char_end": passage.char_end,
-                },
+                passage_payload(passage),
             )
             self.registry.mark_read(evidence_ref)
             evidence_ref_by_passage[passage.passage_id] = evidence_ref
@@ -636,9 +756,11 @@ class SharedRetrievalEngine:
                 )
             )
 
-        relevant_fact_ids = {
-            fact_id for row in triple.triples for fact_id in row.fact_ids
-        } | {fact_id for path in selected_paths for fact_id in path.fact_ids}
+        relevant_fact_ids = (
+            {fact_id for row in triple.triples for fact_id in row.fact_ids}
+            | {fact_id for path in selected_paths for fact_id in path.fact_ids}
+            | set(extra_fact_ids)
+        )
         for context in fact_rows:
             if str(context.fact_id) not in relevant_fact_ids:
                 continue
@@ -648,13 +770,7 @@ class SharedRetrievalEngine:
             evidence_ref_by_passage[passage.passage_id] = self.registry.register(
                 "passage",
                 passage.passage_id,
-                {
-                    "passage_id": passage.passage_id,
-                    "note_id": passage.note_id,
-                    "text": passage.text,
-                    "char_start": passage.char_start,
-                    "char_end": passage.char_end,
-                },
+                passage_payload(passage),
             )
 
         evidence_facts = _assemble_facts(
@@ -665,6 +781,7 @@ class SharedRetrievalEngine:
             selected_paths,
             build_id=self.snapshot.build_id,
             supplied_passage_ids=selected_ids,
+            extra_fact_ids=set(extra_fact_ids),
         )
         evidence_notes = _assemble_notes(
             note_rows,
@@ -713,49 +830,422 @@ class SharedRetrievalEngine:
         )
 
 
-def _triple_head_hits(result: TripleRecognitionResult) -> HeadResult:
-    accepted: list[HeadHit] = []
-    rejected: list[HeadHit] = []
-    for rank, row in enumerate(result.decisions, 1):
-        hit = HeadHit(
-            target_kind="fact",
-            target_id="|".join(row.fact_ids),
-            raw_score=float(row.embedding_score),
-            calibrated_score=float(row.embedding_score),
-            rank=rank,
-            head="triple",
-            reason=row.reason,
+    def _hub_entity_ids(self) -> frozenset[str]:
+        """Traversal-ineligible entities in this snapshot, computed once."""
+
+        if self._hub_ids is None:
+            entity_nodes = tuple(
+                node_id
+                for node_id, kind in zip(
+                    self.snapshot.base_graph.node_ids,
+                    self.snapshot.base_graph.node_kinds,
+                    strict=True,
+                )
+                if kind == "entity"
+            )
+            contexts = getattr(self.store, "entity_contexts", None)
+            rows = (
+                contexts(entity_nodes, build_id=self.snapshot.build_id)
+                if callable(contexts) and entity_nodes
+                else ()
+            )
+            self._hub_ids = frozenset(
+                str(row.entity_id) for row in rows if not row.traversal_eligible
+            )
+        return self._hub_ids
+
+    def _hub_activation(
+        self,
+        activated_hubs: Sequence[str],
+        passage_by_id: Mapping[str, PassageContext],
+    ) -> dict[str, tuple[str, ...]]:
+        """§10.5: an exact query entity may be temporarily enabled.
+
+        For each explicitly resolved hub, synthesize a bounded set of contains
+        links for this query's matrix only — strongest notes (by mention
+        passage count) first, deterministic order.
+        """
+
+        if not activated_hubs:
+            return {}
+        lookup = getattr(self.store, "passage_ids_for_entities", None)
+        if not callable(lookup):
+            return {}
+        activation: dict[str, tuple[str, ...]] = {}
+        cap = max(0, int(config.HUB_ACTIVATION_MAX_EDGES))
+        for entity_id in activated_hubs:
+            passage_ids = tuple(
+                passage_id
+                for passage_id in lookup((entity_id,), build_id=self.snapshot.build_id)
+                if passage_id in passage_by_id
+            )
+            if not passage_ids or cap == 0:
+                continue
+            per_note: dict[str, list[str]] = {}
+            for passage_id in passage_ids:
+                per_note.setdefault(passage_by_id[passage_id].note_id, []).append(
+                    passage_id
+                )
+            ordered_notes = sorted(
+                per_note, key=lambda note_id: (-len(per_note[note_id]), note_id)
+            )
+            bounded: list[str] = []
+            for note_id in ordered_notes:
+                for passage_id in sorted(per_note[note_id]):
+                    bounded.append(passage_id)
+                    if len(bounded) >= cap:
+                        break
+                if len(bounded) >= cap:
+                    break
+            activation[entity_id] = tuple(bounded)
+        return activation
+
+    def _retrieval_graph(
+        self,
+        query: RetrievalQuery,
+        fact_rows: Sequence[Any],
+        hub_activation: Mapping[str, tuple[str, ...]],
+    ) -> tuple[Any, set[str]]:
+        """L29: LRU-cache the materialized temporal graph per intent/activation.
+
+        Fact rows are immutable within a snapshot generation (the accepted L4
+        remove_source staleness aside), so the cache key needs only the
+        temporal-selection inputs and the activated hub set.
+        """
+
+        intent = query.temporal_intent
+        kind = intent.kind if intent is not None else "current"
+        at = intent.at if intent is not None else None
+        if kind == "any":
+            time_key: float | None = None
+        elif at is not None:
+            time_key = at
+        else:
+            time_key = query.now
+        key = (
+            id(self.snapshot),
+            self.snapshot.build_id,
+            kind,
+            time_key,
+            tuple(sorted(hub_activation.items())),
         )
-        (accepted if row.accepted else rejected).append(hit)
+        cached = self._graph_cache.get(key)
+        if cached is not None:
+            self._graph_cache.move_to_end(key)
+            return cached
+        result = _temporal_retrieval_graph(
+            self.snapshot, fact_rows, query, hub_activation=hub_activation
+        )
+        self._graph_cache[key] = result
+        while len(self._graph_cache) > _GRAPH_CACHE_SIZE:
+            self._graph_cache.popitem(last=False)
+        return result
+
+    def _fallback_floor(self, head: str) -> float:
+        # §0.1: the fallback lane floor is 0.75 × the head's acceptance floor,
+        # read through the calibrator so the source of floors stays swappable.
+        return float(config.RETRIEVAL_FALLBACK_FLOOR_RATIO) * float(
+            self.calibrator.acceptance_floor(head)
+        )
+
+    def _fallback_pack(
+        self,
+        query: RetrievalQuery,
+        decision: RetrievalDecision,
+        dense: HeadResult,
+        bm25: HeadResult,
+        accepted_hits: Sequence[HeadHit],
+        rejected_hits: Sequence[HeadHit],
+        latency: Mapping[str, float],
+        triple: TripleRecognitionResult,
+        *,
+        debug: Mapping[str, object],
+    ) -> EvidencePack | None:
+        """§0.1 chat/tool fallback lane: a bounded best-effort pack after an
+        abstention. Passages only (no facts, no paths, ≤1 per note, cap 4),
+        registered and marked read like normal evidence; the decision stays
+        unaccepted with ``fallback=True``. Returns None when disabled or when
+        nothing clears the fallback floor.
+        """
+
+        if not self.fallback_on_abstain:
+            return None
+        best: dict[str, float] = {}
+        for head, result in (("dense", dense), ("bm25", bm25)):
+            if result.status != "ok":
+                continue
+            floor = self._fallback_floor(head)
+            for hit in (*result.accepted, *result.rejected):
+                if hit.target_kind != "passage":
+                    continue
+                score = float(hit.calibrated_score)
+                if math.isfinite(score) and score >= floor:
+                    best[hit.target_id] = max(best.get(hit.target_id, 0.0), score)
+        if not best:
+            return None
+        ordered = sorted(best.items(), key=lambda row: (-row[1], row[0]))
+        contexts = {
+            row.passage_id: row
+            for row in self.store.passage_contexts(
+                tuple(passage_id for passage_id, _score in ordered)
+            )
+        }
+        chosen: list[tuple[PassageContext, float]] = []
+        seen_notes: set[str] = set()
+        cap = max(0, int(config.RETRIEVAL_FALLBACK_PASSAGES))
+        for passage_id, score in ordered:
+            row = contexts.get(passage_id)
+            if row is None or row.note_id in seen_notes or len(chosen) >= cap:
+                continue
+            seen_notes.add(row.note_id)
+            chosen.append((row, score))
+        if not chosen:
+            return None
+        note_rows = {
+            row.note_id: row
+            for row in self.store.note_contexts(tuple(sorted(seen_notes)))
+        }
+        note_ref_by_id: dict[str, str] = {}
+        passages: list[EvidencePassage] = []
+        for row, score in chosen:
+            note_ref = note_ref_by_id.get(row.note_id)
+            if note_ref is None:
+                note_ref = self.registry.register(
+                    "note", row.note_id, {"note_id": row.note_id}
+                )
+                self.registry.mark_read(note_ref)
+                note_ref_by_id[row.note_id] = note_ref
+            evidence_ref = self.registry.register(
+                "passage", row.passage_id, passage_payload(row)
+            )
+            self.registry.mark_read(evidence_ref)
+            passages.append(
+                EvidencePassage(
+                    evidence_id=evidence_ref,
+                    passage_id=row.passage_id,
+                    note_id=row.note_id,
+                    title=row.title,
+                    source=row.source,
+                    text=row.text,
+                    char_start=row.char_start,
+                    char_end=row.char_end,
+                    created=row.created,
+                    modified=row.modified,
+                    retrieval_score=score,
+                    rerank_score=score,
+                )
+            )
+        notes = _assemble_notes(
+            note_rows,
+            note_ref_by_id,
+            passages,
+            support_bonus=self.calibrator.note_support_bonus,
+            support_bonus_cap=self.calibrator.note_support_bonus_cap,
+        )
+        current_refs = {
+            *note_ref_by_id.values(),
+            *(row.evidence_id for row in passages),
+        }
+        read_ids = tuple(
+            ref for ref in self.registry.refs("read") if ref in current_refs
+        )
+        fallback_decision = RetrievalDecision(
+            accepted=False,
+            confidence=max(score for _row, score in chosen),
+            reason="fallback_low_confidence",
+            accepted_heads=decision.accepted_heads,
+            rejected_heads=decision.rejected_heads,
+            fallback=True,
+        )
+        trace = RetrievalTrace(
+            original_query=query.text,
+            rewritten_query=query.text,
+            head_hits=tuple(accepted_hits),
+            rejected_hits=tuple(rejected_hits),
+            entity_resolutions=_entity_trace((*accepted_hits, *rejected_hits)),
+            triple_decisions=_triple_trace(triple),
+            selected_ids=read_ids,
+            read_ids=read_ids,
+            cited_ids=(),
+            active_build_id=self.snapshot.build_id,
+            calibration_hash=self.snapshot.calibration_hash,
+            latency_ms=dict(latency),
+            debug={**debug, "fallback_abstention_reason": decision.reason},
+        )
+        return EvidencePack(
+            decision=fallback_decision,
+            query=query,
+            passages=tuple(passages),
+            facts=(),
+            paths=(),
+            notes=notes,
+            trace=trace,
+        )
+
+
+_GRAPH_CACHE_SIZE = 8
+
+
+def _sanitized_error(exc: BaseException) -> str:
+    detail = " ".join(str(exc).split())[:120]
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
+def _triple_head_hits(result: TripleRecognitionResult) -> HeadResult:
+    """Convert recognition output into head hits without malformed rows (L11).
+
+    Only retained (seeded) triples become accepted hits, ranked 1..n among
+    themselves so preliminary rejections never offset ranks. Each hit carries
+    the recognition score as ``calibrated_score`` and the calibrated embedding
+    probability as ``raw_score``. Non-retained scored decisions and
+    preliminary rejections appear only as rejected hits after the retained
+    ranks.
+    """
+
+    decision_by_key = {row.logical_key: row for row in result.decisions}
+    retained_keys = {row.logical_key for row in result.triples}
+    accepted: list[HeadHit] = []
+    for rank, row in enumerate(result.triples, 1):
+        decision = decision_by_key.get(row.logical_key)
+        accepted.append(
+            HeadHit(
+                target_kind="fact",
+                target_id="|".join(row.fact_ids),
+                raw_score=float(
+                    decision.embedding_score if decision is not None else row.score
+                ),
+                calibrated_score=float(row.score),
+                rank=rank,
+                head="triple",
+                reason=(
+                    decision.reason
+                    if decision is not None
+                    else "accepted_recognized_triple"
+                ),
+            )
+        )
+    remaining = tuple(
+        row for row in result.decisions if row.logical_key not in retained_keys
+    )
+    ordered_remaining = sorted(
+        remaining,
+        key=lambda row: (-row.recognition_score, -row.embedding_score, row.logical_key),
+    )
+    rejected: list[HeadHit] = []
+    for offset, row in enumerate(ordered_remaining, len(accepted) + 1):
+        rejected.append(
+            HeadHit(
+                target_kind="fact",
+                target_id="|".join(row.fact_ids),
+                raw_score=float(row.embedding_score),
+                calibrated_score=float(
+                    row.recognition_score if row.recognition_score > 0.0 else 0.0
+                ),
+                rank=offset,
+                head="triple",
+                reason=row.reason,
+            )
+        )
     return HeadResult(tuple(accepted), tuple(rejected))
 
 
-def _candidate_scores(
+def _order_rerank_candidates(
     candidate_ids: set[str],
+    passage_by_id: Mapping[str, PassageContext],
+    accepted_hits: Sequence[HeadHit],
     fused: Mapping[tuple[TargetKind, str], FusedHit],
     ppr: PPRResult,
-    support_scores: Mapping[str, float],
+    triple_support: Mapping[str, float],
+    path_support: Mapping[str, float],
     paths_by_target: Mapping[str, tuple[PathCandidate, ...]],
-) -> dict[str, float]:
-    scores: dict[str, float] = {}
-    for passage_id in candidate_ids:
-        values = [
-            fused.get(("passage", passage_id), FusedHit("passage", passage_id, 0.0, (), ())).score,
-            float(ppr.ranks.get(passage_id, 0.0)),
-            float(support_scores.get(passage_id, 0.0)),
-        ]
-        values.extend(path.weight for path in paths_by_target.get(passage_id, ()))
-        scores[passage_id] = max(values, default=0.0)
-    return scores
+    *,
+    cap: int,
+) -> tuple[PassageRerankCandidate, ...]:
+    """H6: fill the bounded rerank pool by tier so incomparable score families
+    never evict each other: (1) direct head hits by calibrated score desc,
+    (2) recognized-triple support passages by recognition score desc, (3)
+    PPR/path expansions by PPR mass desc (path weight as tie-break)."""
+
+    known = {
+        passage_id for passage_id in candidate_ids if passage_id in passage_by_id
+    }
+    direct_scores: dict[str, float] = {}
+    for hit in accepted_hits:
+        if hit.target_kind == "passage" and hit.target_id in known:
+            score = float(hit.calibrated_score)
+            if math.isfinite(score):
+                direct_scores[hit.target_id] = max(
+                    direct_scores.get(hit.target_id, 0.0), score
+                )
+    path_weights: dict[str, float] = dict(path_support)
+    for target_id, paths in paths_by_target.items():
+        for path in paths:
+            path_weights[target_id] = max(
+                path_weights.get(target_id, 0.0), float(path.weight)
+            )
+    ordered: list[tuple[str, float]] = []
+    ordered.extend(sorted(direct_scores.items(), key=lambda row: (-row[1], row[0])))
+    ordered.extend(
+        sorted(
+            (
+                (passage_id, float(score))
+                for passage_id, score in triple_support.items()
+                if passage_id in known and passage_id not in direct_scores
+            ),
+            key=lambda row: (-row[1], row[0]),
+        )
+    )
+    remaining = known - set(direct_scores) - set(triple_support)
+    for passage_id in sorted(
+        remaining,
+        key=lambda row: (
+            -float(ppr.ranks.get(row, 0.0)),
+            -path_weights.get(row, 0.0),
+            row,
+        ),
+    ):
+        mass = float(ppr.ranks.get(passage_id, 0.0))
+        ordered.append(
+            (passage_id, mass if mass > 0.0 else path_weights.get(passage_id, 0.0))
+        )
+    seen: set[str] = set()
+    candidates: list[PassageRerankCandidate] = []
+    for passage_id, tier_score in ordered:
+        if passage_id in seen:
+            continue
+        seen.add(passage_id)
+        row = passage_by_id[passage_id]
+        fused_hit = fused.get(("passage", passage_id))
+        candidates.append(
+            PassageRerankCandidate(
+                passage_id=passage_id,
+                note_id=row.note_id,
+                title=row.title,
+                source=row.source,
+                text=row.text,
+                recall_score=float(tier_score),
+                hint=_candidate_hint(
+                    passage_id, triple_support, path_support, paths_by_target
+                ),
+                fused_score=float(fused_hit.score) if fused_hit is not None else 0.0,
+                ppr_mass=float(ppr.ranks.get(passage_id, 0.0)),
+                triple_support=float(triple_support.get(passage_id, 0.0)),
+                path_weight=float(path_weights.get(passage_id, 0.0)),
+            )
+        )
+        if len(candidates) >= max(0, int(cap)):
+            break
+    return tuple(candidates)
 
 
 def _candidate_hint(
     passage_id: str,
-    support_scores: Mapping[str, float],
+    triple_support: Mapping[str, float],
+    path_support: Mapping[str, float],
     paths_by_target: Mapping[str, tuple[PathCandidate, ...]],
 ) -> str:
     hints: list[str] = []
-    if passage_id in support_scores:
+    if passage_id in triple_support or passage_id in path_support:
         hints.append("supports a recognized fact")
     if passage_id in paths_by_target:
         hints.append("reached by an explanatory graph path")
@@ -871,6 +1361,7 @@ def _assemble_facts(
     *,
     build_id: str,
     supplied_passage_ids: set[str],
+    extra_fact_ids: set[str] = frozenset(),  # type: ignore[assignment]
 ) -> tuple[EvidenceFact, ...]:
     path_fact_ids = {fact_id for path in paths for fact_id in path.fact_ids}
     recognized_by_fact = {
@@ -879,7 +1370,9 @@ def _assemble_facts(
     contexts = {
         str(row.fact_id): row
         for row in fact_rows
-        if str(row.fact_id) in path_fact_ids or str(row.fact_id) in recognized_by_fact
+        if str(row.fact_id) in path_fact_ids
+        or str(row.fact_id) in recognized_by_fact
+        or str(row.fact_id) in extra_fact_ids
     }
     grouped: dict[tuple[tuple[str, str, str], str, object, object], list[Any]] = {}
     for context in contexts.values():
@@ -908,23 +1401,13 @@ def _assemble_facts(
             None,
         )
         first = ordered[0]
-        source_identity = "\x1f".join(
-            (build_id, *logical_key, status, repr(valid_from), repr(valid_to))
+        source_identity = fact_source_identity(
+            build_id, logical_key, status, valid_from, valid_to
         )
         source_evidence_ids = tuple(dict.fromkeys(source_ids))
-        core_payload = {
-            "logical_key": list(logical_key),
-            "subject_entity_id": str(first.subject_entity_id),
-            "object_entity_id": str(first.object_entity_id),
-            "subject": str(first.subject),
-            "predicate": str(first.predicate),
-            "object": str(first.object),
-            "direction": "forward",
-            "status": status,
-            "observed_at": max(float(row.observed_at) for row in ordered),
-            "valid_from": valid_from,
-            "valid_to": valid_to,
-        }
+        core_payload = fact_group_payload(
+            logical_key, status, valid_from, valid_to, ordered
+        )
         ref = registry.ref_for("fact", source_identity)
         if ref is None:
             ref = registry.register("fact", source_identity, core_payload)
@@ -934,7 +1417,7 @@ def _assemble_facts(
                 "fact_ids": [str(row.fact_id) for row in ordered],
                 "source_evidence_ids": list(source_evidence_ids),
             },
-            append_list_fields=frozenset({"fact_ids", "source_evidence_ids"}),
+            append_list_fields=FACT_APPEND_FIELDS,
         )
         registry.mark_read(ref)
         facts.append(
@@ -1063,28 +1546,29 @@ def _temporal_retrieval_graph(
     snapshot: IndexSnapshot,
     fact_rows: Sequence[Any],
     query: RetrievalQuery,
+    *,
+    hub_activation: Mapping[str, tuple[str, ...]] | None = None,
 ) -> tuple[Any, set[str]]:
+    """Materialize the query's fact overlay using the one shared temporal
+    predicate (M2), plus synthesized contains links for explicitly
+    query-activated hub entities (M13, §10.5)."""
+
     intent = query.temporal_intent
     kind = intent.kind if intent is not None else "current"
-    at = intent.at if intent is not None and intent.at is not None else query.now
-    selected: list[Any] = []
+    at = intent.at if intent is not None else None
+    selected: list[tuple[Any, float]] = []
     for fact in fact_rows:
-        status = str(fact.status)
-        if status in {"candidate", "conflicted"}:
-            continue
-        valid_at = (
-            float(fact.observed_at) <= at
-            and (fact.valid_from is None or at >= float(fact.valid_from))
-            and (fact.valid_to is None or at < float(fact.valid_to))
+        admitted, weight, _reason = fact_temporal_admission(
+            status=str(fact.status),
+            valid_from=fact.valid_from,
+            valid_to=fact.valid_to,
+            kind=kind,
+            at=at,
+            now=query.now,
+            for_traversal=True,
         )
-        if kind == "historical":
-            if intent is not None and intent.at is not None:
-                if valid_at:
-                    selected.append(fact)
-            elif status in {"historical", "superseded"}:
-                selected.append(fact)
-        elif status == "active" and valid_at:
-            selected.append(fact)
+        if admitted:
+            selected.append((fact, weight))
     fact_inputs = tuple(
         FactGraphInput(
             fact_id=str(fact.fact_id),
@@ -1092,22 +1576,33 @@ def _temporal_retrieval_graph(
             predicate=str(fact.predicate),
             object_entity_id=str(fact.object_entity_id),
             source_note_id=str(fact.source_note_id),
-            confidence=float(getattr(fact, "confidence", 1.0)),
+            confidence=float(getattr(fact, "confidence", 1.0)) * weight,
             status="active",
         )
-        for fact in selected
+        for fact, weight in selected
     )
     non_fact_edges = tuple(
         edge for edge in snapshot.base_graph.edges if edge.kind != "fact"
     )
     overlay_edges = grouped_fact_edges(fact_inputs)
+    known_nodes = set(snapshot.base_graph.node_ids)
+    hub_edges: list[BaseEdge] = []
+    hub_weight = float(config.HUB_ACTIVATION_EDGE_WEIGHT)
+    for entity_id in sorted(hub_activation or {}):
+        if entity_id not in known_nodes:
+            continue
+        for passage_id in (hub_activation or {})[entity_id]:
+            if passage_id not in known_nodes:
+                continue
+            hub_edges.append(BaseEdge(passage_id, entity_id, "contains", hub_weight))
+            hub_edges.append(BaseEdge(entity_id, passage_id, "contains", hub_weight))
     graph = materialize_base_graph(
         build_id=snapshot.build_id,
         node_ids=snapshot.base_graph.node_ids,
         node_kinds=snapshot.base_graph.node_kinds,
-        edges=(*non_fact_edges, *overlay_edges),
+        edges=(*non_fact_edges, *overlay_edges, *hub_edges),
     )
-    return graph, {str(fact.fact_id) for fact in selected}
+    return graph, {str(fact.fact_id) for fact, _weight in selected}
 
 
 def _render_evidence_path(
@@ -1266,7 +1761,10 @@ def _cosine(left: np.ndarray | None, right: np.ndarray | None) -> float:
 
 
 def _reverse_key(value: str) -> tuple[int, ...]:
-    return tuple(-ord(character) for character in value)
+    # Order-reversing key for max(): smallest ID wins ties. The trailing
+    # sentinel (greater than any -ord) makes a prefix beat its extensions
+    # (L12: "a" must win over "ab").
+    return tuple(-ord(character) for character in value) + (1,)
 
 
 def _elapsed_ms(started: float) -> float:

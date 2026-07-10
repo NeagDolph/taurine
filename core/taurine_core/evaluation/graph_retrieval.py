@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class CalibrationIntegrityError(ValueError):
+    """The artifact's declared hash does not match its canonical content."""
 
 
 Split = Literal["train", "calibration", "held_out"]
@@ -120,6 +125,12 @@ class RerankCalibration(_StrictModel):
     chat_floor: float = Field(ge=0.0, le=1.0)
 
 
+class GraphCalibration(_StrictModel):
+    """Build-time graph floors (§16: semantic floors live in the artifact)."""
+
+    semantic_floor: float = Field(ge=0.0, le=1.0)
+
+
 class NLICalibration(_StrictModel):
     entailment_floor: float = Field(ge=0.0, le=1.0)
 
@@ -156,6 +167,9 @@ class CalibrationArtifact(_StrictModel):
     triple_recognition: TripleRecognitionCalibration
     rerank: RerankCalibration
     nli: NLICalibration
+    # additive with a default so pre-existing artifacts validate; the default
+    # matches the retired in-code GRAPH_MIN_SIM constant (L19)
+    graph: GraphCalibration = GraphCalibration(semantic_floor=0.55)
 
     @model_validator(mode="after")
     def validate_modes(self) -> "CalibrationArtifact":
@@ -198,8 +212,29 @@ def load_jsonl(path: str | Path) -> tuple[EvaluationExample, ...]:
     return tuple(examples)
 
 
-def load_calibration(path: str | Path) -> CalibrationArtifact:
-    return CalibrationArtifact.model_validate_json(Path(path).read_text(encoding="utf-8"))
+def compute_artifact_hash(artifact: CalibrationArtifact) -> str:
+    """Canonical content digest over every field except the ``hash`` label."""
+
+    canonical = json.dumps(
+        artifact.model_dump(mode="json", exclude={"hash"}),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def load_calibration(path: str | Path, *, verify: bool = True) -> CalibrationArtifact:
+    artifact = CalibrationArtifact.model_validate_json(
+        Path(path).read_text(encoding="utf-8")
+    )
+    if verify:
+        computed = compute_artifact_hash(artifact)
+        if computed != artifact.hash:
+            raise CalibrationIntegrityError(
+                "calibration artifact content hash mismatch: "
+                f"declared {artifact.hash!r}, computed {computed!r}"
+            )
+    return artifact
 
 
 def validate_split_isolation(examples: tuple[EvaluationExample, ...]) -> None:

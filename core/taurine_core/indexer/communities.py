@@ -7,25 +7,27 @@ from scipy.sparse import csr_matrix
 
 from taurine_core import config
 
-from .rank import NoteGraphMatrix
-
 if TYPE_CHECKING:
     from taurine_core.indexer.projection import ProjectionEdge
 
 
-def label_propagation(matrix: NoteGraphMatrix) -> dict[str, int]:
-    """Deterministic synchronous label propagation over the note graph."""
-    size = len(matrix.note_ids)
+def label_propagation(note_ids: Sequence[str], matrix: csr_matrix) -> dict[str, int]:
+    """Deterministic synchronous label propagation over the note graph.
+
+    ``matrix`` row/column order must match ``note_ids`` order.
+    """
+    size = len(note_ids)
     if size == 0:
         return {}
 
-    base = matrix.matrix.tocsr()
+    base = matrix.tocsr()
     adjacency = ((base + base.T) > 0).astype(np.int8).tocsr()
     adjacency.setdiag(0)
     adjacency.eliminate_zeros()
 
+    row_of = {note_id: row for row, note_id in enumerate(note_ids)}
     labels = np.arange(size, dtype=np.int64)
-    order = [matrix.row_of[note_id] for note_id in sorted(matrix.note_ids)]
+    order = [row_of[note_id] for note_id in sorted(note_ids)]
 
     for _ in range(max(0, int(config.COMMUNITY_LP_ITERS))):
         updated = labels.copy()
@@ -43,10 +45,7 @@ def label_propagation(matrix: NoteGraphMatrix) -> dict[str, int]:
             break
         labels = updated
 
-    return {
-        note_id: int(labels[row])
-        for note_id, row in matrix.row_of.items()
-    }
+    return {note_id: int(labels[row]) for note_id, row in row_of.items()}
 
 
 def projection_communities(edges: Sequence["ProjectionEdge"]) -> dict[str, int]:
@@ -74,4 +73,4 @@ def projection_communities(edges: Sequence["ProjectionEdge"]) -> dict[str, int]:
         (np.ones(len(rows), dtype=np.float32), (rows, cols)),
         shape=(len(note_ids), len(note_ids)),
     )
-    return label_propagation(NoteGraphMatrix(note_ids, matrix))
+    return label_propagation(note_ids, matrix)

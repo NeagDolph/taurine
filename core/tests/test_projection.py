@@ -103,6 +103,98 @@ def test_projection_edges_are_not_inserted_into_base_graph() -> None:
     assert graph.node_ids == ("p1", "p2", "e1", "e2")
 
 
+def test_projection_fact_mechanism_uses_provenance_for_hub_endpoints() -> None:
+    """L1: a fact whose object is traversal-ineligible (date/pronoun hub, so
+    no contains edges) still projects via its provenance source notes."""
+    graph = _graph(
+        (
+            BaseEdge("p1", "e1", "contains", 0.6),
+            BaseEdge("e1", "p1", "contains", 0.6),
+            # e2 (a date) has NO contains edges; the fact was asserted in n2
+            BaseEdge(
+                "e1",
+                "e2",
+                "fact",
+                0.4,
+                direction="forward",
+                fact_ids=("f9",),
+                metadata={"predicate": "scheduled_for", "source_note_ids": ("n2",)},
+            ),
+        )
+    )
+
+    rows = build_projection(
+        graph,
+        passages=(ProjectionPassage("p1", "n1"), ProjectionPassage("p2", "n2")),
+        entity_labels={"e1": "Launch", "e2": "July 18"},
+        max_degree=3,
+    )
+
+    assert len(rows) == 1
+    edge = rows[0]
+    assert (edge.src_note_id, edge.dst_note_id) == ("n1", "n2")
+    assert "fact" in edge.mechanisms
+    assert edge.fact_ids == ("f9",)
+
+
+def test_projection_dates_only_facts_contribute_no_edge() -> None:
+    """L1: a fact with BOTH endpoints ineligible still adds nothing."""
+    graph = _graph(
+        (
+            BaseEdge(
+                "e1",
+                "e2",
+                "fact",
+                0.4,
+                direction="forward",
+                fact_ids=("f9",),
+                metadata={"predicate": "scheduled_for", "source_note_ids": ("n2",)},
+            ),
+        )
+    )
+
+    rows = build_projection(
+        graph,
+        passages=(ProjectionPassage("p1", "n1"), ProjectionPassage("p2", "n2")),
+        entity_labels={},
+        max_degree=3,
+    )
+
+    assert rows == ()
+
+
+def test_spanning_forest_ignores_degree_cap_so_hub_notes_still_connect() -> None:
+    """L2: a hub note bridging more components than max_degree keeps the map
+    connected; the cap applies only to the fill phase."""
+    leaf_count = 14
+    node_ids = ["hub"] + [f"p{index}" for index in range(leaf_count)]
+    edges = []
+    for index in range(leaf_count):
+        weight = 0.9 - index * 0.01
+        edges.append(BaseEdge("hub", f"p{index}", "semantic", weight))
+        edges.append(BaseEdge(f"p{index}", "hub", "semantic", weight))
+    graph = BaseGraph(
+        build_id="build-1",
+        node_ids=tuple(node_ids),
+        node_kinds=tuple(["passage"] * len(node_ids)),
+        row_by_id={node_id: index for index, node_id in enumerate(node_ids)},
+        matrix=csr_matrix(np.zeros((len(node_ids),) * 2, dtype=np.float64)),
+        dangling_rows=tuple(range(len(node_ids))),
+        edges=tuple(edges),
+    )
+    passages = tuple(
+        ProjectionPassage(node_id, f"note-{node_id}") for node_id in node_ids
+    )
+
+    rows = build_projection(graph, passages, {}, max_degree=12)
+
+    assert len(rows) == leaf_count  # every leaf is bridged despite the cap
+    hub_degree = sum(
+        1 for row in rows if "note-hub" in (row.src_note_id, row.dst_note_id)
+    )
+    assert hub_degree == leaf_count > 12
+
+
 def _graph(edges: tuple[BaseEdge, ...]) -> BaseGraph:
     return BaseGraph(
         build_id="build-1",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import faulthandler
+import inspect
 import json
 import logging
 import os
@@ -26,19 +27,26 @@ from taurine_core import session_log
 from taurine_core.asr import ASRClient, ChunkCallback, IndexStatusProvider, StatusCallback
 from taurine_core.chat.engine import ChatEngine
 from taurine_core.chat.retrieval import ChatRetriever
-from taurine_core.connectors.registry import ConnectorRegistry
+from taurine_core.connectors.registry import ConnectorRegistry, SourceExtraction
 from taurine_core.indexer.notes import open_note
-from taurine_core.indexer.build import BuildCancelled, BuildCoordinator, BuildDependencies
+from taurine_core.indexer.build import (
+    BuildCancelled,
+    BuildCoordinator,
+    BuildDependencies,
+    carry_forward_records,
+    relation_completer_for,
+    sweep_stale_build_files,
+)
+from taurine_core.profile_context import owner_aliases as profile_owner_aliases
 from taurine_core.indexer.build_cache import BuildCache
 from taurine_core.indexer.embed import embed_texts
 from taurine_core.indexer.communities import projection_communities
 from taurine_core.indexer.extract import extract_notes
-from taurine_core.indexer.facts import PREDICATES
 from taurine_core.indexer.knowledge_store import KnowledgeSchemaError
 from taurine_core.models_local import passage_tokenizer
 from taurine_core.indexer.profile import ProfileGenerator, ProfileProgress
 from taurine_core.indexer.store import Index
-from taurine_core.indexer.sync import SyncReport
+from taurine_core.live import ambient as live_ambient
 from taurine_core.live.ambient import AmbientRetriever
 from taurine_core.live.grounding import GroundingEngine
 from taurine_core.live.ingest import Event, EventSink, LiveSession
@@ -73,6 +81,7 @@ from taurine_core.schemas import (
     SyncStatus,
     StatusEvent,
     StopMsg,
+    SyncReport,
 )
 
 
@@ -98,6 +107,9 @@ class LiveSessionLike(Protocol):
         ...
 
     def current_summary(self) -> MeetingSummary:
+        ...
+
+    async def aclose(self) -> None:
         ...
 
 
@@ -735,6 +747,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             active_runtime.status_sinks.discard(emit_index_status)
             if not session_started:
                 logger.log("session_start", channels=[])
+            # Cancel and drain any in-flight summary before closing the
+            # logger so the task cannot log into a closed sink (M8).
+            live_close = getattr(live, "aclose", None)
+            if live_close is not None:
+                await live_close()
             await asr.stop()
             sender.cancel()
             await asyncio.gather(sender, return_exceptions=True)
@@ -838,35 +855,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
     connector_registry = ConnectorRegistry()
     connector_registry.reconcile_ledger(index)
 
-    def complete_relations(notes: Any) -> object:
-        payload = {
-            "predicates": {
-                name: spec.description for name, spec in sorted(PREDICATES.items())
-            },
-            "notes": [
-                {
-                    "note_id": note.note_id,
-                    "observed_at": note.observed_at,
-                    "entities": [asdict(entity) for entity in note.entities],
-                    "passages": [asdict(passage) for passage in note.passages],
-                }
-                for note in notes
-            ],
-        }
-        return asyncio.run(
-            llm.complete_json(
-                config.CHAT_MODEL,
-                (
-                    "Return JSON {facts:[...]}. Find only relations directly supported by the "
-                    "supplied passage text. Reuse entity_id and passage_id exactly, select a "
-                    "registered predicate when possible, and provide source-exact assertion_start "
-                    "and assertion_end offsets plus confidence. For an unregistered predicate, "
-                    "also provide predicate_description. Do not infer unsupported relations."
-                ),
-                json.dumps(payload, ensure_ascii=False),
-                timeout_s=config.SUMMARY_TIMEOUT_S,
-            )
-        )
+    complete_relations = relation_completer_for(llm)
 
     report("loading_models", "passage tokenizer")
     # Embeddings and extractions are content-keyed, so repeat syncs only pay
@@ -881,6 +870,8 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
         )
     )
     knowledge_database = Path("taurine-knowledge.db")
+    # L25: crash-orphaned temp builds older than a day are swept at startup
+    sweep_stale_build_files(knowledge_database)
     try:
         report("opening_index", "loading knowledge index")
         knowledge_runtime = RetrievalRuntime(knowledge_database)
@@ -893,21 +884,44 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
         knowledge_runtime = RetrievalRuntime(knowledge_database)
     report("finalizing", "")
 
-    def regenerate_knowledge(progress: Callable[[str], None] | None = None) -> Any:
+    def regenerate_knowledge(
+        progress: Callable[[str], None] | None = None,
+        extraction: SourceExtraction | None = None,
+    ) -> Any:
         def note(detail: str) -> None:
             if progress is not None:
                 progress(detail)
 
-        note("reading enabled sources")
-        records = connector_registry.extract_all_enabled(
-            index,
-            progress=lambda connector_id: note(f"reading {connector_id}"),
-        )
+        if extraction is None:
+            # standalone reindex: read the sources once here. The global sync
+            # path instead passes the records it already extracted (L28).
+            note("reading enabled sources")
+            extraction = connector_registry.extract_all_enabled(
+                index,
+                progress=lambda connector_id: note(f"reading {connector_id}"),
+            )
+        records = list(extraction.records)
+        degraded_reasons: list[str] = []
+        if extraction.unavailable:
+            # enabled-but-unavailable connector: carry its notes forward from
+            # the active knowledge DB instead of wiping the source (L28)
+            present = {record.note_id for record in records}
+            carried = carry_forward_records(
+                knowledge_runtime.knowledge_database, extraction.unavailable
+            )
+            records.extend(
+                record for record in carried if record.note_id not in present
+            )
+            degraded_reasons = [
+                f"connector_unavailable:{name}" for name in extraction.unavailable
+            ]
         build_report = knowledge_builder.build(
             records,
             knowledge_runtime.knowledge_database,
             replace_derived=True,
             on_stage=note,
+            owner_aliases=profile_owner_aliases(index),
+            degraded_reasons=degraded_reasons,
         )
         knowledge_runtime.activate_from_disk()
         return build_report
@@ -922,6 +936,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
                 knowledge_runtime.make_engine("live", registry),
                 clock,
                 span_extractor=span_extractor,
+                query_embedder=live_ambient.default_query_embedder,
             ),
             grounding=grounding,
             trigger=SummaryTrigger(clock.now),
@@ -949,7 +964,11 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
     return Runtime(
         index=index,
         sync_once=lambda: connector_registry.sync_all_enabled(index, llm),
-        sync_all_enabled=lambda: connector_registry.sync_all_enabled(index, llm),
+        # collecting variant: the global sync hands its extracted records to
+        # regenerate_knowledge so each source is read exactly once (L28)
+        sync_all_enabled=lambda: connector_registry.sync_all_enabled_collecting(
+            index, llm
+        ),
         open_note=open_note,
         make_live_session=make_live_session,
         make_asr_client=make_asr_client,
@@ -1300,6 +1319,17 @@ async def _run_connector_sync(runtime: Runtime, connector_id: str) -> None:
         await _emit_index_status(runtime)
 
 
+def _accepts_parameter(func: Any, name: str) -> bool:
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
 async def _run_global_sync(runtime: Runtime) -> None:
     """The single user-triggered job: sync enabled sources, then reindex."""
     log = logging.getLogger("taurine.sync")
@@ -1326,11 +1356,18 @@ async def _run_global_sync(runtime: Runtime) -> None:
             SyncStatus(running=True, phase="syncing", detail="reading enabled sources"),
         )
         sync = runtime.sync_all_enabled or runtime.sync_once
-        await asyncio.to_thread(sync)
+        sync_result = await asyncio.to_thread(sync)
         check_cancel()
         if runtime.regenerate_knowledge is not None:
             _set_sync_status(runtime, SyncStatus(running=True, phase="indexing"))
-            await asyncio.to_thread(runtime.regenerate_knowledge, indexing_progress)
+            # single read per sync (L28): hand the records extracted above to
+            # the rebuild when both sides support it (fakes may not)
+            regenerate_args: tuple[Any, ...] = (indexing_progress,)
+            if isinstance(sync_result, SourceExtraction) and _accepts_parameter(
+                runtime.regenerate_knowledge, "extraction"
+            ):
+                regenerate_args = (indexing_progress, sync_result)
+            await asyncio.to_thread(runtime.regenerate_knowledge, *regenerate_args)
         runtime.index_stale = False
         log.info("sync complete in %.1f s", time.monotonic() - started)
     except asyncio.CancelledError:

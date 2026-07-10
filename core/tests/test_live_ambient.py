@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import pytest
 
 from taurine_core import config
@@ -141,6 +143,110 @@ async def test_span_extraction_failure_degrades_to_shared_heads_without_entities
     assert await retriever.on_window("Maya") is pack
     assert engine.calls[0]["entity_spans"] == ()
     assert retriever.last_entity_spans == ()
+
+
+@pytest.mark.asyncio
+async def test_gliner_span_timeout_fails_open_within_the_live_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "LIVE_SPANS_BUDGET_S", 0.05)
+
+    class SlowExtractor:
+        def extract(self, text: str) -> list[tuple[str, float, str]]:
+            time.sleep(0.5)
+            return [("Maya", 0.9, "person")]
+
+    pack = _pack("slow", accepted=True)
+    engine = FakeSharedEngine([pack])
+    retriever = AmbientRetriever(engine, FakeClock(), span_extractor=SlowExtractor())
+
+    assert await retriever.on_window("Maya") is pack
+    assert engine.calls[0]["entity_spans"] == ()
+    assert retriever.last_spans_timeout
+    assert retriever.last_debug is not None
+    assert retriever.last_debug["spans_timeout"] is True
+
+
+@pytest.mark.asyncio
+async def test_deadline_clock_starts_before_span_extraction() -> None:
+    order: list[str] = []
+
+    def deadline_clock() -> float:
+        order.append("deadline")
+        return 500.0
+
+    class RecordingExtractor:
+        def extract(self, text: str) -> list[tuple[str, float, str]]:
+            order.append("spans")
+            return []
+
+    engine = FakeSharedEngine([_pack("x", accepted=True)])
+    retriever = AmbientRetriever(
+        engine,
+        FakeClock(),
+        span_extractor=RecordingExtractor(),
+        deadline_clock=deadline_clock,
+    )
+
+    await retriever.on_window("query")
+
+    assert order[:2] == ["deadline", "spans"]
+    assert engine.calls[0]["deadline_at"] == pytest.approx(500.75)
+
+
+@pytest.mark.asyncio
+async def test_topic_shift_fires_on_accepted_pivot_and_freezes_on_abstention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "LIVE_TOPIC_SHIFT_SIM", 0.35)
+    east = np.array([1.0, 0.0], dtype=np.float32)
+    north = np.array([0.0, 1.0], dtype=np.float32)
+
+    def embedder(text: str) -> np.ndarray:
+        return east if "east" in text else north
+
+    clock = FakeClock()
+    abstained = EvidencePack.abstained(
+        RetrievalQuery("east filler", "live", now=3.0), "below_floor"
+    )
+    engine = FakeSharedEngine(
+        [
+            _pack("east one", accepted=True),
+            _pack("north pivot", accepted=True),
+            abstained,
+            _pack("east return", accepted=True),
+        ]
+    )
+    retriever = AmbientRetriever(engine, clock, query_embedder=embedder)
+
+    await retriever.on_window("east one")
+    assert not retriever.last_topic_shift  # first accepted window seeds the EMA
+
+    clock.advance(config.C2_THROTTLE_S)
+    await retriever.on_window("north pivot")
+    assert retriever.last_topic_shift
+    assert retriever.last_debug is not None
+    assert retriever.last_debug["topic_shift"] is True
+
+    clock.advance(config.C2_THROTTLE_S)
+    await retriever.on_window("east filler")  # abstained: EMA must not move
+    assert not retriever.last_topic_shift
+
+    clock.advance(config.C2_THROTTLE_S)
+    await retriever.on_window("east return")  # vs north EMA → pivot again
+    assert retriever.last_topic_shift
+
+
+@pytest.mark.asyncio
+async def test_window_embedding_is_exposed_for_the_trigger() -> None:
+    vector = np.array([0.6, 0.8], dtype=np.float32)
+    engine = FakeSharedEngine([_pack("x", accepted=True)])
+    retriever = AmbientRetriever(engine, FakeClock(), query_embedder=lambda text: vector)
+
+    await retriever.on_window("anything")
+
+    assert retriever.last_window_embedding is not None
+    assert float(np.linalg.norm(retriever.last_window_embedding)) == pytest.approx(1.0)
 
 
 def _pack(text: str, *, accepted: bool, degraded: bool = False) -> EvidencePack:

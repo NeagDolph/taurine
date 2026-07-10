@@ -87,6 +87,11 @@ class HeadCalibrator:
     def accepts(self, head: str, raw_score: float) -> bool:
         return self.calibrate(head, raw_score).accepted
 
+    def acceptance_floor(self, head: str) -> float:
+        """The head's calibrated acceptance floor; the one place floors are read."""
+
+        return float(self._curve(head).acceptance_floor)
+
     @property
     def bm25_min_token_coverage(self) -> float:
         return self.mode_calibration.bm25_min_token_coverage
@@ -157,15 +162,36 @@ class AbstentionPolicy:
         self,
         accepted_hits: Sequence[HeadHit],
         rejected_hits: Sequence[HeadHit] = (),
+        *,
+        unavailable_heads: tuple[str, ...] = (),
     ) -> RetrievalDecision:
         qualified, disqualified = self._qualified(accepted_hits)
+        if unavailable_heads:
+            # §17.3: with one or more heads unavailable, cross-head
+            # corroboration may be missing rather than absent, so acceptance
+            # requires the strictest disjunct — an accepted hit at ≥1.1× its
+            # own head's acceptance floor (capped at 1.0).
+            strict: list[HeadHit] = []
+            lenient: list[HeadHit] = []
+            for hit in qualified:
+                curve = self.rules.heads.get(hit.head)
+                floor = min(1.0, 1.1 * curve.acceptance_floor) if curve else 1.0
+                if _safe_probability(hit.calibrated_score) >= floor:
+                    strict.append(hit)
+                else:
+                    lenient.append(hit)
+            qualified, disqualified = tuple(strict), (*disqualified, *lenient)
         heads = _head_names(qualified)
         rejected = _head_names((*rejected_hits, *disqualified))
         if not qualified:
             return RetrievalDecision(
                 accepted=False,
                 confidence=0.0,
-                reason="no_head_cleared_acceptance_floor",
+                reason=(
+                    "no_head_cleared_degraded_strict_floor"
+                    if unavailable_heads
+                    else "no_head_cleared_acceptance_floor"
+                ),
                 accepted_heads=(),
                 rejected_heads=rejected,
             )

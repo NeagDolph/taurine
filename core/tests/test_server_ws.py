@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from taurine_core import session_log
 from taurine_core.indexer.profile import ProfileProgress
-from taurine_core.indexer.sync import SyncReport
+from taurine_core.schemas import SyncReport
 from taurine_core.ports import LLMError
 from taurine_core.schemas import (
     Actionable,

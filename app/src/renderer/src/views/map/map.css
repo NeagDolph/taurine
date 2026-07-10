@@ -549,10 +549,10 @@
 }
 
 /* with the selection side panel open, shift the hover preview left of it
-   (panel width 332px + 12px gap) so the two never overlap */
+   (dynamic panel width + 12px gap) so the two never overlap */
 .map-stage.has-panel .map-hover-panel {
-  max-width: calc(100% - 356px);
-  right: 344px;
+  max-width: calc(100% - min(var(--map-panel-width, 332px), 62%) - 24px);
+  right: calc(min(var(--map-panel-width, 332px), 62%) + 12px);
 }
 
 @keyframes map-hover-in {
@@ -692,8 +692,36 @@
   position: absolute;
   right: 0;
   top: 0;
-  width: 332px;
+  width: var(--map-panel-width, 332px);
   z-index: 5;
+}
+
+/* invisible grab strip straddling the panel's left edge */
+.map-panel-resizer {
+  bottom: 0;
+  cursor: col-resize;
+  position: absolute;
+  right: calc(min(var(--map-panel-width, 332px), 62%) - 3px);
+  top: 0;
+  touch-action: none;
+  width: 7px;
+  z-index: 6;
+}
+
+.map-panel-resizer::after {
+  background: transparent;
+  bottom: 0;
+  content: '';
+  left: 3px;
+  position: absolute;
+  top: 0;
+  transition: background 140ms ease;
+  width: 1px;
+}
+
+.map-panel-resizer:hover::after,
+.map-panel-resizer:active::after {
+  background: rgba(245, 197, 24, 0.55);
 }
 
 @keyframes map-panel-in {

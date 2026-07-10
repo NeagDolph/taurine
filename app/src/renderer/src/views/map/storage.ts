@@ -3,6 +3,11 @@ import type { MapGraphData } from '../../lib/graph'
 export const PINNED_POSITIONS_KEY = 'taurine.map.pins'
 export const COLOR_MODE_KEY = 'taurine.map.colorMode'
 export const MIN_DEGREE_KEY = 'taurine.map.minDegree'
+export const PANEL_WIDTH_KEY = 'taurine.map.panelWidth'
+
+export const PANEL_MIN_WIDTH = 280
+export const PANEL_MAX_WIDTH = 640
+export const PANEL_DEFAULT_WIDTH = 332
 
 export type ColorMode = 'source' | 'community' | 'recency'
 
@@ -112,6 +117,34 @@ export function saveMinDegree(minDegree: number, storage: Storage = window.local
       storage.removeItem(MIN_DEGREE_KEY)
     } else {
       storage.setItem(MIN_DEGREE_KEY, String(minDegree))
+    }
+  } catch {
+    // non-fatal
+  }
+}
+
+/** Clamp a side-panel width to [min, max]; `max` can shrink with the stage. */
+export function clampPanelWidth(width: number, max: number = PANEL_MAX_WIDTH): number {
+  const upper = Math.max(PANEL_MIN_WIDTH, Math.min(PANEL_MAX_WIDTH, max))
+  return Math.round(Math.min(Math.max(width, PANEL_MIN_WIDTH), upper))
+}
+
+export function loadPanelWidth(storage: Storage = window.localStorage): number {
+  try {
+    const value = Number(storage.getItem(PANEL_WIDTH_KEY))
+    return Number.isFinite(value) && value > 0 ? clampPanelWidth(value) : PANEL_DEFAULT_WIDTH
+  } catch {
+    return PANEL_DEFAULT_WIDTH
+  }
+}
+
+export function savePanelWidth(width: number, storage: Storage = window.localStorage): void {
+  try {
+    const rounded = Math.round(width)
+    if (rounded === PANEL_DEFAULT_WIDTH) {
+      storage.removeItem(PANEL_WIDTH_KEY)
+    } else {
+      storage.setItem(PANEL_WIDTH_KEY, String(rounded))
     }
   } catch {
     // non-fatal

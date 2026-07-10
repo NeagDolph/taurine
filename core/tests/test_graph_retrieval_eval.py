@@ -154,3 +154,29 @@ def _example(example_id: str, split: str, source_note_ids: list[str]) -> dict:
         "input": {"query": "example"},
         "labels": {"passage_ids": ["p1"]},
     }
+
+
+def test_checked_in_artifact_hash_is_a_real_content_digest() -> None:
+    from taurine_core.evaluation.graph_retrieval import compute_artifact_hash
+
+    path = Path(__file__).parents[1] / "evals" / "graph_retrieval" / "calibration-v1.json"
+    artifact = load_calibration(path)
+
+    assert artifact.hash == compute_artifact_hash(artifact)
+    assert artifact.hash.startswith("sha256:")
+
+
+def test_tampered_floors_fail_content_hash_verification(tmp_path: Path) -> None:
+    from taurine_core.evaluation.graph_retrieval import CalibrationIntegrityError
+
+    source = Path(__file__).parents[1] / "evals" / "graph_retrieval" / "calibration-v1.json"
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["modes"]["chat"]["evidence_floor"] = 0.01
+    tampered = tmp_path / "tampered.json"
+    tampered.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CalibrationIntegrityError, match="content hash mismatch"):
+        load_calibration(tampered)
+
+    unverified = load_calibration(tampered, verify=False)
+    assert unverified.modes["chat"].evidence_floor == pytest.approx(0.01)

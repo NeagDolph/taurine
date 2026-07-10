@@ -7,39 +7,7 @@ from .schemas import GraphResponse, NoteRecord
 
 
 class IndexPort(Protocol):
-    """Implemented by indexer.store.Index (unit 1). Read side used by the live loop."""
-
-    def dense_search(
-        self,
-        text: str,
-        k: int,
-        *,
-        prompt: str | None = None,
-    ) -> list[tuple[str, float]]:
-        """Embed text, cosine vs all units, per-note max. -> [(note_id, score)] desc."""
-        ...
-
-    def bm25_search(self, text: str, k: int) -> list[tuple[str, float]]:
-        """FTS5 BM25 over title+body. -> [(note_id, score)] desc, empty on no match."""
-        ...
-
-    def neighbors(self, note_id: str) -> list[tuple[str, float]]:
-        """Note-graph neighbors -> [(note_id, edge_weight)] desc."""
-        ...
-
-    def neighbor_edges(self, note_id: str) -> list[tuple[str, float, str]]:
-        """Note-graph neighbors with facts -> [(note_id, edge_weight, fact)] desc."""
-        ...
-
-    def fact_dense_search(
-        self,
-        text: str,
-        k: int,
-        *,
-        prompt: str | None = None,
-    ) -> list[tuple[str, str, float, str]]:
-        """Fact dense search -> [(src, dst, score, fact_text)] desc."""
-        ...
+    """Implemented by indexer.store.Index (unit 1). Product-store read side."""
 
     def note(self, note_id: str) -> NoteRecord | None:
         ...
@@ -47,25 +15,15 @@ class IndexPort(Protocol):
     def notes(self, source: str | None = None) -> list[NoteRecord]:
         ...
 
-    def best_chunk(self, note_id: str, query_text: str) -> str:
-        """Chunk of the note most similar to query_text."""
+    def neighbor_edges(self, note_id: str) -> list[tuple[str, float, str]]:
+        """Note-graph neighbors with facts -> [(note_id, edge_weight, fact)] desc."""
         ...
 
     def aliases(self) -> list[tuple[str, str, bool]]:
         """[(alias_lowercase, note_id, is_title)] for C1."""
         ...
 
-    def doc_frequency(self, term: str) -> int:
-        """Number of notes containing the term."""
-        ...
-
     def graph(self) -> GraphResponse:
-        ...
-
-    def graph_version(self) -> int:
-        ...
-
-    def entity_by_surface(self, surface: str) -> int | None:
         ...
 
     def status(self) -> tuple[int, float | None]:

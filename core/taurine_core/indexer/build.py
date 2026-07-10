@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import inspect
 import json
 import logging
 import os
+import statistics
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from scipy.sparse.csgraph import connected_components
@@ -23,7 +26,7 @@ from taurine_core.indexer.embed import embed_facts, embed_passages, embed_texts
 from taurine_core.indexer.entities import EntityResolver, MentionInput
 from taurine_core.indexer.extract import extract_notes
 from taurine_core.indexer.facts import PREDICATES, promote_fact, reconcile_temporal_facts
-from taurine_core.indexer.knowledge_store import KnowledgeStore
+from taurine_core.indexer.knowledge_store import KnowledgeStore, compute_graph_hash
 from taurine_core.indexer.passages import TokenizerPort, build_passages
 from taurine_core.indexer.projection import ProjectionPassage, build_projection
 from taurine_core.indexer.relation_completion import (
@@ -33,8 +36,9 @@ from taurine_core.indexer.relation_completion import (
     parse_completion_response,
     select_completion_notes,
 )
-from taurine_core.indexer.rank import recency_multiplier, source_rank
-from taurine_core.models_local import passage_tokenizer
+from taurine_core.indexer.priors import recency_multiplier, source_rank
+from taurine_core.indexer.salience import content_quality
+from taurine_core.models_local import local_model_path, passage_tokenizer
 from taurine_core.schemas import NoteRecord
 
 
@@ -91,6 +95,13 @@ class BuildReport:
     predicate_proposal_count: int
     completion_rejected_count: int
     completion_error: str
+    degraded_reasons: tuple[str, ...] = ()
+    straddling_span_count: int = 0
+    contains_weight_stats: dict[str, float] | None = None
+    salience_stats: dict[str, float] | None = None
+    salience_gated_count: int = 0
+    salience_gated_by_source: dict[str, int] | None = None
+    near_duplicate_note_pairs: tuple[tuple[str, str], ...] = ()
 
 
 class BuildCoordinator:
@@ -104,11 +115,15 @@ class BuildCoordinator:
         *,
         replace_derived: bool,
         on_stage: Callable[[str], None] | None = None,
+        owner_aliases: Sequence[str] = (),
+        degraded_reasons: Sequence[str] = (),
+        relation_completion_opt_out: bool = False,
     ) -> BuildReport:
         if not replace_derived:
             raise BuildError("--replace-derived is required for a clean knowledge build")
         announce = on_stage or (lambda stage: None)
         target_path = Path(target)
+        health_reasons = sorted(dict.fromkeys(degraded_reasons))
         calibration = load_calibration(
             Path(__file__).resolve().parents[2]
             / "evals"
@@ -118,9 +133,20 @@ class BuildCoordinator:
         if self.dependencies.embedding_model_id != calibration.model_manifest["embedding"]:
             raise BuildError("embedding model does not match the calibration artifact")
         model_manifest = dict(calibration.model_manifest)
+        # L26: fingerprints live in config_manifest, NOT model_manifest — the
+        # runtime compares model_manifest for equality against the artifact's
+        # identity strings, so fingerprints ride a separate key it tolerates.
         config_manifest = {
             "builder": "knowledge-build-v1",
             "config_hash": calibration.config_hash,
+            "model_fingerprints": json.dumps(
+                {
+                    "embedding": _model_fingerprint(self.dependencies.embedding_model_id),
+                    "gliner": _model_fingerprint(config.GLINER2_MODEL),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         }
         ordered = sorted(records, key=lambda row: row.note_id)
         source_snapshot = _source_snapshot(ordered)
@@ -172,9 +198,28 @@ class BuildCoordinator:
             )
             stage_done("source")
             announce("passages")
+            # §0.2: note_salience = connector ingest salience × deterministic
+            # content quality. Salience gates extraction only — passages, FTS,
+            # and embeddings are ALWAYS built, and the gate re-evaluates on
+            # every build (never a sticky failure).
+            note_salience = {
+                note.note_id: note.ingest_salience * content_quality(note.text)
+                for note in ordered
+            }
+            gated_note_ids = {
+                note_id
+                for note_id, value in note_salience.items()
+                if value < config.EXTRACTION_SALIENCE_FLOOR
+            }
             passage_rows = []
             for note in ordered:
-                store.write_note(note, build_id=build_id, extraction_status="pending")
+                store.write_note(
+                    note,
+                    build_id=build_id,
+                    extraction_status="pending",
+                    ingest_salience=note.ingest_salience,
+                    salience=note_salience[note.note_id],
+                )
                 drafts = build_passages(
                     note,
                     self.dependencies.tokenizer,
@@ -206,7 +251,10 @@ class BuildCoordinator:
                 store.write_passage_embeddings(embedded)
                 embedded_by_id.update({row.passage_id: row for row in embedded})
             stage_done("embeddings")
-            announce(f"extraction 0/{len(ordered)}")
+            # extraction runs only for notes clearing the salience floor;
+            # gated notes stay searchable but grow no entities/facts
+            extractable = [note for note in ordered if note.note_id not in gated_note_ids]
+            announce(f"extraction 0/{len(extractable)}")
             extractor_kwargs: dict[str, Any] = {"tokenizer": self.dependencies.tokenizer}
             if self.dependencies.extractor is not None and _accepts_kwarg(
                 self.dependencies.extractor, "progress"
@@ -215,33 +263,49 @@ class BuildCoordinator:
                     f"extraction {done}/{total}"
                 )
             extractions = (
-                self.dependencies.extractor(ordered, **extractor_kwargs)
+                self.dependencies.extractor(extractable, **extractor_kwargs)
                 if self.dependencies.extractor is not None
                 else {}
             )
             stage_done("extraction")
             announce("entities")
             mention_inputs = []
+            straddling_spans = 0
             passage_by_note = {
                 note.note_id: [draft for source, draft in passage_rows if source.note_id == note.note_id]
                 for note in ordered
             }
             for note in ordered:
+                if note.note_id in gated_note_ids:
+                    store.write_note(
+                        note,
+                        build_id=build_id,
+                        extraction_status="skipped_low_salience",
+                        ingest_salience=note.ingest_salience,
+                        salience=note_salience[note.note_id],
+                    )
+                    continue
                 extraction = extractions.get(note.note_id)
                 store.write_note(
                     note,
                     build_id=build_id,
                     extraction_status=("failed" if extraction is None or extraction.failed else "complete"),
                     extraction_error=(extraction.error if extraction is not None else "extractor unavailable"),
+                    ingest_salience=note.ingest_salience,
+                    salience=note_salience[note.note_id],
                 )
                 if extraction is None or extraction.failed:
                     continue
                 for mention in extraction.mentions:
                     if mention.char_start < 0 or mention.char_end <= mention.char_start:
                         continue  # would violate the mention span CHECK constraint
-                    passage = next((p for p in passage_by_note[note.note_id] if p.char_start <= mention.char_start and mention.char_end <= p.char_end), None)
+                    passage, straddled = _passage_for_span(
+                        passage_by_note[note.note_id], mention.char_start, mention.char_end
+                    )
                     if passage is None:
                         continue
+                    if straddled:
+                        straddling_spans += 1
                     identity = f"{note.note_id}\x1f{mention.etype}\x1f{mention.char_start}\x1f{mention.char_end}"
                     mention_inputs.append(MentionInput("mention-" + hashlib.sha256(identity.encode()).hexdigest()[:24], note.note_id, passage.passage_id, mention))
             # mention identity is (note, etype, span) — surface excluded — so an
@@ -252,9 +316,36 @@ class BuildCoordinator:
                 if current is None or row.mention.confidence > current.mention.confidence:
                     unique_mentions[row.mention_id] = row
             mention_inputs = list(unique_mentions.values())
-            resolution = EntityResolver(total_notes=max(1, len(ordered))).resolve_mentions(mention_inputs)
+            # resolution stages 5-6 (§7.1): surface embeddings generate merge
+            # candidates. The dependency embedder is BuildCache-backed in
+            # production, so unique surfaces are content-cached across builds.
+            similarity: Callable[[str, str], float] | None = None
+            unique_surfaces = sorted({row.mention.surface.strip() for row in mention_inputs})
+            if unique_surfaces:
+                surface_matrix = np.asarray(
+                    self.dependencies.embedder(list(unique_surfaces)), dtype=np.float32
+                )
+                norms = np.linalg.norm(surface_matrix, axis=1, keepdims=True)
+                surface_matrix /= np.maximum(norms, 1e-12)
+                surface_rows = {
+                    surface: index for index, surface in enumerate(unique_surfaces)
+                }
+
+                def similarity(left: str, right: str) -> float:
+                    left_row = surface_rows.get(left.strip())
+                    right_row = surface_rows.get(right.strip())
+                    if left_row is None or right_row is None:
+                        return 0.0
+                    return float(surface_matrix[left_row] @ surface_matrix[right_row])
+
+            resolution = EntityResolver(
+                total_notes=max(1, len(ordered)),
+                owner_aliases={value.casefold() for value in owner_aliases},
+                similarity=similarity,
+                similarity_threshold=config.ENTITY_EMBED_SIM,
+            ).resolve_mentions(mention_inputs)
             for entity in resolution.entities:
-                store.insert_entity(entity_id=entity.entity_id, canonical=entity.canonical, normalized=entity.normalized, etype=entity.etype, df=entity.df, traversal_eligible=entity.traversal_eligible, ambiguity_key=entity.ambiguity_key, build_id=build_id)
+                store.insert_entity(entity_id=entity.entity_id, canonical=entity.canonical, normalized=entity.normalized, etype=entity.etype, df=entity.df, traversal_eligible=entity.traversal_eligible, traversal_reason=entity.traversal_reason, ambiguity_key=entity.ambiguity_key, build_id=build_id)
                 for alias in entity.aliases:
                     store.insert_alias(entity.entity_id, alias, "resolved", 1.0)
             for row in resolution.mentions:
@@ -262,7 +353,14 @@ class BuildCoordinator:
                 store.insert_mention(mention_id=row.mention_id, entity_id=row.entity_id, passage_id=row.passage_id, note_id=row.note_id, surface=m.surface, etype=m.etype, char_start=m.char_start, char_end=m.char_end, confidence=m.confidence, extractor=m.extractor, schema_id=m.schema_id, build_id=build_id)
             stage_done("entities")
             announce("relation_completion")
-            resolved_by_note_span = {(row.note_id, row.mention.char_start, row.mention.char_end, row.mention.surface.casefold()): row for row in resolution.mentions}
+            # keyed per (note, span, surface, etype): a span tagged with two
+            # types keeps both resolutions instead of a hash-arbitrary one (L6)
+            resolved_by_note_span: dict[tuple[str, int, int, str], list[Any]] = {}
+            for row in resolution.mentions:
+                resolved_by_note_span.setdefault(
+                    (row.note_id, row.mention.char_start, row.mention.char_end, row.mention.surface.casefold()),
+                    [],
+                ).append(row)
             fact_rows = []
             degenerate_facts: list[tuple[str, str]] = []
             invalid_candidates = 0
@@ -280,10 +378,16 @@ class BuildCoordinator:
                     ):
                         invalid_candidates += 1
                         continue
-                    subject = resolved_by_note_span.get((note.note_id, candidate.subject_start, candidate.subject_end, candidate.head.casefold()))
-                    object_ = resolved_by_note_span.get((note.note_id, candidate.object_start, candidate.object_end, candidate.tail.casefold()))
-                    passage = next((p for p in passage_by_note[note.note_id] if p.char_start <= candidate.assertion_start and candidate.assertion_end <= p.char_end), None)
+                    subject = _resolve_endpoint(resolved_by_note_span, note.note_id, candidate.subject_start, candidate.subject_end, candidate.head)
+                    object_ = _resolve_endpoint(resolved_by_note_span, note.note_id, candidate.object_start, candidate.object_end, candidate.tail)
+                    passage, straddled = _passage_for_span(
+                        passage_by_note[note.note_id],
+                        candidate.assertion_start,
+                        candidate.assertion_end,
+                    )
                     if subject and object_ and passage:
+                        if straddled:
+                            straddling_spans += 1
                         # Entity resolution can merge distinct surfaces ("Neil",
                         # "Neil Pathangay") into one entity; a relation whose
                         # endpoints collapse together is dropped, never fatal.
@@ -299,6 +403,12 @@ class BuildCoordinator:
                     build_id,
                     invalid_candidates,
                 )
+            if straddling_spans:
+                _LOG.info(
+                    "build %s: %d spans straddle adjacent overlapping passages (kept on the earlier passage)",
+                    build_id,
+                    straddling_spans,
+                )
             if degenerate_facts:
                 _LOG.warning(
                     "build %s: skipped %d degenerate facts (endpoints merged to one entity): %s",
@@ -307,23 +417,32 @@ class BuildCoordinator:
                     "; ".join(f"{note_id}: {text}" for note_id, text in degenerate_facts[:10]),
                 )
             proposals: tuple[Any, ...] = ()
+            completion_aliases: tuple[Any, ...] = ()
             completion_rejected = 0
             completion_error = ""
             if self.dependencies.relation_completer is not None and ordered:
-                _provisional_quality, provisional_values = _compute_note_ranks(
+                # L23/§6.6: the provisional gate is real salience × recency ×
+                # source_rank (empty projection → uniform quality weight)
+                _, provisional_values, _ = _compute_note_ranks(
                     ordered,
                     (),
                     now=self.dependencies.now(),
+                    salience=note_salience,
                 )
                 facts_by_note: dict[str, int] = {}
                 for fact in fact_rows:
                     if fact.status == "active":
                         facts_by_note[fact.source_note_id] = facts_by_note.get(fact.source_note_id, 0) + 1
+                mentions_by_note: dict[str, list[Any]] = {}
+                for row in resolution.mentions:
+                    mentions_by_note.setdefault(row.note_id, []).append(row)
                 completion_notes = tuple(
                     CompletionNote(
                         note_id=note.note_id,
                         value_score=provisional_values.get(note.note_id, 0.0),
                         observed_at=note.modified,
+                        # one CompletionEntity per mention: every span stays
+                        # available for endpoint grounding (H8)
                         entities=tuple(
                             CompletionEntity(
                                 row.entity_id,
@@ -331,8 +450,7 @@ class BuildCoordinator:
                                 row.mention.char_start,
                                 row.mention.char_end,
                             )
-                            for row in resolution.mentions
-                            if row.note_id == note.note_id
+                            for row in mentions_by_note.get(note.note_id, ())
                         ),
                         passages=tuple(
                             CompletionPassage(draft.passage_id, draft.text, draft.char_start)
@@ -342,6 +460,7 @@ class BuildCoordinator:
                         schema_gap=False,
                     )
                     for note in ordered
+                    if note.note_id not in gated_note_ids
                 )
                 selected_completion = select_completion_notes(completion_notes)
                 if selected_completion:
@@ -357,8 +476,11 @@ class BuildCoordinator:
                         fact_rows.extend(completed.facts)
                         proposals = completed.proposals
                         completion_rejected = completed.rejected
+                        completion_aliases = completed.aliases
             for proposal in {row.proposal_id: row for row in proposals}.values():
                 store.insert_predicate_proposal(proposal)
+            for alias in completion_aliases:
+                store.insert_alias(alias.entity_id, alias.alias, alias.origin, 1.0)
             stage_done("relation_completion")
             announce("facts")
             # The same relation can arrive twice (extractor repeats, or the
@@ -405,35 +527,37 @@ class BuildCoordinator:
             base_graph = BaseGraphBuilder(
                 build_id=build_id,
                 semantic_k=config.BASE_GRAPH_PASSAGE_K,
-                semantic_floor=config.GRAPH_MIN_SIM,
+                # L19: the semantic floor lives in the calibration artifact
+                semantic_floor=calibration.graph.semantic_floor,
             ).build(graph_passages, entity_graph, contains_graph, fact_rows)
-            store.write_semantic_edges(
-                tuple(
-                    (edge.src_id, edge.dst_id, edge.weight, edge.weight)
-                    for edge in base_graph.edges
-                    if edge.kind == "semantic" and edge.src_id < edge.dst_id
-                ),
-                build_id=build_id,
+            semantic_edge_rows = tuple(
+                (edge.src_id, edge.dst_id, edge.weight, edge.weight)
+                for edge in base_graph.edges
+                if edge.kind == "semantic" and edge.src_id < edge.dst_id
             )
+            store.write_semantic_edges(semantic_edge_rows, build_id=build_id)
             contains_by_pair = {
                 (row.passage_id, row.entity_id): row for row in contains_graph
             }
-            store.write_passage_entity_edges(
-                tuple(
-                    (
-                        edge.src_id,
-                        edge.dst_id,
-                        contains_by_pair[(edge.src_id, edge.dst_id)].confidence,
-                        int(edge.metadata["mentions"]),
-                        float(edge.metadata["idf"]),
-                        edge.weight,
-                    )
-                    for edge in base_graph.edges
-                    if edge.kind == "contains"
-                    and (edge.src_id, edge.dst_id) in contains_by_pair
-                ),
-                build_id=build_id,
+            contains_edge_rows = tuple(
+                (
+                    edge.src_id,
+                    edge.dst_id,
+                    contains_by_pair[(edge.src_id, edge.dst_id)].confidence,
+                    int(edge.metadata["mentions"]),
+                    float(edge.metadata["idf"]),
+                    edge.weight,
+                )
+                for edge in base_graph.edges
+                if edge.kind == "contains"
+                and (edge.src_id, edge.dst_id) in contains_by_pair
             )
+            store.write_passage_entity_edges(contains_edge_rows, build_id=build_id)
+            contains_weight_stats = _contains_weight_stats(
+                [float(row[5]) for row in contains_edge_rows]
+            )
+            if _degenerate_contains_weights([float(row[5]) for row in contains_edge_rows]):
+                health_reasons.append("degenerate_contains_weights")
             stage_done("base_graph")
             announce("projection")
             projection = build_projection(
@@ -448,10 +572,11 @@ class BuildCoordinator:
             store.write_projection(projection, build_id=build_id)
             stage_done("projection")
             announce("ranks")
-            quality_ranks, value_scores = _compute_note_ranks(
+            quality_ranks, value_scores, near_duplicates = _compute_note_ranks(
                 ordered,
                 projection,
                 now=self.dependencies.now(),
+                salience=note_salience,
             )
             store.set_note_ranks(
                 quality_ranks,
@@ -473,12 +598,37 @@ class BuildCoordinator:
             integrity = store.validate_invariants()
             if not integrity.ok:
                 raise BuildError(f"knowledge invariant failure: {integrity}")
-            graph_hash = _graph_hash(base_graph, projection)
-            stage_done("validation")
+            # L24: every non-dangling column of the materialized matrix must
+            # be stochastic before the build is declared complete.
+            _assert_column_stochastic(base_graph)
             counts = store.counts()
+            _assert_stored_counts(
+                counts,
+                {
+                    "notes": len(ordered),
+                    "passages": len(passage_rows),
+                    "passage_embeddings": len(embedded_by_id),
+                    "entities": len(resolution.entities),
+                    "entity_mentions": len(resolution.mentions),
+                    "facts": len(fact_rows),
+                    "fact_embeddings": len(fact_embeddings),
+                    "passage_semantic_edges": len(semantic_edge_rows),
+                    "passage_entity_edges": len(contains_edge_rows),
+                    "note_projection_edges": len(projection),
+                },
+            )
+            graph_hash = compute_graph_hash(base_graph, projection)
+            # L24: the stored rows must reproduce the in-memory graph exactly.
+            recomputed_hash = store.recompute_graph_hash(build_id)
+            if recomputed_hash != graph_hash:
+                raise BuildError(
+                    "stored graph rows do not reproduce the in-memory graph hash: "
+                    f"{recomputed_hash} != {graph_hash}"
+                )
+            stage_done("validation")
             component_count = _component_count(base_graph)
             hub_exclusions = tuple(
-                (row.entity_id, "document_frequency_hub")
+                (row.entity_id, row.traversal_reason)
                 for row in sorted(resolution.entities, key=lambda item: item.entity_id)
                 if not row.traversal_eligible
             )
@@ -491,20 +641,26 @@ class BuildCoordinator:
                         else "extractor unavailable"
                     ),
                 )
-                for note in ordered
+                for note in extractable
                 if (row := extractions.get(note.note_id)) is None or row.failed
             )
             release_blocker_rows = _calibration_release_blockers(calibration)
-            if ordered and self.dependencies.relation_completer is None:
+            if (
+                extractable
+                and self.dependencies.relation_completer is None
+                and not relation_completion_opt_out
+            ):
                 release_blocker_rows.append("relation_completion_unavailable")
             if completion_error:
                 release_blocker_rows.append("relation_completion_failed")
             release_blockers = tuple(sorted(release_blocker_rows))
+            health_reasons = sorted(dict.fromkeys(health_reasons))
             health = (
                 "healthy"
                 if self.dependencies.extractor is not None
                 and not failed_notes
                 and not release_blockers
+                and not health_reasons
                 else "degraded"
             )
             store.complete_build(
@@ -563,6 +719,13 @@ class BuildCoordinator:
                 predicate_proposal_count=len(proposals),
                 completion_rejected_count=completion_rejected,
                 completion_error=completion_error,
+                degraded_reasons=tuple(health_reasons),
+                straddling_span_count=straddling_spans,
+                contains_weight_stats=contains_weight_stats,
+                salience_stats=_salience_stats(note_salience),
+                salience_gated_count=len(gated_note_ids),
+                salience_gated_by_source=_gated_by_source(ordered, gated_note_ids),
+                near_duplicate_note_pairs=near_duplicates,
             )
         except Exception as exc:
             if store is not None:
@@ -593,11 +756,25 @@ def main(
     dependencies: BuildDependencies | None = None,
     connector_loader: Callable[[], Sequence[NoteRecord]] | None = None,
 ) -> int:
+    """§22 operator contract. Exit codes: 0 healthy install, 1 user abort,
+    2 invariant/build failure (nothing installed), 3 installed but release
+    blockers remain (suppressed by --install-degraded)."""
+
     parser = argparse.ArgumentParser(description="Build a clean Taurine knowledge index")
     parser.add_argument("--db", required=True)
     parser.add_argument("--from-enabled-connectors", action="store_true")
     parser.add_argument("--replace-derived", action="store_true")
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument(
+        "--install-degraded",
+        action="store_true",
+        help="exit 0 even when release blockers remain (build still installs by default)",
+    )
+    parser.add_argument(
+        "--no-relation-completion",
+        action="store_true",
+        help="skip the LLM relation-completion lane intentionally (warning, not a blocker)",
+    )
     args = parser.parse_args(argv)
     if not args.from_enabled_connectors:
         raise BuildError("--from-enabled-connectors is required")
@@ -613,19 +790,55 @@ def main(
         connector_registry = ConnectorRegistry()
 
         def connector_loader() -> Sequence[NoteRecord]:
-            return connector_registry.extract_all_enabled(source_index)
+            return connector_registry.extract_all_enabled(source_index).records
     deps = dependencies or BuildDependencies(
         tokenizer=passage_tokenizer(),
         embedder=embed_texts,
         extractor=extract_notes,
+        relation_completer=(
+            None if args.no_relation_completion else _cli_relation_completer()
+        ),
     )
-    report = BuildCoordinator(deps).build(
-        connector_loader(),
-        args.db,
-        replace_derived=args.replace_derived,
-    )
+    sweep_stale_build_files(args.db)
+    if args.no_relation_completion:
+        print("relation completion skipped by --no-relation-completion", file=sys.stderr)
+    try:
+        report = BuildCoordinator(deps).build(
+            connector_loader(),
+            args.db,
+            replace_derived=args.replace_derived,
+            relation_completion_opt_out=args.no_relation_completion,
+        )
+    except BuildError as exc:
+        print(f"build failed: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps({**report.__dict__, "target": str(report.target)}, sort_keys=True))
+    if not report.release_ready:
+        blockers = "\n".join(f"- {blocker}" for blocker in report.release_blockers)
+        print(
+            "installed, but the build is not release-ready:\n"
+            + (blockers or "- degraded health"),
+            file=sys.stderr,
+        )
+        return 0 if args.install_degraded else 3
     return 0
+
+
+def _cli_relation_completer() -> Callable[[Sequence[CompletionNote]], object] | None:
+    """Reuse the server's LLM completer construction when a key is configured."""
+
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+    except Exception:
+        pass
+    key = os.environ.get("OPEN_ROUTER_API_KEY")
+    if not key:
+        return None
+    from taurine_core.llm import OpenRouterClient
+
+    return relation_completer_for(OpenRouterClient(key))
 
 
 def _keep_failed_builds() -> bool:
@@ -639,6 +852,49 @@ def _accepts_kwarg(func: Callable[..., Any], name: str) -> bool:
         return False
     return name in parameters or any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
+def _passage_for_span(
+    drafts: Sequence[Any],
+    char_start: int,
+    char_end: int,
+) -> tuple[Any, bool]:
+    """Locate the passage holding a span. Spec §6.4: a span may also straddle
+    two ADJACENT overlapping passages whose union contains it — recorded
+    against the earlier passage (L5). Returns (passage | None, straddled)."""
+    for passage in drafts:
+        if passage.char_start <= char_start and char_end <= passage.char_end:
+            return passage, False
+    ordered = sorted(drafts, key=lambda passage: passage.ordinal)
+    for earlier, later in zip(ordered, ordered[1:]):
+        if (
+            later.ordinal == earlier.ordinal + 1
+            and later.char_start <= earlier.char_end  # contiguous union
+            and earlier.char_start <= char_start
+            and char_end <= later.char_end
+        ):
+            return earlier, True
+    return None, False
+
+
+def _resolve_endpoint(
+    resolved: dict[tuple[str, int, int, str], list[Any]],
+    note_id: str,
+    char_start: int,
+    char_end: int,
+    surface: str,
+) -> Any | None:
+    """Pick the resolved mention for a relation endpoint. GLiNER relations do
+    not declare endpoint types, so a same-span etype collision binds
+    deterministically: named types outrank the catch-all concept, then
+    alphabetical order (L6)."""
+    candidates = resolved.get((note_id, char_start, char_end, surface.casefold()))
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda row: (row.mention.etype == "concept", row.mention.etype),
     )
 
 
@@ -663,21 +919,33 @@ def _compute_note_ranks(
     projection: Sequence[Any],
     *,
     now: float,
-) -> tuple[dict[str, float], dict[str, float]]:
+    salience: Mapping[str, float] | None = None,
+) -> tuple[dict[str, float], dict[str, float], tuple[tuple[str, str], ...]]:
     note_ids = tuple(note.note_id for note in notes)
     if not note_ids:
-        return {}, {}
+        return {}, {}, ()
+    note_by_id = {note.note_id: note for note in notes}
     row_by_id = {note_id: index for index, note_id in enumerate(note_ids)}
     matrix = np.zeros((len(note_ids), len(note_ids)), dtype=np.float64)
+    near_duplicates: list[tuple[str, str]] = []
     for edge in projection:
         left = row_by_id.get(edge.src_note_id)
         right = row_by_id.get(edge.dst_note_id)
         if left is None or right is None or left == right:
             continue
+        # M14/§10.4: same-source near-duplicates form mutually-reinforcing
+        # cliques; their edges stay in the projection for display but are
+        # excluded from the PageRank matrix and flagged in the build report.
+        if (
+            note_by_id[edge.src_note_id].source == note_by_id[edge.dst_note_id].source
+            and float(getattr(edge, "mechanisms", {}).get("semantic", 0.0))
+            >= config.DUP_EDGE_SIM
+        ):
+            near_duplicates.append((edge.src_note_id, edge.dst_note_id))
+            continue
         weight = max(0.0, float(edge.weight))
         matrix[right, left] += weight
         matrix[left, right] += weight
-    note_by_id = {note.note_id: note for note in notes}
     teleport = np.asarray(
         [
             source_rank(note_by_id[note_id].source)
@@ -721,37 +989,227 @@ def _compute_note_ranks(
         note = note_by_id[note_id]
         quality_weight = 1.0 if span == 0.0 else 0.1 + ((quality[note_id] - low) / span) * 0.9
         age_days = max(0.0, (float(now) - note.modified) / 86400.0)
+        # §0.2: value multiplies in salience (restores the legacy
+        # ingest_salience behavior) so the §6.6 completion gate is meaningful
+        note_salience = 1.0 if salience is None else float(salience.get(note_id, 1.0))
         values[note_id] = (
             quality_weight
             * float(0.5 ** (age_days / config.VALUE_RECENCY_HALF_LIFE_DAYS))
             * source_rank(note.source)
+            * note_salience
         )
-    return quality, values
+    return quality, values, tuple(sorted(near_duplicates))
 
 
-def _graph_hash(base_graph: object, projection: object) -> str:
-    graph = base_graph
-    payload = {
-        "nodes": list(graph.node_ids),
-        "edges": [
-            (edge.src_id, edge.dst_id, edge.kind, edge.direction, round(edge.weight, 12), edge.fact_ids)
-            for edge in graph.edges
-        ],
-        "projection": [
-            (
-                edge.src_note_id,
-                edge.dst_note_id,
-                edge.edge_type,
-                round(edge.weight, 12),
-                edge.shared,
-                edge.fact_ids,
-            )
-            for edge in projection
-        ],
+def _contains_weight_stats(weights: Sequence[float]) -> dict[str, float]:
+    """Distribution summary of contains weights for the build report (H2)."""
+
+    if not weights:
+        return {"count": 0.0, "min": 0.0, "median": 0.0, "max": 0.0, "stddev": 0.0}
+    ordered = sorted(weights)
+    return {
+        "count": float(len(ordered)),
+        "min": float(ordered[0]),
+        "median": float(statistics.median(ordered)),
+        "max": float(ordered[-1]),
+        "stddev": float(statistics.pstdev(ordered)) if len(ordered) > 1 else 0.0,
     }
-    return "sha256:" + hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _degenerate_contains_weights(
+    weights: Sequence[float],
+    *,
+    fraction: float = 0.8,
+    tolerance: float = 1e-6,
+    minimum_edges: int = 8,
+) -> bool:
+    """H2 health gate: >80% of contains weights collapsed onto one value means
+    the idf/scale formula stopped discriminating (the pre-fix saturation bug).
+    Tiny graphs are exempt — coincidental equality is expected there."""
+
+    if len(weights) < minimum_edges:
+        return False
+    anchor = statistics.median(weights)
+    close = sum(1 for weight in weights if abs(weight - anchor) <= tolerance)
+    return close / len(weights) > fraction
+
+
+def _assert_column_stochastic(graph: Any, *, tolerance: float = 1e-8) -> None:
+    """L24 invariant: every non-dangling column of the materialized matrix
+    sums to exactly one (within tolerance) before the build completes."""
+
+    strengths = np.asarray(graph.matrix.sum(axis=0)).ravel()
+    dangling = set(graph.dangling_rows)
+    bad = [
+        index
+        for index, value in enumerate(strengths)
+        if index not in dangling and abs(float(value) - 1.0) > tolerance
+    ]
+    if bad:
+        raise BuildError(
+            f"base graph has {len(bad)} non-stochastic columns (first: {bad[:5]})"
+        )
+
+
+def _assert_stored_counts(stored: Mapping[str, int], expected: Mapping[str, int]) -> None:
+    """L24 invariant: stored row counts equal the in-memory build quantities."""
+
+    mismatched = {
+        name: (int(stored.get(name, -1)), int(count))
+        for name, count in sorted(expected.items())
+        if int(stored.get(name, -1)) != int(count)
+    }
+    if mismatched:
+        raise BuildError(f"stored counts diverge from in-memory build: {mismatched}")
+
+
+def _salience_stats(note_salience: Mapping[str, float]) -> dict[str, float]:
+    values = sorted(note_salience.values())
+    if not values:
+        return {"count": 0.0, "min": 0.0, "median": 0.0, "mean": 0.0, "max": 0.0}
+    return {
+        "count": float(len(values)),
+        "min": float(values[0]),
+        "median": float(statistics.median(values)),
+        "mean": float(statistics.fmean(values)),
+        "max": float(values[-1]),
+    }
+
+
+def _gated_by_source(
+    notes: Sequence[NoteRecord], gated_note_ids: set[str]
+) -> dict[str, int]:
+    gated: dict[str, int] = {}
+    for note in notes:
+        if note.note_id in gated_note_ids:
+            gated[note.source] = gated.get(note.source, 0) + 1
+    return dict(sorted(gated.items()))
+
+
+def _model_fingerprint(repo_id: str) -> str:
+    """Local artifact fingerprint (L26): size+mtime digest over the bundled
+    model directory. 'unavailable' when the model is not downloaded."""
+
+    root = local_model_path(repo_id)
+    if root is None:
+        return "unavailable"
+    entries = []
+    for path in sorted(Path(root).rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        entries.append((path.relative_to(root).as_posix(), info.st_size, int(info.st_mtime)))
+    digest = hashlib.sha256(
+        json.dumps(entries, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    return f"sha256:{digest}"
+
+
+def sweep_stale_build_files(
+    target: str | Path,
+    *,
+    max_age_s: float = 86_400.0,
+    now: float | None = None,
+) -> tuple[Path, ...]:
+    """Delete crash-orphaned ``<stem>.build-*.db`` temp files older than a day
+    that are not the active database (L25). ``.failed`` post-mortem copies are
+    deliberately kept."""
+
+    target_path = Path(target)
+    stamp = time.time() if now is None else float(now)
+    suffix = target_path.suffix or ".db"
+    removed: list[Path] = []
+    for candidate in sorted(target_path.parent.glob(f"{target_path.stem}.build-*{suffix}")):
+        if candidate == target_path:
+            continue
+        try:
+            if stamp - candidate.stat().st_mtime > max_age_s:
+                candidate.unlink()
+                removed.append(candidate)
+        except OSError:
+            continue
+    if removed:
+        _LOG.info("swept %d stale build temp files", len(removed))
+    return tuple(removed)
+
+
+def carry_forward_records(
+    knowledge_database: str | Path,
+    sources: Sequence[str],
+) -> tuple[NoteRecord, ...]:
+    """Read one source's notes back out of the ACTIVE knowledge DB (L28).
+
+    Used when an enabled connector is unavailable during a sync so a lost
+    permission degrades the build instead of silently wiping the source.
+    """
+
+    wanted = set(sources)
+    if not wanted:
+        return ()
+    path = Path(knowledge_database)
+    if not path.exists():
+        return ()
+    try:
+        store = KnowledgeStore(path, read_only=True)
+    except Exception:
+        return ()
+    try:
+        return tuple(
+            NoteRecord(
+                note_id=row.note_id,
+                title=row.title,
+                folder=row.folder,
+                modified=row.modified,
+                created=row.created,
+                content_hash=row.content_hash,
+                text=row.text,
+                source=row.source,
+                ingest_salience=row.ingest_salience,
+            )
+            for row in store.source_notes()
+            if row.source in wanted
+        )
+    finally:
+        store.close()
+
+
+def relation_completer_for(llm: Any) -> Callable[[Sequence[CompletionNote]], object]:
+    """Bounded LLM relation-completion callable shared by the server and CLI."""
+
+    def complete_relations(notes: Sequence[CompletionNote]) -> object:
+        payload = {
+            "predicates": {
+                name: spec.description for name, spec in sorted(PREDICATES.items())
+            },
+            "notes": [
+                {
+                    "note_id": note.note_id,
+                    "observed_at": note.observed_at,
+                    "entities": [asdict(entity) for entity in note.entities],
+                    "passages": [asdict(passage) for passage in note.passages],
+                }
+                for note in notes
+            ],
+        }
+        return asyncio.run(
+            llm.complete_json(
+                config.CHAT_MODEL,
+                (
+                    "Return JSON {facts:[...]}. Find only relations directly supported by the "
+                    "supplied passage text. Reuse entity_id and passage_id exactly, select a "
+                    "registered predicate when possible, and provide source-exact assertion_start "
+                    "and assertion_end offsets plus confidence. For an unregistered predicate, "
+                    "also provide predicate_description. Do not infer unsupported relations."
+                ),
+                json.dumps(payload, ensure_ascii=False),
+                timeout_s=config.SUMMARY_TIMEOUT_S,
+            )
+        )
+
+    return complete_relations
 
 
 def _component_count(graph: Any) -> int:

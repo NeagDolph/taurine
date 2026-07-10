@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import enrichment, fixture_units, make_note, unit_vec
+from tests.conftest import make_note
 from taurine_core import config
 from taurine_core.llm import StreamEvent
 from taurine_core.ports import LLMError
@@ -92,8 +92,7 @@ async def test_profile_generator_researches_with_graph_tools_before_synthesis(st
         "Taurine roadmap",
         "Neil is building Taurine as a live meeting copilot.",
     )
-    enrich = enrichment("Current Taurine product roadmap.")
-    store.upsert_note(note, enrich, fixture_units(unit_vec(1), enrich))
+    store.replace_source_records("apple_notes", [note])
     retriever = ProfileRetriever()
     llm = ProfileLLM(
         [

@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Literal, Sequence
 
+from taurine_core import config
 from taurine_core.schemas import ExtractedMention
 
 
@@ -105,7 +106,21 @@ class EntityResolver:
                 row.mention_id,
             ),
         )
-        parent = list(range(len(ordered)))
+        # Stages 1-3 (exact / casefold / deterministic normalization) are one
+        # O(n) bucketing pass: casefold-equal surfaces normalize equally, and
+        # digits/type are constant within a (etype, normalized) bucket.
+        bucket_index: dict[tuple[str, str], int] = {}
+        bucket_members: list[list[int]] = []
+        for index, row in enumerate(ordered):
+            key = (row.mention.etype, _normalize(row.mention.surface))
+            bucket = bucket_index.get(key)
+            if bucket is None:
+                bucket = len(bucket_members)
+                bucket_index[key] = bucket
+                bucket_members.append([])
+            bucket_members[bucket].append(index)
+
+        parent = list(range(len(bucket_members)))
 
         def find(index: int) -> int:
             while parent[index] != index:
@@ -118,19 +133,77 @@ class EntityResolver:
             if left_root != right_root:
                 parent[max(left_root, right_root)] = min(left_root, right_root)
 
-        for left in range(len(ordered)):
-            for right in range(left + 1, len(ordered)):
-                if _should_merge(
-                    ordered[left].mention,
-                    ordered[right].mention,
-                    self.similarity,
-                    self.similarity_threshold,
+        def bucket_etype(bucket: int) -> str:
+            return ordered[bucket_members[bucket][0]].mention.etype
+
+        # Stage 4 (H1): map every expansion's acronym BEFORE any union, so a
+        # short form merges only when it names exactly one expansion group in
+        # the whole batch, and unions run short<->expansion only — union-find
+        # transitivity can never bridge two expansions through a shared
+        # acronym (§7.2 uniqueness guard).
+        expansions: dict[tuple[str, str], set[int]] = {}
+        for bucket, members in enumerate(bucket_members):
+            etype = bucket_etype(bucket)
+            for index in members:
+                acronym = _acronym(ordered[index].mention.surface)
+                if len(acronym) >= 2:
+                    expansions.setdefault((etype, acronym.casefold()), set()).add(bucket)
+        for bucket, members in enumerate(bucket_members):
+            etype = bucket_etype(bucket)
+            targets: set[int] = set()
+            for index in members:
+                surface = ordered[index].mention.surface
+                compact = _compact(surface)
+                if not 2 <= len(compact) <= 5:
+                    continue
+                groups_for_acronym = expansions.get((etype, compact), set()) - {bucket}
+                if len(groups_for_acronym) != 1:
+                    continue  # unknown or ambiguous acronym: stays its own entity
+                target = next(iter(groups_for_acronym))
+                if any(
+                    _acronym(ordered[other].mention.surface).casefold() == compact
+                    and _digits(ordered[other].mention.surface) == _digits(surface)
+                    for other in bucket_members[target]
                 ):
-                    union(left, right)
+                    targets.add(target)
+            if len(targets) == 1:
+                union(bucket, targets.pop())
+
+        # Stages 5-6: embedding similarity generates candidates, never merges
+        # by itself — lexical/digit/type guards (and the person last-name
+        # containment rule) must all agree.
+        if self.similarity is not None:
+            representatives = [
+                max(
+                    (ordered[index].mention.surface.strip() for index in members),
+                    key=lambda value: (len(value), value.casefold(), value),
+                )
+                for members in bucket_members
+            ]
+            buckets_by_etype: dict[str, list[int]] = {}
+            for bucket in range(len(bucket_members)):
+                buckets_by_etype.setdefault(bucket_etype(bucket), []).append(bucket)
+            for etype, buckets in sorted(buckets_by_etype.items()):
+                for position, left in enumerate(buckets):
+                    for right in buckets[position + 1 :]:
+                        if find(left) == find(right):
+                            continue
+                        left_rep = representatives[left]
+                        right_rep = representatives[right]
+                        if _digits(left_rep) != _digits(right_rep):
+                            continue
+                        if not _lexically_compatible(left_rep, right_rep):
+                            continue
+                        if etype == "person" and not _person_merge_allowed(
+                            left_rep, right_rep
+                        ):
+                            continue
+                        if self.similarity(left_rep, right_rep) >= self.similarity_threshold:
+                            union(left, right)
 
         groups: dict[int, list[MentionInput]] = {}
-        for index, mention in enumerate(ordered):
-            groups.setdefault(find(index), []).append(mention)
+        for bucket, members in enumerate(bucket_members):
+            groups.setdefault(find(bucket), []).extend(ordered[index] for index in members)
 
         entities: list[ResolvedEntity] = []
         mention_to_entity: dict[str, str] = {}
@@ -214,16 +287,39 @@ class EntityResolver:
             surface = row.mention.surface.strip()
             counts[surface] = counts.get(surface, 0) + 1
             confidence[surface] = max(confidence.get(surface, 0.0), row.mention.confidence)
-        canonical = min(
-            counts,
-            key=lambda value: (
-                -counts[value],
-                -confidence[value],
-                len(value),
-                value.casefold(),
-                value,
-            ),
-        )
+        # An acronym never canonicalizes a group that holds its expansion
+        # (§7.2): prefer the most frequent expansion, longest on ties.
+        acronym_surfaces = {
+            surface
+            for surface in counts
+            if any(
+                other != surface and _compact(surface) == _acronym(other).casefold()
+                for other in counts
+            )
+        }
+        expansion_surfaces = [surface for surface in counts if surface not in acronym_surfaces]
+        if acronym_surfaces and expansion_surfaces:
+            canonical = min(
+                expansion_surfaces,
+                key=lambda value: (
+                    -counts[value],
+                    -confidence[value],
+                    -len(value),
+                    value.casefold(),
+                    value,
+                ),
+            )
+        else:
+            canonical = min(
+                counts,
+                key=lambda value: (
+                    -counts[value],
+                    -confidence[value],
+                    len(value),
+                    value.casefold(),
+                    value,
+                ),
+            )
         etype = members[0].mention.etype
         normalized = _normalize(canonical)
         member_identity = "|".join(sorted({f"{etype}:{_normalize(value)}" for value in surfaces}))
@@ -253,11 +349,13 @@ class EntityResolver:
             return False, "date_default_off"
         if canonical_cf in _PRONOUNS:
             return False, "pronoun"
+        if etype == "concept" and canonical_cf in config.CONCEPT_STOPLIST:
+            return False, "concept_stoplist"
         if canonical_cf in self.owner_aliases and df >= max(3, math.ceil(self.total_notes * 0.5)):
-            return False, "owner_hub"
+            return False, "owner_alias_hub"
         cap = max(5, math.ceil(self.total_notes * (0.5 if etype == "concept" else 0.35)))
         if df > cap:
-            return False, "high_df_hub"
+            return False, "document_frequency_hub"
         return True, "eligible"
 
     def _rebuild_indexes(self, entities: list[ResolvedEntity]) -> None:
@@ -269,28 +367,16 @@ class EntityResolver:
                 self._surface_index.setdefault(alias, set()).add(entity.entity_id)
 
 
-def _should_merge(
-    left: ExtractedMention,
-    right: ExtractedMention,
-    similarity: Callable[[str, str], float] | None,
-    threshold: float,
-) -> bool:
-    if left.etype != right.etype:
+def _person_merge_allowed(left: str, right: str) -> bool:
+    """Embedding merges of people are the known failure mode: require the same
+    last name AND token containment, so "Dr. Maya Chen"/"Maya Chen" merge but
+    two distinct full names sharing a surname never do (§7.2)."""
+    left_tokens = _normalize(left).split()
+    right_tokens = _normalize(right).split()
+    if not left_tokens or not right_tokens or left_tokens[-1] != right_tokens[-1]:
         return False
-    if _digits(left.surface) != _digits(right.surface):
-        return False
-    left_cf, right_cf = left.surface.casefold().strip(), right.surface.casefold().strip()
-    if left_cf == right_cf or _normalize(left.surface) == _normalize(right.surface):
-        return True
-    left_compact = _compact(left.surface)
-    right_compact = _compact(right.surface)
-    if len(left_compact) <= 5 and left_compact == _acronym(right.surface).casefold():
-        return True
-    if len(right_compact) <= 5 and right_compact == _acronym(left.surface).casefold():
-        return True
-    if similarity is None or similarity(left.surface, right.surface) < threshold:
-        return False
-    return _lexically_compatible(left.surface, right.surface)
+    left_set, right_set = set(left_tokens), set(right_tokens)
+    return left_set <= right_set or right_set <= left_set
 
 
 def _normalize(surface: str) -> str:

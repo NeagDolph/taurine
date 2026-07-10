@@ -1,0 +1,44 @@
+{"text": "The launch is scheduled for July 18.", "factual": true, "bypass": false}
+{"text": "Maya owns the launch review.", "factual": true, "bypass": false}
+{"text": "Armaan moved to the platform team in March.", "factual": true, "bypass": false}
+{"text": "The invoice total was $4,200.", "factual": true, "bypass": false}
+{"text": "Revenue grew 12% quarter over quarter.", "factual": true, "bypass": false}
+{"text": "The API migration finished on May 3.", "factual": true, "bypass": false}
+{"text": "Neil met with the design team on Tuesday.", "factual": true, "bypass": false}
+{"text": "The contract renewal deadline is August 1.", "factual": true, "bypass": false}
+{"text": "Two of the three connectors are enabled.", "factual": true, "bypass": false}
+{"text": "The meeting notes mention a budget freeze.", "factual": true, "bypass": false}
+{"text": "Sofia approved the vendor contract.", "factual": true, "bypass": false}
+{"text": "The server runs Postgres 16.", "factual": true, "bypass": false}
+{"text": "The dentist appointment is on Tuesday at 9am.", "factual": true, "bypass": false}
+{"text": "Project Mermaid depends on the billing service.", "factual": true, "bypass": false}
+{"text": "The Q3 roadmap lists four milestones.", "factual": true, "bypass": false}
+{"text": "The flight departs at 6:45am on Friday.", "factual": true, "bypass": false}
+{"text": "Here's what I found: the launch moved to July 18.", "factual": true, "bypass": true}
+{"text": "Here is what I found: Maya owns the Q3 review.", "factual": true, "bypass": true}
+{"text": "I can help: your dentist appointment is on Tuesday.", "factual": true, "bypass": true}
+{"text": "Thanks, the contract was signed on May 2.", "factual": true, "bypass": true}
+{"text": "I think: the server migration finished last week.", "factual": true, "bypass": true}
+{"text": "Let me know, the invoice total was $4,200.", "factual": true, "bypass": true}
+{"text": "I don't know the exact time, but the meeting is on Friday.", "factual": true, "bypass": true}
+{"text": "No new evidence, although the deadline was already extended to August.", "factual": true, "bypass": true}
+{"text": "Perhaps, the payment cleared on Monday.", "factual": true, "bypass": true}
+{"text": "I believe: Armaan approved the budget yesterday.", "factual": true, "bypass": true}
+{"text": "Thanks!", "factual": false, "bypass": false}
+{"text": "Thank you for the details.", "factual": false, "bypass": false}
+{"text": "Let me know if you need anything else.", "factual": false, "bypass": false}
+{"text": "I can help with that.", "factual": false, "bypass": false}
+{"text": "Here's what I found.", "factual": false, "bypass": false}
+{"text": "What should we review next?", "factual": false, "bypass": false}
+{"text": "I might be mistaken about the schedule.", "factual": false, "bypass": false}
+{"text": "I think we should double-check before acting.", "factual": false, "bypass": false}
+{"text": "It could be worth revisiting later.", "factual": false, "bypass": false}
+{"text": "I'm not sure about the exact date.", "factual": false, "bypass": false}
+{"text": "No new evidence.", "factual": false, "bypass": false}
+{"text": "Perhaps we can look again tomorrow.", "factual": false, "bypass": false}
+{"text": "I don't know.", "factual": false, "bypass": false}
+{"text": "I believe there may be more context somewhere.", "factual": false, "bypass": false}
+{"text": "Here's what I found: it might be related to the outage.", "factual": false, "bypass": false}
+{"text": "I suspect the numbers are off, but I have not verified anything.", "factual": false, "bypass": false}
+{"text": "The vendor may still change the date.", "factual": false, "bypass": false}
+{"text": "It may be worth confirming with Sofia first.", "factual": false, "bypass": false}

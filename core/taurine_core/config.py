@@ -117,46 +117,9 @@ EMAIL_SCORE_WEIGHTS = {
 }
 EMAIL_RECENCY_SCORE_HALF_LIFE_DAYS = 30.0
 
-# ── graph term resolution (synonym soft-links, no LLM) ────────────────
-# entity/topic strings are embedded (cached in term_vectors) and clustered;
-# canonical forms are what shared-term edges intersect on. Calibrated on the
-# real corpus 2026-07-07: true variants ('Panasonic Avionics Corp'↔'Corp.',
-# 'recommendation-engine'↔'recommendation_engine') sit ≥0.98; distinct
-# entities (ShopLC↔Shopify 0.67) are far below. Terms whose digit sequences
-# differ NEVER merge ('PR #370'≠'#371', 'voice_agent_v3'≠'v4').
-TERM_SYNONYM_MIN_SIM = 0.95
-# merges additionally require lexical compatibility (containment after
-# stripping non-alphanumerics, or normalized Levenshtein ≥ this): embeddings
-# alone merge distinct referents ('Cologne'↔'Düsseldorf' 0.957) while true
-# variants are always string-close too
-TERM_LEXICAL_MIN_RATIO = 0.80
-
-# ── graph adjudication (corners LLM pass + edge facts) ────────────────
-# GLiNER-confirmed facts skip the queue; remaining uncertainty-band pairs
-# are gated by value score or bridge status before the LLM budget.
-ADJUDICATE_MODEL = "deepseek/deepseek-v4-pro"
-ADJUDICATE_TIMEOUT_S = 90.0
-ADJUDICATE_BATCH_PAIRS = 20              # pairs per LLM call
-ADJUDICATE_CONCURRENCY = 4
-ADJ_VALUE_FRACTION = 0.20                # corners value gate
-ADJUDICATE_MAX_PAIRS_PER_SYNC = 100      # sync adjudication budget
-BRIDGE_RANK_BOOST = 1.5                  # bridge-pair budget boost
-COMMUNITY_LP_ITERS = 20                  # label-propagation passes
-ADJ_TEXT_CAP = 700                       # note-text chars per side
-# Legacy margin/band knobs stay until Task 9 removes old callers.
-MARGIN_SEMANTIC_SIM = 0.50               # legacy near-miss dense floor
-MARGIN_SHARED_W = 0.15                   # legacy near-miss shared-term floor
-MARGIN_MAX_PER_NOTE = 5                  # legacy margin-pair cap
-VETO_MAX_W = 0.45                        # legacy weak-kept edge band
-FACT_TOP_EDGES_PER_NOTE = 6              # strong edges fact candidates
-
-# ── note graph ─────────────────────────────────────────────────────────
-GRAPH_KNN = 6
-GRAPH_MIN_SIM = 0.55                     # percentile-matched to Qwen3-Embedding cosines
-                                         # (bge 0.60 = p93.6 of pairwise sims → 0.550)
-GRAPH_MIN_SHARED_W = 0.25
+# ── note graph / map communities ───────────────────────────────────────
+COMMUNITY_LP_ITERS = 20                  # label-propagation passes (map communities)
 PROJECTION_MAX_DEGREE = 12               # product map only; never retrieval
-GRAPH_MAX_DEGREE = PROJECTION_MAX_DEGREE # legacy alias until projection cutover
 
 # ── evidence-first passage/base graph ─────────────────────────────────
 PASSAGE_TARGET_TOKENS = 220
@@ -164,14 +127,29 @@ PASSAGE_MAX_TOKENS = 300
 PASSAGE_OVERLAP_TOKENS = 40
 BASE_GRAPH_PASSAGE_K = 12
 FACT_REVERSE_WEIGHT_DEFAULT = 0.35
+# contains weight = clip01(idf × confidence × count_bonus / SCALE): realistic
+# max ≈ 3.2 × 1.0 × 2.1 ≈ 6.7 → ~1.0, typical mid values land 0.3-0.7 (H2 —
+# without the rescale every production edge clipped to exactly 1.0)
+CONTAINS_WEIGHT_SCALE = 6.0
+# note_salience = ingest_salience × content_quality; notes below this floor
+# skip GLiNER/mentions/facts/base-graph entity participation (§0.2). Passages,
+# FTS, and embeddings are ALWAYS built; the gate re-evaluates every build.
+EXTRACTION_SALIENCE_FLOOR = 0.35
+# explicit owner aliases (merged with the name parsed from the user card) —
+# owner/self entities above the df cap are traversal hubs (§10.5)
+OWNER_ALIASES: frozenset[str] = frozenset()
 
 # ── C2 retrieval ───────────────────────────────────────────────────────
 C2_THROTTLE_S = 8.0
-C2_WINDOW_CHUNKS = 3
-C2_WINDOW_MIN_S = 12.0
 LIVE_WINDOW_MIN_S = 12.0
 LIVE_WINDOW_MAX_S = 45.0
 LIVE_WINDOW_MAX_CHARS = 6000
+LIVE_ACCUM_DECAY = 0.85                  # per accepted pass, prior accumulated mass decays by this
+LIVE_ACCUM_NOTE_CAP = 1.5                # max accumulated session mass per note
+LIVE_ACCUM_EPSILON = 0.02                # accumulated entries below this are pruned
+LIVE_TOPIC_SHIFT_SIM = 0.35              # window-vs-EMA cosine below this on an accepted pass → pivot
+LIVE_SPANS_BUDGET_S = 0.3                # soft budget for GLiNER query spans; timeout → no spans
+LIVE_LEDGER_MAX_CHUNKS = 2000            # hard safety cap on retained transcript chunks
 RRF_K = 60
 HEAD_TOP_K = 20
 C2_TOP_K = 8                             # match the search-lane quota (was 5: entity notes
@@ -225,6 +203,11 @@ LIVE_RERANK_CANDIDATES = 30
 CHAT_RERANK_CANDIDATES = 60
 LIVE_EVIDENCE_PASSAGES = 8
 CHAT_EVIDENCE_PASSAGES = 12
+TEMPORAL_HISTORY_DOWNWEIGHT = 0.5        # historical/superseded facts under "any"/past intents
+HUB_ACTIVATION_EDGE_WEIGHT = 0.5         # synthesized contains weight for query-activated hubs (§10.5)
+HUB_ACTIVATION_MAX_EDGES = 64            # synthesized contains links per activated hub
+RETRIEVAL_FALLBACK_FLOOR_RATIO = 0.75    # chat/tool fallback lane floor = ratio × head acceptance floor
+RETRIEVAL_FALLBACK_PASSAGES = 4          # fallback pack cap: 4 passages / 0 facts / 0 paths / ≤1 per note
 EVIDENCE_NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
 
 # ── grounding / graph traversal (latent retrieval, no LLM) ─────────────
@@ -232,11 +215,8 @@ GROUNDING_HYSTERESIS = 1.15              # challenger must beat incumbent by thi
 PPR_DAMPING = 0.5                        # HippoRAG value: mass stays within ~2 hops of seeds
 PPR_TOL = 1e-8                           # L1 convergence tolerance
 PPR_MAX_ITERS = 50
-PPR_PASSAGE_RESET_W = 1.0                # note-seed reset weight
-PPR_ENTITY_RESET_W = 1.0                 # entity-seed reset weight
-FACT_EDGE_BOOST = 1.5                    # traversal weight multiplier for adjudicated fact edges
-SHARED_EDGE_BOOST = 1.35                 # entity/topic/mixed edges (audit F3.1 correction)
-DUP_EDGE_SIM = 0.95                      # same-source mean chunk cosine ≥ this → edge excluded from quality rank
+DUP_EDGE_SIM = 0.92                      # same-source semantic mechanism ≥ this → projection edge
+                                         # excluded from quality rank + flagged near-duplicate (M14)
 
 # ── static priors (source rank, quality rank, recency decay) ───────────
 SOURCE_RANK = {
@@ -251,17 +231,13 @@ SOURCE_RANK = {
 }
 SOURCE_RANK_DEFAULT = 0.85               # future connectors until explicitly ranked
 
-# ── value score / slim LLM call ────────────────────────────────────────
+# ── value score ────────────────────────────────────────────────────────
 VALUE_RECENCY_HALF_LIFE_DAYS = 30.0      # value-score recency decay
-SLIM_LLM_VALUE_FRACTION = 0.15           # top-value changed notes
-SLIM_LLM_MIN_NOTES = 5                   # slim-call floor per sync
-SLIM_UTTERANCES = True                   # Task 12 ablation may flip off
 
 QUALITY_DAMPING = 0.85                   # quality-rank PageRank damping
 QUALITY_TOL = 1e-6                       # L1 convergence tolerance
 QUALITY_MAX_ITERS = 100
 QUALITY_CLIP = 2.0                       # quality_rank = clip(log(r/median), ±this)
-QUALITY_LAMBDA = 0.20                    # blend: multiplier = exp(λ·quality_rank) ∈ [0.67, 1.49]
 RECENCY_OFFSET_DAYS = 2.0                # grace window before decay starts
 RECENCY_HALF_LIFE_DAYS = {
     "imessage": 30.0,                    # episodic sources decay fast
@@ -341,6 +317,13 @@ GLINER_RELATION_MIN_CONF = 0.45          # calibration-pending relation floor
 ENTITY_SHARED_DF_FRACTION_CAP = 0.06
 # time words like "today"/"tomorrow" are not connective tissue
 SHARED_EDGE_ETYPE_STOPLIST = frozenset({"date_or_deadline"})
+# entity-resolution stage 5: embedding cosine floor for merge *candidates*
+# (verified by lexical/digit/type guards; never sufficient alone)
+ENTITY_EMBED_SIM = 0.95
+# generic concept surfaces are provenance, not traversal nodes (§10.5)
+CONCEPT_STOPLIST = frozenset(
+    {"things", "stuff", "ideas", "notes", "list", "misc", "todo", "update", "meeting"}
+)
 INGEST_ENTITY_TYPES: dict[str, str] = {
     "person": "A named individual mentioned in the note",
     "organization": "A company, team, client, vendor, or institution",

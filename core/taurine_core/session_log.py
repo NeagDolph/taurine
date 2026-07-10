@@ -129,12 +129,17 @@ def console_line(kind: str, payload: dict[str, Any]) -> str | None:
         usage = payload.get("usage") or {}
         tools = payload.get("tools") or []
         cancelled = " cancelled" if payload.get("cancelled") else ""
+        interrupted = (
+            " interrupted"
+            if payload.get("interrupted") and not payload.get("cancelled")
+            else ""
+        )
         stripped = payload.get("stripped_citations") or 0
         return (
             f"chat {payload.get('chat_id')} msg={payload.get('message_id')} {payload.get('model')} "
             f"{round(payload.get('total_ms') or 0)}ms tools={len(tools)} "
             f"usage={usage.get('prompt', 0)}/{usage.get('completion', 0)}+{usage.get('reasoning', 0)} "
-            f"stripped={stripped}{cancelled}"
+            f"stripped={stripped}{cancelled}{interrupted}"
         )
     return f"{kind}: {_short(payload, 80)}"
 

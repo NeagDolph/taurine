@@ -14,7 +14,7 @@ from taurine_core.indexer.facts import FactRecord
 from taurine_core.indexer.knowledge_store import KnowledgeStore
 from taurine_core.indexer.passages import PassageDraft
 from taurine_core.indexer.projection import ProjectionEdge
-from taurine_core.indexer.sync import SyncReport
+from taurine_core.schemas import SyncReport
 from taurine_core.retrieval.runtime import RetrievalRuntime
 from taurine_core.schemas import NoteRecord
 from taurine_core.server import Runtime, create_app

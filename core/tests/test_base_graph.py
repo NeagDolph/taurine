@@ -66,8 +66,57 @@ def test_contains_edges_use_idf_and_hubs_require_explicit_activation() -> None:
         "hub",
     }
     eligible = next(edge for edge in default_contains if edge.src_id == "p1")
-    assert eligible.weight > 0.8
+    assert 0.0 < eligible.weight < 1.0
     assert eligible.metadata["idf"] > 1.0
+
+
+def test_contains_weights_discriminate_rare_from_common_entities() -> None:
+    """H2: after the CONTAINS_WEIGHT_SCALE rescale, idf rarity must survive
+    into edge weights instead of every edge clipping to exactly 1.0."""
+    note_count = 10
+    passages = tuple(
+        _passage(f"p{index}", f"n{index}", 0, [1.0, float(index) * 0.01])
+        for index in range(note_count)
+    )
+    entities = (
+        EntityGraphInput("rare", "Zephyr", "project", 1, True),
+        EntityGraphInput("common", "Standup", "concept", 8, True),
+    )
+    contains = (
+        PassageEntityInput("p0", "rare", 0.9, 1, 1),
+        PassageEntityInput("p0", "common", 0.9, 1, 8),
+    )
+
+    graph = _builder().build(passages, entities, contains, ())
+
+    weight_by_entity = {
+        edge.dst_id: edge.weight
+        for edge in graph.edges
+        if edge.kind == "contains" and edge.src_id == "p0"
+    }
+    assert weight_by_entity["rare"] > weight_by_entity["common"]
+    assert 0.0 < weight_by_entity["common"] < weight_by_entity["rare"] < 1.0
+    # typical mid values land well inside (0, 1) — the old bug clipped both to 1.0
+    assert weight_by_entity["rare"] < 0.9
+
+
+def test_contains_weight_scale_saturates_only_at_the_realistic_maximum() -> None:
+    """A maximal edge (idf≈3.4, conf 1.0, bonus≈2.4) still reaches ~1.0."""
+    passages = tuple(
+        _passage(f"p{index}", f"n{index}", 0, [1.0, float(index) * 0.01])
+        for index in range(30)
+    )
+    entities = (EntityGraphInput("unique", "Nadir", "person", 1, True),)
+    contains = (PassageEntityInput("p0", "unique", 1.0, 3, 0),)
+
+    graph = _builder().build(passages, entities, contains, ())
+
+    weight = next(
+        edge.weight
+        for edge in graph.edges
+        if edge.kind == "contains" and edge.src_id == "p0"
+    )
+    assert weight > 0.95
 
 
 def test_fact_edges_preserve_direction_and_weaker_reverse_weight() -> None:

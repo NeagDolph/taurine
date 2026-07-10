@@ -5,7 +5,6 @@ import importlib
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
 import pytest
 
 from tests.conftest import make_note
@@ -52,24 +51,6 @@ class StubLLM:
             "topics": ["connectors", "work"],
             "entities": ["Taurine"],
         }
-
-
-@pytest.fixture(autouse=True)
-def deterministic_sync_embeddings(monkeypatch):
-    from taurine_core.indexer import sync
-
-    def fake_embed_texts(texts: list[str]) -> np.ndarray:
-        rows = []
-        for text in texts:
-            digest = hashlib.sha256(text.encode("utf-8")).digest()
-            seed = int.from_bytes(digest[:8], "little")
-            rng = np.random.default_rng(seed)
-            row = rng.normal(size=config.EMBED_DIM).astype(np.float32)
-            row /= np.linalg.norm(row)
-            rows.append(row)
-        return np.vstack(rows) if rows else np.empty((0, config.EMBED_DIM), dtype=np.float32)
-
-    monkeypatch.setattr(sync, "embed_texts", fake_embed_texts)
 
 
 def test_markdown_file_to_record_caps_body_namespaces_id_and_uses_first_heading(tmp_path):

@@ -115,15 +115,12 @@ class FakeConnector:
 def _stub_embeddings(monkeypatch):
     from taurine_core.indexer import extract as extract_mod
     from taurine_core.indexer import store as store_mod
-    from taurine_core.indexer import sync as sync_mod
 
     def fake_embed(texts: list[str]) -> np.ndarray:
         rng = np.random.default_rng(42)
         return rng.normal(size=(len(texts), config.EMBED_DIM)).astype(np.float32)
 
     monkeypatch.setattr(store_mod, "embed_texts", fake_embed, raising=False)
-    monkeypatch.setattr(store_mod, "embed_queries", fake_embed, raising=False)
-    monkeypatch.setattr(sync_mod, "embed_texts", fake_embed, raising=False)
     monkeypatch.setattr(extract_mod, "_extractor_model", lambda: FakeExtractorModel())
     yield
 
@@ -151,8 +148,7 @@ def test_index_survives_concurrent_readers_and_writers(tmp_path) -> None:
             index.graph()
             index.status()
             index.note_count_by_source()
-            index.dense_search("topic about docs", 10)
-            index.bm25_search("topic", 10)
+            index.aliases()
             for source in ("src_a", "src_b"):
                 index.preview(f"{source}:doc-1")
 

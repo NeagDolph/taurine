@@ -4,11 +4,34 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 from taurine_core.indexer.facts import FactRecord, PREDICATES, promote_fact
 from taurine_core.schemas import ExtractedRelation
+
+# open predicates that are plain synonyms of registered ones become normal
+# facts instead of quarantined proposals (L21c); keys are casefolded and
+# underscore-normalized before lookup
+_PREDICATE_SYNONYMS: dict[str, str] = {
+    "based_in": "located_at",
+    "belongs_to": "member_of",
+    "collaborates_with": "works_with",
+    "employed_at": "works_at",
+    "employed_by": "works_at",
+    "finished": "completed",
+    "has": "owns_or_has",
+    "in_charge_of": "responsible_for",
+    "leads": "responsible_for",
+    "located_in": "located_at",
+    "meets_with": "met_with",
+    "owes": "paid_or_owes",
+    "owns": "owns_or_has",
+    "paid": "paid_or_owes",
+    "replaces": "supersedes",
+    "works_for": "works_at",
+}
 
 
 @dataclass(frozen=True)
@@ -57,10 +80,18 @@ class PredicateProposal:
 
 
 @dataclass(frozen=True)
+class CompletionAlias:
+    entity_id: str
+    alias: str
+    origin: str = "completion"
+
+
+@dataclass(frozen=True)
 class CompletionResult:
     facts: tuple[FactRecord, ...]
     proposals: tuple[PredicateProposal, ...]
-    rejected: int
+    aliases: tuple[CompletionAlias, ...] = ()
+    rejected: int = 0
 
 
 def select_completion_notes(notes: Sequence[CompletionNote]) -> tuple[CompletionNote, ...]:
@@ -81,14 +112,14 @@ def parse_completion_response(
     *,
     build_id: str,
 ) -> CompletionResult:
+    if not isinstance(payload, dict):
+        return CompletionResult((), ())
     note_index = {note.note_id: note for note in notes}
     facts: list[FactRecord] = []
     proposals: list[PredicateProposal] = []
     rejected = 0
-    rows = payload.get("facts") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        return CompletionResult((), (), 0)
-    for raw in rows:
+    rows = payload.get("facts")
+    for raw in rows if isinstance(rows, list) else ():
         parsed = _parse_row(raw, note_index, build_id)
         if parsed is None:
             rejected += 1
@@ -96,9 +127,18 @@ def parse_completion_response(
             facts.append(parsed)
         else:
             proposals.append(parsed)
+    aliases: set[CompletionAlias] = set()
+    alias_rows = payload.get("aliases")
+    for raw in alias_rows if isinstance(alias_rows, list) else ():
+        alias = _parse_alias(raw, note_index)
+        if alias is None:
+            rejected += 1
+        else:
+            aliases.add(alias)
     return CompletionResult(
         facts=tuple(sorted(facts, key=lambda row: row.fact_id)),
         proposals=tuple(sorted(proposals, key=lambda row: row.proposal_id)),
+        aliases=tuple(sorted(aliases, key=lambda row: (row.entity_id, row.alias))),
         rejected=rejected,
     )
 
@@ -115,29 +155,52 @@ def _parse_row(
         return None
     passages = {row.passage_id: row for row in note.passages}
     passage = passages.get(str(raw.get("passage_id", "")))
-    entities = {row.entity_id: row for row in note.entities}
-    subject = entities.get(str(raw.get("subject_entity_id", "")))
-    object_ = entities.get(str(raw.get("object_entity_id", "")))
-    if passage is None or subject is None or object_ is None or subject.entity_id == object_.entity_id:
+    # every mention span is kept per entity (H8): the LLM may ground the fact
+    # against any occurrence, not just an arbitrary last-seen one
+    mentions_by_entity: dict[str, list[CompletionEntity]] = {}
+    for row in note.entities:
+        mentions_by_entity.setdefault(row.entity_id, []).append(row)
+    subject_id = str(raw.get("subject_entity_id", ""))
+    object_id = str(raw.get("object_entity_id", ""))
+    subject_mentions = mentions_by_entity.get(subject_id, [])
+    object_mentions = mentions_by_entity.get(object_id, [])
+    if passage is None or not subject_mentions or not object_mentions or subject_id == object_id:
         return None
     assertion_start = _integer(raw.get("assertion_start"))
     assertion_end = _integer(raw.get("assertion_end"))
     confidence = _number(raw.get("confidence"))
     if assertion_start is None or assertion_end is None or confidence is None:
         return None
-    if not (
-        passage.char_start <= assertion_start < assertion_end <= passage.char_end
-        and assertion_start <= subject.char_start < subject.char_end <= assertion_end
-        and assertion_start <= object_.char_start < object_.char_end <= assertion_end
-    ):
+    if not passage.char_start <= assertion_start < assertion_end <= passage.char_end:
         return None
-    subject_local = subject.char_start - passage.char_start
-    object_local = object_.char_start - passage.char_start
-    if not passage.text.startswith(subject.surface, subject_local) or not passage.text.startswith(
-        object_.surface, object_local
-    ):
+
+    def grounded(row: CompletionEntity) -> bool:
+        return (
+            assertion_start <= row.char_start < row.char_end <= assertion_end
+            and passage.text.startswith(row.surface, row.char_start - passage.char_start)
+        )
+
+    pairs = [
+        (subject, object_)
+        for subject in subject_mentions
+        for object_ in object_mentions
+        if grounded(subject) and grounded(object_)
+    ]
+    if not pairs:
         return None
-    predicate = str(raw.get("predicate", "")).strip()
+    # record the tightest containing pair: minimal joint extent, then earliest
+    subject, object_ = min(
+        pairs,
+        key=lambda pair: (
+            max(pair[0].char_end, pair[1].char_end)
+            - min(pair[0].char_start, pair[1].char_start),
+            pair[0].char_start,
+            pair[1].char_start,
+            pair[0].char_end,
+            pair[1].char_end,
+        ),
+    )
+    predicate = _normalize_predicate(str(raw.get("predicate", "")))
     if not predicate:
         return None
     if predicate not in PREDICATES:
@@ -191,6 +254,30 @@ def _parse_row(
         observed_at=note.observed_at,
         build_id=build_id,
     )
+
+
+def _normalize_predicate(value: str) -> str:
+    """Casefold/underscore-normalize, then map registered synonyms (L21c)."""
+    normalized = re.sub(r"[\s\-]+", "_", value.strip().casefold())
+    if normalized in PREDICATES:
+        return normalized
+    return _PREDICATE_SYNONYMS.get(normalized, normalized)
+
+
+def _parse_alias(raw: object, notes: dict[str, CompletionNote]) -> CompletionAlias | None:
+    if not isinstance(raw, dict):
+        return None
+    note = notes.get(str(raw.get("note_id", "")))
+    if note is None:
+        return None
+    entity_id = str(raw.get("entity_id", ""))
+    alias = str(raw.get("alias", "")).strip()
+    if not alias or all(row.entity_id != entity_id for row in note.entities):
+        return None
+    # the alias must appear verbatim in the note's source text (L21b)
+    if not any(alias in passage.text for passage in note.passages):
+        return None
+    return CompletionAlias(entity_id=entity_id, alias=alias)
 
 
 def _integer(value: Any) -> int | None:

@@ -469,7 +469,8 @@ def _iter_relations(raw: object) -> list[_RelationRaw]:
 
 def _relation(item: object, predicate: str) -> _RelationRaw | None:
     if isinstance(item, (list, tuple)) and len(item) == 2:
-        return _RelationRaw(_span(item[0]), predicate, _span(item[1]), 1.0)
+        # legacy tuple shape carries no confidence: fail closed (L7)
+        return _RelationRaw(_span(item[0]), predicate, _span(item[1]), 0.0)
     if not isinstance(item, dict):
         return None
     head = _span(item.get("head"))
@@ -505,7 +506,8 @@ def _temporal_value(value: object) -> float | None:
 
 def _span(item: object) -> _Span:
     if isinstance(item, str):
-        return _Span(item.strip(), 1.0, None, None, False)
+        # bare-string shape carries no confidence: fail closed (L7)
+        return _Span(item.strip(), 0.0, None, None, False)
     if not isinstance(item, dict):
         return _Span("", 0.0, None, None, False)
     value = item.get("text", item.get("surface", item.get("span", "")))
@@ -659,7 +661,8 @@ def _assertion_span(
     for start, end in _sentence_spans(text):
         if start <= left and right <= end:
             return start, end
-    paragraph_start = text.rfind("\n\n", 0, left) + 2
+    separator = text.rfind("\n\n", 0, left)
+    paragraph_start = separator + 2 if separator >= 0 else 0
     paragraph_end = text.find("\n\n", right)
     if paragraph_end < 0:
         paragraph_end = len(text)
@@ -742,15 +745,28 @@ def _shift_spans(value: object, offset: int) -> object:
     return shifted
 
 
+# §6.2: the core predicate registry is always on; only these optional extras
+# vary by family. Written notes are the durable default and enable them all.
+_FAMILY_OPTIONAL_PREDICATES: dict[str, frozenset[str]] = {
+    "email": frozenset({"responsible_for", "scheduled_for", "blocked_by", "completed"}),
+    "conversation": frozenset({"met_with", "decided", "prefers"}),
+}
+_OPTIONAL_PREDICATES: frozenset[str] = frozenset().union(
+    *_FAMILY_OPTIONAL_PREDICATES.values()
+)
+
+
 def _relation_descriptions(family: str) -> dict[str, str]:
     emphasis = {
         "email": "email ownership, deadlines, blockers, and completion",
         "conversation": "conversation decisions, preferences, meetings, and commitments",
         "written": "durable written facts, plans, relationships, and status",
     }[family]
+    enabled_optional = _FAMILY_OPTIONAL_PREDICATES.get(family, _OPTIONAL_PREDICATES)
     return {
         name: f"{template.format(head='subject', tail='object')}; focus on {emphasis}"
         for name, template in config.INGEST_RELATION_TYPES.items()
+        if name not in _OPTIONAL_PREDICATES or name in enabled_optional
     }
 
 

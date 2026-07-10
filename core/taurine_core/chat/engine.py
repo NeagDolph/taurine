@@ -4,21 +4,29 @@ One ChatEngine per server; turns are per-chat single-flight with
 CHAT_MAX_CONCURRENT_TURNS across chats. A turn:
 
 1. persist the user message; create the empty assistant row (→ chat_ack)
-2. Stage-A context pack (→ chat_retrieval)
+2. Stage-A context pack (→ chat_retrieval); fallback (low-confidence) packs
+   render under an explicit LOW-CONFIDENCE header, abstentions as a gap notice
 3. stream_chat(CHAT_MODEL, reasoning=CHAT_REASONING, tools=TOOL_DEFINITIONS):
    reasoning deltas → chat_thinking, content deltas → chat_delta; on
    tool_call: emit chat_activity(running), execute, emit chat_activity(done),
    append tool message, re-open the stream — until no tool calls or
-   CHAT_MAX_TOOL_CALLS
-4. validate citations (lenient: strip unknown [N#]/[F#], never reject),
-   resolve sources, finish_chat_message, save retriever state (→ chat_done)
+   CHAT_MAX_TOOL_CALLS (with an evidence-sufficiency nudge when nothing this
+   turn cleared the retrieval floor, §14.4)
+4. strict citation validation against this turn's read evidence (coverage,
+   availability, fact provenance, temporal consistency, NLI entailment): one
+   constrained repair attempt, then unsupported-sentence stripping (stripped
+   claims persist on the message), then an evidence-excerpt fallback; on
+   acceptance the retriever commits its accepted-turn state and saves
+   (→ chat_done)
 5. auto-title after the first completed exchange (one flash complete_json;
    fallback: first 40 chars) (→ chat_meta)
 
-Cancellation (chat_cancel): cancel the turn task; partial content persists
-with cancelled=True (→ chat_done with cancelled). Fallback model only on
-stream-OPEN failure; mid-stream errors → chat_error. Session-log record
-kinds: chat_turn, chat_retrieval.
+Cancellation (chat_cancel) and mid-stream errors persist the partial content
+exactly as streamed with interrupted=True — no validation, no excerpt, nothing
+cited — and restore the retriever's pre-turn snapshot so failed turns never
+advance the accumulator (→ chat_done with cancelled, or chat_error).
+Fallback model only on stream-OPEN failure. Session-log record kinds:
+chat_turn, chat_retrieval.
 """
 from __future__ import annotations
 
@@ -27,7 +35,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine, Sequence
+from typing import Any, Callable, Coroutine, Mapping, Sequence
 from uuid import uuid4
 
 from .. import config
@@ -46,6 +54,7 @@ from ..schemas import (
     ChatMeta,
     ChatMetaEvent,
     ChatRetrievalEvent,
+    ChatStrippedClaim,
     ChatThinkingEvent,
     ChatUsage,
     EvidencePackPayload,
@@ -281,7 +290,6 @@ class ChatEngine:
         usage = {"prompt": 0, "completion": 0, "reasoning": 0}
         ttft_ms: float | None = None
         tool_summaries: list[dict[str, Any]] = []
-        stripped_citations = 0
         model = config.CHAT_MODEL
         persisted_message: ChatMessage | None = None
         success_finish_task: asyncio.Task[None] | None = None
@@ -303,19 +311,27 @@ class ChatEngine:
             except Exception:
                 pass
 
-        def persist_turn(*, cancelled: bool) -> ChatMessage:
-            nonlocal stripped_citations, persisted_message
+        def persist_turn(*, cancelled: bool, interrupted: bool = False) -> ChatMessage:
+            nonlocal persisted_message
             if persisted_message is not None:
                 return persisted_message
+            interrupted = interrupted or cancelled
             raw_content = _strip_tool_call_remnants("".join(content_parts))
             turn_pack_fn = getattr(retriever, "turn_pack", None)
             audit_pack = turn_pack_fn() if callable(turn_pack_fn) else context_pack
-            final_content, cited_ids, stripped_citations = _finalize_evidence(
-                raw_content,
-                retriever,
-                self._validator_factory,
-                audit_pack,
-            )
+            if interrupted:
+                # H7: persist the partial exactly as streamed — no validation,
+                # no excerpt substitution, nothing cited.
+                final_content = raw_content
+                cited_ids: tuple[str, ...] = ()
+                stripped_claims: tuple[ChatStrippedClaim, ...] = ()
+            else:
+                final_content, cited_ids, stripped_claims = _finalize_evidence(
+                    raw_content,
+                    retriever,
+                    self._validator_factory,
+                    audit_pack,
+                )
             retrieved_ids = list(audit_pack.trace.selected_ids) if audit_pack is not None else []
             consulted_ids = list(audit_pack.trace.read_ids) if audit_pack is not None else []
             total_ms = (time.monotonic() - turn_started) * 1000.0
@@ -343,9 +359,21 @@ class ChatEngine:
                     total_ms=total_ms,
                 ),
                 cancelled=cancelled,
+                interrupted=interrupted,
+                stripped_claims=list(stripped_claims),
                 created=assistant_created,
             )
             self.index.finish_chat_message(message)
+            if interrupted:
+                # H7: failed turns never advance the accumulator — roll the
+                # retriever back to its pre-turn snapshot before saving.
+                discard = getattr(retriever, "discard_turn", None)
+                if callable(discard):
+                    discard()
+            else:
+                commit = getattr(retriever, "commit_turn", None)
+                if callable(commit):
+                    commit()
             retriever.save()
             self.logger.log(
                 "chat_turn",
@@ -364,8 +392,10 @@ class ChatEngine:
                 usage=message.usage.model_dump(mode="json"),
                 ttft_ms=message.usage.ttft_ms,
                 total_ms=total_ms,
-                stripped_citations=stripped_citations,
+                stripped_citations=len(stripped_claims),
+                stripped_claims=[claim.model_dump(mode="json") for claim in stripped_claims],
                 cancelled=cancelled,
+                interrupted=interrupted,
             )
             persisted_message = message
             return message
@@ -400,7 +430,8 @@ class ChatEngine:
 
         async def finish_error(event: ChatErrorEvent) -> None:
             try:
-                persist_turn(cancelled=False)
+                # H7: errored turns persist the raw partial, uncited.
+                persist_turn(cancelled=False, interrupted=True)
             except Exception as exc:
                 log_turn_error(exc)
             await emit(event)
@@ -445,6 +476,7 @@ class ChatEngine:
                 chat_id,
                 text,
                 context_pack,
+                retriever=retriever,
                 current_user_id=user_message_id,
                 assistant_id=assistant_id,
             )
@@ -457,16 +489,25 @@ class ChatEngine:
                     # GLM keeps trying to call tools in plain text when they
                     # vanish silently (live smoke 2026-07-08) — tell it why
                     budget_notice_sent = True
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "(Tool budget exhausted — tools are no longer "
-                                "available. Answer now using only the "
-                                "information you already have.)"
-                            ),
-                        }
+                    notice = (
+                        "(Tool budget exhausted — tools are no longer "
+                        "available. Answer now using only the "
+                        "information you already have.)"
                     )
+                    # M11/§14.4: deterministic evidence-sufficiency check
+                    # before the final no-tools round — if nothing read this
+                    # turn cleared the retrieval floor, tell the model to
+                    # state the gap instead of synthesizing.
+                    sufficient_fn = getattr(retriever, "evidence_sufficient", None)
+                    if callable(sufficient_fn) and not sufficient_fn():
+                        notice += (
+                            " Evidence check: nothing retrieved this turn "
+                            "cleared the retrieval confidence floor for this "
+                            "question. State plainly what information is "
+                            "missing instead of synthesizing an answer, and "
+                            "cite only evidence you actually have."
+                        )
+                    messages.append({"role": "user", "content": notice})
                 try:
                     outcome = await self._stream_round(
                         model,
@@ -773,6 +814,7 @@ class ChatEngine:
         user_text: str,
         context_pack: EvidencePack,
         *,
+        retriever: Any = None,
         current_user_id: int,
         assistant_id: int,
     ) -> list[dict[str, Any]]:
@@ -789,10 +831,14 @@ class ChatEngine:
             if message.role == "assistant" and not message.content:
                 continue
             messages.append({"role": message.role, "content": message.content})
+        # M6: expose bounded non-selected fact-support passages — they become
+        # read/citable and render as compact quotes under their facts.
+        expose = getattr(retriever, "expose_fact_support", None)
+        support = expose(context_pack) if callable(expose) else {}
         messages.append(
             {
                 "role": "user",
-                "content": f"<evidence>\n{_evidence_block(context_pack)}\n</evidence>\n\n{user_text}",
+                "content": f"<evidence>\n{_evidence_block(context_pack, support)}\n</evidence>\n\n{user_text}",
             }
         )
         return messages
@@ -834,7 +880,10 @@ def _system_prompt(profile_block: str = "") -> str:
         "sentence must cite an exact [E#] passage, a supported [F#] fact, or both. [N#] "
         "is navigation metadata and cannot ground a factual claim. Cite only identifiers "
         "in supplied evidence or tool results. If retrieval abstained or evidence is "
-        "insufficient, use tools or state the gap. Be direct and write markdown."
+        "insufficient, use tools or state the gap. Evidence under a LOW-CONFIDENCE "
+        "header (or marked low_confidence) did not clear retrieval's confidence floor: "
+        "treat it as a hint, verify it before asserting, and say so explicitly if you "
+        "rely on it. Be direct and write markdown."
     )
     if not profile_block:
         return prompt
@@ -847,26 +896,52 @@ def _system_prompt(profile_block: str = "") -> str:
     )
 
 
-def _evidence_block(pack: EvidencePack) -> str:
-    if not pack.decision.accepted:
+def _evidence_block(
+    pack: EvidencePack,
+    support: Mapping[str, tuple[str, str, str]] | None = None,
+) -> str:
+    fallback = bool(getattr(pack.decision, "fallback", False))
+    if not pack.decision.accepted and not fallback:
+        # §14.2 abstention message — only for truly empty packs (§0.1).
         return (
             "Knowledge-base retrieval abstained: "
             f"{pack.decision.reason} (confidence {pack.decision.confidence:.2f})."
         )
     lines: list[str] = []
+    if fallback:
+        lines.append(
+            "LOW-CONFIDENCE CONTEXT — retrieval did not clear its confidence "
+            "floor; treat these passages as hints, verify before asserting, "
+            "and say so if you rely on them."
+        )
     notes = {row.note_id: row.note_ref for row in pack.notes}
     for item in pack.passages:
         lines.append(
             f'[{item.evidence_id}] [{notes.get(item.note_id, item.note_id)}] "{item.title}" '
             f"({item.source}, chars {item.char_start}-{item.char_end})\n{item.text}"
         )
+    if fallback:
+        # Fallback packs are passages only — facts/paths sections omitted.
+        return "\n".join(lines) if lines else "none"
+    rendered_refs = {row.evidence_id for row in pack.passages}
     for fact in pack.facts:
         valid = f"; valid={fact.valid_from or '?'}..{fact.valid_to or '?'}"
-        sources = " ".join(f"[{ref}]" for ref in fact.source_evidence_ids)
+        # M6: advertise only support refs the model can actually cite —
+        # rendered passages plus the exposed (read) support snippet.
+        exposed = (support or {}).get(fact.fact_ref)
+        citable = [
+            ref
+            for ref in fact.source_evidence_ids
+            if ref in rendered_refs or (exposed is not None and ref == exposed[0])
+        ]
+        sources = " ".join(f"[{ref}]" for ref in citable)
         lines.append(
             f"[{fact.fact_ref}] {fact.subject} — {fact.predicate} → {fact.object}; "
             f"status={fact.status}{valid}; supported by {sources}"
         )
+        if exposed is not None:
+            ref, title, snippet = exposed
+            lines.append(f'  [{ref}] "{title}": "{snippet}"')
     for path in pack.paths:
         lines.append(f"[{path.path_id}] {path.rendered}")
     return "\n".join(lines) if lines else "none"
@@ -914,14 +989,13 @@ def _finalize_evidence(
     retriever: Any,
     validator_factory: Callable[[Any], EvidenceValidator] | None,
     pack: EvidencePack | None,
-) -> tuple[str, tuple[str, ...], int]:
-    """Validate whole claims; unsupported citations never leave a bare claim."""
+) -> tuple[str, tuple[str, ...], tuple[ChatStrippedClaim, ...]]:
+    """Validate whole claims; unsupported citations never leave a bare claim.
 
-    registry = getattr(retriever, "registry", None)
-    if registry is None:
-        # Fake-only seam for streaming/control-flow unit tests. Runtime chat
-        # retrievers always own an EvidenceRegistry.
-        return content, (), 0
+    Returns (final content, cited refs, stripped claims). Runtime retrievers
+    always own an EvidenceRegistry — there is no unvalidated path (H7)."""
+
+    registry = retriever.registry
     validator = (
         validator_factory(registry)
         if validator_factory is not None
@@ -935,8 +1009,12 @@ def _finalize_evidence(
         available_ids=supplied,
     )
     if result.accepted:
-        return result.accepted_output, result.cited_ids, 0
+        return result.accepted_output, result.cited_ids, ()
 
+    claims = tuple(
+        ChatStrippedClaim(sentence=sentence, reason=reason)
+        for sentence, reason in result.unsupported_details
+    )
     repaired = _remove_unsupported_sentences(
         content,
         (*result.unsupported_sentences, *result.invalid_citations),
@@ -949,14 +1027,16 @@ def _finalize_evidence(
             available_ids=supplied,
         )
         if repaired_result.accepted:
-            removed = len(result.unsupported_sentences) + len(result.invalid_citations)
-            return repaired_result.accepted_output, repaired_result.cited_ids, removed
+            return repaired_result.accepted_output, repaired_result.cited_ids, claims
 
     excerpt, excerpt_ids = _evidence_excerpt(pack, registry)
-    return excerpt, excerpt_ids, max(
-        1,
-        len(result.unsupported_sentences) + len(result.invalid_citations),
-    )
+    if not claims:
+        claims = (
+            ChatStrippedClaim(
+                sentence="", reason=result.degraded_reason or "invalid_citation"
+            ),
+        )
+    return excerpt, excerpt_ids, claims
 
 
 def _remove_unsupported_sentences(content: str, unsupported: tuple[str, ...]) -> str:

@@ -8,7 +8,15 @@ from typing import Any, Sequence
 
 from rapidfuzz.distance import Levenshtein
 
-from taurine_core.evaluation.graph_retrieval import CalibrationArtifact, load_calibration
+from taurine_core.evaluation.graph_retrieval import (
+    CalibrationArtifact,
+    CalibrationCurve,
+    CalibrationIntegrityError,
+    ModeCalibration,
+    RerankCalibration,
+    TripleRecognitionCalibration,
+    load_calibration,
+)
 from taurine_core.indexer.communities import projection_communities
 from taurine_core.indexer.embed import embed_queries
 from taurine_core.models_local import (
@@ -33,6 +41,87 @@ CALIBRATION_PATH = (
     / "graph_retrieval"
     / "calibration-v1.json"
 )
+
+
+# §11.3 fail-closed table used when the checked-in artifact's content hash
+# does not match its declared hash: every mode gets the strictest (live)
+# floors, so a tampered/corrupted artifact can only make retrieval stricter.
+def _conservative_curve(
+    knots: tuple[tuple[float, float], ...], floor: float
+) -> CalibrationCurve:
+    return CalibrationCurve(
+        knots=knots,
+        acceptance_floor=floor,
+        sample_count=0,
+        trained_at="conservative-fallback",
+        held_out={},
+    )
+
+
+def _conservative_mode() -> ModeCalibration:
+    return ModeCalibration(
+        heads={
+            "dense": _conservative_curve(
+                ((-1.0, 0.0), (0.45, 0.05), (0.62, 0.55), (0.78, 0.95), (1.0, 1.0)),
+                0.7,
+            ),
+            "bm25": _conservative_curve(
+                ((0.0, 0.0), (2.0, 0.1), (6.0, 0.7), (20.0, 1.0)), 0.75
+            ),
+            "exact": _conservative_curve(((0.0, 0.0), (0.5, 0.8), (1.0, 1.0)), 0.9),
+            "entity": _conservative_curve(
+                ((0.0, 0.0), (0.6, 0.4), (0.85, 0.9), (1.0, 1.0)), 0.85
+            ),
+            "triple": _conservative_curve(
+                ((-1.0, 0.0), (0.55, 0.1), (0.72, 0.75), (1.0, 1.0)), 0.8
+            ),
+        },
+        head_weights={
+            "dense": 1.0,
+            "bm25": 1.0,
+            "exact": 1.0,
+            "entity": 1.0,
+            "triple": 1.0,
+        },
+        rrf_k=60,
+        mmr_lambda=0.2,
+        source_diversity_penalty=0.05,
+        note_support_bonus=0.05,
+        note_support_bonus_cap=0.1,
+        evidence_floor=0.75,
+        single_head_override=0.92,
+        minimum_independent_heads=2,
+        bm25_min_token_coverage=0.5,
+    )
+
+
+def _conservative_artifact(declared: CalibrationArtifact) -> CalibrationArtifact:
+    """Keep the declared artifact's identity fields (so the snapshot
+    cross-check semantics are unchanged) but replace every runtime floor and
+    curve with the in-code conservative table."""
+
+    mode = _conservative_mode()
+    return declared.model_copy(
+        update={
+            "modes": {"live": mode, "chat": mode, "tool": mode},
+            "triple_recognition": TripleRecognitionCalibration(
+                live_floor=0.82,
+                chat_floor=0.82,
+                tool_floor=0.82,
+                live_fallback_embedding_floor=0.9,
+                chat_fallback_embedding_floor=0.9,
+                tool_fallback_embedding_floor=0.9,
+                chat_ambiguity_low=0.6,
+                chat_ambiguity_high=0.9,
+                tool_ambiguity_low=0.6,
+                tool_ambiguity_high=0.9,
+            ),
+            "rerank": RerankCalibration(live_floor=0.76, chat_floor=0.76),
+            "nli": declared.nli.model_copy(
+                update={"entailment_floor": max(0.8, declared.nli.entailment_floor)}
+            ),
+        }
+    )
 
 
 class _UnavailablePairScorer:
@@ -64,7 +153,19 @@ class RetrievalRuntime:
             self._snapshot.projection
         )
         self._stores: dict[str, Any] = {}
-        self.artifact: CalibrationArtifact = load_calibration(calibration_path)
+        # H4/§11.3: verify the artifact's content hash on load. On a mismatch
+        # fail closed to the in-code conservative floors and surface the
+        # condition as runtime status instead of raising: the tampered file's
+        # floors are untrusted, but its identity fields still let the snapshot
+        # cross-check below distinguish "same declared artifact" from "a build
+        # made under a different artifact" (which stays an activation error).
+        try:
+            self.artifact: CalibrationArtifact = load_calibration(calibration_path)
+            self.calibration_status = "verified"
+        except CalibrationIntegrityError:
+            declared = load_calibration(calibration_path, verify=False)
+            self.artifact = _conservative_artifact(declared)
+            self.calibration_status = "calibration_mismatch"
         self._validate_snapshot(self._snapshot)
         try:
             self.pair_scorer: Any = local_pair_reranker()
@@ -146,6 +247,9 @@ class RetrievalRuntime:
                 query,
             ),
             triple_recognizer=triple_recognizer,
+            # §0.1: chat/tool get the liberal fallback lane; live stays strict.
+            fallback_on_abstain=mode in {"chat", "tool"},
+            calibration_status=self.calibration_status,
         )
 
     def make_validator(self, registry: EvidenceRegistry) -> EvidenceValidator:

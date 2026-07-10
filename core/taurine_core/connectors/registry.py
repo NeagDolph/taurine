@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from taurine_core.ports import ConnectorError, ConnectorPort, LLMPort
@@ -10,6 +12,24 @@ from taurine_core.schemas import ConnectorInfo, ConnectorSyncReport
 from taurine_core.schemas import NoteRecord
 
 from .apple_notes import AppleNotesConnector
+
+
+_LOG = logging.getLogger("taurine.connectors")
+
+
+@dataclass(frozen=True)
+class SourceExtraction:
+    """One clean source snapshot plus the enabled connectors it is missing.
+
+    ``unavailable`` connectors were enabled but could not be read this pass
+    (lost permission, network, provider error) — the knowledge build carries
+    their notes forward from the previous generation instead of wiping the
+    source (L28).
+    """
+
+    records: tuple[NoteRecord, ...] = ()
+    unavailable: tuple[str, ...] = ()
+    reports: tuple[ConnectorSyncReport, ...] = ()
 
 
 def build_connectors() -> list[ConnectorPort]:
@@ -88,12 +108,24 @@ class ConnectorRegistry:
         index: object,
         llm: LLMPort,
     ) -> ConnectorSyncReport:
+        report, _records = self._sync_connector(connector_id, index, llm)
+        return report
+
+    def _sync_connector(
+        self,
+        connector_id: str,
+        index: object,
+        llm: LLMPort,
+    ) -> tuple[ConnectorSyncReport, tuple[NoteRecord, ...] | None]:
+        """Sync one connector; also return its extracted records (or None on
+        failure) so a following knowledge build never re-reads the source."""
         connector = self._connector(connector_id)
         del llm
         state = self._state(index, connector_id)
         self.syncing.add(connector_id)
         self.sync_progress[connector_id] = ("extracting", 0, 0)
         self._notify()
+        extracted: tuple[NoteRecord, ...] | None = None
         try:
             available, detail = connector.available()
             if not available:
@@ -130,6 +162,7 @@ class ConnectorRegistry:
                         )
                         merged_scores.update(salience_scores)
                         set_ingest_salience(merged_scores)
+                    extracted = self._stamped_records(connector, records)
                 except ConnectorError as exc:
                     report = ConnectorSyncReport(connector_id=connector_id, error=str(exc))
                 except Exception as exc:  # any layer failing must surface, not vanish
@@ -145,7 +178,7 @@ class ConnectorRegistry:
         state["last_report"] = report.model_dump()
         self._save_state(index, connector_id, state)
         self._notify()
-        return report
+        return report, extracted
 
     def _set_progress(self, connector_id: str, phase: str, done: int, total: int) -> None:
         self.sync_progress[connector_id] = (phase, done, total)
@@ -160,34 +193,98 @@ class ConnectorRegistry:
                 pass
 
     def sync_all_enabled(self, index: object, llm: LLMPort) -> list[ConnectorSyncReport]:
+        return list(self.sync_all_enabled_collecting(index, llm).reports)
+
+    def sync_all_enabled_collecting(
+        self, index: object, llm: LLMPort
+    ) -> SourceExtraction:
+        """Sync every enabled connector once and keep the extracted records so
+        the knowledge rebuild that follows never re-reads the sources (L28)."""
+
         reports: list[ConnectorSyncReport] = []
+        records: list[NoteRecord] = []
+        unavailable: list[str] = []
         for connector in self._connectors:
-            if self._enabled(connector.connector_id, self._state(index, connector.connector_id)):
-                reports.append(self.sync_connector(connector.connector_id, index, llm))
-        return reports
+            connector_id = connector.connector_id
+            if not self._enabled(connector_id, self._state(index, connector_id)):
+                continue
+            report, extracted = self._sync_connector(connector_id, index, llm)
+            reports.append(report)
+            if extracted is None:
+                unavailable.append(connector_id)
+            else:
+                records.extend(extracted)
+        return SourceExtraction(
+            records=tuple(sorted(records, key=lambda row: (row.source, row.note_id))),
+            unavailable=tuple(unavailable),
+            reports=tuple(reports),
+        )
 
     def extract_all_enabled(
         self,
         index: object,
         *,
         progress: Callable[[str], None] | None = None,
-    ) -> list[NoteRecord]:
-        """Read one clean source snapshot without writing derived index state."""
+    ) -> SourceExtraction:
+        """Read one clean source snapshot without writing derived index state.
+
+        An enabled-but-unavailable connector no longer aborts the whole read
+        (L28): it is skipped and named in ``unavailable`` so the caller can
+        carry its notes forward from the previous build.
+        """
 
         records: list[NoteRecord] = []
+        unavailable: list[str] = []
         for connector in self._connectors:
             state = self._state(index, connector.connector_id)
             if not self._enabled(connector.connector_id, state):
                 continue
-            available, detail = connector.available()
-            if not available:
-                raise ConnectorError(
-                    detail or f"connector {connector.connector_id} is unavailable"
-                )
+            # progress stays OUTSIDE the guard: cooperative cancellation is
+            # raised through it and must abort the read, not mark a connector
+            # unavailable
             if progress is not None:
                 progress(connector.connector_id)
-            records.extend(connector.extract(self._config(connector, state)))
-        return sorted(records, key=lambda row: (row.source, row.note_id))
+            try:
+                available, detail = connector.available()
+                if not available:
+                    raise ConnectorError(
+                        detail or f"connector {connector.connector_id} is unavailable"
+                    )
+                extracted = list(connector.extract(self._config(connector, state)))
+            except Exception as exc:
+                _LOG.warning(
+                    "connector %s unavailable during extraction: %s",
+                    connector.connector_id,
+                    exc,
+                )
+                unavailable.append(connector.connector_id)
+                continue
+            records.extend(self._stamped_records(connector, extracted))
+        return SourceExtraction(
+            records=tuple(sorted(records, key=lambda row: (row.source, row.note_id))),
+            unavailable=tuple(unavailable),
+        )
+
+    @staticmethod
+    def _stamped_records(
+        connector: ConnectorPort, records: Iterable[NoteRecord]
+    ) -> tuple[NoteRecord, ...]:
+        """Stamp connector-computed salience onto the records themselves so it
+        survives the trip into the knowledge build (§0.2 plumbing)."""
+
+        scores = getattr(connector, "ingest_salience_scores", None)
+        if not isinstance(scores, dict) or not scores:
+            return tuple(records)
+        return tuple(
+            record.model_copy(
+                update={
+                    "ingest_salience": float(
+                        scores.get(record.note_id, record.ingest_salience)
+                    )
+                }
+            )
+            for record in records
+        )
 
     def _info_for(self, index: object, connector: ConnectorPort, docs: int) -> ConnectorInfo:
         state = self._state(index, connector.connector_id)

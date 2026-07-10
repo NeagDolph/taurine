@@ -21,10 +21,11 @@ from typing import Any, Sequence
 import numpy as np
 
 from taurine_core import config
+from taurine_core.indexer import extract
 from taurine_core.indexer.facts import PREDICATES
 from taurine_core.schemas import Extraction, NoteRecord
 
-_EXTRACTION_CACHE_VERSION = "extraction-cache-v1"
+_EXTRACTION_CACHE_VERSION = "extraction-cache-v2"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS embedding_cache (
@@ -51,6 +52,7 @@ class BuildCache:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._lock = threading.Lock()
+        self.stats: dict[str, int] = {"cache_corrupt": 0}
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
 
@@ -102,6 +104,7 @@ class BuildCache:
 
     def _embedding_rows(self, keys: Sequence[str]) -> dict[str, np.ndarray]:
         rows: dict[str, np.ndarray] = {}
+        corrupt: list[str] = []
         with self._lock:
             for start in range(0, len(keys), 500):
                 chunk = list(dict.fromkeys(keys[start : start + 500]))
@@ -110,8 +113,23 @@ class BuildCache:
                     f"SELECT key, dim, vec FROM embedding_cache WHERE key IN ({placeholders})",
                     chunk,
                 ):
+                    # a corrupt row is a cache miss, never a build failure (L8)
+                    if int(dim) <= 0 or len(blob) != int(dim) * 4:
+                        corrupt.append(key)
+                        continue
                     rows[key] = np.frombuffer(blob, dtype=np.float32, count=int(dim))
+        self._drop_corrupt("embedding_cache", corrupt)
         return rows
+
+    def _drop_corrupt(self, table: str, keys: Sequence[str]) -> None:
+        if not keys:
+            return
+        assert table in {"embedding_cache", "extraction_cache"}
+        with self._lock, self._conn:
+            self._conn.executemany(
+                f"DELETE FROM {table} WHERE key = ?", [(key,) for key in keys]
+            )
+        self.stats["cache_corrupt"] += len(keys)
 
     def _store_embeddings(
         self,
@@ -153,16 +171,24 @@ class BuildCache:
         ) -> dict[str, Extraction]:
             if not notes:
                 return {}
-            keys = {note.note_id: _extraction_key(note) for note in notes}
+            fingerprint = _schema_fingerprint()
+            keys = {note.note_id: _extraction_key(note, fingerprint) for note in notes}
             cached = self._extraction_rows(list(keys.values()))
             results: dict[str, Extraction] = {}
             missing: list[NoteRecord] = []
+            corrupt: list[str] = []
             for note in notes:
                 payload = cached.get(keys[note.note_id])
                 if payload is None:
                     missing.append(note)
                     continue
-                results[note.note_id] = Extraction.model_validate_json(payload)
+                try:
+                    results[note.note_id] = Extraction.model_validate_json(payload)
+                except Exception:
+                    # a corrupt row is a cache miss, never a build failure (L8)
+                    corrupt.append(keys[note.note_id])
+                    missing.append(note)
+            self._drop_corrupt("extraction_cache", corrupt)
             hits = len(results)
             if progress is not None:
                 progress(hits, len(notes))
@@ -222,22 +248,41 @@ def _embedding_key(model_id: str, text: str) -> str:
 
 
 def _schema_fingerprint() -> str:
-    """Entity types and predicates drive extraction output; changing either
-    must invalidate cached extractions."""
+    """Everything that shapes an extraction result must invalidate the cache
+    (H5): the rendered GLiNER schema request (entity types + descriptions and
+    the per-family relation prompts), chunking knobs, the extractor model id,
+    and the calibrated per-type threshold tables baked into accepted rows."""
+    calibration = extract._calibration().extraction
     payload = {
+        "extractor": extract._EXTRACTOR_ID,
         "entities": dict(config.INGEST_ENTITY_TYPES),
+        "relations": {
+            family: extract._relation_descriptions(family)
+            for family in ("conversation", "email", "written")
+        },
         "predicates": {name: spec.description for name, spec in sorted(PREDICATES.items())},
+        "chunking": {
+            "chunk_size": int(config.GLINER_CHUNK_SIZE),
+            "chunk_overlap": int(config.GLINER_CHUNK_OVERLAP),
+            "long_chunk_tokens": int(config.GLINER_LONG_CHUNK_TOKENS),
+            "long_overlap_tokens": int(config.GLINER_LONG_OVERLAP_TOKENS),
+        },
+        "thresholds": {
+            "entity": dict(sorted(calibration.entity_thresholds.items())),
+            "relation": dict(sorted(calibration.relation_thresholds.items())),
+            "promotion": dict(sorted(calibration.promotion_thresholds.items())),
+        },
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
 
 
-def _extraction_key(note: NoteRecord) -> str:
+def _extraction_key(note: NoteRecord, schema_fingerprint: str) -> str:
     identity = "\x1f".join(
         (
             _EXTRACTION_CACHE_VERSION,
-            _schema_fingerprint(),
+            schema_fingerprint,
             note.source,
             note.content_hash,
         )

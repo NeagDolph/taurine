@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import numpy as np
 import pytest
 
 from tests.conftest import make_note
+from taurine_core.evaluation.graph_retrieval import load_calibration
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies, BuildError, main
 from taurine_core.indexer.knowledge_store import KnowledgeStore
 from taurine_core.retrieval.snapshot import load_index_snapshot
@@ -58,7 +60,10 @@ def test_clean_build_is_atomic_deterministic_and_order_independent(tmp_path: Pat
     assert first.dangling_node_count >= 0
     assert set(first.stage_timings_ms) == set(first.stages)
     assert all(value >= 0.0 for value in first.stage_timings_ms.values())
-    assert first.calibration_hash == "sha256:initial-conservative-2026-07-09"
+    artifact = load_calibration(
+        Path(__file__).parents[1] / "evals" / "graph_retrieval" / "calibration-v1.json"
+    )
+    assert first.calibration_hash == artifact.hash
     assert first.release_ready is False
     assert "uncalibrated_retrieval_head:live:dense" in first.release_blockers
     assert first.stages == (
@@ -124,7 +129,9 @@ def test_failed_build_never_replaces_active_target(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("active.build-*.db"))
 
 
-def test_cli_from_enabled_connectors_uses_clean_replace_contract(tmp_path: Path) -> None:
+def test_cli_installs_but_exits_3_when_release_blockers_remain(tmp_path: Path) -> None:
+    """M10/§22: the CLI must not report false green — an uncalibrated build
+    still installs (availability) but exits nonzero with blockers printed."""
     target = tmp_path / "knowledge.db"
     notes = [make_note("a", "Alpha", "body")]
     deps = BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
@@ -135,8 +142,89 @@ def test_cli_from_enabled_connectors_uses_clean_replace_contract(tmp_path: Path)
         connector_loader=lambda: notes,
     )
 
+    assert code == 3
+    assert target.exists()
+
+
+def test_cli_install_degraded_flag_accepts_blockers_with_exit_0(tmp_path: Path) -> None:
+    target = tmp_path / "knowledge.db"
+    deps = BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+
+    code = main(
+        [
+            "--db",
+            str(target),
+            "--from-enabled-connectors",
+            "--replace-derived",
+            "--yes",
+            "--install-degraded",
+        ],
+        dependencies=deps,
+        connector_loader=lambda: [make_note("a", "Alpha", "body")],
+    )
+
     assert code == 0
     assert target.exists()
+
+
+def test_cli_exits_2_and_installs_nothing_on_build_failure(tmp_path: Path) -> None:
+    target = tmp_path / "knowledge.db"
+    deps = BuildDependencies(
+        tokenizer=Tokenizer(),
+        embedder=lambda _texts: (_ for _ in ()).throw(RuntimeError("embedding failed")),
+        embedding_dim=16,
+    )
+
+    code = main(
+        ["--db", str(target), "--from-enabled-connectors", "--replace-derived", "--yes"],
+        dependencies=deps,
+        connector_loader=lambda: [make_note("a", "Alpha", "body")],
+    )
+
+    assert code == 2
+    assert not target.exists()
+
+
+def test_cli_no_relation_completion_downgrades_the_blocker(tmp_path: Path) -> None:
+    target = tmp_path / "knowledge.db"
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {"a": Extraction(mentions=[], fact_candidates=[], schema_id="s1")}
+
+    deps = BuildDependencies(
+        tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+    )
+    report_holder: list = []
+
+    class SpyCoordinator(BuildCoordinator):
+        def build(self, *args, **kwargs):
+            report = super().build(*args, **kwargs)
+            report_holder.append(report)
+            return report
+
+    import taurine_core.indexer.build as build_module
+
+    original = build_module.BuildCoordinator
+    build_module.BuildCoordinator = SpyCoordinator  # type: ignore[misc]
+    try:
+        main(
+            [
+                "--db",
+                str(target),
+                "--from-enabled-connectors",
+                "--replace-derived",
+                "--yes",
+                "--no-relation-completion",
+            ],
+            dependencies=deps,
+            connector_loader=lambda: [make_note("a", "Alpha", "body")],
+        )
+    finally:
+        build_module.BuildCoordinator = original  # type: ignore[misc]
+
+    assert report_holder
+    assert "relation_completion_unavailable" not in report_holder[0].release_blockers
 
 
 def test_replace_derived_flag_is_required(tmp_path: Path) -> None:
@@ -425,3 +513,597 @@ def test_build_preserves_extracted_observed_and_valid_time(tmp_path: Path) -> No
         )
     finally:
         store.close()
+
+
+# ── §0.2 salience + extraction gating ─────────────────────────────────────
+
+
+def _named_extractor(surfaces_by_note):
+    def extractor(notes, *, tokenizer):
+        del tokenizer
+        results = {}
+        for note in notes:
+            mentions = []
+            for surface in surfaces_by_note.get(note.note_id, ()):
+                start = note.text.find(surface)
+                if start < 0:
+                    continue
+                mentions.append(
+                    ExtractedMention(
+                        surface=surface,
+                        etype="person",
+                        confidence=0.95,
+                        char_start=start,
+                        char_end=start + len(surface),
+                        extractor="fake",
+                        schema_id="s1",
+                    )
+                )
+            results[note.note_id] = Extraction(
+                mentions=mentions, fact_candidates=[], schema_id="s1"
+            )
+        return results
+
+    return extractor
+
+
+def test_low_salience_notes_skip_extraction_but_stay_searchable(tmp_path: Path) -> None:
+    good = make_note("good", "Plan", "Maya owns the Zephyr launch checklist.")
+    junk = make_note("junk", "Filler", "yeah " * 12)
+    seen_by_extractor: list[list[str]] = []
+
+    def extractor(notes, *, tokenizer):
+        del tokenizer
+        seen_by_extractor.append([note.note_id for note in notes])
+        return {
+            note.note_id: Extraction(
+                mentions=[
+                    ExtractedMention(
+                        surface="Maya",
+                        etype="person",
+                        confidence=0.95,
+                        char_start=0,
+                        char_end=4,
+                        extractor="fake",
+                        schema_id="s1",
+                    )
+                ],
+                fact_candidates=[],
+                schema_id="s1",
+            )
+            for note in notes
+        }
+
+    target = tmp_path / "knowledge.db"
+    report = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+        )
+    ).build([good, junk], target, replace_derived=True)
+
+    assert seen_by_extractor == [["good"]]  # GLiNER never sees the junk note
+    assert report.salience_gated_count == 1
+    assert report.salience_gated_by_source == {"apple_notes": 1}
+    assert report.salience_stats is not None and report.salience_stats["count"] == 2.0
+    # gating is never a failure and never degrades health by itself
+    assert report.failed_notes == ()
+    assert "junk" not in dict(report.failed_notes)
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        notes = {row.note_id: row for row in store.source_notes()}
+        assert notes["junk"].extraction_status == "skipped_low_salience"
+        assert notes["good"].extraction_status == "complete"
+        assert notes["junk"].salience < notes["good"].salience
+        # passages, FTS, and embeddings are ALWAYS built for gated notes
+        assert store.counts()["passages"] == 2
+        assert store.counts()["passage_embeddings"] == 2
+        assert store.search_passages_bm25("yeah", 5) != ()
+        # but no entity/fact participation
+        assert all(
+            mention_row[0] != "junk"
+            for mention_row in store._conn.execute(
+                "SELECT note_id FROM entity_mentions"
+            )
+        )
+    finally:
+        store.close()
+
+
+def test_connector_ingest_salience_reaches_the_note_row_and_the_gate(
+    tmp_path: Path,
+) -> None:
+    """§0.2 plumbing (M4): a low connector salience gates a note whose content
+    alone would extract, and both factors stay inspectable on the row."""
+    text = (
+        "Follow-up on the vendor contract: Maya wants the revised terms "
+        "reviewed by legal before the Thursday sync so we can countersign."
+    )
+    normal = make_note("kept", "Contract", text)
+    demoted = make_note("demoted", "Contract copy", text + " Extra.").model_copy(
+        update={"ingest_salience": 0.1}
+    )
+
+    target = tmp_path / "knowledge.db"
+    report = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(),
+            embedder=embedder,
+            embedding_dim=16,
+            extractor=_named_extractor({"kept": ("Maya",), "demoted": ("Maya",)}),
+        )
+    ).build([normal, demoted], target, replace_derived=True)
+
+    assert report.salience_gated_count == 1
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        notes = {row.note_id: row for row in store.source_notes()}
+        assert notes["demoted"].ingest_salience == pytest.approx(0.1)
+        assert notes["demoted"].extraction_status == "skipped_low_salience"
+        assert notes["kept"].extraction_status == "complete"
+    finally:
+        store.close()
+
+
+def test_value_scores_multiply_in_salience(tmp_path: Path) -> None:
+    text = (
+        "Planning notes for the quarterly review: gather the metrics deck, "
+        "confirm attendees, and align on the launch narrative beforehand."
+    )
+    high = make_note("high", "Review", text, modified=1.0)
+    low = make_note("low", "Review B", text + " More.", modified=1.0).model_copy(
+        update={"ingest_salience": 0.5}
+    )
+
+    target = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+    ).build([high, low], target, replace_derived=True)
+
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        notes = {row.note_id: row for row in store.source_notes()}
+        assert notes["low"].value_score < notes["high"].value_score
+        assert notes["low"].value_score == pytest.approx(
+            notes["high"].value_score * notes["low"].salience / notes["high"].salience,
+            rel=0.05,
+        )
+    finally:
+        store.close()
+
+
+# ── M13 (build half) — hub provenance ─────────────────────────────────────
+
+
+def test_hub_exclusions_report_real_traversal_reasons_and_persist(
+    tmp_path: Path,
+) -> None:
+    note = make_note(
+        "n1", "Plan", "Maya moved the deadline to tomorrow for the launch review."
+    )
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {
+            "n1": Extraction(
+                mentions=[
+                    ExtractedMention(surface="Maya", etype="person", confidence=0.95, char_start=0, char_end=4, extractor="fake", schema_id="s1"),
+                    ExtractedMention(surface="tomorrow", etype="date_or_deadline", confidence=0.9, char_start=26, char_end=34, extractor="fake", schema_id="s1"),
+                ],
+                fact_candidates=[],
+                schema_id="s1",
+            )
+        }
+
+    target = tmp_path / "knowledge.db"
+    report = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+        )
+    ).build([note], target, replace_derived=True)
+
+    reasons = dict(report.hub_exclusions)
+    assert "date_default_off" in reasons.values()
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        rows = {
+            row["canonical"]: (bool(row["traversal_eligible"]), str(row["traversal_reason"]))
+            for row in store._conn.execute(
+                "SELECT canonical, traversal_eligible, traversal_reason FROM entities"
+            )
+        }
+        assert rows["tomorrow"] == (False, "date_default_off")
+        assert rows["Maya"] == (True, "eligible")
+        context = store.entity_contexts(
+            [entity_id for entity_id, reason in report.hub_exclusions]
+        )[0]
+        assert context.traversal_reason == "date_default_off"
+    finally:
+        store.close()
+
+
+def test_owner_aliases_gate_the_owner_entity_as_a_hub(tmp_path: Path) -> None:
+    """L18 (build half): aliases passed into the build reach the resolver."""
+    notes = [
+        make_note(f"n{index}", f"Note {index}", f"Neil reviewed item {index} today.")
+        for index in range(4)
+    ]
+
+    def extractor(records, *, tokenizer):
+        del tokenizer
+        return {
+            note.note_id: Extraction(
+                mentions=[
+                    ExtractedMention(surface="Neil", etype="person", confidence=0.95, char_start=0, char_end=4, extractor="fake", schema_id="s1")
+                ],
+                fact_candidates=[],
+                schema_id="s1",
+            )
+            for note in records
+        }
+
+    target = tmp_path / "knowledge.db"
+    report = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+        )
+    ).build(notes, target, replace_derived=True, owner_aliases=("Neil",))
+
+    assert dict(report.hub_exclusions)
+    assert set(dict(report.hub_exclusions).values()) == {"owner_alias_hub"}
+
+
+# ── H2 degeneracy + L24 invariants ────────────────────────────────────────
+
+
+def test_degenerate_contains_weights_marks_health_degraded() -> None:
+    from taurine_core.indexer.build import _degenerate_contains_weights
+
+    flat = [0.7] * 10
+    assert _degenerate_contains_weights(flat) is True
+    varied = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    assert _degenerate_contains_weights(varied) is False
+    # tiny graphs are exempt: coincidental equality is expected
+    assert _degenerate_contains_weights([0.5, 0.5, 0.5]) is False
+
+
+def test_contains_weight_stats_summarize_the_distribution(tmp_path: Path) -> None:
+    note = make_note("n1", "Launch", "Maya owns Launch.")
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {
+            "n1": Extraction(
+                mentions=[
+                    ExtractedMention(surface="Maya", etype="person", confidence=0.95, char_start=0, char_end=4, extractor="fake", schema_id="s1"),
+                    ExtractedMention(surface="Launch", etype="project", confidence=0.9, char_start=10, char_end=16, extractor="fake", schema_id="s1"),
+                ],
+                fact_candidates=[],
+                schema_id="s1",
+            )
+        }
+
+    report = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+        )
+    ).build([note], tmp_path / "knowledge.db", replace_derived=True)
+
+    stats = report.contains_weight_stats
+    assert stats is not None
+    assert stats["count"] == 2.0
+    assert 0.0 < stats["min"] <= stats["median"] <= stats["max"] < 1.0
+    assert report.health in {"healthy", "degraded"}
+    assert "degenerate_contains_weights" not in report.degraded_reasons
+
+
+def test_column_stochastic_check_rejects_a_corrupt_matrix() -> None:
+    from scipy.sparse import csr_matrix as _csr
+
+    from taurine_core.indexer.build import _assert_column_stochastic
+
+    class FakeGraph:
+        matrix = _csr(np.asarray([[0.5, 0.0], [0.4, 0.0]]))  # column 0 sums to 0.9
+        dangling_rows = (1,)
+
+    with pytest.raises(BuildError, match="non-stochastic"):
+        _assert_column_stochastic(FakeGraph())
+
+
+def test_stored_count_check_rejects_divergence() -> None:
+    from taurine_core.indexer.build import _assert_stored_counts
+
+    with pytest.raises(BuildError, match="diverge"):
+        _assert_stored_counts({"notes": 2}, {"notes": 3})
+    _assert_stored_counts({"notes": 2, "facts": 0}, {"notes": 2, "facts": 0})
+
+
+def test_graph_hash_round_trips_through_the_store(tmp_path: Path) -> None:
+    """L24: stored rows reproduce the recorded graph hash exactly."""
+    note = make_note("n1", "Launch", "Maya owns Launch.")
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {
+            "n1": Extraction(
+                mentions=[
+                    ExtractedMention(surface="Maya", etype="person", confidence=0.95, char_start=0, char_end=4, extractor="fake", schema_id="s1"),
+                    ExtractedMention(surface="Launch", etype="project", confidence=0.9, char_start=10, char_end=16, extractor="fake", schema_id="s1"),
+                ],
+                fact_candidates=[
+                    ExtractedRelation(head="Maya", predicate="owns_or_has", tail="Launch", confidence=0.9, subject_start=0, subject_end=4, object_start=10, object_end=16, assertion_start=0, assertion_end=17, extraction_method="fake", schema_id="s1", status="active")
+                ],
+                schema_id="s1",
+            )
+        }
+
+    target = tmp_path / "knowledge.db"
+    report = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+        )
+    ).build([note], target, replace_derived=True)
+
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        assert store.recompute_graph_hash(report.build_id) == report.graph_hash
+        assert store.verify_graph_hash(report.build_id) is True
+    finally:
+        store.close()
+
+
+# ── M14 — same-source near-duplicate guard ────────────────────────────────
+
+
+def test_note_ranks_exclude_same_source_near_duplicate_edges() -> None:
+    from taurine_core.indexer.build import _compute_note_ranks
+    from taurine_core.indexer.projection import ProjectionEdge
+
+    notes = [
+        make_note("a", "A", "alpha body"),
+        make_note("b", "B", "alpha body copy"),
+        make_note("c", "C", "unrelated"),
+    ]
+
+    def edge(src: str, dst: str, semantic: float) -> ProjectionEdge:
+        return ProjectionEdge(
+            src_note_id=src,
+            dst_note_id=dst,
+            edge_type="semantic",
+            weight=semantic,
+            shared=(),
+            fact_ids=(),
+            mechanisms={"semantic": semantic},
+        )
+
+    duplicate = edge("a", "b", 0.97)  # same source, above DUP_EDGE_SIM
+    normal = edge("a", "c", 0.5)  # same source, below the near-duplicate floor
+
+    cross_source_notes = [
+        notes[0],
+        notes[1].model_copy(update={"source": "obsidian"}),
+        notes[2],
+    ]
+
+    _, _, flagged = _compute_note_ranks(notes, [duplicate, normal], now=100.0)
+    assert flagged == (("a", "b"),)
+
+    _, _, cross_flagged = _compute_note_ranks(
+        cross_source_notes, [duplicate, normal], now=100.0
+    )
+    assert cross_flagged == ()  # different sources are never duplicate-guarded
+
+    quality_with_dup, _, _ = _compute_note_ranks(notes, [duplicate], now=100.0)
+    quality_without, _, _ = _compute_note_ranks(notes, [], now=100.0)
+    assert quality_with_dup == quality_without  # the edge left the matrix
+
+
+def test_build_report_flags_near_duplicate_pairs(tmp_path: Path) -> None:
+    shared = (
+        "Weekly planning notes for the checkout redesign project covering "
+        "the payment vendor migration and the rollout schedule for Thursday."
+    )
+    # identical title+body → identical passage embeddings under the fake
+    # hash embedder → a semantic mechanism of 1.0 between the two notes
+    first = make_note("dup1", "Plan", shared)
+    second = make_note("dup2", "Plan", shared)
+
+    report = BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+    ).build([first, second], tmp_path / "knowledge.db", replace_derived=True)
+
+    assert report.near_duplicate_note_pairs == (("dup1", "dup2"),)
+
+
+# ── L25 — startup temp sweep ──────────────────────────────────────────────
+
+
+def test_sweep_removes_only_stale_orphaned_build_files(tmp_path: Path) -> None:
+    import os as _os
+
+    from taurine_core.indexer.build import sweep_stale_build_files
+
+    target = tmp_path / "taurine-knowledge.db"
+    target.write_bytes(b"active")
+    stale = tmp_path / "taurine-knowledge.build-old.db"
+    stale.write_bytes(b"orphan")
+    fresh = tmp_path / "taurine-knowledge.build-new.db"
+    fresh.write_bytes(b"in-progress")
+    failed = tmp_path / "taurine-knowledge.build-x.db.failed"
+    failed.write_bytes(b"post-mortem")
+    old = 1_000_000.0
+    _os.utime(stale, (old, old))
+
+    removed = sweep_stale_build_files(target, now=old + 100_000.0)
+
+    assert removed == (stale,)
+    assert not stale.exists()
+    assert target.exists() and fresh.exists() and failed.exists()
+
+
+# ── L26 — real model manifest fingerprints ────────────────────────────────
+
+
+def test_model_fingerprints_ride_config_manifest_not_model_manifest(
+    tmp_path: Path,
+) -> None:
+    report = BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+    ).build([], tmp_path / "knowledge.db", replace_derived=True)
+
+    fingerprints = json.loads(report.config_manifest["model_fingerprints"])
+    assert set(fingerprints) == {"embedding", "gliner"}
+    # the model_manifest keeps ONLY the artifact identity strings the runtime
+    # compares for equality — fingerprints must never leak into it
+    artifact = load_calibration(
+        Path(__file__).parents[1] / "evals" / "graph_retrieval" / "calibration-v1.json"
+    )
+    assert report.model_manifest == artifact.model_manifest
+
+
+def test_model_fingerprint_tracks_local_artifact_changes(tmp_path: Path, monkeypatch) -> None:
+    import os as _os
+
+    import taurine_core.indexer.build as build_module
+
+    model_dir = tmp_path / "some-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
+    monkeypatch.setattr(build_module, "local_model_path", lambda repo_id: str(model_dir))
+
+    first = build_module._model_fingerprint("org/some-model")
+    assert first.startswith("sha256:")
+    assert first == build_module._model_fingerprint("org/some-model")
+
+    (model_dir / "config.json").write_text('{"changed": true}')
+    _os.utime(model_dir / "config.json", (2_000_000_000, 2_000_000_000))
+    assert build_module._model_fingerprint("org/some-model") != first
+
+    monkeypatch.setattr(build_module, "local_model_path", lambda repo_id: None)
+    assert build_module._model_fingerprint("org/none") == "unavailable"
+
+
+# ── L28 — sync resilience and single-read orchestration ───────────────────
+
+
+class _MemoryState:
+    def __init__(self) -> None:
+        self.states: dict[str, dict] = {}
+
+    def connector_state(self, connector_id: str) -> dict:
+        return dict(self.states.get(connector_id, {"enabled": True}))
+
+    def set_connector_state(self, connector_id: str, state: dict) -> None:
+        self.states[connector_id] = dict(state)
+
+    def replace_source_records(self, connector_id, records):
+        return len(records), 0, 0
+
+
+class _StubConnector:
+    kind = "local"
+
+    def __init__(self, connector_id: str, records, *, up: bool = True) -> None:
+        self.connector_id = connector_id
+        self.label = connector_id.title()
+        self.records = list(records)
+        self.up = up
+        self.extract_calls = 0
+        self.ingest_salience_scores = {row.note_id: 0.6 for row in self.records}
+
+    def available(self):
+        return (True, "") if self.up else (False, "token expired")
+
+    def default_config(self):
+        return {}
+
+    def extract(self, config):
+        self.extract_calls += 1
+        return list(self.records)
+
+
+def test_extract_all_enabled_skips_unavailable_connectors_instead_of_aborting() -> None:
+    from taurine_core.connectors.registry import ConnectorRegistry
+
+    good = _StubConnector("good", [make_note("g1", "G", "body")])
+    down = _StubConnector("down", [make_note("d1", "D", "body")], up=False)
+    registry = ConnectorRegistry([good, down])
+
+    extraction = registry.extract_all_enabled(_MemoryState())
+
+    assert [row.note_id for row in extraction.records] == ["g1"]
+    assert extraction.unavailable == ("down",)
+    # §0.2 plumbing: connector salience is stamped onto the records
+    assert extraction.records[0].ingest_salience == pytest.approx(0.6)
+
+
+def test_sync_all_enabled_collecting_reads_each_source_exactly_once() -> None:
+    from taurine_core.connectors.registry import ConnectorRegistry
+
+    good = _StubConnector("good", [make_note("g1", "G", "body")])
+    down = _StubConnector("down", [], up=False)
+    registry = ConnectorRegistry([good, down])
+
+    extraction = registry.sync_all_enabled_collecting(_MemoryState(), None)
+
+    assert good.extract_calls == 1
+    assert [row.note_id for row in extraction.records] == ["g1"]
+    assert extraction.records[0].ingest_salience == pytest.approx(0.6)
+    assert extraction.unavailable == ("down",)
+    assert [report.connector_id for report in extraction.reports] == ["good", "down"]
+    assert extraction.reports[1].error == "token expired"
+
+
+def test_carry_forward_records_reads_a_source_from_the_active_db(tmp_path: Path) -> None:
+    from taurine_core.indexer.build import carry_forward_records
+
+    kept = make_note("gmail:t1", "Thread", "Maya confirmed the Thursday review.")
+    kept = kept.model_copy(update={"source": "gmail", "ingest_salience": 0.8})
+    other = make_note("a1", "Alpha", "body")
+    target = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+    ).build([kept, other], target, replace_derived=True)
+
+    carried = carry_forward_records(target, ["gmail"])
+
+    assert [row.note_id for row in carried] == ["gmail:t1"]
+    assert carried[0].source == "gmail"
+    assert carried[0].text == kept.text
+    assert carried[0].ingest_salience == pytest.approx(0.8)
+    assert carry_forward_records(target, []) == ()
+    assert carry_forward_records(tmp_path / "missing.db", ["gmail"]) == ()
+
+
+def test_degraded_reasons_mark_build_health_degraded(tmp_path: Path) -> None:
+    report = BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+    ).build(
+        [],
+        tmp_path / "knowledge.db",
+        replace_derived=True,
+        degraded_reasons=("connector_unavailable:gmail",),
+    )
+
+    assert report.health == "degraded"
+    assert "connector_unavailable:gmail" in report.degraded_reasons
+
+
+def test_profile_owner_aliases_parse_the_user_card_heading() -> None:
+    from taurine_core.profile_context import owner_aliases
+
+    class FakeIndex:
+        def __init__(self, card: str | None) -> None:
+            self._card = card
+
+        def user_card(self) -> str | None:
+            return self._card
+
+    card = "# Neil Pathangay\n\nNeil is a software engineer working on Taurine."
+    aliases = owner_aliases(FakeIndex(card))
+    assert "neil pathangay" in aliases
+    assert "neil" in aliases
+    assert "pathangay" in aliases
+
+    # generic headings never become owner aliases
+    assert owner_aliases(FakeIndex("# User Profile\n\nSome background.")) == ()
+    assert owner_aliases(FakeIndex(None)) == ()

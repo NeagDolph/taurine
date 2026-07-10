@@ -48,11 +48,14 @@ import {
 } from './render'
 import {
   applyPinnedPositions,
+  clampPanelWidth,
   loadColorMode,
   loadMinDegree,
+  loadPanelWidth,
   loadPinnedPositions,
   saveColorMode,
   saveMinDegree,
+  savePanelWidth,
   savePinnedPositions,
   type ColorMode,
   type PinnedPositions
@@ -181,6 +184,8 @@ export function MapView({
   const [pins, setPins] = useState<PinnedPositions>(() => loadPinnedPositions())
   const [colorMode, setColorMode] = useState<ColorMode>(() => loadColorMode())
   const [minDegree, setMinDegree] = useState<number>(() => loadMinDegree())
+  const [panelWidth, setPanelWidth] = useState<number>(() => loadPanelWidth())
+  const panelResizingRef = useRef(false)
   const [timeRange, setTimeRange] = useState<TimeRange | null>(null)
 
   // mirrors for async callbacks (ego fetch fallback, pin rehydration)
@@ -612,6 +617,40 @@ export function MapView({
   useEffect(() => {
     saveMinDegree(minDegree)
   }, [minDegree])
+
+  useEffect(() => {
+    savePanelWidth(panelWidth)
+  }, [panelWidth])
+
+  // ── side-panel resize ──────────────────────────────────────────────────
+
+  const handlePanelResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    panelResizingRef.current = true
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }, [])
+
+  const handlePanelResizeMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!panelResizingRef.current) {
+      return
+    }
+    const stage = containerRef.current?.getBoundingClientRect()
+    if (!stage) {
+      return
+    }
+    // panel is anchored to the stage's right edge; cap at 62% of the stage
+    // to match the panel's CSS max-width backstop
+    const max = Math.round(stage.width * 0.62)
+    setPanelWidth(clampPanelWidth(stage.right - event.clientX, max))
+  }, [])
+
+  const handlePanelResizeEnd = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!panelResizingRef.current) {
+      return
+    }
+    panelResizingRef.current = false
+    event.currentTarget.releasePointerCapture(event.pointerId)
+  }, [])
 
   const togglePin = useCallback(
     (noteId: string) => {
@@ -1507,7 +1546,11 @@ export function MapView({
         </div>
       ) : null}
 
-      <div className={`map-stage${selectedNodeId ? ' has-panel' : ''}`} ref={containerRef}>
+      <div
+        className={`map-stage${selectedNodeId ? ' has-panel' : ''}`}
+        ref={containerRef}
+        style={{ '--map-panel-width': `${panelWidth}px` } as CSSProperties}
+      >
         <ForceGraph2D<MapNode, MapLink>
           ref={graphRef}
           autoPauseRedraw={!visible}
@@ -1615,6 +1658,20 @@ export function MapView({
             onAskAbout={onAskAbout}
             onTogglePin={togglePin}
             onHideNode={hideNode}
+          />
+        ) : null}
+
+        {selectedNodeId ? (
+          <div
+            className="map-panel-resizer"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize side panel"
+            title="Drag to resize"
+            onPointerDown={handlePanelResizeStart}
+            onPointerMove={handlePanelResizeMove}
+            onPointerUp={handlePanelResizeEnd}
+            onPointerCancel={handlePanelResizeEnd}
           />
         ) : null}
 

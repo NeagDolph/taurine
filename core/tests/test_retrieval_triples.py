@@ -116,7 +116,7 @@ def _snapshot(tmp_path: Path) -> IndexSnapshot:
     return IndexSnapshot(
         build_id="build-1",
         database_path=tmp_path / "knowledge.db",
-        calibration_hash="sha256:initial-conservative-2026-07-09",
+        calibration_hash="sha256:test-calibration",
         passage_ids=(),
         passage_matrix=np.empty((0, 2), dtype=np.float32),
         fact_ids=("f1", "f2", "f3"),
@@ -281,9 +281,15 @@ def test_recognizer_groups_duplicate_logical_facts_and_seeds_endpoints_once(
         (None, "active", None, None, True),
         (None, "superseded", None, 150.0, False),
         (TemporalIntent("historical"), "superseded", None, 150.0, True),
+        # M2: historical intent also admits active facts whose validity
+        # covers the asked-about past (fixes the active-fact blindness).
+        (TemporalIntent("historical"), "active", 50.0, None, True),
         (TemporalIntent("current"), "active", 250.0, None, False),
         (TemporalIntent("at_time", 120.0), "superseded", 50.0, 150.0, True),
-        (TemporalIntent("any"), "conflicted", None, None, True),
+        # M2/§8.3: conflicted never traverses and is presentable only under
+        # historical intent (or both-endpoints seeding, handled engine-side).
+        (TemporalIntent("any"), "conflicted", None, None, False),
+        (TemporalIntent("historical"), "conflicted", None, None, True),
     ],
 )
 def test_recognizer_applies_strict_temporal_and_status_compatibility(
@@ -559,3 +565,68 @@ def test_no_fact_embeddings_is_an_explicit_empty_fallback(tmp_path: Path, artifa
     assert result.triples == ()
     assert result.entity_seed_weights == {}
     assert result.reason == "no_fact_candidates"
+
+
+@pytest.mark.parametrize(
+    ("status", "kind", "at", "for_traversal", "admitted", "weight"),
+    [
+        ("active", "any", None, True, True, 1.0),
+        ("superseded", "any", None, True, True, 0.5),
+        ("historical", "any", None, True, True, 0.5),
+        ("conflicted", "any", None, True, False, 0.0),
+        ("conflicted", "historical", None, True, False, 0.0),
+        ("conflicted", "historical", None, False, True, 0.5),
+        ("active", "historical", None, True, True, 0.5),
+        ("superseded", "historical", None, True, True, 1.0),
+        ("active", "current", None, True, True, 1.0),
+        ("superseded", "current", None, True, False, 0.0),
+        ("candidate", "any", None, False, False, 0.0),
+    ],
+)
+def test_fact_temporal_admission_shared_predicate(
+    status: str,
+    kind: str,
+    at: float | None,
+    for_traversal: bool,
+    admitted: bool,
+    weight: float,
+) -> None:
+    from taurine_core.retrieval.triples import fact_temporal_admission
+
+    result_admitted, result_weight, reason = fact_temporal_admission(
+        status=status,
+        valid_from=None,
+        valid_to=None,
+        kind=kind,
+        at=at,
+        now=100.0,
+        for_traversal=for_traversal,
+    )
+
+    assert result_admitted is admitted
+    if admitted:
+        assert result_weight == pytest.approx(weight)
+        assert reason is None
+    else:
+        assert reason
+
+
+def test_fact_temporal_admission_at_time_window() -> None:
+    from taurine_core.retrieval.triples import fact_temporal_admission
+
+    inside, _weight, _reason = fact_temporal_admission(
+        status="superseded", valid_from=50.0, valid_to=150.0,
+        kind="at_time", at=120.0, now=200.0, for_traversal=True,
+    )
+    before, _w2, before_reason = fact_temporal_admission(
+        status="superseded", valid_from=50.0, valid_to=150.0,
+        kind="at_time", at=20.0, now=200.0, for_traversal=True,
+    )
+    after, _w3, after_reason = fact_temporal_admission(
+        status="superseded", valid_from=50.0, valid_to=150.0,
+        kind="at_time", at=150.0, now=200.0, for_traversal=True,
+    )
+
+    assert inside
+    assert not before and before_reason == "not_yet_valid"
+    assert not after and after_reason == "no_longer_valid"

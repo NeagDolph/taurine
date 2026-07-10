@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
+from threading import RLock
 from types import MappingProxyType
 from typing import Literal, Mapping
 
@@ -33,6 +34,9 @@ class EvidenceRegistry:
     """Assign each source identity once; state only advances retrieved -> read -> cited."""
 
     def __init__(self) -> None:
+        # Engines run in worker threads while validators/ledgers mutate on the
+        # event loop; one reentrant lock guards every check-then-act sequence.
+        self._lock = RLock()
         self._by_identity: dict[tuple[EvidenceKind, str], str] = {}
         self._records: dict[str, EvidenceRecord] = {}
         self._next = {prefix: 1 for prefix in _PREFIX.values()}
@@ -47,30 +51,35 @@ class EvidenceRegistry:
             raise ValueError(f"unknown evidence kind: {kind}")
         identity = (kind, str(source_id))
         frozen_payload = _freeze_payload(payload)
-        existing_ref = self._by_identity.get(identity)
-        if existing_ref is not None:
-            if self._records[existing_ref].payload != frozen_payload:
-                raise ValueError("evidence identity was registered with a different payload")
-            return existing_ref
-        prefix = _PREFIX[kind]
-        ref = f"{prefix}{self._next[prefix]}"
-        self._next[prefix] += 1
-        record = EvidenceRecord(
-            ref=ref,
-            kind=kind,
-            source_id=str(source_id),
-            payload=frozen_payload,
-            states=frozenset({"retrieved"}),
-        )
-        self._records[ref] = record
-        self._by_identity[identity] = ref
-        return ref
+        with self._lock:
+            existing_ref = self._by_identity.get(identity)
+            if existing_ref is not None:
+                if self._records[existing_ref].payload != frozen_payload:
+                    raise ValueError(
+                        "evidence identity was registered with a different payload"
+                    )
+                return existing_ref
+            prefix = _PREFIX[kind]
+            ref = f"{prefix}{self._next[prefix]}"
+            self._next[prefix] += 1
+            record = EvidenceRecord(
+                ref=ref,
+                kind=kind,
+                source_id=str(source_id),
+                payload=frozen_payload,
+                states=frozenset({"retrieved"}),
+            )
+            self._records[ref] = record
+            self._by_identity[identity] = ref
+            return ref
 
     def resolve(self, ref: str) -> EvidenceRecord | None:
-        return self._records.get(ref)
+        with self._lock:
+            return self._records.get(ref)
 
     def ref_for(self, kind: EvidenceKind, source_id: str) -> str | None:
-        return self._by_identity.get((kind, str(source_id)))
+        with self._lock:
+            return self._by_identity.get((kind, str(source_id)))
 
     def mark_read(self, ref: str) -> None:
         self._mark(ref, "read")
@@ -88,46 +97,57 @@ class EvidenceRegistry:
     ) -> None:
         """Merge stable metadata while allowing explicit append-only provenance lists."""
 
-        record = self._records.get(ref)
-        if record is None:
-            raise KeyError(f"unknown evidence reference: {ref}")
-        current = _thaw_payload(record.payload)
-        incoming = _thaw_payload(_freeze_payload(payload))
-        for key, value in incoming.items():
-            if key in append_list_fields:
-                existing = current.get(key, [])
-                if not isinstance(existing, list) or not isinstance(value, list):
-                    raise ValueError(f"append-only evidence field {key!r} must be a list")
-                current[key] = list(dict.fromkeys((*existing, *value)))
-            elif key in current and current[key] != value:
-                raise ValueError(f"evidence payload field {key!r} cannot be replaced")
-            else:
-                current[key] = value
-        self._records[ref] = replace(record, payload=_freeze_payload(current))
+        with self._lock:
+            record = self._records.get(ref)
+            if record is None:
+                raise KeyError(f"unknown evidence reference: {ref}")
+            current = _thaw_payload(record.payload)
+            incoming = _thaw_payload(_freeze_payload(payload))
+            for key, value in incoming.items():
+                if key in append_list_fields:
+                    existing = current.get(key, [])
+                    if not isinstance(existing, list) or not isinstance(value, list):
+                        raise ValueError(
+                            f"append-only evidence field {key!r} must be a list"
+                        )
+                    current[key] = list(dict.fromkeys((*existing, *value)))
+                elif key in current and current[key] != value:
+                    raise ValueError(f"evidence payload field {key!r} cannot be replaced")
+                else:
+                    current[key] = value
+            self._records[ref] = replace(record, payload=_freeze_payload(current))
 
     def refs(self, state: EvidenceState) -> tuple[str, ...]:
-        return tuple(
-            sorted(
-                (ref for ref, record in self._records.items() if state in record.states),
-                key=_ref_key,
+        with self._lock:
+            return tuple(
+                sorted(
+                    (
+                        ref
+                        for ref, record in self._records.items()
+                        if state in record.states
+                    ),
+                    key=_ref_key,
+                )
             )
-        )
 
     def snapshot(self) -> dict[str, object]:
-        return {
-            "version": 1,
-            "next": dict(sorted(self._next.items())),
-            "entries": [
-                {
-                    "ref": record.ref,
-                    "kind": record.kind,
-                    "source_id": record.source_id,
-                    "payload": _thaw_payload(record.payload),
-                    "states": sorted(record.states),
-                }
-                for record in sorted(self._records.values(), key=lambda row: _ref_key(row.ref))
-            ],
-        }
+        with self._lock:
+            return {
+                "version": 1,
+                "next": dict(sorted(self._next.items())),
+                "entries": [
+                    {
+                        "ref": record.ref,
+                        "kind": record.kind,
+                        "source_id": record.source_id,
+                        "payload": _thaw_payload(record.payload),
+                        "states": sorted(record.states),
+                    }
+                    for record in sorted(
+                        self._records.values(), key=lambda row: _ref_key(row.ref)
+                    )
+                ],
+            }
 
     @classmethod
     def from_snapshot(cls, snapshot: Mapping[str, object]) -> "EvidenceRegistry":
@@ -180,10 +200,11 @@ class EvidenceRegistry:
         return registry
 
     def _mark(self, ref: str, state: EvidenceState) -> None:
-        record = self._records.get(ref)
-        if record is None:
-            raise KeyError(f"unknown evidence reference: {ref}")
-        self._records[ref] = replace(record, states=record.states | {state})
+        with self._lock:
+            record = self._records.get(ref)
+            if record is None:
+                raise KeyError(f"unknown evidence reference: {ref}")
+            self._records[ref] = replace(record, states=record.states | {state})
 
 
 def _freeze_payload(payload: Mapping[str, object]) -> Mapping[str, object]:

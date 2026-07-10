@@ -256,3 +256,100 @@ def _passage() -> PassageDraft:
         text="Maya owns the launch checklist.",
         content_hash="passage-hash",
     )
+
+
+def test_note_salience_columns_and_gated_status_round_trip(tmp_path: Path) -> None:
+    store = KnowledgeStore(tmp_path / "knowledge.db")
+    try:
+        store.write_note(
+            _note(),
+            build_id="build-1",
+            extraction_status="skipped_low_salience",
+            ingest_salience=0.4,
+            salience=0.12,
+        )
+
+        row = store.source_notes()[0]
+        assert row.extraction_status == "skipped_low_salience"
+        assert row.ingest_salience == pytest.approx(0.4)
+        assert row.salience == pytest.approx(0.12)
+    finally:
+        store.close()
+
+
+def test_entity_traversal_reason_round_trips(tmp_path: Path) -> None:
+    store = KnowledgeStore(tmp_path / "knowledge.db")
+    try:
+        store.write_note(_note(), build_id="build-1", extraction_status="complete")
+        store.write_passages(
+            _note().note_id,
+            (_passage(),),
+            created=1.0,
+            modified=2.0,
+            build_id="build-1",
+        )
+        store.insert_entity(
+            entity_id="entity-date",
+            canonical="tomorrow",
+            normalized="tomorrow",
+            etype="date_or_deadline",
+            df=1,
+            traversal_eligible=False,
+            traversal_reason="date_default_off",
+            ambiguity_key="tomorrow",
+            build_id="build-1",
+        )
+        store.insert_mention(
+            mention_id="mention-1",
+            entity_id="entity-date",
+            passage_id="passage-1",
+            note_id=_note().note_id,
+            surface="tomorrow",
+            etype="date_or_deadline",
+            char_start=0,
+            char_end=8,
+            confidence=0.9,
+            extractor="fake",
+            schema_id="s1",
+            build_id="build-1",
+        )
+
+        context = store.entity_contexts(["entity-date"])[0]
+        assert context.traversal_eligible is False
+        assert context.traversal_reason == "date_default_off"
+    finally:
+        store.close()
+
+
+def test_verify_graph_hash_detects_missing_or_wrong_hash(tmp_path: Path) -> None:
+    store = KnowledgeStore(tmp_path / "knowledge.db")
+    try:
+        store.begin_build(
+            "build-1",
+            source_snapshot="sha256:sources",
+            model_manifest={},
+            config_manifest={},
+            calibration_hash="sha256:calibration",
+            started_at=1.0,
+        )
+        # incomplete build: no graph_hash recorded yet
+        assert store.verify_graph_hash("build-1") is False
+        store.complete_build(
+            "build-1",
+            completed_at=2.0,
+            health="healthy",
+            graph_hash="sha256:not-the-real-hash",
+            base_edge_count=0,
+            projection_count=0,
+        )
+        assert store.verify_graph_hash("build-1") is False
+
+        recomputed = store.recompute_graph_hash("build-1")
+        store._conn.execute(
+            "UPDATE index_builds SET graph_hash = ? WHERE build_id = 'build-1'",
+            (recomputed,),
+        )
+        store._conn.commit()
+        assert store.verify_graph_hash("build-1") is True
+    finally:
+        store.close()

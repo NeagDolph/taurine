@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from taurine_core.indexer.relation_completion import (
+    CompletionAlias,
     CompletionEntity,
     CompletionNote,
     CompletionPassage,
@@ -87,6 +88,179 @@ def test_completion_parser_accepts_registered_fact_and_quarantines_open_predicat
     assert len(result.proposals) == 1
     assert result.proposals[0].proposed_predicate == "reviewed_for"
     assert result.proposals[0].source_passage_id == "p1"
+
+
+def test_completion_accepts_any_grounded_mention_of_multi_mention_entity() -> None:
+    """H8: an entity mentioned at offsets 10 and 500 must ground at either."""
+    text = "well, ok. Maya" + " pad" * 120 + ". Maya runs Launch."
+    first = text.index("Maya")
+    second = text.rindex("Maya")
+    launch = text.rindex("Launch")
+    note = CompletionNote(
+        note_id="n1",
+        value_score=1.0,
+        observed_at=10.0,
+        entities=(
+            # deliberately listed with the grounded mention first: a last-wins
+            # entity map would keep only the ungrounded offset-10 mention
+            CompletionEntity("maya", "Maya", second, second + 4),
+            CompletionEntity("maya", "Maya", first, first + 4),
+            CompletionEntity("launch", "Launch", launch, launch + 6),
+        ),
+        passages=(CompletionPassage("p1", text, 0),),
+        active_relation_count=0,
+        schema_gap=False,
+    )
+    payload = {
+        "facts": [
+            {
+                "note_id": "n1",
+                "passage_id": "p1",
+                "subject_entity_id": "maya",
+                "predicate": "responsible_for",
+                "object_entity_id": "launch",
+                "assertion_start": second,
+                "assertion_end": len(text),
+                "confidence": 0.9,
+            }
+        ]
+    }
+
+    result = parse_completion_response(payload, (note,), build_id="build-1")
+
+    assert result.rejected == 0
+    assert len(result.facts) == 1
+    assert result.facts[0].subject_start == second
+    assert result.facts[0].object_start == launch
+
+
+def test_completion_picks_tightest_mention_pair_inside_wide_assertion() -> None:
+    text = "Maya intro" + " pad" * 60 + ". Maya runs Launch now."
+    first = text.index("Maya")
+    second = text.rindex("Maya")
+    launch = text.rindex("Launch")
+    note = CompletionNote(
+        note_id="n1",
+        value_score=1.0,
+        observed_at=10.0,
+        entities=(
+            CompletionEntity("maya", "Maya", first, first + 4),
+            CompletionEntity("maya", "Maya", second, second + 4),
+            CompletionEntity("launch", "Launch", launch, launch + 6),
+        ),
+        passages=(CompletionPassage("p1", text, 0),),
+        active_relation_count=0,
+        schema_gap=False,
+    )
+    payload = {
+        "facts": [
+            {
+                "note_id": "n1",
+                "passage_id": "p1",
+                "subject_entity_id": "maya",
+                "predicate": "responsible_for",
+                "object_entity_id": "launch",
+                "assertion_start": 0,
+                "assertion_end": len(text),
+                "confidence": 0.9,
+            }
+        ]
+    }
+
+    result = parse_completion_response(payload, (note,), build_id="build-1")
+
+    assert len(result.facts) == 1
+    assert result.facts[0].subject_start == second
+
+
+def test_completion_aliases_are_validated_verbatim() -> None:
+    text = "Maya (M. Chen) runs Launch."
+    note = CompletionNote(
+        note_id="n1",
+        value_score=1.0,
+        observed_at=10.0,
+        entities=(
+            CompletionEntity("maya", "Maya", 0, 4),
+            CompletionEntity("launch", "Launch", 20, 26),
+        ),
+        passages=(CompletionPassage("p1", text, 0),),
+        active_relation_count=0,
+        schema_gap=False,
+    )
+    payload = {
+        "facts": [],
+        "aliases": [
+            {"note_id": "n1", "entity_id": "maya", "alias": "M. Chen"},
+            {"note_id": "n1", "entity_id": "maya", "alias": "Maya C."},
+            {"note_id": "n1", "entity_id": "ghost", "alias": "Maya"},
+        ],
+    }
+
+    result = parse_completion_response(payload, (note,), build_id="build-1")
+
+    assert result.aliases == (
+        CompletionAlias(entity_id="maya", alias="M. Chen", origin="completion"),
+    )
+    assert result.rejected == 2
+
+
+def test_open_predicates_normalize_to_registered_before_quarantine() -> None:
+    """L21c: synonyms of registered predicates become normal facts."""
+    text = "Maya works for Acme and owns Launch."
+    note = CompletionNote(
+        note_id="n1",
+        value_score=1.0,
+        observed_at=10.0,
+        entities=(
+            CompletionEntity("maya", "Maya", 0, 4),
+            CompletionEntity("acme", "Acme", 15, 19),
+            CompletionEntity("launch", "Launch", 29, 35),
+        ),
+        passages=(CompletionPassage("p1", text, 0),),
+        active_relation_count=0,
+        schema_gap=False,
+    )
+    payload = {
+        "facts": [
+            {
+                "note_id": "n1",
+                "passage_id": "p1",
+                "subject_entity_id": "maya",
+                "predicate": "Works For",
+                "object_entity_id": "acme",
+                "assertion_start": 0,
+                "assertion_end": len(text),
+                "confidence": 0.9,
+            },
+            {
+                "note_id": "n1",
+                "passage_id": "p1",
+                "subject_entity_id": "maya",
+                "predicate": "owns",
+                "object_entity_id": "launch",
+                "assertion_start": 0,
+                "assertion_end": len(text),
+                "confidence": 0.85,
+            },
+            {
+                "note_id": "n1",
+                "passage_id": "p1",
+                "subject_entity_id": "maya",
+                "predicate": "mentored",
+                "predicate_description": "a person mentored another party",
+                "object_entity_id": "launch",
+                "assertion_start": 0,
+                "assertion_end": len(text),
+                "confidence": 0.8,
+            },
+        ]
+    }
+
+    result = parse_completion_response(payload, (note,), build_id="build-1")
+
+    assert sorted(fact.predicate for fact in result.facts) == ["owns_or_has", "works_at"]
+    assert [row.proposed_predicate for row in result.proposals] == ["mentored"]
+    assert result.rejected == 0
 
 
 def test_completion_parser_rejects_offsets_outside_source_passage() -> None:

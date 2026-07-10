@@ -128,3 +128,72 @@ def test_entity_resolver_output_flows_through_query_entity_head(
         )
         hits = list(result.accepted) + list(result.rejected)
         assert [hit.target_id for hit in hits] == [resolution[0].target_id]
+
+
+def test_tampered_calibration_degrades_to_conservative_floors_without_raising(
+    tmp_path, monkeypatch
+) -> None:
+    import json
+    from pathlib import Path
+
+    from taurine_core.retrieval.runtime import CALIBRATION_PATH
+
+    database = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=_embed, embedding_dim=16)
+    ).build([make_note("n1", "One", "first source passage")], database, replace_derived=True)
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_pair_reranker",
+        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
+    )
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_nli_scorer",
+        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
+    )
+
+    # Tamper a floor but keep the declared hash: the content check must catch
+    # it and the runtime must degrade instead of raising.
+    payload = json.loads(Path(CALIBRATION_PATH).read_text(encoding="utf-8"))
+    payload["modes"]["chat"]["evidence_floor"] = 0.01
+    payload["modes"]["chat"]["heads"]["dense"]["acceptance_floor"] = 0.01
+    tampered = tmp_path / "tampered-calibration.json"
+    tampered.write_text(json.dumps(payload), encoding="utf-8")
+
+    runtime = RetrievalRuntime(database, calibration_path=tampered)
+    try:
+        assert runtime.calibration_status == "calibration_mismatch"
+        # Conservative table: strictest (live) floors on every mode, not the
+        # tampered 0.01 values.
+        assert runtime.artifact.modes["chat"].evidence_floor >= 0.75
+        assert runtime.artifact.modes["chat"].heads["dense"].acceptance_floor >= 0.7
+        engine = runtime.make_engine("chat", EvidenceRegistry())
+        assert engine.calibration_status == "calibration_mismatch"
+        assert engine.fallback_on_abstain is True
+    finally:
+        runtime.close()
+
+
+def test_intact_calibration_is_verified_and_wires_fallback_modes(
+    tmp_path, monkeypatch
+) -> None:
+    database = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=_embed, embedding_dim=16)
+    ).build([make_note("n1", "One", "first source passage")], database, replace_derived=True)
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_pair_reranker",
+        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
+    )
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_nli_scorer",
+        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
+    )
+
+    runtime = RetrievalRuntime(database)
+    try:
+        assert runtime.calibration_status == "verified"
+        assert runtime.make_engine("live", EvidenceRegistry()).fallback_on_abstain is False
+        assert runtime.make_engine("chat", EvidenceRegistry()).fallback_on_abstain is True
+        assert runtime.make_engine("tool", EvidenceRegistry()).fallback_on_abstain is True
+    finally:
+        runtime.close()

@@ -75,3 +75,30 @@ def test_registry_restore_rejects_cited_without_read_state() -> None:
 
     with pytest.raises(ValueError, match="state hierarchy"):
         EvidenceRegistry.from_snapshot(snapshot)
+
+
+def test_registry_is_safe_under_concurrent_registration_and_marking() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    registry = EvidenceRegistry()
+
+    def work(worker: int) -> list[str]:
+        refs = []
+        for index in range(100):
+            ref = registry.register(
+                "passage", f"w{worker}-p{index}", {"passage_id": f"w{worker}-p{index}"}
+            )
+            registry.mark_read(ref)
+            registry.refs("read")
+            registry.snapshot()
+            refs.append(ref)
+        return refs
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(work, range(8)))
+
+    all_refs = [ref for refs in results for ref in refs]
+    assert len(all_refs) == len(set(all_refs)) == 800
+    assert len(registry.refs("read")) == 800
+    restored = EvidenceRegistry.from_snapshot(registry.snapshot())
+    assert restored.register("passage", "fresh", {}) == "E801"

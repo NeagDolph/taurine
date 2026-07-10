@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import logging
+
+import pytest
+
+from taurine_core import config
 from taurine_core.live.ledger import TranscriptLedger
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.schemas import Chunk
@@ -114,6 +119,40 @@ def test_summary_budget_checkpoints_only_the_oldest_fully_supplied_chunks() -> N
     assert snapshot.through_seq == 1
     ledger.accept_summary(snapshot)
     assert [row.seq for row in ledger.pending()] == [2, 3]
+
+
+def test_chunk_cap_drops_oldest_first_and_logs_loudly(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(config, "LIVE_LEDGER_MAX_CHUNKS", 3)
+    ledger = TranscriptLedger(EvidenceRegistry())
+
+    with caplog.at_level(logging.ERROR, logger="taurine.session"):
+        for index in range(1, 6):
+            ledger.append(_chunk(str(index), float(index)))
+
+    assert [row.seq for row in ledger.chunks] == [3, 4, 5]
+    assert "ledger cap" in caplog.text
+    # the window keeps working over the surviving chunks
+    window = ledger.query_window(now=6.0)
+    assert [row.seq for row in window.citeable] == [3, 4, 5]
+
+
+def test_chunk_cap_drop_of_already_summarized_chunks_is_quiet(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(config, "LIVE_LEDGER_MAX_CHUNKS", 3)
+    ledger = TranscriptLedger(EvidenceRegistry())
+    for index in range(1, 4):
+        ledger.append(_chunk(str(index), float(index)))
+    snapshot = ledger.begin_summary()
+    ledger.accept_summary(snapshot)
+
+    with caplog.at_level(logging.ERROR, logger="taurine.session"):
+        ledger.append(_chunk("4", 4.0))
+
+    assert [row.seq for row in ledger.chunks] == [2, 3, 4]
+    assert "ledger cap" not in caplog.text
 
 
 def _chunk(text: str, ts: float, *, channel: int = 0) -> Chunk:

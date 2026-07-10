@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+import pytest
 
 from taurine_core.evaluation.graph_retrieval import load_calibration
 from taurine_core.indexer.base_graph import BaseEdge, materialize_base_graph
@@ -58,6 +59,15 @@ class NoteRow:
     modified: float
 
 
+@dataclass(frozen=True)
+class EntityRow:
+    entity_id: str
+    canonical: str
+    etype: str
+    traversal_eligible: bool
+    build_id: str = "build-1"
+
+
 class FakeStore:
     def __init__(
         self,
@@ -65,11 +75,36 @@ class FakeStore:
         facts: Sequence[FactContext] = (),
         *,
         bm25: Sequence[BM25PassageHit] = (),
+        entities: Sequence[EntityRow] = (),
+        entity_passages: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         self._passages = {row.passage_id: row for row in passages}
         self._facts = tuple(facts)
         self._bm25 = tuple(bm25)
+        self._entities = {row.entity_id: row for row in entities}
+        self._entity_passages = dict(entity_passages or {})
         self.passage_reads: list[tuple[str, ...]] = []
+
+    def entity_contexts(
+        self, entity_ids: Sequence[str], *, build_id: str | None = None
+    ) -> tuple[EntityRow, ...]:
+        del build_id
+        return tuple(
+            self._entities[entity_id]
+            for entity_id in sorted(set(entity_ids))
+            if entity_id in self._entities
+        )
+
+    def passage_ids_for_entities(
+        self, entity_ids: Sequence[str], *, build_id: str | None = None
+    ) -> tuple[str, ...]:
+        del build_id
+        collected = {
+            passage_id
+            for entity_id in entity_ids
+            for passage_id in self._entity_passages.get(entity_id, ())
+        }
+        return tuple(sorted(collected))
 
     def search_passages_bm25(self, query: str, k: int) -> tuple[BM25PassageHit, ...]:
         del query
@@ -671,3 +706,752 @@ def test_knowledge_store_exposes_typed_passage_and_note_contexts(tmp_path: Path)
         assert store.passage_contexts(("missing",)) == ()
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# H-B2 — per-head failure isolation (§17.3)
+# ---------------------------------------------------------------------------
+
+
+class ExplodingBM25Store(FakeStore):
+    def search_passages_bm25(self, query: str, k: int):
+        raise RuntimeError("fts index corrupted")
+
+
+def test_failing_bm25_head_degrades_to_dense_only_and_names_the_dead_head(
+    tmp_path: Path,
+) -> None:
+    rows = _passages()
+    snapshot = _snapshot(tmp_path, rows)
+    calibrator, abstention = _calibrator("chat")
+    registry = EvidenceRegistry()
+    store = ExplodingBM25Store(rows, (_fact(),))
+    engine = SharedRetrievalEngine(
+        snapshot,
+        store,
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        registry=registry,
+        reranker=LocalPassageReranker(
+            FakeScorer((0.96, 0.91, 0.88, 0.86)), mode="chat", acceptance_floor=0.65
+        ),
+    )
+
+    pack = engine.retrieve(RetrievalQuery("Maya", "chat", now=10.0))
+
+    assert pack.decision.accepted
+    assert "bm25" in pack.trace.debug["unavailable_heads"]
+    assert "RuntimeError" in pack.trace.debug["unavailable_heads"]["bm25"]
+    assert any(row.passage_id == "p1" for row in pack.passages)
+
+
+def test_degraded_head_set_requires_strict_floor_for_acceptance(
+    tmp_path: Path,
+) -> None:
+    rows = _passages()
+    snapshot = _snapshot(tmp_path, rows)
+    calibrator, abstention = _calibrator("chat")
+    store = ExplodingBM25Store(rows)
+    # Dense cosine ≈ 0.625 calibrates to ≈ 0.65: above the normal 0.62 floor
+    # but below the degraded strict floor of 1.1 × 0.62 = 0.682.
+    engine = SharedRetrievalEngine(
+        snapshot,
+        store,
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array(
+            [0.625, -0.78, 0.0], dtype=np.float32
+        ),
+        registry=EvidenceRegistry(),
+        reranker=LocalPassageReranker(
+            FakeScorer((0.9,) * 4), mode="chat", acceptance_floor=0.65
+        ),
+    )
+
+    # No alias appears in the query, so only the dense head can qualify.
+    pack = engine.retrieve(RetrievalQuery("Who owns the launch?", "chat", now=10.0))
+
+    assert not pack.decision.accepted
+    assert pack.decision.reason == "no_head_cleared_degraded_strict_floor"
+
+
+def test_totally_failed_head_set_abstains_with_explicit_reason(tmp_path: Path) -> None:
+    class ExplodingAliasIndex(dict):
+        def items(self):
+            raise RuntimeError("alias index corrupted")
+
+    rows = _passages()
+    snapshot = _snapshot(tmp_path, rows)
+    object.__setattr__(snapshot, "alias_index", ExplodingAliasIndex())
+    calibrator, abstention = _calibrator("chat")
+    engine = SharedRetrievalEngine(
+        snapshot,
+        ExplodingBM25Store(rows),
+        calibrator,
+        abstention,
+        # Wrong dimensionality kills the dense head inside its own search.
+        query_embedder=lambda text: np.array([1.0, 0.0], dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=LocalPassageReranker(
+            FakeScorer((0.9,) * 4), mode="chat", acceptance_floor=0.65
+        ),
+    )
+
+    pack = engine.retrieve(RetrievalQuery("Maya", "chat", now=10.0))
+
+    assert not pack.decision.accepted
+    assert pack.decision.reason == "all_heads_unavailable"
+    assert set(pack.trace.debug["unavailable_heads"]) == {"dense", "bm25", "exact"}
+
+
+# ---------------------------------------------------------------------------
+# H6 — tiered rerank-cap ordering
+# ---------------------------------------------------------------------------
+
+
+def test_direct_dense_hits_are_never_evicted_from_the_rerank_cap_by_expansions() -> None:
+    from taurine_core.retrieval.evidence import _order_rerank_candidates
+    from taurine_core.retrieval.ppr import PPRResult
+    from taurine_core.retrieval.types import HeadHit
+
+    direct_ids = tuple(f"d{index:02d}" for index in range(40))
+    expansion_ids = tuple(f"x{index:02d}" for index in range(20))
+    passage_by_id = {
+        passage_id: PassageRow(
+            passage_id, f"n-{passage_id}", passage_id, "obsidian", "text", 0, 4, 1.0, 2.0
+        )
+        for passage_id in (*direct_ids, *expansion_ids)
+    }
+    accepted_hits = tuple(
+        HeadHit("passage", passage_id, 0.9, 0.9 - index * 0.001, index + 1, "dense", "ok")
+        for index, passage_id in enumerate(direct_ids)
+    )
+    ppr = PPRResult(
+        accepted=True,
+        reason="converged",
+        build_id="build-1",
+        ranks={passage_id: 0.9 for passage_id in expansion_ids},
+        teleport={},
+        passage_mass=1.0,
+        entity_mass=0.0,
+        iterations=1,
+        residual=0.0,
+        contributions={},
+    )
+    path_support = {passage_id: 0.95 for passage_id in expansion_ids}
+
+    candidates = _order_rerank_candidates(
+        set(passage_by_id),
+        passage_by_id,
+        accepted_hits,
+        {},
+        ppr,
+        {},
+        path_support,
+        {},
+        cap=30,
+    )
+
+    chosen = [row.passage_id for row in candidates]
+    assert len(chosen) == 30
+    assert all(passage_id.startswith("d") for passage_id in chosen)
+    assert chosen == sorted(chosen, key=lambda pid: direct_ids.index(pid))
+    assert all(
+        row.recall_score == pytest.approx(0.9 - direct_ids.index(row.passage_id) * 0.001)
+        for row in candidates
+    )
+
+
+def test_rerank_cap_orders_triple_support_before_expansions() -> None:
+    from taurine_core.retrieval.evidence import _order_rerank_candidates
+    from taurine_core.retrieval.ppr import PPRResult
+    from taurine_core.retrieval.types import HeadHit
+
+    passage_by_id = {
+        passage_id: PassageRow(
+            passage_id, f"n-{passage_id}", passage_id, "obsidian", "text", 0, 4, 1.0, 2.0
+        )
+        for passage_id in ("direct", "support", "expanded")
+    }
+    ppr = PPRResult(
+        accepted=True,
+        reason="converged",
+        build_id="build-1",
+        ranks={"expanded": 0.99, "support": 0.98},
+        teleport={},
+        passage_mass=1.0,
+        entity_mass=0.0,
+        iterations=1,
+        residual=0.0,
+        contributions={},
+    )
+
+    candidates = _order_rerank_candidates(
+        {"direct", "support", "expanded"},
+        passage_by_id,
+        (HeadHit("passage", "direct", 0.7, 0.66, 1, "dense", "ok"),),
+        {},
+        ppr,
+        {"support": 0.8},
+        {},
+        {},
+        cap=2,
+    )
+
+    assert [row.passage_id for row in candidates] == ["direct", "support"]
+    assert candidates[0].recall_score == pytest.approx(0.66)
+    assert candidates[1].triple_support == pytest.approx(0.8)
+
+
+# ---------------------------------------------------------------------------
+# M2 — temporal coherence and conflicted-fact presentation
+# ---------------------------------------------------------------------------
+
+
+def test_recognized_historical_triple_can_render_a_path(tmp_path: Path) -> None:
+    historical = replace(_fact(), status="superseded", valid_from=1.0, valid_to=5.0)
+    rows = _passages()
+    snapshot = _snapshot(tmp_path, rows)
+    calibrator, abstention = _calibrator("chat")
+    registry = EvidenceRegistry()
+    store = FakeStore(rows, (historical,), bm25=(BM25PassageHit("p2", 20.0, 1.0),))
+    engine = SharedRetrievalEngine(
+        snapshot,
+        store,
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        registry=registry,
+        reranker=LocalPassageReranker(
+            FakeScorer((0.96, 0.91, 0.88, 0.86)), mode="chat", acceptance_floor=0.65
+        ),
+        entity_resolver=lambda surface, etype, query: (
+            RawHeadCandidate("entity", "e-launch", 0.99, "resolved"),
+        ),
+        triple_recognizer=FakeTripleRecognizer(_recognized()),
+    )
+
+    pack = engine.retrieve(
+        RetrievalQuery(
+            "Who owned the launch before?",
+            "chat",
+            now=10.0,
+            temporal_intent=TemporalIntent("historical"),
+        ),
+        entity_spans=(("Launch", "project"),),
+    )
+
+    assert pack.decision.accepted
+    assert any(path.fact_ids == ("f1",) for path in pack.paths)
+    assert any(row.status == "superseded" for row in pack.facts)
+
+
+def test_conflicted_fact_is_presented_but_never_traversed_when_both_endpoints_seed(
+    tmp_path: Path,
+) -> None:
+    conflicted = replace(_fact(), status="conflicted", source_passage_id="p1")
+    rows = _passages()
+    snapshot = _snapshot(tmp_path, rows)
+    calibrator, abstention = _calibrator("chat")
+    registry = EvidenceRegistry()
+    store = FakeStore(rows, (conflicted,), bm25=(BM25PassageHit("p2", 20.0, 1.0),))
+    engine = SharedRetrievalEngine(
+        snapshot,
+        store,
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        registry=registry,
+        reranker=LocalPassageReranker(
+            FakeScorer((0.96, 0.91, 0.88, 0.86)), mode="chat", acceptance_floor=0.65
+        ),
+        entity_resolver=lambda surface, etype, query: (
+            RawHeadCandidate("entity", "e-launch", 0.99, "resolved"),
+        ),
+    )
+
+    # "Maya" resolves via the exact head; "Launch" via the entity span:
+    # both endpoints of the conflicted pair are query-seeded.
+    pack = engine.retrieve(
+        RetrievalQuery("What do Maya and Launch disagree on?", "chat", now=10.0),
+        entity_spans=(("Launch", "project"),),
+    )
+
+    assert pack.decision.accepted
+    conflicted_facts = [row for row in pack.facts if row.status == "conflicted"]
+    assert conflicted_facts and conflicted_facts[0].fact_ids == ("f1",)
+    assert all("f1" not in path.fact_ids for path in pack.paths)
+
+    unseeded = SharedRetrievalEngine(
+        snapshot,
+        FakeStore(rows, (conflicted,), bm25=(BM25PassageHit("p2", 20.0, 1.0),)),
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=LocalPassageReranker(
+            FakeScorer((0.96, 0.91, 0.88, 0.86)), mode="chat", acceptance_floor=0.65
+        ),
+    ).retrieve(RetrievalQuery("What does Maya own?", "chat", now=10.0))
+    assert all(row.status != "conflicted" for row in unseeded.facts)
+
+
+def test_temporal_admission_downweights_history_under_any_intent(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path, _passages())
+    active = _fact()
+    superseded = replace(_fact(), fact_id="f2", status="superseded")
+
+    any_graph, selected = _temporal_retrieval_graph(
+        snapshot,
+        (active, superseded),
+        RetrievalQuery("any", "chat", now=10.0, temporal_intent=TemporalIntent("any")),
+    )
+
+    assert selected == {"f1", "f2"}
+    fact_edges = [edge for edge in any_graph.edges if edge.kind == "fact"]
+    assert fact_edges
+
+
+# ---------------------------------------------------------------------------
+# M7 — entity reset must not double-count into passage reset
+# ---------------------------------------------------------------------------
+
+
+def test_resolved_entity_mass_enters_teleport_only_via_entity_reset(
+    tmp_path: Path,
+) -> None:
+    rows = _passages()
+    snapshot = _snapshot(tmp_path, rows)
+    calibrator, abstention = _calibrator("chat")
+    # p4 mentions e-maya but has no dense/bm25 hit of its own: before the M7
+    # fix it inherited the strongest entity weight straight into the teleport.
+    store = FakeStore(
+        rows,
+        bm25=(BM25PassageHit("p2", 20.0, 1.0),),
+        entity_passages={"e-maya": ("p4",)},
+    )
+    engine = SharedRetrievalEngine(
+        snapshot,
+        store,
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=LocalPassageReranker(
+            FakeScorer((0.96, 0.91, 0.88, 0.86)), mode="chat", acceptance_floor=0.65
+        ),
+    )
+
+    pack = engine.retrieve(RetrievalQuery("Maya", "chat", now=10.0))
+
+    assert pack.decision.accepted
+    assert "p4" not in pack.trace.teleport
+    assert "e-maya" in pack.trace.teleport
+
+
+# ---------------------------------------------------------------------------
+# M13 (query half) — explicit hub seeding temporarily enables traversal
+# ---------------------------------------------------------------------------
+
+
+def _hub_snapshot(tmp_path: Path, rows: Sequence[PassageRow]) -> IndexSnapshot:
+    passage_ids = tuple(row.passage_id for row in rows)
+    vectors = {"p1": (1.0, 0.0, 0.0)}
+    matrix = np.asarray(
+        [vectors.get(row_id, (0.0, 1.0, 0.0)) for row_id in passage_ids],
+        dtype=np.float32,
+    )
+    node_ids = passage_ids + ("e-date",)
+    node_kinds = ("passage",) * len(passage_ids) + ("entity",)
+    return IndexSnapshot(
+        build_id="build-1",
+        database_path=tmp_path / "knowledge.db",
+        calibration_hash="calibration-hash",
+        passage_ids=passage_ids,
+        passage_matrix=matrix,
+        fact_ids=(),
+        fact_matrix=np.empty((0, 3), dtype=np.float32),
+        alias_index={},
+        base_graph=materialize_base_graph(
+            build_id="build-1", node_ids=node_ids, node_kinds=node_kinds, edges=()
+        ),
+        projection=(),
+        quality_ranks={},
+    )
+
+
+def _hub_engine(tmp_path: Path) -> SharedRetrievalEngine:
+    rows = (
+        PassageRow("p1", "n1", "Plan", "obsidian", "The plan is set.", 0, 16, 1.0, 2.0),
+        PassageRow("p2", "n2", "Dates", "obsidian", "Due July 18.", 0, 12, 1.0, 2.0),
+    )
+    snapshot = _hub_snapshot(tmp_path, rows)
+    calibrator, abstention = _calibrator("chat")
+    store = FakeStore(
+        rows,
+        entities=(EntityRow("e-date", "July 18", "date_or_deadline", False),),
+        entity_passages={"e-date": ("p2",)},
+    )
+    return SharedRetrievalEngine(
+        snapshot,
+        store,
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=LocalPassageReranker(
+            FakeScorer((0.96, 0.91)), mode="chat", acceptance_floor=0.65
+        ),
+        entity_resolver=lambda surface, etype, query: (
+            RawHeadCandidate("entity", "e-date", 1.0, "july 18"),
+        ),
+    )
+
+
+def test_explicitly_seeded_hub_entity_becomes_traversable(tmp_path: Path) -> None:
+    engine = _hub_engine(tmp_path)
+
+    pack = engine.retrieve(
+        RetrievalQuery("What is due on July 18?", "chat", now=10.0),
+        entity_spans=(("July 18", "date_or_deadline"),),
+    )
+
+    assert pack.decision.accepted
+    assert any(row.passage_id == "p2" for row in pack.passages)
+    assert "e-date" in pack.trace.teleport
+
+
+def test_unseeded_hub_entity_stays_dangling(tmp_path: Path) -> None:
+    engine = _hub_engine(tmp_path)
+
+    pack = engine.retrieve(RetrievalQuery("What is the plan?", "chat", now=10.0))
+
+    assert all(row.passage_id != "p2" for row in pack.passages)
+    assert "e-date" not in pack.trace.teleport
+
+
+# ---------------------------------------------------------------------------
+# M15 — hub path penalty is wired into the engine's path finder
+# ---------------------------------------------------------------------------
+
+
+def test_engine_passes_snapshot_hub_entities_to_the_path_finder(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import taurine_core.retrieval.evidence as evidence_module
+
+    captured: dict[str, frozenset[str]] = {}
+    real_finder = evidence_module.EvidencePathFinder
+
+    def capturing_finder(graph, *, fact_status, hub_entity_ids=frozenset(), note_by_passage=None):
+        captured["hub_entity_ids"] = frozenset(hub_entity_ids)
+        return real_finder(
+            graph,
+            fact_status=fact_status,
+            hub_entity_ids=hub_entity_ids,
+            note_by_passage=note_by_passage,
+        )
+
+    monkeypatch.setattr(evidence_module, "EvidencePathFinder", capturing_finder)
+    rows = _passages()
+    snapshot = _snapshot(tmp_path, rows)
+    calibrator, abstention = _calibrator("chat")
+    store = FakeStore(
+        rows,
+        bm25=(BM25PassageHit("p2", 20.0, 1.0),),
+        entities=(
+            EntityRow("e-maya", "Maya", "person", True),
+            EntityRow("e-launch", "Launch", "concept", False),
+        ),
+    )
+    engine = SharedRetrievalEngine(
+        snapshot,
+        store,
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=LocalPassageReranker(
+            FakeScorer((0.96, 0.91, 0.88, 0.86)), mode="chat", acceptance_floor=0.65
+        ),
+    )
+
+    engine.retrieve(RetrievalQuery("Maya", "chat", now=10.0))
+
+    assert captured["hub_entity_ids"] == {"e-launch"}
+
+
+# ---------------------------------------------------------------------------
+# §0.1 — chat/tool fallback lane
+# ---------------------------------------------------------------------------
+
+
+def _fallback_rows() -> tuple[PassageRow, ...]:
+    return tuple(
+        PassageRow(
+            f"f{index}", f"note-{index}", f"T{index}", "obsidian",
+            f"low confidence text {index}", 0, 20, 1.0, 2.0,
+        )
+        for index in range(5)
+    ) + (
+        PassageRow(
+            "f5", "note-0", "T0b", "obsidian", "same note extra", 0, 15, 1.0, 2.0
+        ),
+    )
+
+
+def _fallback_engine(
+    tmp_path: Path, mode: str, *, fallback_on_abstain: bool, cosine: float = 0.56
+) -> tuple[SharedRetrievalEngine, EvidenceRegistry]:
+    rows = _fallback_rows()
+    passage_ids = tuple(row.passage_id for row in rows)
+    # Every passage shares the query direction with the requested cosine, so
+    # each calibrates below the acceptance floor but (for 0.56) above the
+    # 0.75 × floor fallback floor.
+    matrix = np.zeros((len(rows), 8), dtype=np.float32)
+    for index in range(len(rows)):
+        matrix[index, 0] = cosine
+        matrix[index, index + 1] = float(np.sqrt(1.0 - cosine * cosine))
+    snapshot = IndexSnapshot(
+        build_id="build-1",
+        database_path=tmp_path / "knowledge.db",
+        calibration_hash="calibration-hash",
+        passage_ids=passage_ids,
+        passage_matrix=matrix,
+        fact_ids=(),
+        fact_matrix=np.empty((0, 8), dtype=np.float32),
+        alias_index={},
+        base_graph=materialize_base_graph(
+            build_id="build-1",
+            node_ids=passage_ids,
+            node_kinds=("passage",) * len(rows),
+            edges=(),
+        ),
+        projection=(),
+        quality_ranks={},
+    )
+    calibrator, abstention = _calibrator(mode)
+    registry = EvidenceRegistry()
+    engine = SharedRetrievalEngine(
+        snapshot,
+        FakeStore(rows),
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array(
+            [1.0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32
+        ),
+        registry=registry,
+        reranker=LocalPassageReranker(
+            FakeScorer((0.9,) * len(rows)),
+            mode=mode,  # type: ignore[arg-type]
+            acceptance_floor=0.65,
+        ),
+        fallback_on_abstain=fallback_on_abstain,
+    )
+    return engine, registry
+
+
+def test_chat_abstention_with_near_floor_candidates_yields_fallback_pack(
+    tmp_path: Path,
+) -> None:
+    engine, registry = _fallback_engine(tmp_path, "chat", fallback_on_abstain=True)
+
+    pack = engine.retrieve(RetrievalQuery("vaguely related", "chat", now=10.0))
+
+    assert not pack.decision.accepted
+    assert pack.decision.fallback is True
+    assert pack.decision.reason == "fallback_low_confidence"
+    assert len(pack.passages) == 4
+    assert pack.facts == () and pack.paths == ()
+    note_ids = [row.note_id for row in pack.passages]
+    assert len(set(note_ids)) == len(note_ids)
+    assert 0.0 < pack.decision.confidence < 0.62
+    # Fallback passages are registered and marked read like normal evidence.
+    for row in pack.passages:
+        record = registry.resolve(row.evidence_id)
+        assert record is not None and "read" in record.states
+    assert set(pack.trace.read_ids) >= {row.evidence_id for row in pack.passages}
+
+
+def test_live_mode_same_inputs_returns_strict_empty_pack(tmp_path: Path) -> None:
+    engine, registry = _fallback_engine(tmp_path, "live", fallback_on_abstain=False)
+
+    pack = engine.retrieve(RetrievalQuery("vaguely related", "live", now=10.0))
+
+    assert not pack.decision.accepted
+    assert pack.decision.fallback is False
+    assert pack.passages == ()
+    assert registry.refs("read") == ()
+
+
+def test_nothing_above_fallback_floor_returns_normal_empty_pack(
+    tmp_path: Path,
+) -> None:
+    engine, registry = _fallback_engine(
+        tmp_path, "chat", fallback_on_abstain=True, cosine=0.30
+    )
+
+    pack = engine.retrieve(RetrievalQuery("vaguely related", "chat", now=10.0))
+
+    assert not pack.decision.accepted
+    assert pack.decision.fallback is False
+    assert pack.passages == ()
+    assert registry.refs("read") == ()
+
+
+# ---------------------------------------------------------------------------
+# L11 — triple head hit hygiene
+# ---------------------------------------------------------------------------
+
+
+def test_triple_head_hits_keep_only_retained_triples_with_clean_ranks() -> None:
+    from taurine_core.retrieval.evidence import _triple_head_hits
+
+    def _decision(key_suffix: str, embedding: float, recognition: float, accepted: bool, reason: str):
+        return TripleRecognitionDecision(
+            ("e-a", "owns_or_has", f"e-{key_suffix}"),
+            (f"fact-{key_suffix}",),
+            embedding,
+            recognition,
+            accepted,
+            reason,
+        )
+
+    def _triple(key_suffix: str, score: float) -> RecognizedTriple:
+        context = replace(
+            _fact(),
+            fact_id=f"fact-{key_suffix}",
+            object_entity_id=f"e-{key_suffix}",
+            logical_key=("e-a", "owns_or_has", f"e-{key_suffix}"),
+        )
+        return RecognizedTriple(
+            logical_key=context.logical_key,
+            fact_ids=(context.fact_id,),
+            source_passage_ids=("p1",),
+            source_note_ids=("n1",),
+            subject_entity_id="e-a",
+            subject="A",
+            predicate="owns_or_has",
+            predicate_description="owns or has",
+            object_entity_id=context.object_entity_id,
+            object=key_suffix,
+            score=score,
+            contexts=(context,),
+        )
+
+    result = TripleRecognitionResult(
+        triples=(_triple("kept1", 0.95), _triple("kept2", 0.90)),
+        decisions=(
+            # Preliminary rejection: must not offset ranks.
+            _decision("prelim", 0.88, 0.0, False, "required_entity_mismatch"),
+            _decision("kept1", 0.81, 0.95, True, "accepted_local_triple_recognition"),
+            _decision("kept2", 0.85, 0.90, True, "accepted_local_triple_recognition"),
+            # Accepted beyond the seed cap: not retained, so not an accepted hit.
+            _decision("overflow", 0.80, 0.89, True, "accepted_local_triple_recognition"),
+            _decision("scoredout", 0.79, 0.30, False, "below_triple_recognition_floor"),
+        ),
+        entity_seed_weights={},
+        degraded=False,
+        reason="recognized_triples",
+    )
+
+    hits = _triple_head_hits(result)
+
+    assert [(hit.target_id, hit.rank) for hit in hits.accepted] == [
+        ("fact-kept1", 1),
+        ("fact-kept2", 2),
+    ]
+    # Recognition score is the calibrated score; embedding calibrated is raw.
+    assert hits.accepted[0].calibrated_score == pytest.approx(0.95)
+    assert hits.accepted[0].raw_score == pytest.approx(0.81)
+    rejected_ids = [hit.target_id for hit in hits.rejected]
+    assert set(rejected_ids) == {"fact-prelim", "fact-overflow", "fact-scoredout"}
+    assert min(hit.rank for hit in hits.rejected) == 3
+
+
+# ---------------------------------------------------------------------------
+# L12 — MMR tie-break prefix inversion
+# ---------------------------------------------------------------------------
+
+
+def test_reverse_key_makes_smallest_id_win_for_prefix_pairs() -> None:
+    from taurine_core.retrieval.evidence import _reverse_key
+
+    assert max(["ab", "a"], key=_reverse_key) == "a"
+    assert max(["b", "ab"], key=_reverse_key) == "ab"
+    assert max(["p10", "p1"], key=_reverse_key) == "p1"
+
+
+# ---------------------------------------------------------------------------
+# L29 — per-query temporal graph caching
+# ---------------------------------------------------------------------------
+
+
+def test_temporal_graph_is_cached_per_intent_and_activation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import taurine_core.retrieval.evidence as evidence_module
+
+    calls: list[tuple[str, ...]] = []
+    real = evidence_module._temporal_retrieval_graph
+
+    def counting(snapshot, fact_rows, query, *, hub_activation=None):
+        intent = query.temporal_intent
+        calls.append((intent.kind if intent else "current",))
+        return real(snapshot, fact_rows, query, hub_activation=hub_activation)
+
+    monkeypatch.setattr(evidence_module, "_temporal_retrieval_graph", counting)
+    engine, _registry, _store = _engine(tmp_path)
+
+    engine.retrieve(RetrievalQuery("Maya", "chat", now=10.0))
+    engine.retrieve(RetrievalQuery("Maya owns what", "chat", now=10.0))
+    assert len(calls) == 1
+
+    engine.retrieve(
+        RetrievalQuery(
+            "Maya then", "chat", now=10.0, temporal_intent=TemporalIntent("any")
+        )
+    )
+    assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# C2 prep — shared payload helpers must match the engine's registered shapes
+# ---------------------------------------------------------------------------
+
+
+def test_payload_helpers_match_engine_registered_shapes(tmp_path: Path) -> None:
+    from taurine_core.retrieval.evidence_payloads import (
+        fact_group_payload,
+        fact_source_identity,
+        passage_payload,
+    )
+
+    engine, registry, _store = _engine(tmp_path)
+    pack = engine.retrieve(
+        RetrievalQuery("What does Maya own?", "chat", now=10.0),
+        entity_spans=(("Launch", "project"),),
+    )
+
+    passage = pack.passages[0]
+    record = registry.resolve(passage.evidence_id)
+    assert record is not None
+    assert dict(record.payload) == passage_payload(passage)
+    assert set(record.payload) == {
+        "passage_id", "note_id", "text", "char_start", "char_end",
+    }
+
+    fact = pack.facts[0]
+    fact_record = registry.resolve(fact.fact_ref)
+    assert fact_record is not None
+    context = _fact()
+    identity = fact_source_identity(
+        "build-1", context.logical_key, "active", None, None
+    )
+    assert registry.ref_for("fact", identity) == fact.fact_ref
+    core = fact_group_payload(context.logical_key, "active", None, None, (context,))
+    for key, value in core.items():
+        assert fact_record.payload[key] == value

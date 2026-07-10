@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from typing import Mapping, Sequence
@@ -9,6 +10,9 @@ from typing import Mapping, Sequence
 from taurine_core import config
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.schemas import Chunk
+
+
+_LOGGER = logging.getLogger("taurine.session")
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,28 @@ class TranscriptLedger:
             ts=float(chunk.ts),
         )
         self.chunks.append(row)
+        self._enforce_chunk_cap()
         return row
+
+    def _enforce_chunk_cap(self) -> None:
+        # Safety bound only: the summary checkpoint normally consumes chunks
+        # long before this cap, so hitting it is loud. Oldest chunks drop
+        # first, even above the accepted checkpoint if the cap demands it.
+        cap = int(config.LIVE_LEDGER_MAX_CHUNKS)
+        if cap <= 0 or len(self.chunks) <= cap:
+            return
+        dropped_unsummarized = 0
+        while len(self.chunks) > cap:
+            row = self.chunks.popleft()
+            if row.seq > self.last_accepted_summary_seq:
+                dropped_unsummarized += 1
+        if dropped_unsummarized:
+            _LOGGER.error(
+                "transcript ledger cap %d exceeded: dropped %d unsummarized "
+                "chunks (summary checkpoint is stalled)",
+                cap,
+                dropped_unsummarized,
+            )
 
     def pending(self, *, through_seq: int | None = None) -> tuple[SequencedChunk, ...]:
         upper = through_seq if through_seq is not None else float("inf")

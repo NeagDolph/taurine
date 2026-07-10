@@ -1,7 +1,7 @@
 """Pydantic models: ws protocol, REST payloads, and cross-unit data shapes."""
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from pydantic import BaseModel
@@ -94,6 +94,7 @@ class NoteRecord(BaseModel):
     gist: str = ""                 # heuristic display line (fallback: first non-empty line)
     source: str = "apple_notes"    # connector_id that produced this document
     quality_rank: float = 0.0      # log(pagerank/median), clipped ±QUALITY_CLIP; set at rebuild
+    ingest_salience: float = 1.0   # connector-computed salience (email funnel etc.); §0.2
 
 
 EdgeType = Literal["semantic", "topic", "entity", "mixed"]
@@ -183,6 +184,8 @@ class RetrievalDecisionPayload(BaseModel):
     reason: str
     accepted_heads: list[str] = []
     rejected_heads: list[str] = []
+    # §0.1 chat/tool fallback lane: True on a best-effort low-confidence pack.
+    fallback: bool = False
 
 
 class EvidencePassagePayload(BaseModel):
@@ -199,6 +202,11 @@ class EvidencePassagePayload(BaseModel):
     retrieval_score: float
     rerank_score: float
     path_ids: list[str] = []
+    # Live display only: True when the entry survives from a prior accepted
+    # pass (incumbent hysteresis) and was not re-accepted this pass.
+    prior_context: bool = False
+    # §0.1: True when this row came from a fallback (low-confidence) pack.
+    low_confidence: bool = False
 
 
 class EvidenceFactPayload(BaseModel):
@@ -251,12 +259,16 @@ class EvidencePackPayload(BaseModel):
                 reason=pack.decision.reason,
                 accepted_heads=list(pack.decision.accepted_heads),
                 rejected_heads=list(pack.decision.rejected_heads),
+                fallback=bool(getattr(pack.decision, "fallback", False)),
             ),
             passages=[
                 EvidencePassagePayload(
                     **{
                         **row.__dict__,
                         "path_ids": list(row.path_ids),
+                        "low_confidence": bool(
+                            getattr(pack.decision, "fallback", False)
+                        ),
                     }
                 )
                 for row in pack.passages
@@ -391,9 +403,13 @@ class LiveGroundingEvent(BaseModel):
 
     @classmethod
     def from_domain(cls, update: "GroundingUpdate") -> "LiveGroundingEvent":
-        def passage(row: object) -> EvidencePassagePayload:
+        prior_context_ids = set(getattr(update, "prior_context_ids", ()))
+
+        def passage(row: object, *, flag_prior: bool = False) -> EvidencePassagePayload:
             values = dict(vars(row))
             values["path_ids"] = list(values.get("path_ids", ()))
+            if flag_prior and values.get("evidence_id") in prior_context_ids:
+                values["prior_context"] = True
             return EvidencePassagePayload(**values)
 
         def fact(row: object) -> EvidenceFactPayload:
@@ -428,7 +444,9 @@ class LiveGroundingEvent(BaseModel):
             facts=[fact(row) for row in update.facts],
             paths=[path(row) for row in update.paths],
             notes=[note(row) for row in update.notes],
-            display_passages=[passage(row) for row in update.display_passages],
+            display_passages=[
+                passage(row, flag_prior=True) for row in update.display_passages
+            ],
             display_notes=[note(row) for row in update.display_notes],
             revision=update.revision,
             no_new_evidence=update.no_new_evidence,
@@ -522,6 +540,16 @@ class ConnectorSyncReport(BaseModel):
     removed: int = 0
     enrich_failures: int = 0
     error: str = ""
+
+
+@dataclass(frozen=True)
+class SyncReport:
+    """Aggregate sync counters (server Runtime.sync_once seam)."""
+
+    added: int
+    changed: int
+    removed: int
+    enrich_failures: int
 
 
 class NeighborRef(BaseModel):
@@ -647,6 +675,13 @@ class ChatUsage(BaseModel):
     total_ms: float = 0.0
 
 
+class ChatStrippedClaim(BaseModel):
+    """A sentence removed or repaired away during citation validation (L31)."""
+
+    sentence: str
+    reason: str = ""
+
+
 class ChatMessage(BaseModel):
     id: int = 0                    # chat_messages rowid
     chat_id: str
@@ -665,6 +700,11 @@ class ChatMessage(BaseModel):
     activity: list[ChatActivityStep] = []
     usage: ChatUsage = ChatUsage()
     cancelled: bool = False
+    # True when the turn ended before finalization (cancel or stream error):
+    # content is the raw partial exactly as streamed, unvalidated, cites nothing.
+    interrupted: bool = False
+    # Sentences stripped/repaired away by citation validation (L31).
+    stripped_claims: list[ChatStrippedClaim] = []
     created: float = 0.0
 
 

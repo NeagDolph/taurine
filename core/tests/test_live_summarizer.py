@@ -19,6 +19,8 @@ from taurine_core.retrieval.types import (
 )
 from taurine_core.retrieval.validate import EvidenceValidator
 
+from taurine_core.schemas import Actionable
+
 from tests.fakes import FakeIndex
 
 
@@ -171,6 +173,150 @@ async def test_fallback_model_is_single_retry_and_double_failure_returns_none() 
             None, '[T1] [channel 0] "hello"', update, []
         )
         is None
+    )
+
+
+async def test_rolling_summary_retains_previously_accepted_citations_then_prunes() -> None:
+    """C3a: refs cited by the last ACCEPTED summary stay citeable; refs the
+    current accepted summary drops lose grandfathered status."""
+
+    registry, update1 = _evidence()
+    llm = FakeLLM(
+        [
+            {"summary_md": "Maya owns the launch. [E1]", "actionables": []},
+            {
+                "summary_md": "Maya owns the launch. [E1]\nBudget approved. [T2]",
+                "actionables": [],
+            },
+            {"summary_md": "Maya owns the launch. [E1]", "actionables": []},
+        ]
+    )
+    summarizer = _summarizer(llm, registry, Entails())
+
+    one = await summarizer.summarize(
+        None, '[T1] [channel 0] "Maya owns the launch."', update1, []
+    )
+    assert one is not None and not one.rejected
+
+    # pass 2 supplies only E2/T2, yet may retain the pass-1 sentence citing E1
+    update2 = _pass_update(registry, passage_id="p2", note_id="n2")
+    registry.register("transcript", "chunk-2", {"text": "Budget approved."})
+    registry.mark_read("T2")
+    two = await summarizer.summarize(
+        one.summary, '[T2] [channel 0] "Budget approved."', update2, []
+    )
+    assert two is not None and not two.rejected
+    assert two.summary is not None and two.summary.rev == 2
+
+    # pass 2's accepted summary cited E1 and T2 — but a pass-3 summary after
+    # one that DROPPED E1 must fail. Simulate by pruning: accept a summary
+    # citing only T2, then try E1 again.
+    llm.responses.insert(0, {"summary_md": "Budget approved. [T2]", "actionables": []})
+    update3 = _pass_update(registry, passage_id="p3", note_id="n3")
+    three = await summarizer.summarize(
+        two.summary, "(no new transcript)", update3, []
+    )
+    assert three is not None and not three.rejected
+
+    update4 = _pass_update(registry, passage_id="p4", note_id="n4")
+    four = await summarizer.summarize(
+        three.summary, "(no new transcript)", update4, []
+    )
+    assert four is not None and four.rejected
+    assert four.reject_reason == "evidence_unavailable"
+
+
+async def test_never_validated_old_ref_still_fails() -> None:
+    """A ref that was read in some earlier pass but never cited by an
+    accepted summary is not citeable later (strictness preserved)."""
+
+    registry, _update1 = _evidence()  # registers E1 as read
+    update2 = _pass_update(registry, passage_id="p2", note_id="n2")
+    llm = FakeLLM([{"summary_md": "Maya owns the launch. [E1]", "actionables": []}])
+
+    result = await _summarizer(llm, registry, Entails()).summarize(
+        None, '[T1] [channel 0] "unrelated speech."', update2, []
+    )
+
+    assert result is not None and result.rejected
+    assert result.reject_reason == "evidence_unavailable"
+
+
+async def test_failing_highlight_is_dropped_without_rejecting_the_summary() -> None:
+    registry, update = _evidence()
+    llm = FakeLLM(
+        [
+            {
+                "summary_md": "Maya owns the launch. [F1]",
+                "highlights": [
+                    {"fact_id": "F1", "why": "Maya owns it"},
+                    {"fact_id": "F1", "why": "budget doubled overnight"},
+                ],
+                "actionables": [],
+            }
+        ]
+    )
+
+    class Selective:
+        def score(self, premise: str, hypothesis: str) -> float:
+            del premise
+            return 0.99 if "owns" in hypothesis else 0.01
+
+    result = await _summarizer(llm, registry, Selective()).summarize(
+        None, '[T1] [channel 0] "Maya owns the launch."', update, []
+    )
+
+    assert result is not None and not result.rejected
+    assert result.summary is not None
+    assert [row.why for row in result.summary.highlights] == ["Maya owns it"]
+
+
+async def test_open_actionable_grounding_refs_are_included_in_prompt() -> None:
+    registry, update = _evidence()
+    llm = FakeLLM([{"no_update": True}])
+    row = Actionable(
+        id="a1", title="Do X", quote="do x", grounding=["T1", "F1"], status="open"
+    )
+
+    await _summarizer(llm, registry, Entails()).summarize(
+        None, '[T1] [channel 0] "Maya owns the launch."', update, [row]
+    )
+
+    assert '"grounding": ["T1", "F1"]' in llm.calls[0].user
+
+
+def _pass_update(
+    registry: EvidenceRegistry, *, passage_id: str, note_id: str
+) -> GroundingUpdate:
+    """A minimal accepted pass whose only support is one fresh passage."""
+
+    text = f"Evidence {passage_id}."
+    note_ref = registry.register("note", note_id, {"title": note_id})
+    registry.mark_read(note_ref)
+    evidence_ref = registry.register(
+        "passage", passage_id, {"text": text, "note_id": note_id}
+    )
+    registry.mark_read(evidence_ref)
+    passage = EvidencePassage(
+        evidence_ref, passage_id, note_id, note_id, "obsidian", text,
+        0, len(text), 1.0, 2.0, 0.9, 0.95,
+    )
+    note = EvidenceNote(note_ref, note_id, note_id, "obsidian", 2.0, 0.95, (evidence_ref,))
+    return GroundingUpdate(
+        decision=RetrievalDecision(True, 0.9, "accepted", ("dense",)),
+        passages=(passage,),
+        facts=(),
+        paths=(),
+        notes=(note,),
+        display_passages=(passage,),
+        display_notes=(note,),
+        no_new_evidence=False,
+        new_support_ids=(evidence_ref,),
+        revision=2,
+        support_passages=(passage,),
+        support_facts=(),
+        support_paths=(),
+        support_notes=(note,),
     )
 
 

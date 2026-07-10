@@ -431,6 +431,125 @@ def test_invalid_returned_entity_span_is_rejected(monkeypatch: pytest.MonkeyPatc
     assert result.entities == []
 
 
+def test_assertion_span_covers_first_paragraph_without_leading_blank_line() -> None:
+    """M1: rfind returning -1 must map to paragraph start 0, not 1."""
+    text = "Alice joined Acme. She runs the launch with Bob"
+
+    span = extract._assertion_span(text, 0, 5, 44, 47)
+
+    assert span == (0, len(text))
+
+
+def test_assertion_span_mid_document_paragraph_offsets_are_exact() -> None:
+    text = "Intro line.\n\nAlice joined Acme. She runs the launch with Bob"
+    subject_start = text.index("Alice")
+    object_start = text.index("Bob")
+
+    span = extract._assertion_span(
+        text, subject_start, subject_start + 5, object_start, object_start + 3
+    )
+
+    assert span is not None
+    assert text[span[0] : span[1]] == "Alice joined Acme. She runs the launch with Bob"
+
+
+def test_relation_with_first_word_subject_spanning_sentences_is_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "Alice joined Acme. She runs the launch with Bob"
+    fake = FakeModel(
+        {
+            "Alice": {
+                "entities": {
+                    "person": [
+                        {"text": "Alice", "confidence": 0.95, "start": 0, "end": 5},
+                        {"text": "Bob", "confidence": 0.94, "start": 44, "end": 47},
+                    ]
+                },
+                "relation_extraction": {
+                    "works_with": [
+                        {
+                            "head": {"text": "Alice", "confidence": 0.9, "start": 0, "end": 5},
+                            "tail": {"text": "Bob", "confidence": 0.9, "start": 44, "end": 47},
+                            "confidence": 0.9,
+                        }
+                    ]
+                },
+            }
+        }
+    )
+    _install_fake(monkeypatch, fake)
+
+    result = extract.extract_notes(
+        [make_note("n1", "Team", text)], tokenizer=OffsetTokenizer()
+    )["n1"]
+
+    assert len(result.fact_candidates) == 1
+    relation = result.fact_candidates[0]
+    assert relation.assertion_start == 0
+    assert text[relation.subject_start : relation.subject_end] == "Alice"
+    assert text[relation.object_start : relation.object_end] == "Bob"
+
+
+def test_tuple_relations_and_bare_string_spans_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L7: legacy shapes without confidence default to 0.0 and fail floors."""
+    fake = FakeModel(
+        {
+            "legacy": {
+                "entities": {
+                    "person": ["Maya", {"text": "Bob Smith", "confidence": 0.9}],
+                },
+                "relation_extraction": {
+                    "works_with": [["Maya", "Bob Smith"]],
+                },
+            }
+        }
+    )
+    _install_fake(monkeypatch, fake)
+
+    result = extract.extract_notes(
+        [make_note("n1", "Legacy", "legacy Maya and Bob Smith work.")]
+    )["n1"]
+
+    assert [(row.surface, row.etype) for row in result.entities] == [
+        ("Bob Smith", "person")
+    ]
+    assert result.fact_candidates == []
+    assert result.relations == []
+
+
+def test_family_schemas_gate_optional_predicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L21a: the core registry is always on; optional extras vary per family."""
+    fake = FakeModel({})
+    _install_fake(monkeypatch, fake)
+    email = make_note("email", "Email", "body").model_copy(update={"source": "gmail"})
+    conversation = make_note("chat", "Chat", "body").model_copy(
+        update={"source": "imessage"}
+    )
+    written = make_note("note", "Note", "body")
+
+    extract.extract_notes([email, conversation, written], tokenizer=OffsetTokenizer())
+
+    email_schema, conversation_schema, written_schema = (
+        set(schema.relation_types) for schema in fake.schemas
+    )
+    assert written_schema == set(config.INGEST_RELATION_TYPES)
+    assert {"responsible_for", "scheduled_for", "blocked_by", "completed"} <= email_schema
+    assert {"met_with", "decided", "prefers"}.isdisjoint(email_schema)
+    assert {"met_with", "decided", "prefers"} <= conversation_schema
+    assert {"responsible_for", "scheduled_for", "blocked_by", "completed"}.isdisjoint(
+        conversation_schema
+    )
+    # the core registry never varies
+    assert {"works_at", "works_with", "about", "related_to"} <= (
+        email_schema & conversation_schema & written_schema
+    )
+
+
 def test_source_families_produce_distinct_stable_schema_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

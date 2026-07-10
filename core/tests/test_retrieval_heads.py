@@ -158,7 +158,7 @@ def _snapshot(tmp_path: Path) -> IndexSnapshot:
     return IndexSnapshot(
         build_id="build-1",
         database_path=tmp_path / "knowledge.db",
-        calibration_hash="sha256:initial-conservative-2026-07-09",
+        calibration_hash="sha256:test-calibration",
         passage_ids=("p1", "p2"),
         passage_matrix=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
         fact_ids=(),

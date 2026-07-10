@@ -41,7 +41,33 @@ class FakeRetriever:
         del index
         self.chat_id = chat_id
         self.saved = 0
+        self.committed = 0
+        self.discarded = 0
+        self.sufficient = True
+        self.registry = EvidenceRegistry()
+        self.registry.register("note", "n1", {"note_id": "n1"})
+        self.registry.register(
+            "passage",
+            "p1",
+            {"passage_id": "p1", "note_id": "n1", "text": "Roadmap gist", "char_start": 0, "char_end": 12},
+        )
+        self.registry.register(
+            "fact",
+            "fact-1",
+            {"source_evidence_ids": ["E1"], "status": "active"},
+        )
+        for ref in ("N1", "E1", "F1"):
+            self.registry.mark_read(ref)
         FakeRetriever.instances.append(self)
+
+    def commit_turn(self) -> None:
+        self.committed += 1
+
+    def discard_turn(self) -> None:
+        self.discarded += 1
+
+    def evidence_sufficient(self) -> bool:
+        return self.sufficient
 
     def context_pack(
         self,
@@ -126,6 +152,29 @@ class FixedNLI:
     def score(self, premise: str, hypothesis: str) -> float:
         del premise, hypothesis
         return self.value
+
+
+class AcceptAllValidator:
+    """Streaming/control-flow tests inject this through the public
+    validator_factory seam; validation semantics have their own tests."""
+
+    def validate(self, output: str, *, mode: str, supplied_ids=(), available_ids=()) -> Any:
+        del mode, supplied_ids, available_ids
+        from taurine_core.retrieval.validate import ValidationResult
+
+        return ValidationResult(
+            accepted=True,
+            accepted_output=output,
+            unsupported_sentences=(),
+            invalid_citations=(),
+            repair_required=False,
+            cited_ids=(),
+            degraded_reason="",
+        )
+
+
+def _accept_all(_registry: Any) -> Any:
+    return AcceptAllValidator()
 
 
 @dataclass
@@ -275,7 +324,14 @@ async def test_turn_event_order_tool_round_trip_budget_no_tools_and_citation_str
         ]
     )
     logger = MemoryLogger()
-    engine = ChatEngine(store, llm, logger)
+    engine = ChatEngine(
+        store,
+        llm,
+        logger,
+        validator_factory=lambda registry: EvidenceValidator(
+            registry, FixedNLI(1.0), entailment_floor=.8
+        ),
+    )
     events: list[dict[str, Any]] = []
 
     await engine.send("", "What changed?", lambda event: _capture(event, events))
@@ -350,7 +406,7 @@ async def test_pre_tool_narration_is_separated_from_the_answer(
             ],
         ]
     )
-    engine = ChatEngine(store, llm, MemoryLogger())
+    engine = ChatEngine(store, llm, MemoryLogger(), validator_factory=_accept_all)
     events: list[dict[str, Any]] = []
 
     await engine.send("", "State?", lambda event: _capture(event, events))
@@ -380,7 +436,7 @@ async def test_tool_call_remnants_are_stripped_from_final_content(store: Any) ->
             ],
         ]
     )
-    engine = ChatEngine(store, llm, MemoryLogger())
+    engine = ChatEngine(store, llm, MemoryLogger(), validator_factory=_accept_all)
     events: list[dict[str, Any]] = []
 
     await engine.send("", "State of things?", lambda event: _capture(event, events))
@@ -453,7 +509,15 @@ async def test_cancel_persists_partial_content_with_cancelled_true(store: Any) -
     assert done["message"]["content"] == "partial answer"
     assert done["message"]["thinking"] == "partial thought"
     assert done["message"]["cancelled"] is True
-    assert store.chat_messages(chat_id)[1].cancelled is True
+    assert done["message"]["interrupted"] is True
+    assert done["message"]["cited_ids"] == []
+    persisted = store.chat_messages(chat_id)[1]
+    assert persisted.cancelled is True
+    assert persisted.interrupted is True
+    retriever = FakeRetriever.instances[-1]
+    assert retriever.discarded == 1
+    assert retriever.committed == 0
+    assert retriever.saved == 1
 
 
 @pytest.mark.asyncio
@@ -465,7 +529,7 @@ async def test_cancel_during_success_finish_does_not_emit_cancelled_second_termi
         title_started=title_started,
         release_title=release_title,
     )
-    engine = ChatEngine(store, llm, MemoryLogger())
+    engine = ChatEngine(store, llm, MemoryLogger(), validator_factory=_accept_all)
     events: list[dict[str, Any]] = []
     task = asyncio.create_task(engine.send("", "title me", lambda event: _capture(event, events)))
     await title_started.wait()
@@ -483,13 +547,17 @@ async def test_cancel_during_success_finish_does_not_emit_cancelled_second_termi
     assert _terminal_types(events) == ["chat_done"]
     assert done_events[0]["message"]["content"] == "complete answer"
     assert done_events[0]["message"]["cancelled"] is False
+    assert done_events[0]["message"]["interrupted"] is False
     assert store.chat_messages(chat_id)[1].cancelled is False
+    retriever = FakeRetriever.instances[-1]
+    assert retriever.committed == 1
+    assert retriever.discarded == 0
 
 
 @pytest.mark.asyncio
 async def test_regenerate_deletes_last_assistant_and_reruns_last_user(store: Any) -> None:
     first_llm = FakeLLM(streams=[[StreamEvent(kind="content", text="first"), StreamEvent(kind="done")]])
-    engine = ChatEngine(store, first_llm, MemoryLogger())
+    engine = ChatEngine(store, first_llm, MemoryLogger(), validator_factory=_accept_all)
     events: list[dict[str, Any]] = []
     await engine.send("", "question", lambda event: _capture(event, events))
     chat_id = [event for event in events if event["type"] == "chat_done"][-1]["chat_id"]
@@ -516,7 +584,9 @@ async def test_fallback_only_for_first_stream_open_failure(store: Any) -> None:
     )
     events: list[dict[str, Any]] = []
 
-    await ChatEngine(store, llm, MemoryLogger()).send("", "question", lambda event: _capture(event, events))
+    await ChatEngine(store, llm, MemoryLogger(), validator_factory=_accept_all).send(
+        "", "question", lambda event: _capture(event, events)
+    )
 
     assert [call["model"] for call in llm.calls] == [config.CHAT_MODEL, config.CHAT_FALLBACK_MODEL]
     assert [event["type"] for event in events if event["type"] == "chat_error"] == []
@@ -545,6 +615,11 @@ async def test_midstream_llm_error_emits_error_and_persists_partial_without_fall
     persisted = store.chat_messages(chat_id)[1]
     assert persisted.content == "partial"
     assert persisted.cancelled is False
+    assert persisted.interrupted is True
+    assert persisted.cited_ids == []
+    retriever = FakeRetriever.instances[-1]
+    assert retriever.discarded == 1
+    assert retriever.committed == 0
 
 
 @pytest.mark.asyncio
@@ -578,6 +653,7 @@ async def test_context_pack_exception_emits_error_persists_empty_partial_and_doe
     persisted = store.chat_messages(chat_id)[1]
     assert persisted.content == ""
     assert persisted.cancelled is False
+    assert persisted.interrupted is True
     assert any(
         kind == "chat_error" and payload["detail"] == "context exploded"
         for kind, payload in logger.records
@@ -759,6 +835,297 @@ async def test_regeneration_restores_pre_turn_retrieval_state(store: Any) -> Non
     await engine.regenerate("chat-regen-state", lambda _event: _capture(_event, []))
 
     assert restored == ["chat-regen-state"]
+
+
+@pytest.mark.asyncio
+async def test_persisted_retrieved_and_consulted_sets_stay_distinct(store: Any) -> None:
+    """M5: retrieved = Stage A candidates, consulted = everything read."""
+
+    from dataclasses import replace
+
+    class AuditRetriever(EvidenceRetriever):
+        def __init__(self, index: Any, chat_id: str) -> None:
+            super().__init__(index, chat_id)
+            self.registry.register(
+                "passage",
+                "p2",
+                {"passage_id": "p2", "note_id": "n1", "text": "Armaan owns the review.", "char_start": 30, "char_end": 53},
+            )
+            self.registry.mark_read("E2")
+
+        def turn_pack(self) -> EvidencePack:
+            pack = super().context_pack("audit", now=1.0)
+            return replace(
+                pack,
+                trace=replace(pack.trace, read_ids=("N1", "E1", "E2")),
+            )
+
+    llm = FakeLLM(
+        streams=[[StreamEvent(kind="content", text="The launch is July 18 [E1]."), StreamEvent(kind="done")]]
+    )
+    logger = MemoryLogger()
+    engine = ChatEngine(
+        store,
+        llm,
+        logger,
+        retriever_factory=lambda chat_id: AuditRetriever(store, chat_id),
+        validator_factory=lambda registry: EvidenceValidator(
+            registry, FixedNLI(1.0), entailment_floor=.8
+        ),
+    )
+    events: list[dict[str, Any]] = []
+
+    await engine.send("", "When is launch?", lambda event: _capture(event, events))
+
+    done = next(event for event in events if event["type"] == "chat_done")["message"]
+    assert done["retrieved_ids"] == ["N1", "E1"]
+    assert done["consulted_ids"] == ["N1", "E1", "E2"]
+    assert done["cited_ids"] == ["E1"]
+    persisted = store.chat_messages(done["chat_id"])[1]
+    assert persisted.retrieved_ids == ["N1", "E1"]
+    assert persisted.consulted_ids == ["N1", "E1", "E2"]
+    turn_log = next(payload for kind, payload in logger.records if kind == "chat_turn")
+    assert turn_log["retrieval"]["retrieved_ids"] == ["N1", "E1"]
+    assert turn_log["retrieval"]["consulted_ids"] == ["N1", "E1", "E2"]
+
+
+@pytest.mark.asyncio
+async def test_fact_support_snippet_is_rendered_and_citable(store: Any) -> None:
+    """M6: an exposed fact-support E# renders as a quote and validates."""
+
+    from dataclasses import replace
+
+    class SupportRetriever(EvidenceRetriever):
+        def __init__(self, index: Any, chat_id: str) -> None:
+            super().__init__(index, chat_id)
+            self.registry.register(
+                "passage",
+                "p2",
+                {"passage_id": "p2", "note_id": "n1", "text": "Armaan owns the review.", "char_start": 30, "char_end": 53},
+            )
+            self.registry.register(
+                "fact", "fact-1", {"source_evidence_ids": ["E1", "E2"], "status": "active"}
+            )
+            self.registry.mark_read("F1")
+            self.exposed = 0
+
+        def context_pack(self, message: str, *, now: float, conversation_context=(), rewritten_query=None) -> EvidencePack:
+            pack = super().context_pack(
+                message, now=now,
+                conversation_context=conversation_context,
+                rewritten_query=rewritten_query,
+            )
+            fact = EvidenceFact(
+                "F1", ("f1",), "Armaan", "responsible_for", "review", "forward",
+                "active", now, None, None, .9, ("E1", "E2"),
+            )
+            return replace(
+                pack,
+                facts=(fact,),
+                trace=replace(pack.trace, read_ids=("N1", "E1", "F1")),
+            )
+
+        def expose_fact_support(self, pack: EvidencePack) -> dict[str, tuple[str, str, str]]:
+            del pack
+            self.exposed += 1
+            self.registry.mark_read("E2")
+            return {"F1": ("E2", "Roadmap", "Armaan owns the review.")}
+
+        def turn_pack(self) -> EvidencePack:
+            pack = self.context_pack("audit", now=1.0)
+            return replace(
+                pack,
+                trace=replace(pack.trace, read_ids=("N1", "E1", "F1", "E2")),
+            )
+
+    llm = FakeLLM(
+        streams=[[StreamEvent(kind="content", text="Armaan owns the review [E2]."), StreamEvent(kind="done")]]
+    )
+    engine = ChatEngine(
+        store,
+        llm,
+        MemoryLogger(),
+        retriever_factory=lambda chat_id: SupportRetriever(store, chat_id),
+        validator_factory=lambda registry: EvidenceValidator(
+            registry, FixedNLI(1.0), entailment_floor=.8
+        ),
+    )
+    events: list[dict[str, Any]] = []
+
+    await engine.send("", "Who owns the review?", lambda event: _capture(event, events))
+
+    evidence_message = llm.calls[0]["messages"][-1]["content"]
+    assert 'supported by [E1] [E2]' in evidence_message
+    assert '[E2] "Roadmap": "Armaan owns the review."' in evidence_message
+    done = next(event for event in events if event["type"] == "chat_done")["message"]
+    assert done["content"] == "Armaan owns the review [E2]."
+    assert done["cited_ids"] == ["E2"]
+    assert FakeRetriever.instances[-1].exposed >= 1
+
+
+@pytest.mark.asyncio
+async def test_budget_exhaustion_injects_evidence_sufficiency_nudge(
+    store: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M11: the forced no-tools round states the evidence gap explicitly."""
+
+    monkeypatch.setattr(config, "CHAT_MAX_TOOL_CALLS", 1)
+    monkeypatch.setattr(
+        engine_module,
+        "execute_tool",
+        lambda name, arguments, retriever, now: (
+            '{"passages":[]}',
+            ChatActivityStep(kind="search", label="Searched", note_ids=[]),
+        ),
+    )
+
+    def streams() -> list[Any]:
+        return [
+            [
+                StreamEvent(kind="tool_call", tool_call={"id": "c1", "name": "search_evidence", "arguments": {"query": "x"}}),
+                StreamEvent(kind="done"),
+            ],
+            [StreamEvent(kind="content", text="I don't have that information."), StreamEvent(kind="done")],
+        ]
+
+    # insufficient evidence → nudge present
+    llm = FakeLLM(streams=streams())
+    engine = ChatEngine(store, llm, MemoryLogger(), validator_factory=_accept_all)
+    await engine.send("", "Question?", lambda _event: _capture(_event, []))
+    notice = llm.calls[1]["messages"][-1]
+    assert notice["role"] == "user"
+    assert "Tool budget exhausted" in notice["content"]
+    assert "Evidence check" not in notice["content"]  # sufficient turn: no nudge
+
+    class InsufficientRetriever(FakeRetriever):
+        def __init__(self, index: Any, chat_id: str) -> None:
+            super().__init__(index, chat_id)
+            self.sufficient = False
+
+    monkeypatch.setattr(engine_module, "ChatRetriever", InsufficientRetriever, raising=False)
+    llm_low = FakeLLM(streams=streams())
+    engine_low = ChatEngine(store, llm_low, MemoryLogger(), validator_factory=_accept_all)
+    await engine_low.send("", "Question?", lambda _event: _capture(_event, []))
+    low_notice = llm_low.calls[1]["messages"][-1]
+    assert "Evidence check" in low_notice["content"]
+    assert "missing" in low_notice["content"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_pack_renders_low_confidence_header_and_validates(store: Any) -> None:
+    """§0.1: fallback evidence renders under the LOW-CONFIDENCE header and is
+    normally citable; the abstention message is reserved for empty packs."""
+
+    class FallbackRetriever(EvidenceRetriever):
+        def context_pack(self, message: str, *, now: float, conversation_context=(), rewritten_query=None) -> EvidencePack:
+            pack = super().context_pack(
+                message, now=now,
+                conversation_context=conversation_context,
+                rewritten_query=rewritten_query,
+            )
+            from dataclasses import replace
+
+            return replace(
+                pack,
+                decision=RetrievalDecision(
+                    False, .48, "fallback_low_confidence", fallback=True
+                ),
+            )
+
+    llm = FakeLLM(
+        streams=[[StreamEvent(kind="content", text="The launch is July 18 [E1]."), StreamEvent(kind="done")]]
+    )
+    engine = ChatEngine(
+        store,
+        llm,
+        MemoryLogger(),
+        retriever_factory=lambda chat_id: FallbackRetriever(store, chat_id),
+        validator_factory=lambda registry: EvidenceValidator(
+            registry, FixedNLI(1.0), entailment_floor=.8
+        ),
+    )
+    events: list[dict[str, Any]] = []
+
+    await engine.send("", "When is launch?", lambda event: _capture(event, events))
+
+    system_prompt = llm.calls[0]["messages"][0]["content"]
+    assert "LOW-CONFIDENCE" in system_prompt  # discipline sentence (§0.1)
+    evidence_message = llm.calls[0]["messages"][-1]["content"]
+    assert "LOW-CONFIDENCE CONTEXT" in evidence_message
+    assert "The launch is July 18." in evidence_message
+    assert "retrieval abstained" not in evidence_message
+    done = next(event for event in events if event["type"] == "chat_done")["message"]
+    assert done["content"] == "The launch is July 18 [E1]."
+    assert done["cited_ids"] == ["E1"]
+    assert done["evidence"]["decision"]["fallback"] is True
+    assert done["evidence"]["passages"][0]["low_confidence"] is True
+
+
+@pytest.mark.asyncio
+async def test_truly_empty_abstained_pack_renders_abstention_message(store: Any) -> None:
+    class AbstainRetriever(EvidenceRetriever):
+        def context_pack(self, message: str, *, now: float, conversation_context=(), rewritten_query=None) -> EvidencePack:
+            return EvidencePack.abstained(
+                RetrievalQuery(message, "chat", now), "below_threshold"
+            )
+
+    llm = FakeLLM(
+        streams=[[StreamEvent(kind="content", text="I don't have that in the knowledge base."), StreamEvent(kind="done")]]
+    )
+    engine = ChatEngine(
+        store,
+        llm,
+        MemoryLogger(),
+        retriever_factory=lambda chat_id: AbstainRetriever(store, chat_id),
+        validator_factory=_accept_all,
+    )
+
+    await engine.send("", "Anything?", lambda _event: _capture(_event, []))
+
+    evidence_message = llm.calls[0]["messages"][-1]["content"]
+    assert "Knowledge-base retrieval abstained: below_threshold" in evidence_message
+    assert "LOW-CONFIDENCE" not in evidence_message
+
+
+@pytest.mark.asyncio
+async def test_stripped_claims_persist_with_reasons(store: Any) -> None:
+    """L31: repaired-away sentences persist as {sentence, reason} records."""
+
+    llm = FakeLLM(
+        streams=[
+            [
+                StreamEvent(
+                    kind="content",
+                    text="The launch is July 18 [E1]. The venue is Boston according to my records.",
+                ),
+                StreamEvent(kind="done"),
+            ]
+        ]
+    )
+    engine = ChatEngine(
+        store,
+        llm,
+        MemoryLogger(),
+        retriever_factory=lambda chat_id: EvidenceRetriever(store, chat_id),
+        validator_factory=lambda registry: EvidenceValidator(
+            registry, FixedNLI(1.0), entailment_floor=.8
+        ),
+    )
+    events: list[dict[str, Any]] = []
+
+    await engine.send("", "When is launch?", lambda event: _capture(event, events))
+
+    done = next(event for event in events if event["type"] == "chat_done")["message"]
+    assert done["content"] == "The launch is July 18 [E1]."
+    assert done["stripped_claims"] == [
+        {
+            "sentence": "The venue is Boston according to my records.",
+            "reason": "citation_coverage",
+        }
+    ]
+    persisted = store.chat_messages(done["chat_id"])[1]
+    assert [claim.reason for claim in persisted.stripped_claims] == ["citation_coverage"]
 
 
 @pytest.mark.asyncio

@@ -88,6 +88,25 @@ class LiveSession:
         self._summary: MeetingSummary | None = None
         self._actionables: list[Actionable] = []
         self._summary_task: asyncio.Task[None] | None = None
+        self._topic_start_seq: int | None = None
+        # User-set actionable statuses always win over summarizer snapshots
+        # (a dismissal during an in-flight summary must survive acceptance).
+        self._user_status: dict[str, str] = {}
+        self._closed = False
+
+    async def aclose(self) -> None:
+        """Idempotent shutdown: cancel and drain any in-flight summary task.
+
+        Callers must await this before closing the session logger so the
+        cancelled task cannot log into a closed sink.
+        """
+
+        self._closed = True
+        task = self._summary_task
+        self._summary_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def on_chunk(self, chunk: Chunk) -> None:
         if chunk.final:
@@ -129,6 +148,7 @@ class LiveSession:
     async def set_actionable_status(self, actionable_id: str, status: str) -> None:
         if status not in {"confirmed", "dismissed"}:
             return
+        self._user_status[actionable_id] = status
         rows = self._summary.actionables if self._summary else self._actionables
         for index, row in enumerate(rows):
             if row.id != actionable_id:
@@ -150,7 +170,11 @@ class LiveSession:
             return
 
     async def _run_retrieval(self, now: float) -> None:
-        window = self.ledger.query_window(now=now, partials=self._partials)
+        window = self.ledger.query_window(
+            now=now,
+            partials=self._partials,
+            topic_start_seq=self._topic_start_seq,
+        )
         if not window.query_text.strip():
             return
         context_text = "\n".join(row.text for row in window.context)
@@ -161,7 +185,13 @@ class LiveSession:
         )
         if pack is None:
             return
-        update = self._grounding.on_pack(pack)
+        topic_shift = bool(getattr(self._ambient, "last_topic_shift", False))
+        if topic_shift and window.citeable:
+            # Later query windows must not span the detected pivot. The
+            # newest chunk of the pivoting window is what confirmed the
+            # shift, so it starts the new topic region.
+            self._topic_start_seq = window.citeable[-1].seq
+        update = self._grounding.on_pack(pack, topic_shift=topic_shift)
         self.last_grounding = update
         await self._emit_event(LiveGroundingEvent.from_domain(update))
         self._logger.log(
@@ -171,6 +201,7 @@ class LiveSession:
             confidence=pack.decision.confidence,
             revision=update.revision,
             new_support_ids=list(update.new_support_ids),
+            topic_shift=topic_shift,
             active_build_id=pack.trace.active_build_id,
             calibration_hash=pack.trace.calibration_hash,
             latency_ms=dict(pack.trace.latency_ms),
@@ -178,12 +209,14 @@ class LiveSession:
         await self._offer_summary(update)
 
     async def _offer_summary(self, update: GroundingUpdate) -> None:
+        if self._closed:
+            return
         pending = self.ledger.pending()
         if not pending:
             return
         fire, reason = self._trigger.offer(
             update,
-            None,
+            getattr(self._ambient, "last_window_embedding", None),
             sum(len(row.text) for row in pending),
         )
         if fire and self._summary_in_flight():
@@ -211,64 +244,92 @@ class LiveSession:
         transcript_evidence: str,
         open_actionables: list[Actionable],
     ) -> None:
+        # Any exit that neither accepts nor rejects the checkpoint —
+        # including task cancellation — must release it, or the ledger stays
+        # in-flight forever and summaries die for the session (M8).
+        settled = False
+
+        def reject(reason: str) -> None:
+            nonlocal settled
+            settled = True
+            self.ledger.reject_summary(snapshot)
+            self._trigger.note_rejected()
+            self._log_summary_rejection(reason)
+
         try:
-            result = await self._summarizer.summarize(
-                self._summary,
-                transcript_evidence,
-                update,
-                open_actionables,
-            )
-        except Exception as exc:
-            self.ledger.reject_summary(snapshot)
-            self._trigger.note_rejected()
-            self._log_summary_rejection(str(exc))
-            return
-        if result is None:
-            self.ledger.reject_summary(snapshot)
-            self._trigger.note_rejected()
-            self._log_summary_rejection("llm_unavailable")
-            return
-        if result.no_update:
-            self.ledger.reject_summary(snapshot)
-            self._trigger.note_summary(update, no_update=True)
+            try:
+                result = await self._summarizer.summarize(
+                    self._summary,
+                    transcript_evidence,
+                    update,
+                    open_actionables,
+                )
+            except Exception as exc:
+                reject(str(exc))
+                return
+            if result is None:
+                reject("llm_unavailable")
+                return
+            if result.no_update:
+                settled = True
+                self.ledger.reject_summary(snapshot)
+                self._trigger.note_summary(update, no_update=True)
+                self._logger.log(
+                    "summary",
+                    no_update=True,
+                    rejected=False,
+                    model=result.model,
+                    latency_ms=result.latency_ms,
+                    through_seq=snapshot.through_seq,
+                )
+                return
+            if result.summary is None or result.rejected:
+                reject(result.reject_reason or "unsupported_claim")
+                return
+
+            settled = True
+            self.ledger.accept_summary(snapshot)
+            self.ledger.prune_accepted(retain=2)
+            # User-set statuses (confirm/dismiss during the in-flight call)
+            # take precedence over the summarizer's stale snapshot (M9).
+            actionables = self._apply_user_status(result.summary.actionables)
+            summary = result.summary.model_copy(update={"actionables": actionables})
+            self._summary = summary
+            self._actionables = list(actionables)
+            self._trigger.note_summary(update, no_update=False)
             self._logger.log(
                 "summary",
-                no_update=True,
+                no_update=False,
                 rejected=False,
                 model=result.model,
                 latency_ms=result.latency_ms,
                 through_seq=snapshot.through_seq,
+                cited_ids=(
+                    list(result.validation.cited_ids)
+                    if result.validation is not None
+                    else []
+                ),
             )
-            return
-        if result.summary is None or result.rejected:
-            self.ledger.reject_summary(snapshot)
-            self._trigger.note_rejected()
-            self._log_summary_rejection(result.reject_reason or "unsupported_claim")
-            return
+            await self._emit_event(SummaryEvent.from_summary(summary))
+            for row in self._apply_user_status(result.new_actionables):
+                await self._emit_event(ActionableEvent(op="new", item=row))
+            for row in self._apply_user_status(result.updated_actionables):
+                await self._emit_event(ActionableEvent(op="update", item=row))
+        finally:
+            if not settled:
+                # Cancellation path: release the checkpoint, then let the
+                # CancelledError propagate.
+                self.ledger.reject_summary(snapshot)
+                self._trigger.note_rejected()
+                self._log_summary_rejection("cancelled")
 
-        self.ledger.accept_summary(snapshot)
-        self.ledger.prune_accepted(retain=2)
-        self._summary = result.summary
-        self._actionables = list(result.summary.actionables)
-        self._trigger.note_summary(update, no_update=False)
-        self._logger.log(
-            "summary",
-            no_update=False,
-            rejected=False,
-            model=result.model,
-            latency_ms=result.latency_ms,
-            through_seq=snapshot.through_seq,
-            cited_ids=(
-                list(result.validation.cited_ids)
-                if result.validation is not None
-                else []
-            ),
-        )
-        await self._emit_event(SummaryEvent.from_summary(result.summary))
-        for row in result.new_actionables:
-            await self._emit_event(ActionableEvent(op="new", item=row))
-        for row in result.updated_actionables:
-            await self._emit_event(ActionableEvent(op="update", item=row))
+    def _apply_user_status(self, rows: list[Actionable]) -> list[Actionable]:
+        return [
+            row.model_copy(update={"status": self._user_status[row.id]})
+            if self._user_status.get(row.id, row.status) != row.status
+            else row
+            for row in rows
+        ]
 
     def _log_summary_rejection(self, reason: str) -> None:
         self._logger.log(
