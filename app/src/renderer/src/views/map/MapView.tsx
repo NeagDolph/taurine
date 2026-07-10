@@ -24,6 +24,10 @@ import {
   sourceLabel,
   sourcesFromMapData,
   staticLinkOpacity,
+  traceIdea,
+  IdeaLensError,
+  type GraphCluster,
+  type IdeaLensResult,
   type LiveGraphLink,
   type MapGraphData,
   type MapLink,
@@ -33,6 +37,8 @@ import {
 import type { RetrievalEvent } from '../../lib/sidecar'
 import { MapContextMenu, type MenuTarget } from './ContextMenu'
 import { MapHoverPanel } from './HoverPanel'
+import { IdeaLens, type IdeaLensStatus } from './IdeaLens'
+import { IdeaPanel } from './IdeaPanel'
 import { MapLegend } from './MapLegend'
 import { MapSearch, type SearchResult } from './MapSearch'
 import { SidePanel } from './SidePanel'
@@ -93,7 +99,18 @@ interface EgoNav {
   history: string[]
 }
 
-const EMPTY_GRAPH: MapGraphData = graphResponseToMapData({ nodes: [], edges: [] }, 'Now')
+type IdeaState =
+  | { status: 'idle'; idea: ''; error: '' }
+  | { status: 'pending'; idea: string; error: '' }
+  | { status: 'ready'; idea: string; result: IdeaLensResult; error: '' }
+  | { status: 'error'; idea: string; error: string }
+
+const IDEA_IDLE: IdeaState = { status: 'idle', idea: '', error: '' }
+
+const EMPTY_GRAPH: MapGraphData = graphResponseToMapData(
+  { nodes: [], edges: [], clusters: [] },
+  'Now'
+)
 const GRAPH_REFETCH_DEBOUNCE_MS = 800
 // ~760 nodes need a few hundred ticks to untangle from d3's initial spiral;
 // the old 80 froze half-laid-out graphs whenever a refetch reset positions
@@ -103,6 +120,8 @@ const DIM_OPACITY = 0.06
 // ~5 minutes so a glance shows where the conversation has walked
 const HEAT_TRAIL_MS = 5 * 60 * 1000
 const SEARCH_HALO_COLOR = '#9edcff'
+// idea-lens matches: warm accent halo, distinct from the cool search halo
+const IDEA_HALO_COLOR = '#f5c518'
 const HEAT_TRAIL_COLOR = '#ff8a3d'
 const MAX_SEARCH_RESULTS = 8
 // zoomToFit on one or two nodes otherwise zooms in until a node fills the
@@ -187,6 +206,9 @@ export function MapView({
   const [panelWidth, setPanelWidth] = useState<number>(() => loadPanelWidth())
   const panelResizingRef = useRef(false)
   const [timeRange, setTimeRange] = useState<TimeRange | null>(null)
+  const [ideaState, setIdeaState] = useState<IdeaState>(IDEA_IDLE)
+  const ideaAbortRef = useRef<AbortController | null>(null)
+  const [highlightedCluster, setHighlightedCluster] = useState<number | null>(null)
 
   // mirrors for async callbacks (ego fetch fallback, pin rehydration)
   const baseGraphRef = useRef(baseGraph)
@@ -222,6 +244,87 @@ export function MapView({
     }
     return titles
   }, [baseGraph, egoGraph])
+
+  // ── clusters ───────────────────────────────────────────────────────────
+
+  // each graph response carries its own cluster table (ids are contiguous per
+  // response); fall back to the global table when a response omits clusters
+  const clusterById = useMemo(() => {
+    const source = displayedGraph.clusters.length > 0 ? displayedGraph.clusters : baseGraph.clusters
+    return new Map<number, GraphCluster>(source.map((cluster) => [cluster.id, cluster]))
+  }, [baseGraph.clusters, displayedGraph.clusters])
+
+  const clusterName = useCallback(
+    (community: number): string => clusterById.get(community)?.name || `Cluster ${community + 1}`,
+    [clusterById]
+  )
+
+  const toggleClusterHighlight = useCallback((community: number) => {
+    setHighlightedCluster((current) => (current === community ? null : community))
+  }, [])
+
+  // the highlight is a community-lens affordance: it only dims while the
+  // community color mode is active in the global map (cluster ids are
+  // per-response, so an ego graph may use a different id space)
+  const activeHighlightedCluster =
+    colorMode === 'community' && !isEgoMode ? highlightedCluster : null
+
+  // ── idea lens ──────────────────────────────────────────────────────────
+
+  const ideaResult = ideaState.status === 'ready' ? ideaState.result : null
+
+  const ideaStrengthById = useMemo(() => {
+    const strengths = new Map<string, number>()
+    if (ideaResult) {
+      for (const match of ideaResult.matches) {
+        strengths.set(match.note_id, Math.max(match.strength, strengths.get(match.note_id) ?? 0))
+      }
+    }
+    return strengths
+  }, [ideaResult])
+
+  const clearIdea = useCallback(() => {
+    ideaAbortRef.current?.abort()
+    ideaAbortRef.current = null
+    setIdeaState(IDEA_IDLE)
+  }, [])
+
+  const submitIdea = useCallback((idea: string) => {
+    ideaAbortRef.current?.abort()
+    const controller = new AbortController()
+    ideaAbortRef.current = controller
+    setIdeaState({ status: 'pending', idea, error: '' })
+    // the lens replaces the literal note search as the active dim, and the
+    // results panel takes over the side-panel slot from any selected note
+    setQuery('')
+    setSelectedNodeId(null)
+
+    traceIdea(idea, { signal: controller.signal })
+      .then((result) => {
+        if (!controller.signal.aborted) {
+          setIdeaState({ status: 'ready', idea, result, error: '' })
+        }
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) {
+          return
+        }
+        const message =
+          error instanceof IdeaLensError
+            ? error.status === 503
+              ? 'LLM unavailable — configure OpenRouter'
+              : error.status === 400
+                ? 'Enter an idea to trace'
+                : `Idea trace failed (HTTP ${error.status})`
+            : 'Idea trace failed — backend unreachable'
+        setIdeaState({ status: 'error', idea, error: message })
+      })
+  }, [])
+
+  // abort any in-flight trace on unmount
+  useEffect(() => {
+    return () => ideaAbortRef.current?.abort()
+  }, [])
 
   // ── filtering ──────────────────────────────────────────────────────────
 
@@ -311,7 +414,21 @@ export function MapView({
 
     return matches
   }, [activeSources, queryActive, queryMatchedIds, visibleNodes])
-  const matchedNodeKey = useMemo(() => [...matchedNodeIds].sort().join('\u0000'), [matchedNodeIds])
+
+  // idea-lens results act like a filter: matched notes stay lit and the rest
+  // dims through the same machinery as search/source filters
+  const displayFilterActive = hasActiveMapFilter || ideaResult !== null
+  const displayMatchedIds = useMemo(() => {
+    if (!ideaResult) {
+      return matchedNodeIds
+    }
+    // intersect with source/search matches so active source chips keep filtering
+    return new Set([...ideaStrengthById.keys()].filter((id) => matchedNodeIds.has(id)))
+  }, [ideaResult, ideaStrengthById, matchedNodeIds])
+  const displayMatchedKey = useMemo(
+    () => [...displayMatchedIds].sort().join(' '),
+    [displayMatchedIds]
+  )
 
   const searchResults: SearchResult[] = useMemo(() => {
     if (!queryActive) {
@@ -424,22 +541,29 @@ export function MapView({
 
   // ── ego navigation ─────────────────────────────────────────────────────
 
-  const enterEgo = useCallback((noteId: string, depth?: number) => {
-    setEgoNav((current) => {
-      if (!current) {
-        return { center: noteId, depth: depth ?? 2, history: [] }
-      }
-      if (current.center === noteId) {
-        const nextDepth = depth ?? current.depth
-        return nextDepth === current.depth ? current : { ...current, depth: nextDepth }
-      }
-      return {
-        center: noteId,
-        depth: depth ?? current.depth,
-        history: [...current.history, current.center]
-      }
-    })
-  }, [])
+  const enterEgo = useCallback(
+    (noteId: string, depth?: number) => {
+      // ego mode replaces the global lenses: idea matches and cluster
+      // highlights refer to the global graph's id space
+      clearIdea()
+      setHighlightedCluster(null)
+      setEgoNav((current) => {
+        if (!current) {
+          return { center: noteId, depth: depth ?? 2, history: [] }
+        }
+        if (current.center === noteId) {
+          const nextDepth = depth ?? current.depth
+          return nextDepth === current.depth ? current : { ...current, depth: nextDepth }
+        }
+        return {
+          center: noteId,
+          depth: depth ?? current.depth,
+          history: [...current.history, current.center]
+        }
+      })
+    },
+    [clearIdea]
+  )
 
   const exitEgo = useCallback(() => {
     setEgoNav(null)
@@ -729,12 +853,14 @@ export function MapView({
     // deferred so the tab switch commits before the map re-navigates; the
     // nonce guard above makes the scheduled work run exactly once
     window.setTimeout(() => {
+      clearIdea()
+      setHighlightedCluster(null)
       setSelectedNodeId(focusRequest.noteId)
       setEgoNav({ center: focusRequest.noteId, depth: 1, history: [] })
       pulseNode(focusRequest.noteId)
       scheduleFlashPrune()
     }, 0)
-  }, [focusRequest, pulseNode, scheduleFlashPrune])
+  }, [clearIdea, focusRequest, pulseNode, scheduleFlashPrune])
 
   const toggleSource = useCallback((source: string) => {
     setSelectedSources((current) => {
@@ -923,7 +1049,7 @@ export function MapView({
   }, [retrieval, scheduleFlashPrune, scheduleGlowPrune, schedulePrune])
 
   useEffect(() => {
-    if (!visible || isEgoMode || hasActiveMapFilter || baseGraph.nodes.length <= 1) {
+    if (!visible || isEgoMode || displayFilterActive || baseGraph.nodes.length <= 1) {
       return
     }
 
@@ -932,10 +1058,10 @@ export function MapView({
     }, 120)
 
     return () => window.clearTimeout(timeout)
-  }, [baseGraph.nodes.length, hasActiveMapFilter, isEgoMode, visible])
+  }, [baseGraph.nodes.length, displayFilterActive, isEgoMode, visible])
 
   useEffect(() => {
-    if (!visible || !hasActiveMapFilter || matchedNodeIds.size === 0) {
+    if (!visible || !displayFilterActive || displayMatchedIds.size === 0) {
       return
     }
 
@@ -943,7 +1069,7 @@ export function MapView({
       graphRef.current?.zoomToFit(
         360,
         64,
-        (node) => node.kind === 'note' && matchedNodeIds.has(String(node.id))
+        (node) => node.kind === 'note' && displayMatchedIds.has(String(node.id))
       )
     }, 100)
     const clampTimeout = window.setTimeout(() => clampZoom(graphRef.current), 540)
@@ -952,7 +1078,7 @@ export function MapView({
       window.clearTimeout(timeout)
       window.clearTimeout(clampTimeout)
     }
-  }, [hasActiveMapFilter, matchedNodeIds, matchedNodeKey, visible])
+  }, [displayFilterActive, displayMatchedIds, displayMatchedKey, visible])
 
   useEffect(() => {
     return () => {
@@ -1146,8 +1272,9 @@ export function MapView({
         id,
         selectedNeighborhood,
         hoverNeighborhood,
-        hasActiveMapFilter,
-        matchedNodeIds,
+        displayFilterActive,
+        displayMatchedIds,
+        activeHighlightedCluster,
         activeTimeRange !== null,
         inTimeRange
       )
@@ -1192,6 +1319,26 @@ export function MapView({
         ctx.beginPath()
         ctx.arc(x, y, radius + 4, 0, Math.PI * 2)
         ctx.strokeStyle = rgba(SEARCH_HALO_COLOR, 0.75)
+        ctx.lineWidth = Math.max(1.2 / globalScale, 0.9)
+        ctx.stroke()
+      }
+
+      const ideaStrength = ideaStrengthById.get(id)
+      const isIdeaMatch = ideaStrength !== undefined && node.kind === 'note'
+      if (isIdeaMatch) {
+        // idea-lens hit: warm accent halo, intensity scaled by match strength
+        const strength = ideaStrength
+        const haloRadius = radius + 7 + strength * 4
+        const gradient = ctx.createRadialGradient(x, y, radius * 0.7, x, y, haloRadius + 4)
+        gradient.addColorStop(0, rgba(IDEA_HALO_COLOR, 0.18 + strength * 0.34))
+        gradient.addColorStop(1, rgba(IDEA_HALO_COLOR, 0))
+        ctx.beginPath()
+        ctx.arc(x, y, haloRadius + 4, 0, Math.PI * 2)
+        ctx.fillStyle = gradient
+        ctx.fill()
+        ctx.beginPath()
+        ctx.arc(x, y, radius + 4, 0, Math.PI * 2)
+        ctx.strokeStyle = rgba(IDEA_HALO_COLOR, 0.3 + strength * 0.6)
         ctx.lineWidth = Math.max(1.2 / globalScale, 0.9)
         ctx.stroke()
       }
@@ -1267,7 +1414,7 @@ export function MapView({
 
       // the selected node's 1-hop titles stay fully readable while selected
       const alpha =
-        isNow || isHovered || isSelected || isSelectedNeighbor || isQueryMatch
+        isNow || isHovered || isSelected || isSelectedNeighbor || isQueryMatch || isIdeaMatch
           ? 1
           : labelAlpha(globalScale, node.degree >= hubDegree)
       if (alpha > 0.02) {
@@ -1280,12 +1427,14 @@ export function MapView({
       flashUntilByNode,
       glowByNode,
       groundedSet,
-      hasActiveMapFilter,
+      displayFilterActive,
+      displayMatchedIds,
+      activeHighlightedCluster,
       hoverNeighborhood,
       hoverNodeId,
       hubDegree,
+      ideaStrengthById,
       inTimeRange,
-      matchedNodeIds,
       nodeFillColor,
       nowLabel,
       pins,
@@ -1329,8 +1478,9 @@ export function MapView({
         opacity = linkOpacityFor(
           link,
           baseOpacity,
-          hasActiveMapFilter,
-          matchedNodeIds,
+          displayFilterActive,
+          displayMatchedIds,
+          activeHighlightedCluster,
           activeTimeRange !== null,
           inTimeRange
         )
@@ -1355,11 +1505,12 @@ export function MapView({
       ctx.restore()
     },
     [
-      hasActiveMapFilter,
+      displayFilterActive,
+      displayMatchedIds,
+      activeHighlightedCluster,
       hoverLinkId,
       hoverNodeId,
       inTimeRange,
-      matchedNodeIds,
       selectedNeighborhood,
       selectedNodeId,
       activeTimeRange
@@ -1404,7 +1555,7 @@ export function MapView({
   // ── overlay text ───────────────────────────────────────────────────────
 
   const noteCount = visibleNodes.filter((node) => node.kind === 'note').length
-  const matchCount = hasActiveMapFilter ? matchedNodeIds.size : noteCount
+  const matchCount = displayFilterActive ? displayMatchedIds.size : noteCount
   const centerTitle = egoNav ? (titleById.get(egoNav.center) ?? egoNav.center) : ''
   const overlayText = error
     ? error
@@ -1418,8 +1569,8 @@ export function MapView({
             : `${truncateTitle(centerTitle)} · depth ${egoNav.depth} · ${noteCount} notes`
         : noteCount === 0
           ? 'No notes indexed'
-          : hasActiveMapFilter
-            ? `${matchCount}/${noteCount} matches · ${graphData.links.length} links`
+          : displayFilterActive
+            ? `${matchCount}/${noteCount} ${ideaResult ? 'idea matches' : 'matches'} · ${graphData.links.length} links`
             : `${noteCount} notes · ${graphData.links.length} links`
 
   const communities = useMemo(() => {
@@ -1433,6 +1584,12 @@ export function MapView({
   }, [visibleNodes])
 
   const selectedNode = selectedNodeId ? findDisplayedNode(selectedNodeId) : null
+  const selectedCluster =
+    selectedNode && selectedNode.community >= 0
+      ? (clusterById.get(selectedNode.community) ?? null)
+      : null
+  const ideaStatus: IdeaLensStatus = ideaState.status
+  const panelOpen = selectedNodeId !== null || ideaResult !== null
 
   return (
     <section aria-hidden={!visible} aria-label="Map view" className="map-view">
@@ -1440,8 +1597,23 @@ export function MapView({
         <MapSearch
           query={query}
           results={searchResults}
-          onQueryChange={setQuery}
+          onQueryChange={(next) => {
+            setQuery(next)
+            // a literal note search replaces the idea lens as the active dim
+            if (next.trim().length > 0) {
+              clearIdea()
+            }
+          }}
           onPick={(noteId) => selectNode(noteId, { center: true })}
+        />
+
+        <IdeaLens
+          status={ideaStatus}
+          activeIdea={ideaState.idea}
+          error={ideaState.error}
+          onSubmit={submitIdea}
+          onCancel={clearIdea}
+          onClear={clearIdea}
         />
 
         <div className="map-source-filters" aria-label="Source filters">
@@ -1472,7 +1644,13 @@ export function MapView({
               className={`map-seg${colorMode === mode ? ' active' : ''}`}
               type="button"
               aria-pressed={colorMode === mode}
-              onClick={() => setColorMode(mode)}
+              onClick={() => {
+                setColorMode(mode)
+                // leaving the community lens drops any legend highlight
+                if (mode !== 'community') {
+                  setHighlightedCluster(null)
+                }
+              }}
             >
               {mode === 'source' ? 'Source' : mode === 'community' ? 'Clusters' : 'Recency'}
             </button>
@@ -1547,7 +1725,7 @@ export function MapView({
       ) : null}
 
       <div
-        className={`map-stage${selectedNodeId ? ' has-panel' : ''}`}
+        className={`map-stage${panelOpen ? ' has-panel' : ''}`}
         ref={containerRef}
         style={{ '--map-panel-width': `${panelWidth}px` } as CSSProperties}
       >
@@ -1643,6 +1821,7 @@ export function MapView({
         {!(hoverNode && String(hoverNode.id) === selectedNodeId) ? (
           <MapHoverPanel
             colorMode={colorMode}
+            clusterName={clusterName}
             hoverLink={hoverLink}
             hoverNode={hoverNode}
             nowLabel={nowLabel}
@@ -1660,6 +1839,9 @@ export function MapView({
         <MapLegend
           colorMode={colorMode}
           communities={communities}
+          clusterById={clusterById}
+          highlightedCluster={activeHighlightedCluster}
+          onToggleCluster={toggleClusterHighlight}
           sourceIds={sourceIds}
           timeDomain={timeDomain}
         />
@@ -1677,7 +1859,7 @@ export function MapView({
           />
         ) : null}
 
-        {selectedNodeId ? (
+        {panelOpen ? (
           <div
             className="map-panel-resizer"
             role="separator"
@@ -1696,11 +1878,18 @@ export function MapView({
             key={selectedNodeId}
             noteId={selectedNodeId}
             node={selectedNode}
+            cluster={selectedCluster}
             onClose={() => setSelectedNodeId(null)}
             onFocus={focusNode}
             onAskAbout={onAskAbout}
             onOpenNote={onOpenNote}
             onSelectNeighbor={(noteId) => selectNode(noteId, { center: true })}
+          />
+        ) : ideaResult ? (
+          <IdeaPanel
+            result={ideaResult}
+            onSelect={(noteId) => selectNode(noteId, { center: true })}
+            onClose={clearIdea}
           />
         ) : null}
       </div>
@@ -1754,6 +1943,7 @@ function nodeOpacityFor(
   hoverNeighborhood: Set<string> | null,
   hasActiveMapFilter: boolean,
   matchedNodeIds: Set<string>,
+  highlightedCluster: number | null,
   timeFilterActive: boolean,
   inTimeRange: (node: MapNode) => boolean
 ): number {
@@ -1769,6 +1959,15 @@ function nodeOpacityFor(
     return DIM_OPACITY
   }
 
+  // legend cluster highlight: notes outside the highlighted cluster fade
+  if (
+    highlightedCluster !== null &&
+    node.kind === 'note' &&
+    node.community !== highlightedCluster
+  ) {
+    return DIM_OPACITY
+  }
+
   const dimByFilter = hasActiveMapFilter && !(node.kind === 'note' && matchedNodeIds.has(id))
   const dimByTime = timeFilterActive && node.kind === 'note' && !inTimeRange(node)
   return dimByFilter || dimByTime ? DIM_OPACITY : 1
@@ -1779,9 +1978,21 @@ function linkOpacityFor(
   baseOpacity: number,
   hasActiveMapFilter: boolean,
   matchedNodeIds: Set<string>,
+  highlightedCluster: number | null,
   timeFilterActive: boolean,
   inTimeRange: (node: MapNode) => boolean
 ): number {
+  if (highlightedCluster !== null) {
+    // legend cluster highlight: only intra-cluster edges stay visible
+    const sourceNode = asMapNode(link.source)
+    const targetNode = asMapNode(link.target)
+    const sourceOut = sourceNode?.kind === 'note' && sourceNode.community !== highlightedCluster
+    const targetOut = targetNode?.kind === 'note' && targetNode.community !== highlightedCluster
+    if (sourceOut || targetOut) {
+      return DIM_OPACITY
+    }
+  }
+
   if (!hasActiveMapFilter && !timeFilterActive) {
     return baseOpacity
   }

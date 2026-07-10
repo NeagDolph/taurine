@@ -3,6 +3,7 @@ import { SIDECAR_PORT, type RetrievalEvent } from './sidecar'
 export const NOW_NODE_ID = '__taurine_now__'
 export const SIDECAR_GRAPH_URL = `http://127.0.0.1:${SIDECAR_PORT}/graph`
 export const SIDECAR_GRAPH_LOCAL_URL = `http://127.0.0.1:${SIDECAR_PORT}/graph/local`
+export const SIDECAR_GRAPH_IDEA_URL = `http://127.0.0.1:${SIDECAR_PORT}/graph/idea`
 export const SIDECAR_FACTS_URL = `http://127.0.0.1:${SIDECAR_PORT}/facts`
 export const LIVE_EDGE_FADE_MS = 3000
 export const TOUCH_FLASH_MS = 1800
@@ -41,9 +42,19 @@ export interface GraphEdge {
   mechanisms: Record<string, number>
 }
 
+/** LLM-named cluster summary (contiguous ids 0..N-1 ordered by size desc). */
+export interface GraphCluster {
+  id: number
+  name: string
+  description: string
+  size: number
+}
+
 export interface GraphResponse {
   nodes: GraphNode[]
   edges: GraphEdge[]
+  /** absent on older backends — defaulted to [] by the parser */
+  clusters: GraphCluster[]
 }
 
 export interface LocalGraphResponse extends GraphResponse {
@@ -119,6 +130,7 @@ export type MapLink = StaticGraphLink | LiveGraphLink
 export interface MapGraphData {
   nodes: MapNode[]
   links: MapLink[]
+  clusters: GraphCluster[]
 }
 
 export interface LiveGraphUpdate {
@@ -148,8 +160,9 @@ export function parseGraphResponse(value: unknown): GraphResponse {
 
   const nodes = record.nodes.map(parseGraphNode)
   const edges = record.edges.map(parseGraphEdge)
+  const clusters = parseGraphClusters(record.clusters)
 
-  return { nodes, edges }
+  return { nodes, edges, clusters }
 }
 
 export async function fetchLocalGraph(
@@ -215,6 +228,95 @@ export function parseFactsResponse(value: unknown): FactRecord[] {
     }
   }
   return facts
+}
+
+// ── idea lens (agentic concept search) ──────────────────────────────────
+
+export interface IdeaMatch {
+  note_id: string
+  title: string
+  source: string
+  /** 0..1 relevance */
+  strength: number
+  reason: string
+}
+
+export interface IdeaLensResult {
+  idea: string
+  matches: IdeaMatch[]
+  considered: number
+  expanded: number
+  latency_ms: number
+}
+
+/** HTTP failure from POST /graph/idea — status 503 means LLM unavailable. */
+export class IdeaLensError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'IdeaLensError'
+    this.status = status
+  }
+}
+
+export interface TraceIdeaOptions {
+  limit?: number
+  signal?: AbortSignal
+  url?: string
+  fetcher?: typeof fetch
+}
+
+export async function traceIdea(
+  idea: string,
+  options: TraceIdeaOptions = {}
+): Promise<IdeaLensResult> {
+  const fetcher = options.fetcher ?? globalThis.fetch
+  const body: Record<string, unknown> = { idea }
+  if (typeof options.limit === 'number') {
+    body.limit = options.limit
+  }
+
+  const response = await fetcher(options.url ?? SIDECAR_GRAPH_IDEA_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: options.signal
+  })
+  if (!response.ok) {
+    throw new IdeaLensError(`Idea trace failed with HTTP ${response.status}`, response.status)
+  }
+
+  return parseIdeaLensResult(await response.json(), idea)
+}
+
+export function parseIdeaLensResult(value: unknown, fallbackIdea: string): IdeaLensResult {
+  const record = asRecord(value)
+  const matches: IdeaMatch[] = []
+  if (record && Array.isArray(record.matches)) {
+    for (const row of record.matches) {
+      const match = asRecord(row)
+      if (!match || typeof match.note_id !== 'string' || match.note_id.length === 0) {
+        continue
+      }
+      matches.push({
+        note_id: match.note_id,
+        title: typeof match.title === 'string' && match.title ? match.title : match.note_id,
+        source: typeof match.source === 'string' ? match.source : 'apple_notes',
+        strength: typeof match.strength === 'number' ? clamp(match.strength, 0, 1) : 0,
+        reason: typeof match.reason === 'string' ? match.reason : ''
+      })
+    }
+  }
+  matches.sort((left, right) => right.strength - left.strength)
+
+  return {
+    idea: typeof record?.idea === 'string' && record.idea ? record.idea : fallbackIdea,
+    matches,
+    considered: typeof record?.considered === 'number' ? record.considered : 0,
+    expanded: typeof record?.expanded === 'number' ? record.expanded : 0,
+    latency_ms: typeof record?.latency_ms === 'number' ? record.latency_ms : 0
+  }
 }
 
 export interface GraphToMapOptions {
@@ -288,7 +390,7 @@ export function graphResponseToMapData(
       mechanisms: { ...edge.mechanisms }
     }))
 
-  return { nodes, links }
+  return { nodes, links, clusters: response.clusters.map((cluster) => ({ ...cluster })) }
 }
 
 /**
@@ -349,7 +451,9 @@ export function localSubgraphFromMapData(
     })
   }
 
-  return { nodes, links }
+  // node.community keeps global ids in this fallback path, so global cluster
+  // metadata stays correct for the subgraph
+  return { nodes, links, clusters: data.clusters.map((cluster) => ({ ...cluster })) }
 }
 
 /** Endpoint id from a link source/target that force-graph may have objectified. */
@@ -384,7 +488,8 @@ export function mergeGraphPositions(previous: MapGraphData, next: MapGraphData):
       // while the simulation coordinates on the reused object stay put
       return Object.assign(existing, node)
     }),
-    links: next.links
+    links: next.links,
+    clusters: next.clusters
   }
 }
 
@@ -644,6 +749,27 @@ function parseGraphEdge(value: unknown): GraphEdge {
     fact_ids: stringArray(record.fact_ids),
     mechanisms: numberRecord(record.mechanisms)
   }
+}
+
+function parseGraphClusters(value: unknown): GraphCluster[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  const clusters: GraphCluster[] = []
+  for (const row of value) {
+    const record = asRecord(row)
+    if (!record || typeof record.id !== 'number') {
+      continue
+    }
+    clusters.push({
+      id: Math.trunc(record.id),
+      name: typeof record.name === 'string' ? record.name : '',
+      description: typeof record.description === 'string' ? record.description : '',
+      size: typeof record.size === 'number' ? Math.max(0, Math.trunc(record.size)) : 0
+    })
+  }
+  return clusters
 }
 
 function parseFactRecord(value: unknown): FactRecord | null {

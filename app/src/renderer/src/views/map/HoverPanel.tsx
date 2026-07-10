@@ -18,13 +18,16 @@ export function MapHoverPanel({
   hoverNode,
   hoverLink,
   nowLabel,
-  colorMode
+  colorMode,
+  clusterName
 }: {
   hoverNode: GraphNodeObject | null
   hoverLink: GraphLinkObject | null
   nowLabel: string
   /** active color mode; shows cluster info when set to 'community' */
   colorMode?: ColorMode
+  /** resolves a community id to its display name */
+  clusterName?: (community: number) => string
 }): React.JSX.Element | null {
   if (hoverNode) {
     const isNow = String(hoverNode.id) === NOW_NODE_ID
@@ -61,7 +64,7 @@ export function MapHoverPanel({
                 style={{ '--map-dot-color': communityColor(hoverNode.community) } as CSSProperties}
                 aria-hidden="true"
               />
-              Cluster {hoverNode.community}
+              {clusterName?.(hoverNode.community) ?? `Cluster ${hoverNode.community + 1}`}
             </>
           ) : null}
         </div>

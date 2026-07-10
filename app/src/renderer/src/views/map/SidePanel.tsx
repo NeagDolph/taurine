@@ -1,6 +1,12 @@
 import { useEffect, useState, type CSSProperties } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { communityColor, sourceColor, sourceLabel, type MapNode } from '../../lib/graph'
+import {
+  communityColor,
+  sourceColor,
+  sourceLabel,
+  type GraphCluster,
+  type MapNode
+} from '../../lib/graph'
 import { fetchNotePreview, type NotePreview } from '../../lib/sidecar'
 import { formatTimestamp } from './render'
 
@@ -8,6 +14,8 @@ interface SidePanelProps {
   noteId: string
   /** graph node when present in the currently displayed graph (extra metadata) */
   node: MapNode | null
+  /** named cluster metadata for the node's community, when clustered */
+  cluster: GraphCluster | null
   onClose: () => void
   onFocus: (noteId: string) => void
   onAskAbout: (noteId: string, title: string) => void
@@ -25,6 +33,7 @@ type PanelState =
 export function SidePanel({
   noteId,
   node,
+  cluster,
   onClose,
   onFocus,
   onAskAbout,
@@ -66,15 +75,6 @@ export function SidePanel({
             <span aria-hidden="true" />
             {sourceLabel(source)}
           </span>
-          {node && node.community >= 0 ? (
-            <span
-              className="map-side-community"
-              style={{ '--map-community-color': communityColor(node.community) } as CSSProperties}
-              title={`Community ${node.community}`}
-            >
-              <span aria-hidden="true" />C{node.community}
-            </span>
-          ) : null}
           <button
             className="map-icon-btn map-side-close"
             type="button"
@@ -102,6 +102,20 @@ export function SidePanel({
                 {entity}
               </span>
             ))}
+          </div>
+        ) : null}
+        {node && node.community >= 0 ? (
+          <div className="map-side-cluster" aria-label="Cluster">
+            <span
+              className="map-side-community"
+              style={{ '--map-community-color': communityColor(node.community) } as CSSProperties}
+            >
+              <span aria-hidden="true" />
+              {cluster?.name || `Cluster ${node.community + 1}`}
+            </span>
+            {cluster?.description ? (
+              <p className="map-side-cluster-desc">{cluster.description}</p>
+            ) : null}
           </div>
         ) : null}
       </header>

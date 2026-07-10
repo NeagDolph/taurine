@@ -1,5 +1,11 @@
 import type { CSSProperties } from 'react'
-import { RECENCY_LEGEND_GRADIENT, communityColor, sourceColor, sourceLabel } from '../../lib/graph'
+import {
+  RECENCY_LEGEND_GRADIENT,
+  communityColor,
+  sourceColor,
+  sourceLabel,
+  type GraphCluster
+} from '../../lib/graph'
 import { formatTimestamp } from './render'
 import type { ColorMode } from './storage'
 
@@ -8,15 +14,23 @@ interface MapLegendProps {
   sourceIds: string[]
   /** [communityId, noteCount] sorted by count desc */
   communities: Array<[number, number]>
+  /** cluster id → LLM-generated name/description/size */
+  clusterById: Map<number, GraphCluster>
+  /** cluster id currently highlighted via the legend, if any */
+  highlightedCluster: number | null
+  onToggleCluster: (community: number) => void
   timeDomain: [number, number] | null
 }
 
-const MAX_LEGEND_COMMUNITIES = 6
+const MAX_LEGEND_COMMUNITIES = 12
 
 export function MapLegend({
   colorMode,
   sourceIds,
   communities,
+  clusterById,
+  highlightedCluster,
+  onToggleCluster,
   timeDomain
 }: MapLegendProps): React.JSX.Element {
   return (
@@ -54,19 +68,36 @@ export function MapLegend({
 
       {colorMode === 'community' ? (
         <>
-          {communities.slice(0, MAX_LEGEND_COMMUNITIES).map(([community, count]) => (
-            <span className="map-legend-row" key={`legend-community-${community}`}>
-              <span
-                className="map-legend-swatch"
-                style={{ '--map-source-color': communityColor(community) } as CSSProperties}
-                aria-hidden="true"
-              />
-              {community < 0 ? 'unclustered' : `cluster ${community}`} · {count}
-            </span>
-          ))}
+          {communities.slice(0, MAX_LEGEND_COMMUNITIES).map(([community, count]) => {
+            const cluster = community >= 0 ? clusterById.get(community) : undefined
+            const name = community < 0 ? 'Unclustered' : cluster?.name || `Cluster ${community + 1}`
+            const tooltip = cluster?.description
+              ? `${cluster.description} · ${cluster.size || count} notes`
+              : `${count} note${count === 1 ? '' : 's'}`
+            const active = highlightedCluster === community
+
+            return (
+              <button
+                className={`map-legend-cluster${active ? ' active' : ''}`}
+                key={`legend-community-${community}`}
+                type="button"
+                aria-pressed={active}
+                title={tooltip}
+                onClick={() => onToggleCluster(community)}
+              >
+                <span
+                  className="map-legend-swatch"
+                  style={{ '--map-source-color': communityColor(community) } as CSSProperties}
+                  aria-hidden="true"
+                />
+                <span className="map-legend-cluster-name">{name}</span>
+                <span className="map-legend-cluster-count">{count}</span>
+              </button>
+            )
+          })}
           {communities.length > MAX_LEGEND_COMMUNITIES ? (
             <span className="map-legend-row map-legend-more">
-              +{communities.length - MAX_LEGEND_COMMUNITIES} more clusters
+              …{communities.length - MAX_LEGEND_COMMUNITIES} more
             </span>
           ) : null}
         </>
