@@ -12,8 +12,8 @@ CHAT_MAX_CONCURRENT_TURNS across chats. A turn:
    append tool message, re-open the stream — until no tool calls or
    CHAT_MAX_TOOL_CALLS (with an evidence-sufficiency nudge when nothing this
    turn cleared the retrieval floor, §14.4)
-4. strict citation validation against this turn's read evidence (coverage,
-   availability, fact provenance, temporal consistency, NLI entailment): one
+4. citation validation against this turn's read evidence (identifier
+   validity, availability, fact provenance, temporal consistency): one
    constrained repair attempt, then unsupported-sentence stripping (stripped
    claims persist on the message), then an evidence-excerpt fallback; on
    acceptance the retriever commits its accepted-turn state and saves
@@ -1004,7 +1004,7 @@ def _finalize_evidence(
     validator = (
         validator_factory(registry)
         if validator_factory is not None
-        else EvidenceValidator(registry, None, entailment_floor=1.0)
+        else EvidenceValidator(registry)
     )
     supplied = pack.trace.read_ids if pack is not None else ()
     result = validator.validate(

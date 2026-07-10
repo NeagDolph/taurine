@@ -40,3 +40,20 @@ Deferred from the 2026-07-09 graph rehaul (see `graph-rehaul-spec.md`). Roughly 
 10. **UMAP-seeded layout (F29)** — average passage embeddings per note, use UMAP coords
     as force-layout initialization/weak gravity for a stable semantic geography across
     builds.
+
+## 2026-07-10 — validation stages 3 and 5 removed
+
+Per-sentence citation coverage (stage 3) and NLI entailment (stage 5) were
+removed from `retrieval/validate.py` by decision. Rationale: entailment
+cannot prove absence claims, so honest "not found" answers were shredded
+into the excerpt fallback; across all real chats the strip reasons were
+74× nli_unavailable / 9× citation_coverage / 5× entailment_below_floor and
+zero observed hallucinated citations — enforcement only ever punished
+correct answers. The 2026-07-08 spec had scoped NLI verification as
+"add only if hallucinated citations appear"; that trigger was never met.
+
+Remaining hard stages: citation identifier validity, availability, fact
+provenance, temporal consistency. `nli-deberta-v3-base` is no longer part
+of the download manifest; `models_local.local_nli_scorer` is kept for a
+possible future re-enable. If hallucinated citations do start appearing,
+reintroduce entailment as annotate-first (flag, don't strip).

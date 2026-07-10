@@ -12,7 +12,6 @@ def main() -> int:
         config.EMBED_MODEL,
         config.GLINER2_MODEL,
         config.RERANK_MODEL,
-        config.EVIDENCE_NLI_MODEL,
     ):
         target = MODELS_DIR / repo_id.split("/")[-1]
         print(f"downloading {repo_id} -> {target}", flush=True)

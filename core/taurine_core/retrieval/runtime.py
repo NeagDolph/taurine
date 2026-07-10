@@ -23,7 +23,6 @@ from taurine_core.indexer.communities import projection_communities
 from taurine_core.indexer.embed import embed_queries
 from taurine_core.models_local import (
     LocalModelUnavailable,
-    local_nli_scorer,
     local_pair_reranker,
 )
 from taurine_core.retrieval.calibration import AbstentionPolicy, HeadCalibrator
@@ -179,16 +178,6 @@ class RetrievalRuntime:
                 "run: uv run python -m taurine_core.download_models",
                 exc,
             )
-        try:
-            self.nli_scorer: Any | None = local_nli_scorer()
-        except LocalModelUnavailable as exc:
-            self.nli_scorer = None
-            log.warning(
-                "local NLI model unavailable (%s) — synthesized answers cannot "
-                "be validated and will fall back to raw excerpts; "
-                "run: uv run python -m taurine_core.download_models",
-                exc,
-            )
 
     def make_engine(
         self,
@@ -267,11 +256,7 @@ class RetrievalRuntime:
         )
 
     def make_validator(self, registry: EvidenceRegistry) -> EvidenceValidator:
-        return EvidenceValidator(
-            registry,
-            self.nli_scorer,
-            entailment_floor=self.artifact.nli.entailment_floor,
-        )
+        return EvidenceValidator(registry)
 
     def close(self) -> None:
         with self._lock:

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 
@@ -12,7 +10,6 @@ from taurine_core import models_local
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.retrieval.validate import (
     EvidenceValidator,
-    _sentences,
     validate_evidence_output,
 )
 
@@ -32,7 +29,7 @@ class FakeNLI:
 def test_rejects_unknown_and_unsupplied_citations_without_stripping_claim() -> None:
     registry = EvidenceRegistry()
     registry.register("passage", "p1", {"text": "Launch is July 18."})
-    validator = EvidenceValidator(registry, FakeNLI({}), entailment_floor=0.8)
+    validator = EvidenceValidator(registry)
 
     unknown = validator.validate(
         "Launch is July 18. [E99]", mode="chat", available_ids=("E1",)
@@ -54,7 +51,7 @@ def test_explicit_turn_availability_excludes_evidence_read_on_prior_turns() -> N
     registry = EvidenceRegistry()
     ref = registry.register("passage", "p1", {"text": "Launch is July 18."})
     registry.mark_read(ref)
-    validator = EvidenceValidator(registry, FakeNLI({}), entailment_floor=0.8)
+    validator = EvidenceValidator(registry)
 
     result = validator.validate(
         "Launch is July 18. [E1]",
@@ -67,61 +64,46 @@ def test_explicit_turn_availability_excludes_evidence_read_on_prior_turns() -> N
 
 
 @pytest.mark.parametrize("citation", ["", " [N1]", " [P1]"])
-def test_factual_sentence_requires_e_f_or_t_coverage(citation: str) -> None:
+def test_uncited_and_navigation_cited_sentences_are_accepted(citation: str) -> None:
+    """Per-sentence citation coverage (stage 3) was removed 2026-07-10:
+    uncited prose is the model's judgment, not the validator's."""
     registry = EvidenceRegistry()
     registry.register("note", "n1", {"title": "Roadmap"})
     registry.register("path", "path1", {"rendered": "N1 -> E1"})
 
-    result = EvidenceValidator(
-        registry, FakeNLI({}), entailment_floor=0.8
-    ).validate(
+    result = EvidenceValidator(registry).validate(
         f"Launch is July 18.{citation}", mode="chat", available_ids=("N1", "P1")
     )
 
-    assert not result.accepted
-    assert result.unsupported_sentences == (f"Launch is July 18.{citation}",)
+    assert result.accepted
+    assert result.unsupported_sentences == ()
 
 
-def test_entailed_passage_is_accepted_and_contradiction_requires_repair() -> None:
-    evidence = "The launch date is July 18."
-    claim = "Launch is July 18."
-    registry = _read_passage(evidence)
+def test_cited_sentences_are_accepted_without_entailment_checks() -> None:
+    """NLI entailment (stage 5) was removed 2026-07-10: a valid, available
+    citation is sufficient; claim/evidence agreement is the model's job."""
+    registry = _read_passage("The launch date is July 18.")
 
-    entailed = EvidenceValidator(
-        registry,
-        FakeNLI({(evidence, claim): 0.92}),
-        entailment_floor=0.8,
-    ).validate(f"{claim} [E1]", mode="chat", available_ids=("E1",))
-    contradicted = EvidenceValidator(
-        registry,
-        FakeNLI({(evidence, claim): 0.1}),
-        entailment_floor=0.8,
-    ).validate(f"{claim} [E1]", mode="chat", available_ids=("E1",))
+    result = EvidenceValidator(registry).validate(
+        "Launch is cancelled forever. [E1]", mode="chat", available_ids=("E1",)
+    )
 
-    assert entailed.accepted
-    assert entailed.accepted_output == f"{claim} [E1]"
-    assert entailed.cited_ids == ("E1",)
-    assert not contradicted.accepted
-    assert contradicted.accepted_output == ""
-    assert contradicted.repair_required
-    assert contradicted.unsupported_sentences == (f"{claim} [E1]",)
+    assert result.accepted
+    assert result.cited_ids == ("E1",)
 
 
-def test_fact_requires_supplied_passage_provenance_and_uses_it_for_nli() -> None:
-    evidence = "Maya owns Launch."
+def test_fact_citation_requires_supplied_passage_provenance() -> None:
     claim = "Maya owns Launch."
-    registry = _read_passage(evidence)
+    registry = _read_passage("Maya owns Launch.")
     registry.register(
         "fact",
         "owns-launch",
         {"source_evidence_ids": ["E1"], "status": "active"},
     )
 
-    result = EvidenceValidator(
-        registry,
-        FakeNLI({(evidence, claim): 0.95}),
-        entailment_floor=0.8,
-    ).validate(f"{claim} [F1]", mode="chat", available_ids=("E1", "F1"))
+    result = EvidenceValidator(registry).validate(
+        f"{claim} [F1]", mode="chat", available_ids=("E1", "F1")
+    )
 
     assert result.accepted
     assert result.cited_ids == ("F1",)
@@ -132,16 +114,13 @@ def test_fact_requires_supplied_passage_provenance_and_uses_it_for_nli() -> None
         "owns-launch",
         {"source_evidence_ids": ["E9"], "status": "active"},
     )
-    invalid = EvidenceValidator(
-        broken, FakeNLI({}), entailment_floor=0.8
-    ).validate(f"{claim} [F1]", mode="chat", available_ids=("F1",))
+    invalid = EvidenceValidator(broken).validate(f"{claim} [F1]", mode="chat", available_ids=("F1",))
     assert not invalid.accepted
     assert "F1" in invalid.invalid_citations
 
 
 def test_fact_support_group_needs_at_least_one_supplied_source_not_every_source() -> None:
-    evidence = "Maya owns Launch."
-    registry = _read_passage(evidence)
+    registry = _read_passage("Maya owns Launch.")
     registry.register("passage", "p2", {"text": "A duplicate unsupplied assertion."})
     registry.register(
         "fact",
@@ -149,11 +128,9 @@ def test_fact_support_group_needs_at_least_one_supplied_source_not_every_source(
         {"source_evidence_ids": ["E1", "E2"], "status": "active"},
     )
 
-    result = EvidenceValidator(
-        registry,
-        FakeNLI({(evidence, "Maya owns Launch."): 0.95}),
-        entailment_floor=0.8,
-    ).validate("Maya owns Launch. [F1]", mode="chat", available_ids=("E1", "F1"))
+    result = EvidenceValidator(registry).validate(
+        "Maya owns Launch. [F1]", mode="chat", available_ids=("E1", "F1")
+    )
 
     assert result.accepted
 
@@ -166,13 +143,7 @@ def test_current_claim_cannot_rely_only_on_superseded_fact() -> None:
         "maya-wink",
         {"source_evidence_ids": ["E1"], "status": "superseded"},
     )
-    nli = FakeNLI(
-        {
-            (evidence, "Maya works at Wink."): 0.95,
-            (evidence, "Maya formerly worked at Wink."): 0.95,
-        }
-    )
-    validator = EvidenceValidator(registry, nli, entailment_floor=0.8)
+    validator = EvidenceValidator(registry)
 
     current = validator.validate(
         "Maya works at Wink. [F1]", mode="chat", available_ids=("E1", "F1")
@@ -197,34 +168,13 @@ launch_date = "July 18"
 
 I might be mistaken about the schedule.
 """
-    result = EvidenceValidator(
-        EvidenceRegistry(), FakeNLI({}), entailment_floor=0.8
-    ).validate(output, mode="chat", available_ids=())
+    result = EvidenceValidator(EvidenceRegistry()).validate(
+        output, mode="chat", available_ids=()
+    )
 
     assert result.accepted
     assert result.accepted_output == output
     assert result.unsupported_sentences == ()
-
-
-def test_missing_nli_fails_live_closed_and_requires_chat_evidence_excerpt() -> None:
-    registry = _read_passage("Launch is July 18.")
-    validator = EvidenceValidator(registry, None, entailment_floor=0.8)
-
-    live = validator.validate(
-        "Launch is July 18. [E1]", mode="live", available_ids=("E1",)
-    )
-    chat = validator.validate(
-        "Launch is July 18. [E1]", mode="chat", available_ids=("E1",)
-    )
-
-    assert not live.accepted
-    assert live.accepted_output == ""
-    assert live.degraded_reason == "nli_unavailable_live_fail_closed"
-    assert not live.evidence_excerpt_required
-    assert not chat.accepted
-    assert chat.degraded_reason == "nli_unavailable_chat_excerpt_required"
-    assert chat.evidence_excerpt_required
-    assert not chat.repair_required
 
 
 def test_local_nli_loader_never_falls_back_to_network(monkeypatch) -> None:
@@ -254,7 +204,7 @@ def test_local_nli_loader_is_fake_friendly_and_process_cached(monkeypatch) -> No
     assert constructed == ["/bundled/nli-deberta"]
 
 
-def test_download_manifest_includes_nli_model(monkeypatch, tmp_path) -> None:
+def test_download_manifest_excludes_retired_nli_model(monkeypatch, tmp_path) -> None:
     downloaded: list[str] = []
     monkeypatch.setattr(download_models, "MODELS_DIR", tmp_path)
     monkeypatch.setattr(
@@ -264,14 +214,17 @@ def test_download_manifest_includes_nli_model(monkeypatch, tmp_path) -> None:
     )
 
     assert download_models.main() == 0
-    assert config.EVIDENCE_NLI_MODEL in downloaded
+    # NLI entailment validation was removed 2026-07-10; its model is no
+    # longer part of the offline bundle.
+    assert config.EVIDENCE_NLI_MODEL not in downloaded
+    assert config.RERANK_MODEL in downloaded
 
 
 def test_available_ids_is_required_and_never_session_cumulative() -> None:
     """L13: no default availability — callers must scope the citable set."""
 
     registry = _read_passage("Launch is July 18.")
-    validator = EvidenceValidator(registry, FakeNLI({}), entailment_floor=0.8)
+    validator = EvidenceValidator(registry)
 
     with pytest.raises(TypeError):
         validator.validate("Launch is July 18. [E1]", mode="chat")  # type: ignore[call-arg]
@@ -281,30 +234,22 @@ def test_available_ids_is_required_and_never_session_cumulative() -> None:
             "Launch is July 18. [E1]",
             registry,
             mode="chat",
-            nli_scorer=FakeNLI({}),
-            entailment_floor=0.8,
         )
 
 
 def test_validate_evidence_output_threads_available_ids() -> None:
-    evidence = "Launch is July 18."
-    registry = _read_passage(evidence)
-    nli = FakeNLI({(evidence, "Launch is July 18."): 0.95})
+    registry = _read_passage("Launch is July 18.")
 
     accepted = validate_evidence_output(
         "Launch is July 18. [E1]",
         registry,
         mode="chat",
-        nli_scorer=nli,
-        entailment_floor=0.8,
         available_ids=("E1",),
     )
     unavailable = validate_evidence_output(
         "Launch is July 18. [E1]",
         registry,
         mode="chat",
-        nli_scorer=nli,
-        entailment_floor=0.8,
         available_ids=(),
     )
 
@@ -316,53 +261,16 @@ def test_validate_evidence_output_threads_available_ids() -> None:
 def test_unsupported_details_carry_per_sentence_reasons() -> None:
     """L31: stripped claims persist with their rejection reason."""
 
-    evidence = "Launch is July 18."
-    registry = _read_passage(evidence)
-    result = EvidenceValidator(
-        registry,
-        FakeNLI({(evidence, "The launch is tomorrow."): 0.0}),
-        entailment_floor=0.8,
-    ).validate(
-        "The launch is tomorrow. [E1] The venue is unknown to me for now.",
+    registry = _read_passage("Launch is July 18.")
+    result = EvidenceValidator(registry).validate(
+        "The launch is tomorrow. [E99] The venue is booked. [E1]",
         mode="chat",
-        available_ids=("E1",),
+        available_ids=(),
     )
 
     assert not result.accepted
-    assert ("The launch is tomorrow. [E1]", "entailment_below_floor") in result.unsupported_details
-    assert (
-        "The venue is unknown to me for now.",
-        "citation_coverage",
-    ) in result.unsupported_details
-
-
-def _classify(text: str) -> bool:
-    sentences, _visible = _sentences(text)
-    assert len(sentences) == 1, text
-    return sentences[0].factual
-
-
-def test_sentence_classifier_fixture_accuracy_and_zero_bypass_exempts() -> None:
-    """M12: ≥0.95 accuracy on the labeled set; bypass phrasings are NEVER
-    exempted ("Here's what I found: <claim>" must classify factual)."""
-
-    fixture = Path(__file__).parent / "fixtures" / "sentence_classes.jsonl"
-    rows = [
-        json.loads(line)
-        for line in fixture.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert len(rows) >= 40
-
-    correct = 0
-    for row in rows:
-        predicted = _classify(str(row["text"]))
-        if predicted == bool(row["factual"]):
-            correct += 1
-        if row.get("bypass"):
-            assert predicted is True, f"false exempt on bypass: {row['text']}"
-    accuracy = correct / len(rows)
-    assert accuracy >= 0.95, f"classifier accuracy {accuracy:.3f} below 0.95"
+    assert ("The launch is tomorrow. [E99]", "invalid_citation") in result.unsupported_details
+    assert ("The venue is booked. [E1]", "evidence_unavailable") in result.unsupported_details
 
 
 def _read_passage(text: str) -> EvidenceRegistry:
@@ -370,40 +278,3 @@ def _read_passage(text: str) -> EvidenceRegistry:
     registry.register("passage", "p1", {"text": text})
     registry.mark_read("E1")
     return registry
-
-
-def test_absence_claims_and_structural_headers_bypass_validation() -> None:
-    """Honest "not found" answers must survive: entailment cannot prove an
-    absence from a passage, and framing labels are not claims."""
-    from taurine_core.retrieval.validate import _is_factual
-
-    absences = (
-        "I can't find any evidence stating when Brevinh is coming back.",
-        "So there's no supported date for Brevinh's return in the available evidence.",
-        "The note lists LA activities, but gives no return date",
-        "The tab notes are expense tallies, with no travel dates",
-        "That isn't recorded in your knowledge base.",
-        "I found no mention of the trip.",
-    )
-    for claim in absences:
-        assert _is_factual(claim, is_heading=False) is False, claim
-
-    assert _is_factual("What's in the record:", is_heading=False) is False
-
-    # positive claims still validate
-    positives = (
-        "Brevinh returns on the 25th",
-        "Maya lives in Paris",
-        "The meeting is scheduled for Friday",
-    )
-    for claim in positives:
-        assert _is_factual(claim, is_heading=False) is True, claim
-
-    # M12 guard intact: an absence prefix cannot smuggle a factual tail
-    assert (
-        _is_factual(
-            "I found no mention of the trip: Brevinh returns on the 25th",
-            is_heading=False,
-        )
-        is True
-    )

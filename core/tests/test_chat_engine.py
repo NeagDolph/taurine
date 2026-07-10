@@ -328,9 +328,7 @@ async def test_turn_event_order_tool_round_trip_budget_no_tools_and_citation_str
         store,
         llm,
         logger,
-        validator_factory=lambda registry: EvidenceValidator(
-            registry, FixedNLI(1.0), entailment_floor=.8
-        ),
+        validator_factory=lambda registry: EvidenceValidator(registry),
     )
     events: list[dict[str, Any]] = []
 
@@ -672,9 +670,7 @@ async def test_final_answer_is_nli_validated_and_persists_cited_vs_consulted(
         llm,
         MemoryLogger(),
         retriever_factory=lambda chat_id: EvidenceRetriever(store, chat_id),
-        validator_factory=lambda registry: EvidenceValidator(
-            registry, FixedNLI(1.0), entailment_floor=.8
-        ),
+        validator_factory=lambda registry: EvidenceValidator(registry),
     )
     events: list[dict[str, Any]] = []
 
@@ -698,20 +694,18 @@ async def test_final_answer_is_nli_validated_and_persists_cited_vs_consulted(
 
 
 @pytest.mark.asyncio
-async def test_failed_chat_entailment_returns_source_excerpt_not_unsupported_claim(
+async def test_unrepairable_invalid_citation_returns_source_excerpt(
     store: Any,
 ) -> None:
     llm = FakeLLM(
-        streams=[[StreamEvent(kind="content", text="The launch is tomorrow [E1]."), StreamEvent(kind="done")]]
+        streams=[[StreamEvent(kind="content", text="The launch is tomorrow [E9]."), StreamEvent(kind="done")]]
     )
     engine = ChatEngine(
         store,
         llm,
         MemoryLogger(),
         retriever_factory=lambda chat_id: EvidenceRetriever(store, chat_id),
-        validator_factory=lambda registry: EvidenceValidator(
-            registry, FixedNLI(0.0), entailment_floor=.8
-        ),
+        validator_factory=lambda registry: EvidenceValidator(registry),
     )
     events: list[dict[str, Any]] = []
 
@@ -725,11 +719,6 @@ async def test_failed_chat_entailment_returns_source_excerpt_not_unsupported_cla
 
 @pytest.mark.asyncio
 async def test_chat_runs_one_constrained_repair_and_revalidates_it(store: Any) -> None:
-    class ConditionalNLI:
-        def score(self, premise: str, hypothesis: str) -> float:
-            del premise
-            return 1.0 if "July 18" in hypothesis else 0.0
-
     class RepairLLM(FakeLLM):
         repair_calls = 0
 
@@ -741,16 +730,14 @@ async def test_chat_runs_one_constrained_repair_and_revalidates_it(store: Any) -
             return {"title": "Launch date"}
 
     llm = RepairLLM(
-        streams=[[StreamEvent(kind="content", text="The launch is tomorrow [E1]."), StreamEvent(kind="done")]]
+        streams=[[StreamEvent(kind="content", text="The launch is tomorrow [E9]."), StreamEvent(kind="done")]]
     )
     engine = ChatEngine(
         store,
         llm,
         MemoryLogger(),
         retriever_factory=lambda chat_id: EvidenceRetriever(store, chat_id),
-        validator_factory=lambda registry: EvidenceValidator(
-            registry, ConditionalNLI(), entailment_floor=.8
-        ),
+        validator_factory=lambda registry: EvidenceValidator(registry),
     )
     events: list[dict[str, Any]] = []
 
@@ -804,7 +791,7 @@ async def test_dependent_query_uses_one_structured_flash_rewrite(store: Any) -> 
         llm,
         MemoryLogger(),
         retriever_factory=lambda chat_id: RewriteRetriever(store, chat_id),
-        validator_factory=lambda registry: EvidenceValidator(registry, FixedNLI(1.0), entailment_floor=.8),
+        validator_factory=lambda registry: EvidenceValidator(registry),
     )
 
     await engine.send("chat-rewrite", "When does it launch?", lambda _event: _capture(_event, []))
@@ -869,9 +856,7 @@ async def test_persisted_retrieved_and_consulted_sets_stay_distinct(store: Any) 
         llm,
         logger,
         retriever_factory=lambda chat_id: AuditRetriever(store, chat_id),
-        validator_factory=lambda registry: EvidenceValidator(
-            registry, FixedNLI(1.0), entailment_floor=.8
-        ),
+        validator_factory=lambda registry: EvidenceValidator(registry),
     )
     events: list[dict[str, Any]] = []
 
@@ -946,9 +931,7 @@ async def test_fact_support_snippet_is_rendered_and_citable(store: Any) -> None:
         llm,
         MemoryLogger(),
         retriever_factory=lambda chat_id: SupportRetriever(store, chat_id),
-        validator_factory=lambda registry: EvidenceValidator(
-            registry, FixedNLI(1.0), entailment_floor=.8
-        ),
+        validator_factory=lambda registry: EvidenceValidator(registry),
     )
     events: list[dict[str, Any]] = []
 
@@ -1041,9 +1024,7 @@ async def test_fallback_pack_renders_low_confidence_header_and_validates(store: 
         llm,
         MemoryLogger(),
         retriever_factory=lambda chat_id: FallbackRetriever(store, chat_id),
-        validator_factory=lambda registry: EvidenceValidator(
-            registry, FixedNLI(1.0), entailment_floor=.8
-        ),
+        validator_factory=lambda registry: EvidenceValidator(registry),
     )
     events: list[dict[str, Any]] = []
 
@@ -1097,7 +1078,7 @@ async def test_stripped_claims_persist_with_reasons(store: Any) -> None:
             [
                 StreamEvent(
                     kind="content",
-                    text="The launch is July 18 [E1]. The venue is Boston according to my records.",
+                    text="The launch is July 18 [E1]. The venue is Boston [E9].",
                 ),
                 StreamEvent(kind="done"),
             ]
@@ -1108,9 +1089,7 @@ async def test_stripped_claims_persist_with_reasons(store: Any) -> None:
         llm,
         MemoryLogger(),
         retriever_factory=lambda chat_id: EvidenceRetriever(store, chat_id),
-        validator_factory=lambda registry: EvidenceValidator(
-            registry, FixedNLI(1.0), entailment_floor=.8
-        ),
+        validator_factory=lambda registry: EvidenceValidator(registry),
     )
     events: list[dict[str, Any]] = []
 
@@ -1120,12 +1099,12 @@ async def test_stripped_claims_persist_with_reasons(store: Any) -> None:
     assert done["content"] == "The launch is July 18 [E1]."
     assert done["stripped_claims"] == [
         {
-            "sentence": "The venue is Boston according to my records.",
-            "reason": "citation_coverage",
+            "sentence": "The venue is Boston [E9].",
+            "reason": "invalid_citation",
         }
     ]
     persisted = store.chat_messages(done["chat_id"])[1]
-    assert [claim.reason for claim in persisted.stripped_claims] == ["citation_coverage"]
+    assert [claim.reason for claim in persisted.stripped_claims] == ["invalid_citation"]
 
 
 @pytest.mark.asyncio

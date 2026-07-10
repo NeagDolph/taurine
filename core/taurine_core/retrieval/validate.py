@@ -1,12 +1,17 @@
-"""Sentence-level evidence, provenance, NLI, and temporal validation."""
+"""Citation validity, availability, fact provenance, and temporal validation.
+
+Per-sentence citation-coverage and NLI-entailment stages were removed by
+decision on 2026-07-10: they rejected honest absence answers (entailment
+cannot prove an absence) and no hallucinated citations were ever observed.
+See docs/graph-followups.md.
+"""
 
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal
 
 from taurine_core.retrieval.registry import EvidenceRecord, EvidenceRegistry
 
@@ -18,42 +23,10 @@ _HISTORICAL_QUALIFIERS = re.compile(
     r"\b(?:formerly|previously|historically|used to|at the time|was|were|had|did)\b",
     flags=re.IGNORECASE,
 )
-_UNCERTAINTY = re.compile(
-    r"\b(?:might|perhaps|possibly|uncertain|unsure|not sure|"
-    r"could be|I (?:do not|don't) know|I (?:think|believe|suspect))\b",
-    flags=re.IGNORECASE,
-)
-# "may" hedges only in lowercase — "May 2"/"signed in May" are dates, and
-# exempting them would let factual date claims skip citation (M12).
-_MAY_HEDGE = re.compile(r"\bmay\b")
-_CONVERSATIONAL = re.compile(
-    r"^(?:thanks|thank you|here(?:'s| is) what I found|"
-    r"I can help|let me know|no new evidence)\b",
-    flags=re.IGNORECASE,
-)
-# Absence-of-evidence statements ("couldn't find a return date", "no record
-# of X") assert nothing positive from the knowledge base; entailment cannot
-# prove an absence from a passage, so validating them only shreds honest
-# "not found" answers into the excerpt fallback.
-_ABSENCE = re.compile(
-    r"(?:\b(?:couldn't|can't|cannot|could not|did not|didn't|do not|don't|doesn't|was unable to)\s+"
-    r"(?:find|locate|see|surface)\b"
-    r"|\bfound\s+no\b"
-    r"|\b(?:no|not any|none of the|nothing in)\b"
-    r".{0,60}?\b(?:evidence|record(?:s|ed)?|mention(?:s|ed)?|information|"
-    r"date(?:s)?|detail(?:s)?|reference(?:s)?|indication|answer|passage(?:s)?|note(?:s)?)\b"
-    r"|\b(?:is|are|was|were)n?(?:'t| not)\s+(?:recorded|mentioned|documented|available|stated)\b)",
-    flags=re.IGNORECASE,
-)
 _INACTIVE_FACT_STATUSES = frozenset(
     {"historical", "superseded", "conflicted", "candidate"}
 )
 
-
-class NLIScorer(Protocol):
-    """Fake-friendly local entailment seam: evidence premise, generated claim."""
-
-    def score(self, premise: str, hypothesis: str) -> float: ...
 
 
 @dataclass(frozen=True)
@@ -79,22 +52,11 @@ class _Sentence:
     rendered: str
     claim: str
     citations: tuple[str, ...]
-    factual: bool
 
 
 class EvidenceValidator:
-    def __init__(
-        self,
-        registry: EvidenceRegistry,
-        nli_scorer: NLIScorer | None,
-        *,
-        entailment_floor: float,
-    ) -> None:
-        if not 0.0 <= entailment_floor <= 1.0:
-            raise ValueError("entailment floor must be within [0, 1]")
+    def __init__(self, registry: EvidenceRegistry) -> None:
         self.registry = registry
-        self.nli_scorer = nli_scorer
-        self.entailment_floor = float(entailment_floor)
 
     def validate(
         self,
@@ -143,11 +105,9 @@ class EvidenceValidator:
                 provenance_invalid.add(ref)
         invalid.update(provenance_invalid)
 
-        factual = tuple(sentence for sentence in sentences if sentence.factual)
         unsupported: list[str] = []
         details: list[tuple[str, str]] = []
         reason = ""
-        nli_candidates: list[tuple[_Sentence, tuple[str, ...]]] = []
 
         def reject(sentence: _Sentence, sentence_reason: str) -> None:
             nonlocal reason
@@ -155,14 +115,10 @@ class EvidenceValidator:
             details.append((sentence.rendered, sentence_reason))
             reason = reason or sentence_reason
 
-        for sentence in factual:
+        for sentence in sentences:
             sentence_refs = set(sentence.citations)
-            coverage = {
-                ref for ref in sentence_refs if ref[:1] in _COVERAGE_PREFIXES
-            }
-            if not coverage:
-                reject(sentence, "citation_coverage")
-                continue
+            if not sentence_refs:
+                continue  # uncited prose is the model's judgment, not ours
             if sentence_refs & invalid:
                 if sentence_refs & provenance_invalid:
                     reject(sentence, "fact_provenance")
@@ -173,38 +129,6 @@ class EvidenceValidator:
                 continue
             if _temporally_inconsistent(sentence, records):
                 reject(sentence, "temporal_inconsistency")
-                continue
-            premises = _premises(
-                coverage,
-                records=records,
-                fact_sources=fact_sources,
-                registry=self.registry,
-            )
-            if not premises:
-                reject(sentence, "evidence_text_unavailable")
-                continue
-            nli_candidates.append((sentence, premises))
-
-        if nli_candidates and self.nli_scorer is None:
-            return self._nli_unavailable(
-                output, factual, invalid, cited_ids, mode
-            )
-
-        for sentence, premises in nli_candidates:
-            try:
-                scores = tuple(
-                    float(self.nli_scorer.score(premise, sentence.claim))
-                    for premise in premises
-                )
-            except Exception:
-                return self._nli_unavailable(
-                    output, factual, invalid, cited_ids, mode
-                )
-            if not any(
-                math.isfinite(score) and score >= self.entailment_floor
-                for score in scores
-            ):
-                reject(sentence, "entailment_below_floor")
 
         if invalid and not reason:
             reason = "invalid_citation"
@@ -223,50 +147,16 @@ class EvidenceValidator:
             unsupported_details=tuple(dict.fromkeys(details)),
         )
 
-    def _nli_unavailable(
-        self,
-        output: str,
-        factual: tuple[_Sentence, ...],
-        invalid: set[str],
-        cited_ids: tuple[str, ...],
-        mode: ValidationMode,
-    ) -> ValidationResult:
-        del output
-        is_live = mode == "live"
-        return ValidationResult(
-            accepted=False,
-            accepted_output="",
-            unsupported_sentences=tuple(sentence.rendered for sentence in factual),
-            invalid_citations=_ordered_refs(invalid),
-            repair_required=False,
-            cited_ids=cited_ids,
-            degraded_reason=(
-                "nli_unavailable_live_fail_closed"
-                if is_live
-                else "nli_unavailable_chat_excerpt_required"
-            ),
-            evidence_excerpt_required=not is_live,
-            unsupported_details=tuple(
-                (sentence.rendered, "nli_unavailable") for sentence in factual
-            ),
-        )
-
 
 def validate_evidence_output(
     output: str,
     registry: EvidenceRegistry,
     *,
     mode: ValidationMode,
-    nli_scorer: NLIScorer | None,
-    entailment_floor: float,
     available_ids: Collection[str],
     supplied_ids: Collection[str] = (),
 ) -> ValidationResult:
-    return EvidenceValidator(
-        registry,
-        nli_scorer,
-        entailment_floor=entailment_floor,
-    ).validate(
+    return EvidenceValidator(registry).validate(
         output,
         mode=mode,
         available_ids=available_ids,
@@ -286,15 +176,13 @@ def _sentences(output: str) -> tuple[tuple[_Sentence, ...], str]:
         if in_code or not stripped:
             continue
         visible.append(raw_line)
-        is_heading = bool(re.match(r"^\s{0,3}#{1,6}\s+", raw_line))
         for rendered in _split_line(stripped):
             citations = _ordered_refs(
                 match.group(0)[1:-1] for match in _CITATION_RE.finditer(rendered)
             )
             claim = _CITATION_RE.sub("", rendered).strip()
             claim = re.sub(r"^[-*+]\s+", "", claim).strip()
-            factual = _is_factual(claim, is_heading=is_heading)
-            rows.append(_Sentence(rendered, claim, citations, factual))
+            rows.append(_Sentence(rendered, claim, citations))
     return tuple(rows), "\n".join(visible)
 
 
@@ -304,37 +192,6 @@ def _split_line(line: str) -> tuple[str, ...]:
         line,
     )
     return tuple(part.strip() for part in matches if part.strip())
-
-
-def _is_factual(claim: str, *, is_heading: bool, _depth: int = 0) -> bool:
-    if not claim or is_heading or claim.endswith("?"):
-        return False
-    if not re.search(r"[A-Za-z0-9]", claim):
-        return False
-    # short structural labels ("What's in the record:") frame, not claim
-    if claim.endswith(":") and len(claim.split()) <= 8:
-        return False
-    match = (
-        _CONVERSATIONAL.search(claim)
-        or _UNCERTAINTY.search(claim)
-        or _MAY_HEDGE.search(claim)
-        or _ABSENCE.search(claim)
-    )
-    if match is None:
-        return True
-    if _depth >= 1:
-        return False
-    # M12: a conversational/uncertainty prefix only exempts the sentence when
-    # NO factual-claim tail follows a colon/comma boundary after the matched
-    # phrase ("Here's what I found: <claim>" must not bypass validation).
-    # Split once and classify the remainder independently.
-    boundary = re.search(r"[:,]", claim[match.end() :])
-    if boundary is None:
-        return False
-    tail = claim[match.end() + boundary.end() :].strip()
-    if not tail:
-        return False
-    return _is_factual(tail, is_heading=False, _depth=1)
 
 
 def _fact_source_refs(record: EvidenceRecord) -> tuple[str, ...]:
@@ -362,33 +219,6 @@ def _temporally_inconsistent(
         if record is not None
     }
     return bool(statuses) and statuses <= _INACTIVE_FACT_STATUSES
-
-
-def _premises(
-    coverage: set[str],
-    *,
-    records: dict[str, EvidenceRecord | None],
-    fact_sources: dict[str, tuple[str, ...]],
-    registry: EvidenceRegistry,
-) -> tuple[str, ...]:
-    source_refs: set[str] = set()
-    for ref in coverage:
-        record = records.get(ref)
-        if record is None:
-            continue
-        if record.kind in {"passage", "transcript"}:
-            source_refs.add(ref)
-        elif record.kind == "fact":
-            source_refs.update(fact_sources.get(ref, ()))
-    texts: list[str] = []
-    for ref in _ordered_refs(source_refs):
-        record = registry.resolve(ref)
-        if record is None:
-            continue
-        text = _payload_text(record)
-        if text and text not in texts:
-            texts.append(text)
-    return tuple(texts)
 
 
 def _payload_text(record: EvidenceRecord) -> str:

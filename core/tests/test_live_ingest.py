@@ -381,7 +381,7 @@ async def test_rolling_summary_two_pass_real_summarizer_advances_checkpoint() ->
     summarizer = Summarizer(
         llm,  # type: ignore[arg-type]
         FakeIndex(),  # type: ignore[arg-type]
-        EvidenceValidator(registry, Entails(), entailment_floor=0.8),
+        EvidenceValidator(registry),
     )
     abstain = lambda text, ts: EvidencePack.abstained(  # noqa: E731
         RetrievalQuery(text, "live", ts), "below_live_floor"

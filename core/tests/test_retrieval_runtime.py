@@ -44,10 +44,6 @@ def test_runtime_checks_manifests_and_publishes_new_complete_build(
         "taurine_core.retrieval.runtime.local_pair_reranker",
         lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
     )
-    monkeypatch.setattr(
-        "taurine_core.retrieval.runtime.local_nli_scorer",
-        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
-    )
 
     runtime = RetrievalRuntime(database)
     engine = runtime.make_engine("live", EvidenceRegistry())
@@ -55,7 +51,6 @@ def test_runtime_checks_manifests_and_publishes_new_complete_build(
     assert engine.snapshot.build_id == first.build_id
     assert same_generation.store is engine.store
     assert engine.calibrator.mode == "live"
-    assert runtime.nli_scorer is None
 
     second = builder.build(
         [make_note("n2", "Two", "second source passage")],
@@ -87,10 +82,6 @@ def test_activation_rejects_tampered_installed_build(tmp_path, monkeypatch) -> N
     )
     monkeypatch.setattr(
         "taurine_core.retrieval.runtime.local_pair_reranker",
-        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
-    )
-    monkeypatch.setattr(
-        "taurine_core.retrieval.runtime.local_nli_scorer",
         lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
     )
     runtime = RetrievalRuntime(database)
@@ -152,10 +143,6 @@ def test_entity_resolver_output_flows_through_query_entity_head(
         "taurine_core.retrieval.runtime.local_pair_reranker",
         lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
     )
-    monkeypatch.setattr(
-        "taurine_core.retrieval.runtime.local_nli_scorer",
-        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
-    )
 
     runtime = RetrievalRuntime(database)
     for mode in ("chat", "live"):
@@ -187,10 +174,6 @@ def test_tampered_calibration_degrades_to_conservative_floors_without_raising(
     ).build([make_note("n1", "One", "first source passage")], database, replace_derived=True)
     monkeypatch.setattr(
         "taurine_core.retrieval.runtime.local_pair_reranker",
-        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
-    )
-    monkeypatch.setattr(
-        "taurine_core.retrieval.runtime.local_nli_scorer",
         lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
     )
 
@@ -225,10 +208,6 @@ def test_intact_calibration_is_verified_and_wires_fallback_modes(
     ).build([make_note("n1", "One", "first source passage")], database, replace_derived=True)
     monkeypatch.setattr(
         "taurine_core.retrieval.runtime.local_pair_reranker",
-        lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
-    )
-    monkeypatch.setattr(
-        "taurine_core.retrieval.runtime.local_nli_scorer",
         lambda: (_ for _ in ()).throw(LocalModelUnavailable("missing")),
     )
 

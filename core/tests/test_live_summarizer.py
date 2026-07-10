@@ -75,7 +75,7 @@ async def test_prompt_supplies_exact_t_e_f_p_n_and_uncitable_profile(
     result = await Summarizer(
         llm,
         index,  # type: ignore[arg-type]
-        EvidenceValidator(registry, Entails(), entailment_floor=0.8),
+        EvidenceValidator(registry),
     ).summarize(None, '[T1] [channel 0] "Maya owns launch."', update, [])
 
     assert result is not None and result.no_update
@@ -135,13 +135,12 @@ async def test_abstained_pass_cannot_reuse_accumulated_session_evidence() -> Non
 @pytest.mark.parametrize(
     ("summary", "scorer", "reason"),
     [
-        ("Maya owns the launch.", Entails(), "citation_coverage"),
+        # coverage and NLI stages were removed 2026-07-10; only citation
+        # validity/availability still rejects a summary
         ("Maya owns the launch. [E99]", Entails(), "invalid_citation"),
-        ("Maya owns the launch. [E1]", Contradicts(), "entailment_below_floor"),
-        ("Maya owns the launch. [E1]", None, "nli_unavailable_live_fail_closed"),
     ],
 )
-async def test_rejects_unsupported_unknown_contradicted_and_unvalidated_claims(
+async def test_rejects_unknown_citations(
     summary: str,
     scorer: object | None,
     reason: str,
@@ -242,7 +241,7 @@ async def test_never_validated_old_ref_still_fails() -> None:
     assert result.reject_reason == "evidence_unavailable"
 
 
-async def test_failing_highlight_is_dropped_without_rejecting_the_summary() -> None:
+async def test_invalidly_cited_highlight_is_dropped_without_rejecting_the_summary() -> None:
     registry, update = _evidence()
     llm = FakeLLM(
         [
@@ -250,19 +249,14 @@ async def test_failing_highlight_is_dropped_without_rejecting_the_summary() -> N
                 "summary_md": "Maya owns the launch. [F1]",
                 "highlights": [
                     {"fact_id": "F1", "why": "Maya owns it"},
-                    {"fact_id": "F1", "why": "budget doubled overnight"},
+                    {"fact_id": "F9", "why": "unknown fact reference"},
                 ],
                 "actionables": [],
             }
         ]
     )
 
-    class Selective:
-        def score(self, premise: str, hypothesis: str) -> float:
-            del premise
-            return 0.99 if "owns" in hypothesis else 0.01
-
-    result = await _summarizer(llm, registry, Selective()).summarize(
+    result = await _summarizer(llm, registry, Entails()).summarize(
         None, '[T1] [channel 0] "Maya owns the launch."', update, []
     )
 
@@ -324,7 +318,7 @@ def _summarizer(llm: FakeLLM, registry: EvidenceRegistry, scorer: object | None)
     return Summarizer(
         llm,  # type: ignore[arg-type]
         FakeIndex(),  # type: ignore[arg-type]
-        EvidenceValidator(registry, scorer, entailment_floor=0.8),  # type: ignore[arg-type]
+        EvidenceValidator(registry),  # type: ignore[arg-type]
     )
 
 
