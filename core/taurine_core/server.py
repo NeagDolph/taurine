@@ -875,10 +875,24 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
     try:
         report("opening_index", "loading knowledge index")
         knowledge_runtime = RetrievalRuntime(knowledge_database)
-    except (FileNotFoundError, ValueError, KnowledgeSchemaError):
+    except (FileNotFoundError, ValueError, KnowledgeSchemaError) as exc:
         # Startup never reads sources or indexes user data: bootstrap an
         # empty (but valid) knowledge index so retrieval components load.
         # Real data enters only through the user-triggered sync.
+        if knowledge_database.exists():
+            # A present-but-incompatible index (manifest/schema drift after an
+            # upgrade) must never be silently destroyed: keep a timestamped
+            # copy beside it and say so loudly.
+            backup = knowledge_database.with_name(
+                f"{knowledge_database.name}.incompatible-{int(time.time())}"
+            )
+            os.replace(knowledge_database, backup)
+            logging.getLogger("taurine.server").warning(
+                "knowledge index incompatible with current code (%s); moved to %s "
+                "and starting empty — run a sync to rebuild",
+                exc,
+                backup.name,
+            )
         report("opening_index", "creating empty knowledge index")
         knowledge_builder.build((), knowledge_database, replace_derived=True)
         knowledge_runtime = RetrievalRuntime(knowledge_database)
