@@ -162,13 +162,13 @@ def log_grounding(
         items=[
             {
                 "note_id": getattr(item, "note_id", ""),
-                "short_id": getattr(item, "short_id", ""),
-                "score": getattr(item, "score", 0.0),
+                "evidence_id": getattr(item, "evidence_id", ""),
+                "score": getattr(item, "rerank_score", 0.0),
             }
-            for item in getattr(update, "items", [])
+            for item in getattr(update, "display_passages", [])
         ],
         fact_ids=[
-            getattr(fact, "fact_id", "")
+            getattr(fact, "fact_ref", "")
             for fact in getattr(update, "facts", [])
         ],
         trigger_decision=decision,

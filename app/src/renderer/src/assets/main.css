@@ -411,6 +411,12 @@ button:disabled {
   color: var(--text-1);
 }
 
+.citation-passage,
+.citation-transcript {
+  background: rgba(90, 170, 255, 0.15);
+  color: #9ecfff;
+}
+
 .summary-highlights {
   border-top: 1px solid var(--line-strong);
   display: flex;
@@ -963,6 +969,16 @@ button:disabled {
 
 .ambient-empty {
   align-self: start;
+}
+
+.ambient-prior-context,
+.source-state {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.ambient-prior-context {
+  padding: 0 2px 8px;
 }
 
 /* ---- map view ---- */
@@ -2822,6 +2838,32 @@ body.preview-body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.retrieval-trace-section {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.retrieval-trace-section h3 {
+  color: var(--text-2);
+  font-size: 11px;
+  margin: 0 0 6px;
+  text-transform: uppercase;
+}
+
+.retrieval-trace-section ul {
+  display: grid;
+  gap: 4px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.retrieval-trace-section code {
+  color: var(--text-3);
+  font-size: 10px;
+  overflow-wrap: anywhere;
 }
 
 /* ---- narrow safety (window minWidth is 980; keep two columns robust,

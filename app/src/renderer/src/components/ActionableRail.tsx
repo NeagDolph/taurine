@@ -1,19 +1,17 @@
 import { useState } from 'react'
-import { ageLabel, sourceLabel } from '../lib/labels'
-import type { Actionable, GroundedFact, GroundingItem } from '../lib/sidecar'
+import { sourceLabel } from '../lib/labels'
+import type { Actionable, EvidencePack } from '../lib/sidecar'
 
 interface ActionableRailProps {
   actionables: Actionable[]
-  grounding: GroundingItem[]
-  facts: GroundedFact[]
+  evidence: EvidencePack | null
   onStatus: (id: string, status: 'confirmed' | 'dismissed') => void
   onOpenNote: (noteId: string) => void
 }
 
 export function ActionableRail({
   actionables,
-  grounding,
-  facts,
+  evidence,
   onStatus,
   onOpenNote
 }: ActionableRailProps): React.JSX.Element | null {
@@ -30,8 +28,7 @@ export function ActionableRail({
           <ActionableCard
             key={item.id}
             item={item}
-            grounding={grounding}
-            facts={facts}
+            evidence={evidence}
             onStatus={onStatus}
             onOpenNote={onOpenNote}
           />
@@ -43,28 +40,25 @@ export function ActionableRail({
 
 interface ActionableCardProps {
   item: Actionable
-  grounding: GroundingItem[]
-  facts: GroundedFact[]
+  evidence: EvidencePack | null
   onStatus: (id: string, status: 'confirmed' | 'dismissed') => void
   onOpenNote: (noteId: string) => void
 }
 
 function ActionableCard({
   item,
-  grounding,
-  facts,
+  evidence,
   onStatus,
   onOpenNote
 }: ActionableCardProps): React.JSX.Element {
   const [expanded, setExpanded] = useState(false)
 
-  const groundingRefs = item.grounding
-    .map((id) =>
-      id.startsWith('F')
-        ? { kind: 'fact' as const, id, fact: facts.find((fact) => fact.fact_id === id) }
-        : { kind: 'note' as const, id, note: grounding.find((note) => note.short_id === id) }
-    )
-    .filter((ref) => (ref.kind === 'fact' ? ref.fact : ref.note))
+  const groundingRefs = item.grounding.map((id) => ({
+    id,
+    fact: evidence?.facts.find((row) => row.fact_ref === id),
+    passage: evidence?.passages.find((row) => row.evidence_id === id),
+    note: evidence?.notes.find((row) => row.note_ref === id)
+  }))
 
   return (
     <article className={`actionable-card${item.status === 'confirmed' ? ' confirmed' : ''}`}>
@@ -115,12 +109,25 @@ function ActionableCard({
           {item.why_new ? <p className="grounding-why-new">{item.why_new}</p> : null}
           <ul>
             {groundingRefs.map((ref) =>
-              ref.kind === 'fact' && ref.fact ? (
+              ref.fact ? (
                 <li key={ref.id}>
                   <span className="citation-chip citation-fact">{ref.id}</span>
-                  <span className="grounding-text">{ref.fact.text}</span>
+                  <span className="grounding-text">
+                    {ref.fact.subject} {ref.fact.predicate} {ref.fact.object}
+                  </span>
                 </li>
-              ) : ref.kind === 'note' && ref.note ? (
+              ) : ref.passage ? (
+                <li key={ref.id}>
+                  <button
+                    className="citation-chip citation-passage"
+                    type="button"
+                    onClick={() => onOpenNote(ref.passage!.note_id)}
+                  >
+                    {ref.id}
+                  </button>
+                  <span className="grounding-text">{ref.passage.text}</span>
+                </li>
+              ) : ref.note ? (
                 <li key={ref.id}>
                   <button
                     className="citation-chip citation-note"
@@ -134,9 +141,12 @@ function ActionableCard({
                     <span className={`source-chip source-${ref.note.source}`}>
                       {sourceLabel(ref.note.source)}
                     </span>
-                    <span className="age-chip">{ageLabel(ref.note.age_days)}</span>
-                    <span className="grounding-gist">{ref.note.gist}</span>
                   </span>
+                </li>
+              ) : ref.id.startsWith('T') ? (
+                <li key={ref.id}>
+                  <span className="citation-chip citation-transcript">{ref.id}</span>
+                  <span className="grounding-text">Transcript evidence</span>
                 </li>
               ) : null
             )}

@@ -7,6 +7,7 @@ from typing import Any
 
 from taurine_core.ports import ConnectorError, ConnectorPort, LLMPort
 from taurine_core.schemas import ConnectorInfo, ConnectorSyncReport
+from taurine_core.schemas import NoteRecord
 
 from .apple_notes import AppleNotesConnector
 
@@ -88,6 +89,7 @@ class ConnectorRegistry:
         llm: LLMPort,
     ) -> ConnectorSyncReport:
         connector = self._connector(connector_id)
+        del llm
         state = self._state(index, connector_id)
         self.syncing.add(connector_id)
         self.sync_progress[connector_id] = ("extracting", 0, 0)
@@ -101,17 +103,21 @@ class ConnectorRegistry:
                 )
             else:
                 try:
-                    records = connector.extract(self._config(connector, state))
-                    from taurine_core.indexer.sync import sync_source
-
-                    report = sync_source(
-                        index,  # type: ignore[arg-type]
+                    records = list(connector.extract(self._config(connector, state)))
+                    self._set_progress(connector_id, "source_cache", 0, len(records))
+                    added, changed, removed = index.replace_source_records(  # type: ignore[attr-defined]
                         connector_id,
                         records,
-                        llm,
-                        progress=lambda phase, done, total: self._set_progress(
-                            connector_id, phase, done, total
-                        ),
+                    )
+                    report = ConnectorSyncReport(
+                        connector_id=connector_id,
+                        added=added,
+                        changed=changed,
+                        removed=removed,
+                        enrich_failures=0,
+                    )
+                    self._set_progress(
+                        connector_id, "source_cache", len(records), len(records)
                     )
                     salience_scores = getattr(connector, "ingest_salience_scores", None)
                     set_ingest_salience = getattr(index, "set_ingest_salience", None)
@@ -159,6 +165,22 @@ class ConnectorRegistry:
             if self._enabled(connector.connector_id, self._state(index, connector.connector_id)):
                 reports.append(self.sync_connector(connector.connector_id, index, llm))
         return reports
+
+    def extract_all_enabled(self, index: object) -> list[NoteRecord]:
+        """Read one clean source snapshot without writing derived index state."""
+
+        records: list[NoteRecord] = []
+        for connector in self._connectors:
+            state = self._state(index, connector.connector_id)
+            if not self._enabled(connector.connector_id, state):
+                continue
+            available, detail = connector.available()
+            if not available:
+                raise ConnectorError(
+                    detail or f"connector {connector.connector_id} is unavailable"
+                )
+            records.extend(connector.extract(self._config(connector, state)))
+        return sorted(records, key=lambda row: (row.source, row.note_id))
 
     def _info_for(self, index: object, connector: ConnectorPort, docs: int) -> ConnectorInfo:
         state = self._state(index, connector.connector_id)

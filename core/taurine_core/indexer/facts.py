@@ -186,6 +186,15 @@ def reconcile_temporal_facts(facts: Sequence[FactRecord]) -> tuple[FactRecord, .
             continue
         winner = latest[0]
         winner_start = winner.valid_from if winner.valid_from is not None else winner.observed_at
+        prior = [fact for fact in active if fact.fact_id != winner.fact_id]
+        if any(
+            (fact.valid_from if fact.valid_from is not None else fact.observed_at)
+            >= winner_start
+            for fact in prior
+        ):
+            for fact in active:
+                rows[fact.fact_id] = replace(fact, status="conflicted")
+            continue
         for fact in active:
             if fact.fact_id == winner.fact_id:
                 continue

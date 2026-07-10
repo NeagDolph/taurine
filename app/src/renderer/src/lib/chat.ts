@@ -1,5 +1,5 @@
-import type { GroundedFact, GroundingItem } from './sidecar'
-import { SIDECAR_PORT, SIDECAR_REST_URL } from './sidecar'
+import type { EvidencePack } from './sidecar'
+import { parseEvidencePack, SIDECAR_PORT, SIDECAR_REST_URL } from './sidecar'
 
 export const CHAT_WS_URL = `ws://127.0.0.1:${SIDECAR_PORT}/chat`
 
@@ -34,8 +34,10 @@ export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
   thinking: string
-  sources: GroundingItem[]
-  facts: GroundedFact[]
+  evidence: EvidencePack | null
+  retrieved_ids: string[]
+  consulted_ids: string[]
+  cited_ids: string[]
   activity: ChatActivityStep[]
   usage: ChatUsage
   cancelled: boolean
@@ -54,8 +56,9 @@ export interface ChatRetrievalEvent {
   type: 'chat_retrieval'
   chat_id: string
   message_id: number
-  sources: GroundingItem[]
-  facts: GroundedFact[]
+  evidence: EvidencePack
+  retrieved_ids: string[]
+  consulted_ids: string[]
 }
 
 export interface ChatThinkingEvent {
@@ -322,12 +325,17 @@ export function parseChatEvent(raw: string): ChatEvent | null {
       if (typeof record.chat_id !== 'string' || typeof record.message_id !== 'number') {
         return null
       }
+      const evidence = parseEvidencePack(record.evidence)
+      if (!evidence) {
+        return null
+      }
       return {
         type: 'chat_retrieval',
         chat_id: record.chat_id,
         message_id: record.message_id,
-        sources: parseArray(record.sources, parseGroundingItemLoose),
-        facts: parseArray(record.facts, parseFactLoose)
+        evidence,
+        retrieved_ids: stringArray(record.retrieved_ids),
+        consulted_ids: stringArray(record.consulted_ids)
       }
     }
     case 'chat_thinking':
@@ -435,14 +443,23 @@ function parseChatMessage(value: unknown): ChatMessage | null {
     return null
   }
   const usage = asRecord(record.usage)
+  const evidence =
+    record.evidence === null || record.evidence === undefined
+      ? null
+      : parseEvidencePack(record.evidence)
+  if (record.evidence !== null && record.evidence !== undefined && !evidence) {
+    return null
+  }
   return {
     id: typeof record.id === 'number' ? record.id : 0,
     chat_id: record.chat_id,
     role: record.role,
     content: record.content,
     thinking: typeof record.thinking === 'string' ? record.thinking : '',
-    sources: parseArray(record.sources, parseGroundingItemLoose),
-    facts: parseArray(record.facts, parseFactLoose),
+    evidence,
+    retrieved_ids: stringArray(record.retrieved_ids),
+    consulted_ids: stringArray(record.consulted_ids),
+    cited_ids: stringArray(record.cited_ids),
     activity: parseArray(record.activity, parseActivityStep),
     usage: {
       prompt: numberOr(usage?.prompt, 0),
@@ -483,44 +500,8 @@ function parseActivityStep(value: unknown): ChatActivityStep | null {
   }
 }
 
-function parseGroundingItemLoose(value: unknown): GroundingItem | null {
-  const record = asRecord(value)
-  if (!record || typeof record.note_id !== 'string' || typeof record.title !== 'string') {
-    return null
-  }
-  const why = asRecord(record.why)
-  return {
-    note_id: record.note_id,
-    short_id: typeof record.short_id === 'string' ? record.short_id : '',
-    title: record.title,
-    gist: typeof record.gist === 'string' ? record.gist : '',
-    source: typeof record.source === 'string' ? record.source : 'apple_notes',
-    age_days: numberOr(record.age_days, 0),
-    score: numberOr(record.score, 0),
-    why: why
-      ? {
-          heads: Array.isArray(why.heads)
-            ? why.heads.filter((head): head is string => typeof head === 'string')
-            : [],
-          ppr_mass: numberOr(why.ppr_mass, 0),
-          exact_alias: typeof why.exact_alias === 'string' ? why.exact_alias : ''
-        }
-      : null
-  }
-}
-
-function parseFactLoose(value: unknown): GroundedFact | null {
-  const record = asRecord(value)
-  if (
-    !record ||
-    typeof record.fact_id !== 'string' ||
-    typeof record.src !== 'string' ||
-    typeof record.dst !== 'string' ||
-    typeof record.text !== 'string'
-  ) {
-    return null
-  }
-  return { fact_id: record.fact_id, src: record.src, dst: record.dst, text: record.text }
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((row): row is string => typeof row === 'string') : []
 }
 
 function parseArray<T>(value: unknown, parse: (item: unknown) => T | null): T[] {

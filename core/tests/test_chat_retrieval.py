@@ -1,385 +1,333 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from types import SimpleNamespace
 
-import numpy as np
-import pytest
-
-from taurine_core import config
 from taurine_core.chat.retrieval import ChatRetriever
-from taurine_core.indexer import store as store_module
-from taurine_core.live.grounding import GroundingEngine
-from taurine_core.schemas import Enrichment, EntityMention, GraphEdge, GraphNode, GraphResponse, NoteRecord
-
-from tests.fakes import note
-
-
-class _CallableNotes(dict[str, NoteRecord]):
-    def __call__(self, source: str | None = None) -> list[NoteRecord]:
-        rows = list(self.values())
-        if source is not None:
-            rows = [row for row in rows if row.source == source]
-        return rows
+from taurine_core.retrieval.registry import EvidenceRegistry
+from taurine_core.retrieval.types import (
+    EvidenceNote,
+    EvidencePack,
+    EvidencePassage,
+    RetrievalDecision,
+    RetrievalQuery,
+    RetrievalTrace,
+)
 
 
-def _vec(axis: int) -> np.ndarray:
-    values = np.zeros(config.EMBED_DIM, dtype=np.float32)
-    values[axis] = 1.0
-    return values
+class FakeIndex:
+    def __init__(self) -> None:
+        self.registries: dict[str, dict[str, object]] = {}
 
-
-def _enrichment(gist: str) -> Enrichment:
-    return Enrichment(
-        gist=gist,
-        utterances=[gist],
-        aliases=[],
-        entities=[EntityMention(surface="work", etype="concept", conf=0.9)],
-        relations=[],
-        extraction_failed=False,
-    )
-
-
-@dataclass
-class ChatFakeIndex:
-    notes: dict[str, NoteRecord] = field(default_factory=dict)
-    dense_by_query: dict[str, list[tuple[str, float]]] = field(default_factory=dict)
-    bm25_by_query: dict[str, list[tuple[str, float]]] = field(default_factory=dict)
-    fact_by_query: dict[str, list[tuple[str, str, float, str]]] = field(
-        default_factory=dict
-    )
-    alias_rows: list[tuple[str, str, bool]] = field(default_factory=list)
-    edges: list[GraphEdge] = field(default_factory=list)
-    registries: dict[str, dict[str, Any]] = field(default_factory=dict)
-    dense_calls: list[tuple[str, int, str | None]] = field(default_factory=list)
-    fact_calls: list[tuple[str, int, str | None]] = field(default_factory=list)
-    version: int = 1
-
-    def __post_init__(self) -> None:
-        self.notes = _CallableNotes(self.notes)
-
-    def dense_search(
-        self,
-        text: str,
-        k: int,
-        *,
-        prompt: str | None = None,
-    ) -> list[tuple[str, float]]:
-        self.dense_calls.append((text, k, prompt))
-        return self.dense_by_query.get(text, [])[:k]
-
-    def bm25_search(self, text: str, k: int) -> list[tuple[str, float]]:
-        return self.bm25_by_query.get(text, [])[:k]
-
-    def fact_dense_search(
-        self,
-        text: str,
-        k: int,
-        *,
-        prompt: str | None = None,
-    ) -> list[tuple[str, str, float, str]]:
-        self.fact_calls.append((text, k, prompt))
-        return self.fact_by_query.get(text, [])[:k]
-
-    def note(self, note_id: str) -> NoteRecord | None:
-        return self.notes.get(note_id)
-
-    def aliases(self) -> list[tuple[str, str, bool]]:
-        return self.alias_rows
-
-    def graph_version(self) -> int:
-        return self.version
-
-    def graph(self) -> GraphResponse:
-        active = set(self.notes)
-        degree = {note_id: 0 for note_id in active}
-        edges: list[GraphEdge] = []
-        for edge in self.edges:
-            if edge.src not in active or edge.dst not in active:
-                continue
-            degree[edge.src] += 1
-            degree[edge.dst] += 1
-            edges.append(edge)
-        return GraphResponse(
-            nodes=[
-                GraphNode(
-                    note_id=row.note_id,
-                    title=row.title,
-                    degree=degree.get(row.note_id, 0),
-                    source=row.source,
-                )
-                for row in self.notes.values()
-            ],
-            edges=edges,
-        )
-
-    def chat_registry(self, chat_id: str) -> dict:
+    def chat_registry(self, chat_id: str) -> dict[str, object]:
         return self.registries.get(chat_id, {})
 
-    def set_chat_registry(self, chat_id: str, registry: dict) -> None:
-        self.registries[chat_id] = registry
+    def set_chat_registry(self, chat_id: str, state: dict[str, object]) -> None:
+        self.registries[chat_id] = state
 
 
-def test_context_pack_respects_chat_sizes_and_has_no_hysteresis(monkeypatch) -> None:
-    monkeypatch.setattr(config, "CHAT_CONTEXT_NOTES", 1)
-    monkeypatch.setattr(config, "CHAT_CONTEXT_FACTS", 1)
-    monkeypatch.setattr(config, "PPR_BLEND", 0.0)
-    now = 1_000.0
-    index = ChatFakeIndex(
-        notes={
-            "incumbent": note("incumbent", "Incumbent"),
-            "challenger": note("challenger", "Challenger").model_copy(
-                update={"quality_rank": 0.05}
+class FakeStore:
+    def __init__(self) -> None:
+        self.passages = (
+            SimpleNamespace(
+                passage_id="p1", note_id="n1", title="Roadmap", source="obsidian",
+                text="The roadmap launches on July 18.", char_start=20, char_end=52,
+                created=1.0, modified=2.0,
             ),
-            "fact-a": note("fact-a", "Fact A"),
-            "fact-b": note("fact-b", "Fact B"),
-            "fact-c": note("fact-c", "Fact C"),
-        },
-        dense_by_query={
-            "first": [("incumbent", 1.0)],
-            "second": [("incumbent", 1.0), ("challenger", 0.9)],
-        },
-        bm25_by_query={
-            "second": [("challenger", 1.0), ("incumbent", 0.9)],
-        },
-        fact_by_query={
-            "second": [
-                ("fact-a", "fact-b", 1.0, "first fact"),
-                ("fact-b", "fact-c", 0.9, "second fact"),
-            ],
-        },
+            SimpleNamespace(
+                passage_id="p2", note_id="n1", title="Roadmap", source="obsidian",
+                text="Armaan owns the review.", char_start=80, char_end=104,
+                created=1.0, modified=2.0,
+            ),
+            SimpleNamespace(
+                passage_id="p3", note_id="n2", title="API", source="obsidian",
+                text="The API review is blocked.", char_start=0, char_end=26,
+                created=1.0, modified=2.0,
+            ),
+        )
+
+    def passage_contexts(self, passage_ids):
+        wanted = set(passage_ids)
+        return tuple(row for row in self.passages if row.passage_id in wanted)
+
+    def note_contexts(self, note_ids):
+        return tuple(
+            SimpleNamespace(note_id="n1", title="Roadmap", source="obsidian", modified=2.0)
+            for note_id in note_ids if note_id == "n1"
+        )
+
+
+class FakeEngine:
+    def __init__(self, registry: EvidenceRegistry) -> None:
+        self.registry = registry
+        self.store = FakeStore()
+        self.snapshot = SimpleNamespace(
+            build_id="build-1",
+            passage_ids=("p1", "p2", "p3"),
+            base_graph=SimpleNamespace(edges=(
+                SimpleNamespace(src_id="p1", dst_id="p3", kind="semantic", fact_ids=()),
+                SimpleNamespace(src_id="e-a", dst_id="e-b", kind="fact:depends_on", fact_ids=("f1",)),
+                SimpleNamespace(src_id="e-b", dst_id="p3", kind="contains", fact_ids=()),
+            )),
+        )
+        self.calls: list[tuple[RetrievalQuery, dict[str, float] | None, tuple[tuple[str, str | None], ...]]] = []
+        self.passage_limits: list[int | None] = []
+
+    def retrieve(self, query: RetrievalQuery, *, session_reset=None, entity_spans=(), passage_limit=None, **_kwargs) -> EvidencePack:
+        self.calls.append((query, dict(session_reset) if session_reset else None, tuple(entity_spans)))
+        self.passage_limits.append(passage_limit)
+        if query.text == "nothing":
+            return EvidencePack.abstained(query, "below_threshold")
+        note_ref = self.registry.register("note", "n1", {"note_id": "n1"})
+        evidence_ref = self.registry.register(
+            "passage", "p1",
+            {"passage_id": "p1", "note_id": "n1", "text": "The roadmap launches on July 18.", "char_start": 20, "char_end": 52},
+        )
+        self.registry.mark_read(note_ref)
+        self.registry.mark_read(evidence_ref)
+        passage = EvidencePassage(
+            evidence_id=evidence_ref, passage_id="p1", note_id="n1", title="Roadmap",
+            source="obsidian", text="The roadmap launches on July 18.", char_start=20,
+            char_end=52, created=1.0, modified=2.0, retrieval_score=.8, rerank_score=.9,
+        )
+        note = EvidenceNote(
+            note_ref=note_ref, note_id="n1", title="Roadmap", source="obsidian",
+            modified=2.0, score=.9, evidence_ids=(evidence_ref,),
+        )
+        return EvidencePack(
+            decision=RetrievalDecision(True, .9, "accepted", ("dense", "bm25")),
+            query=query,
+            passages=(passage,), facts=(), paths=(), notes=(note,),
+            trace=RetrievalTrace(original_query=query.text, rewritten_query=query.text, read_ids=(note_ref, evidence_ref), active_build_id="build-1"),
+        )
+
+
+def _make(index: FakeIndex, chat_id: str = "chat-1") -> tuple[ChatRetriever, list[FakeEngine]]:
+    engines: list[FakeEngine] = []
+
+    def factory(registry: EvidenceRegistry) -> FakeEngine:
+        engine = FakeEngine(registry)
+        engines.append(engine)
+        return engine
+
+    return ChatRetriever(
+        index,
+        chat_id,
+        engine_factory=factory,
+        tool_engine_factory=factory,
+    ), engines  # type: ignore[arg-type]
+
+
+def test_stage_a_rewrites_dependent_query_and_keeps_original_in_trace() -> None:
+    retriever, engines = _make(FakeIndex())
+
+    pack = retriever.context_pack(
+        "When does it launch?",
+        now=100.0,
+        conversation_context=("Tell me about the roadmap", "It is the Mermaid project"),
     )
-    retriever = ChatRetriever(index, "chat-a")  # type: ignore[arg-type]
 
-    first_items, _first_facts = retriever.context_pack("first", now=now)
-    second_items, second_facts = retriever.context_pack("second", now=now)
-
-    assert [item.note_id for item in first_items] == ["incumbent"]
-    assert [item.note_id for item in second_items] == ["challenger"]
-    assert len(second_items) == config.CHAT_CONTEXT_NOTES
-    assert len(second_facts) == config.CHAT_CONTEXT_FACTS
-
-
-def test_seed_decay_is_per_turn_and_search_does_not_decay_mid_turn(monkeypatch) -> None:
-    monkeypatch.setattr(config, "CHAT_CONTEXT_NOTES", 4)
-    monkeypatch.setattr(config, "CHAT_CONTEXT_FACTS", 2)
-    monkeypatch.setattr(config, "CHAT_SEED_DECAY", 0.25)
-    monkeypatch.setattr(config, "PPR_BLEND", 0.0)
-    index = ChatFakeIndex(
-        notes={
-            "alpha": note("alpha", "Alpha"),
-            "beta": note("beta", "Beta"),
-            "gamma": note("gamma", "Gamma"),
-        },
-        dense_by_query={
-            "turn-one": [("alpha", 1.0)],
-            "turn-two": [("beta", 1.0)],
-            "tool-query": [("gamma", 1.0)],
-        },
+    assert pack.query.text == "When does it launch?"
+    assert pack.trace.original_query == "When does it launch?"
+    assert pack.trace.rewritten_query == "Tell me about the roadmap\nIt is the Mermaid project\nWhen does it launch?"
+    assert engines[-1].calls[0][0].text == pack.trace.rewritten_query
+    assert engines[-1].calls[0][0].conversation_context == (
+        "Tell me about the roadmap", "It is the Mermaid project",
     )
-    retriever = ChatRetriever(index, "chat-seeds")  # type: ignore[arg-type]
 
-    retriever.context_pack("turn-one", now=1_000.0)
-    first_alpha_seed = retriever._grounding._seeds["alpha"]
-    retriever.context_pack("turn-two", now=1_001.0)
 
-    assert retriever._grounding._seeds["alpha"] == pytest.approx(
-        first_alpha_seed * config.CHAT_SEED_DECAY
+def test_independent_topic_does_not_rewrite_or_retain_old_reset() -> None:
+    retriever, engines = _make(FakeIndex())
+    retriever.context_pack("Tell me about Mermaid", now=100.0)
+
+    pack = retriever.context_pack(
+        "What is the garden plan?",
+        now=101.0,
+        conversation_context=("Tell me about Mermaid",),
     )
-    alpha_after_turn = retriever._grounding._seeds["alpha"]
 
-    retriever.search("tool-query", 2, now=1_002.0)
-
-    assert retriever._grounding._seeds["alpha"] == pytest.approx(alpha_after_turn)
-    assert "gamma" in retriever._grounding._seeds
+    assert pack.trace.rewritten_query == "What is the garden plan?"
+    assert engines[-1].calls[-1][1] is None
 
 
-def test_chat_uses_chat_query_prompt_and_store_default_stays_live_prompt(
-    store,
-    monkeypatch,
-) -> None:
-    index = ChatFakeIndex(
-        notes={"alpha": note("alpha", "Alpha")},
-        dense_by_query={"chat prompt": [("alpha", 1.0)]},
+def test_explicit_what_about_topic_pivot_drops_previous_topic() -> None:
+    retriever, engines = _make(FakeIndex())
+    retriever.context_pack("Tell me about Mermaid", now=100.0)
+
+    pack = retriever.context_pack(
+        "What about the garden plan?",
+        now=101.0,
+        conversation_context=("Tell me about Mermaid",),
     )
-    retriever = ChatRetriever(index, "chat-prompt")  # type: ignore[arg-type]
 
-    retriever.context_pack("chat prompt", now=1_000.0)
-
-    assert index.dense_calls == [
-        ("chat prompt", config.HEAD_TOP_K, config.CHAT_EMBED_QUERY_PROMPT)
-    ]
-    assert index.fact_calls == [
-        ("chat prompt", config.CHAT_CONTEXT_FACTS, config.CHAT_EMBED_QUERY_PROMPT)
-    ]
-
-    store.upsert_note(
-        note("stored-alpha", "Stored Alpha"),
-        _enrichment("stored alpha gist"),
-        [("chunk", "stored alpha text", _vec(0))],
-    )
-    prompts: list[str | None] = []
-
-    def fake_embed_queries(texts: list[str], *, prompt: str | None = None) -> np.ndarray:
-        prompts.append(prompt)
-        return np.vstack([_vec(0) for _text in texts])
-
-    monkeypatch.setattr(store_module, "embed_queries", fake_embed_queries)
-
-    store.dense_search("live prompt", 1)
-    store.dense_search("chat prompt", 1, prompt=config.CHAT_EMBED_QUERY_PROMPT)
-
-    # the default path passes NO prompt kwarg (None): embed.embed_queries owns
-    # the None -> EMBED_QUERY_PROMPT resolution, so prompt-less fakes keep
-    # working and real TypeErrors are never masked (Stage A review finding)
-    assert prompts == [None, config.CHAT_EMBED_QUERY_PROMPT]
+    assert pack.trace.rewritten_query == "What about the garden plan?"
+    assert engines[-1].calls[-1][1] is None
 
 
-def test_exact_hits_are_rank_one_and_fact_hits_credit_endpoints(monkeypatch) -> None:
-    monkeypatch.setattr(config, "CHAT_CONTEXT_NOTES", 4)
-    monkeypatch.setattr(config, "CHAT_CONTEXT_FACTS", 3)
-    monkeypatch.setattr(config, "PPR_BLEND", 0.0)
-    index = ChatFakeIndex(
-        notes={
-            "mermaid": note("mermaid", "Mermaid Roadmap"),
-            "fact-a": note("fact-a", "Fact A"),
-            "fact-b": note("fact-b", "Fact B"),
-        },
-        alias_rows=[("mermaid roadmap", "mermaid", True)],
-        fact_by_query={
-            "What happened with Mermaid Roadmap?": [
-                ("fact-a", "fact-b", 0.8, "Fact A depends on Fact B")
-            ]
-        },
-    )
-    retriever = ChatRetriever(index, "chat-exact")  # type: ignore[arg-type]
+def test_tool_search_uses_tool_mode_without_advancing_accepted_turn_state() -> None:
+    retriever, engines = _make(FakeIndex())
+    retriever.context_pack("Roadmap", now=100.0)
+    before = retriever.snapshot()
 
-    items, facts = retriever.context_pack(
-        "What happened with Mermaid Roadmap?",
-        now=1_000.0,
-    )
-    by_id = {item.note_id: item for item in items}
+    pack = retriever.search_evidence("Armaan review", k=4, temporal="current", now=101.0)
 
-    assert by_id["mermaid"].why.exact_alias == "mermaid roadmap"
-    assert "exact" in by_id["mermaid"].why.heads
-    assert by_id["fact-a"].why.heads == ["fact"]
-    assert by_id["fact-b"].why.heads == ["fact"]
-    assert [(fact.src, fact.dst, fact.text) for fact in facts] == [
-        ("fact-a", "fact-b", "Fact A depends on Fact B")
-    ]
+    assert pack.query.mode == "tool"
+    assert pack.query.temporal_intent is not None
+    assert pack.query.temporal_intent.kind == "current"
+    assert retriever.snapshot()["accepted_reset"] == before["accepted_reset"]
+    assert engines[-1].calls[-1][1] == {"p1": .9}
+    assert engines[-1].passage_limits[-1] == 4
+    assert engines[0] is not engines[-1]
 
 
-def test_registry_ids_survive_turns_save_restore_and_fact_ids_are_never_reused(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(config, "CHAT_CONTEXT_NOTES", 2)
-    monkeypatch.setattr(config, "CHAT_CONTEXT_FACTS", 1)
-    monkeypatch.setattr(config, "PPR_BLEND", 0.0)
-    index = ChatFakeIndex(
-        notes={
-            "alpha": note("alpha", "Alpha"),
-            "beta": note("beta", "Beta"),
-            "gamma": note("gamma", "Gamma"),
-        },
-        dense_by_query={
-            "ab": [("alpha", 1.0), ("beta", 1.0)],
-            "ag": [("alpha", 1.0), ("gamma", 1.0)],
-        },
-        fact_by_query={
-            "ab": [("alpha", "beta", 1.0, "AB fact")],
-            "ag": [("alpha", "gamma", 1.0, "AG fact")],
-        },
-    )
-    retriever = ChatRetriever(index, "chat-registry")  # type: ignore[arg-type]
+def test_accepted_tool_search_promotes_abstained_stage_a_for_turn_audit() -> None:
+    retriever, _ = _make(FakeIndex())
+    stage_a = retriever.context_pack("nothing", now=100.0)
+    assert stage_a.decision.accepted is False
 
-    ab_items, ab_facts = retriever.context_pack("ab", now=1_000.0)
-    ag_items, ag_facts = retriever.context_pack("ag", now=1_001.0)
+    tool_pack = retriever.search_evidence("Roadmap", k=4, temporal="any", now=101.0)
+    audit = retriever.turn_pack()
+
+    assert tool_pack.decision.accepted is True
+    assert audit is not None and audit.decision.accepted is True
+    assert audit.trace.original_query == "nothing"
+    assert audit.trace.debug["stage_a_abstention"] == "below_threshold"
+    assert audit.trace.debug["tool_query"] == "Roadmap"
+
+
+def test_registry_persists_and_regeneration_restores_pre_turn_snapshot() -> None:
+    index = FakeIndex()
+    retriever, _engines = _make(index)
+    first = retriever.context_pack("Roadmap", now=100.0)
     retriever.save()
-    restored = ChatRetriever(index, "chat-registry")  # type: ignore[arg-type]
-    restored_items, restored_facts = restored.context_pack("ab", now=1_002.0)
+    first_ref = first.passages[0].evidence_id
 
-    assert [(item.note_id, item.short_id) for item in ab_items] == [
-        ("alpha", "N1"),
-        ("beta", "N2"),
-    ]
-    assert next(item.short_id for item in ag_items if item.note_id == "alpha") == "N1"
-    assert [(fact.src, fact.dst, fact.fact_id) for fact in ab_facts] == [
-        ("alpha", "beta", "F1")
-    ]
-    assert [(fact.src, fact.dst, fact.fact_id) for fact in ag_facts] == [
-        ("alpha", "gamma", "F2")
-    ]
-    assert [(item.note_id, item.short_id) for item in restored_items] == [
-        ("alpha", "N1"),
-        ("beta", "N2"),
-    ]
-    assert [(fact.src, fact.dst, fact.fact_id) for fact in restored_facts] == [
-        ("alpha", "beta", "F1")
-    ]
+    restored, _ = _make(index)
+    restored.restore_pre_turn()
+    regenerated = restored.context_pack("Roadmap", now=101.0)
+
+    assert regenerated.passages[0].evidence_id == first_ref
+    assert restored.snapshot()["accepted_turn"] == 1
 
 
-def test_resolve_accepts_registry_refs_raw_note_ids_and_unknowns(monkeypatch) -> None:
-    monkeypatch.setattr(config, "CHAT_CONTEXT_NOTES", 1)
-    monkeypatch.setattr(config, "PPR_BLEND", 0.0)
-    index = ChatFakeIndex(
-        notes={
-            "alpha": note("alpha", "Alpha"),
-            "beta": note("beta", "Beta"),
+def test_typed_query_gliner_spans_seed_shared_entity_head() -> None:
+    class Spans:
+        def extract(self, text: str):
+            assert text == "What is Armaan reviewing?"
+            return [("Armaan", .97, "person")]
+
+    index = FakeIndex()
+    engines: list[FakeEngine] = []
+
+    def factory(registry: EvidenceRegistry) -> FakeEngine:
+        engine = FakeEngine(registry)
+        engines.append(engine)
+        return engine
+
+    retriever = ChatRetriever(
+        index,
+        "chat-spans",
+        engine_factory=factory,
+        tool_engine_factory=factory,
+        span_extractor=Spans(),
+    )  # type: ignore[arg-type]
+
+    retriever.context_pack("What is Armaan reviewing?", now=100.0)
+
+    assert engines[-1].calls[-1][2] == (("Armaan", "person"),)
+
+
+def test_read_note_is_query_relevant_registered_and_paginated() -> None:
+    retriever, _ = _make(FakeIndex())
+    pack = retriever.context_pack("Roadmap", now=100.0)
+    note_ref = pack.notes[0].note_ref
+
+    page = retriever.read_note(note_ref, query="Armaan review", max_chars=30)
+
+    assert page["note"] == note_ref
+    assert page["truncated"] is True
+    assert page["next_cursor"]
+    assert page["passages"][0]["text"] == "Armaan owns the review."
+    assert page["passages"][0]["evidence_id"].startswith("E")
+    assert page["passages"][0]["evidence_id"] in retriever.registry.refs("read")
+    record = retriever.registry.resolve(page["passages"][0]["evidence_id"])
+    assert record is not None
+    assert record.payload["text"] == page["passages"][0]["text"]
+
+    turn_pack = retriever.turn_pack()
+    assert turn_pack is not None
+    assert {row.evidence_id for row in turn_pack.passages} == {"E1", page["passages"][0]["evidence_id"]}
+
+
+def test_read_note_pages_one_oversized_passage_without_registering_hidden_text() -> None:
+    retriever, _ = _make(FakeIndex())
+    pack = retriever.context_pack("Roadmap", now=100.0)
+    note_ref = pack.notes[0].note_ref
+
+    first = retriever.read_note(note_ref, query="launch", max_chars=10)
+    second = retriever.read_note(
+        note_ref,
+        query="launch",
+        cursor=str(first["next_cursor"]),
+        max_chars=10,
+    )
+
+    assert first["passages"][0]["text"] == "The roadma"
+    assert second["passages"][0]["text"] == "p launches"
+    first_record = retriever.registry.resolve(first["passages"][0]["evidence_id"])
+    second_record = retriever.registry.resolve(second["passages"][0]["evidence_id"])
+    assert first_record is not None and first_record.payload["text"] == "The roadma"
+    assert second_record is not None and second_record.payload["text"] == "p launches"
+
+
+def test_turn_audit_does_not_leak_evidence_read_in_prior_turns() -> None:
+    retriever, _ = _make(FakeIndex())
+    old_ref = retriever.registry.register(
+        "passage", "old-passage",
+        {"passage_id": "old-passage", "note_id": "old-note", "text": "old", "char_start": 0, "char_end": 3},
+    )
+    retriever.registry.mark_read(old_ref)
+
+    retriever.context_pack("Roadmap", now=100.0)
+    audit = retriever.turn_pack()
+
+    assert audit is not None
+    assert old_ref not in audit.trace.read_ids
+    assert old_ref not in audit.trace.selected_ids
+
+
+def test_note_and_directed_fact_expansion_use_registered_graph_node_ids() -> None:
+    retriever, _ = _make(FakeIndex())
+    pack = retriever.context_pack("Roadmap", now=100.0)
+
+    note_result = retriever.expand_evidence(
+        pack.notes[0].note_ref,
+        direction="outgoing",
+        max_hops=1,
+        limit=4,
+    )
+    fact_ref = retriever.registry.register(
+        "fact",
+        "build-1\x1fe-a\x1fdepends_on\x1fe-b",
+        {
+            "logical_key": ["A", "depends_on", "B"],
+            "subject_entity_id": "e-a",
+            "object_entity_id": "e-b",
+            "subject": "A",
+            "predicate": "depends_on",
+            "object": "B",
+            "direction": "forward",
+            "status": "active",
+            "observed_at": 1.0,
         },
-        dense_by_query={"alpha question": [("alpha", 1.0)]},
     )
-    retriever = ChatRetriever(index, "chat-resolve")  # type: ignore[arg-type]
-
-    retriever.context_pack("alpha question", now=1_000.0)
-
-    assert retriever.resolve("N1") == "alpha"
-    assert retriever.resolve("beta") == "beta"
-    assert retriever.resolve("N404") is None
-    assert retriever.resolve("missing") is None
-
-
-def test_grounding_engine_parameters_and_state_round_trip(monkeypatch) -> None:
-    monkeypatch.setattr(config, "PPR_BLEND", 0.0)
-    index = ChatFakeIndex(
-        notes={
-            "alpha": note("alpha", "Alpha"),
-            "beta": note("beta", "Beta"),
-        },
-        fact_by_query={"window": [("alpha", "beta", 1.0, "AB fact")]},
-    )
-    engine = GroundingEngine(
-        index,  # type: ignore[arg-type]
-        top_k=1,
-        facts_max=1,
-        seed_decay=0.5,
-        hysteresis=None,
+    retriever.registry.mark_read(fact_ref)
+    fact_result = retriever.expand_evidence(
+        fact_ref,
+        direction="outgoing",
+        max_hops=2,
+        limit=4,
     )
 
-    first = engine.on_pass("window", [("alpha", 1.0), ("beta", 1.0)], [], 1_000.0)
-    note_short_ids = engine.note_short_ids()
-    fact_short_ids = engine.fact_short_ids()
-    assert note_short_ids == {"alpha": "N1"}
-    assert fact_short_ids == {("alpha", "beta"): "F1"}
-    note_short_ids["beta"] = "N404"
-    fact_short_ids[("beta", "gamma")] = "F404"
-    assert engine.note_short_ids() == {"alpha": "N1"}
-    assert engine.fact_short_ids() == {("alpha", "beta"): "F1"}
-    state = engine.export_state()
-    restored = GroundingEngine(
-        index,  # type: ignore[arg-type]
-        top_k=1,
-        facts_max=1,
-        seed_decay=0.5,
-        hysteresis=None,
-    )
-    restored.restore_state(state)
-    second = restored.on_pass("window", [("beta", 1.0), ("alpha", 1.0)], [], 1_001.0)
-
-    assert len(first.items) == 1
-    assert len(first.facts) == 1
-    assert first.items[0].short_id == "N1"
-    assert second.items[0].short_id == "N2"
-    assert second.facts[0].fact_id == "F1"
-    assert restored._seeds["alpha"] == pytest.approx(
-        state["seeds"]["alpha"] * 0.5 + 1.0
-    )
+    assert note_result["results"][0]["text"] == "The API review is blocked."
+    assert fact_result["results"][0]["text"] == "The API review is blocked."
+    assert fact_result["paths"][0]["edge_kinds"] == ["fact:depends_on", "contains"]

@@ -56,3 +56,22 @@ def test_registry_rejects_unknown_refs_and_identity_payload_mutation() -> None:
         registry.mark_read("E9")
     with pytest.raises(ValueError, match="different payload"):
         registry.register("fact", "logical-fact", {"fact_ids": ["f2"]})
+
+
+def test_registry_restore_rejects_cited_without_read_state() -> None:
+    snapshot = {
+        "version": 1,
+        "next": {"N": 1, "E": 2, "F": 1, "P": 1, "T": 1},
+        "entries": [
+            {
+                "ref": "E1",
+                "kind": "passage",
+                "source_id": "p1",
+                "payload": {},
+                "states": ["retrieved", "cited"],
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="state hierarchy"):
+        EvidenceRegistry.from_snapshot(snapshot)

@@ -74,8 +74,6 @@ async def reenrich_all(
         progress(ReenrichStatus(running=True, phase="notes", done=done, total=total))
 
     progress(ReenrichStatus(running=True, phase="finalizing", done=done, total=total))
-    for note_id in changed_note_ids:
-        index.rebuild_for(note_id)  # type: ignore[attr-defined]
     index.load()  # type: ignore[attr-defined]
     from .rank import compute_quality_ranks, compute_value_scores, refresh_fact_embeddings
 
@@ -88,8 +86,6 @@ async def reenrich_all(
         llm,
         value_scores,
     )
-    for note_id in changed_note_ids:
-        index.rebuild_for(note_id)  # type: ignore[attr-defined]
     index.load()  # type: ignore[attr-defined]
     compute_quality_ranks(index)  # type: ignore[arg-type]
     compute_value_scores(index)  # type: ignore[arg-type]

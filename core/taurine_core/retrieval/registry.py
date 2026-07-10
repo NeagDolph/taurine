@@ -69,12 +69,41 @@ class EvidenceRegistry:
     def resolve(self, ref: str) -> EvidenceRecord | None:
         return self._records.get(ref)
 
+    def ref_for(self, kind: EvidenceKind, source_id: str) -> str | None:
+        return self._by_identity.get((kind, str(source_id)))
+
     def mark_read(self, ref: str) -> None:
         self._mark(ref, "read")
 
     def mark_cited(self, ref: str) -> None:
         self._mark(ref, "read")
         self._mark(ref, "cited")
+
+    def merge_payload(
+        self,
+        ref: str,
+        payload: Mapping[str, object],
+        *,
+        append_list_fields: frozenset[str] = frozenset(),
+    ) -> None:
+        """Merge stable metadata while allowing explicit append-only provenance lists."""
+
+        record = self._records.get(ref)
+        if record is None:
+            raise KeyError(f"unknown evidence reference: {ref}")
+        current = _thaw_payload(record.payload)
+        incoming = _thaw_payload(_freeze_payload(payload))
+        for key, value in incoming.items():
+            if key in append_list_fields:
+                existing = current.get(key, [])
+                if not isinstance(existing, list) or not isinstance(value, list):
+                    raise ValueError(f"append-only evidence field {key!r} must be a list")
+                current[key] = list(dict.fromkeys((*existing, *value)))
+            elif key in current and current[key] != value:
+                raise ValueError(f"evidence payload field {key!r} cannot be replaced")
+            else:
+                current[key] = value
+        self._records[ref] = replace(record, payload=_freeze_payload(current))
 
     def refs(self, state: EvidenceState) -> tuple[str, ...]:
         return tuple(
@@ -124,6 +153,8 @@ class EvidenceRegistry:
             state_set = frozenset(states)
             if not state_set <= {"retrieved", "read", "cited"} or "retrieved" not in state_set:
                 raise ValueError("invalid evidence registry states")
+            if "cited" in state_set and "read" not in state_set:
+                raise ValueError("invalid evidence registry state hierarchy")
             record = EvidenceRecord(
                 ref=ref,
                 kind=kind,

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import type { ChatActivityStep, ChatMessage } from '../../lib/chat'
-import type { GroundedFact, GroundingItem } from '../../lib/sidecar'
-import { ageLabel, sourceLabel } from '../../lib/labels'
+import type { EvidencePack } from '../../lib/sidecar'
+import { sourceLabel } from '../../lib/labels'
 import { MessageMarkdown, type CitationTarget } from './MessageMarkdown'
 
 export type TurnPhase = 'retrieving' | 'thinking' | 'answering' | 'done' | 'error'
@@ -14,8 +14,9 @@ export interface StreamingTurn {
   thinkingEndedAt: number | null
   activity: ChatActivityStep[]
   content: string
-  sources: GroundingItem[]
-  facts: GroundedFact[]
+  evidence: EvidencePack | null
+  retrievedIds: string[]
+  consultedIds: string[]
   error: string
 }
 
@@ -39,23 +40,34 @@ export function AssistantTurn({
   const thinking = streaming?.thinking ?? message?.thinking ?? ''
   const content = streaming?.content ?? message?.content ?? ''
   const activity = streaming?.activity ?? message?.activity ?? []
-  const sources = streaming?.sources ?? message?.sources ?? []
-  const facts = streaming?.facts ?? message?.facts ?? []
+  const evidence = streaming?.evidence ?? message?.evidence ?? null
+  const retrievedIds = streaming?.retrievedIds ?? message?.retrieved_ids ?? []
+  const consultedIds = streaming?.consultedIds ?? message?.consulted_ids ?? []
   const phase: TurnPhase = streaming?.phase ?? 'done'
   const isStreaming = streaming !== undefined && phase !== 'done' && phase !== 'error'
 
   const citations = useMemo(() => {
     const map = new Map<string, CitationTarget>()
-    for (const item of sources) {
-      if (item.short_id) {
-        map.set(item.short_id, { title: item.title, noteId: item.note_id })
-      }
+    for (const item of evidence?.notes ?? []) {
+      map.set(item.note_ref, { title: item.title, noteId: item.note_id })
     }
-    for (const fact of facts) {
-      map.set(fact.fact_id, { title: fact.text, noteId: fact.src })
+    for (const passage of evidence?.passages ?? []) {
+      map.set(passage.evidence_id, { title: passage.text, noteId: passage.note_id })
+    }
+    for (const fact of evidence?.facts ?? []) {
+      const source = evidence?.passages.find((row) =>
+        fact.source_evidence_ids.includes(row.evidence_id)
+      )
+      map.set(fact.fact_ref, {
+        title: `${fact.subject} ${fact.predicate} ${fact.object}`,
+        noteId: source?.note_id ?? ''
+      })
+    }
+    for (const path of evidence?.paths ?? []) {
+      map.set(path.path_id, { title: path.rendered, noteId: '' })
     }
     return map
-  }, [sources, facts])
+  }, [evidence])
 
   const thinkingSeconds = useMemo(() => {
     if (streaming?.thinkingStartedAt && streaming.thinkingEndedAt) {
@@ -123,7 +135,9 @@ export function AssistantTurn({
       {!isStreaming && message ? (
         <TurnFooter
           message={message}
-          sources={sources}
+          evidence={evidence}
+          citedIds={message.cited_ids}
+          consultedIds={consultedIds.length > 0 ? consultedIds : retrievedIds}
           isLast={isLast}
           onOpenNote={onOpenNote}
           onRegenerate={onRegenerate}
@@ -177,20 +191,42 @@ function autoScrollRef(node: HTMLDivElement | null): void {
 
 function TurnFooter({
   message,
-  sources,
+  evidence,
+  citedIds,
+  consultedIds,
   isLast,
   onOpenNote,
   onRegenerate
 }: {
   message: ChatMessage
-  sources: GroundingItem[]
+  evidence: EvidencePack | null
+  citedIds: string[]
+  consultedIds: string[]
   isLast: boolean
   onOpenNote: (noteId: string) => void
   onRegenerate: () => void
 }): React.JSX.Element {
   const [copied, setCopied] = useState(false)
   const [sourcesExpanded, setSourcesExpanded] = useState(false)
-  const visibleSources = sourcesExpanded ? sources : sources.slice(0, 4)
+  const cited = new Set(citedIds)
+  const consulted = new Set(consultedIds)
+  const citedPassages = new Set(
+    (evidence?.facts ?? [])
+      .filter((fact) => cited.has(fact.fact_ref))
+      .flatMap((fact) => fact.source_evidence_ids)
+  )
+  const sourceNotes = (evidence?.notes ?? []).filter(
+    (note) =>
+      cited.has(note.note_ref) ||
+      note.evidence_ids.some((id) => cited.has(id) || citedPassages.has(id))
+  )
+  const consultedNotes = (evidence?.notes ?? []).filter(
+    (note) =>
+      !sourceNotes.includes(note) &&
+      (consulted.has(note.note_ref) || note.evidence_ids.some((id) => consulted.has(id)))
+  )
+  const allVisible = [...sourceNotes, ...consultedNotes]
+  const visibleSources = sourcesExpanded ? allVisible : allVisible.slice(0, 4)
 
   const copy = (): void => {
     void navigator.clipboard.writeText(message.content).then(() => {
@@ -219,27 +255,29 @@ function TurnFooter({
           </span>
         ) : null}
       </div>
-      {sources.length > 0 ? (
+      {allVisible.length > 0 ? (
         <div className="turn-sources">
           {visibleSources.map((item) => (
             <button
               key={item.note_id}
               className="source-pill"
               type="button"
-              title={item.gist}
+              title={item.title}
               onClick={() => onOpenNote(item.note_id)}
             >
-              <span className="citation-chip citation-note">{item.short_id || '·'}</span>
+              <span className="citation-chip citation-note">{item.note_ref}</span>
               <span className="source-pill-title">{item.title}</span>
               <span className={`source-chip source-${item.source}`}>
                 {sourceLabel(item.source)}
               </span>
-              <span className="age-chip">{ageLabel(item.age_days)}</span>
+              <span className="source-state">
+                {sourceNotes.includes(item) ? 'source' : 'consulted'}
+              </span>
             </button>
           ))}
-          {sources.length > 4 && !sourcesExpanded ? (
+          {allVisible.length > 4 && !sourcesExpanded ? (
             <button className="turn-action" type="button" onClick={() => setSourcesExpanded(true)}>
-              +{sources.length - 4} more
+              +{allVisible.length - 4} more
             </button>
           ) : null}
         </div>

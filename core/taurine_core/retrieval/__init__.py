@@ -1,14 +1,8 @@
-"""Shared evidence-first retrieval subsystem."""
+"""Shared evidence-first retrieval subsystem.
 
-from .calibration import AbstentionPolicy, HeadCalibrator
-from .evidence import empty_pack, weighted_score_aware_rrf
-from .types import EvidencePack, RetrievalQuery
+Keep package initialization dependency-free: index construction imports
+``retrieval.types`` and must not eagerly load the evidence engine back through
+the knowledge store.
+"""
 
-__all__ = [
-    "AbstentionPolicy",
-    "EvidencePack",
-    "HeadCalibrator",
-    "RetrievalQuery",
-    "empty_pack",
-    "weighted_score_aware_rrf",
-]
+__all__: list[str] = []

@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
@@ -69,6 +70,10 @@ class _RelationRaw:
     predicate: str
     tail: _Span
     confidence: float
+    observed_at: float | None = None
+    valid_from: float | None = None
+    valid_to: float | None = None
+    historical: bool = False
 
 
 def extract_notes(
@@ -454,7 +459,30 @@ def _relation(item: object, predicate: str) -> _RelationRaw | None:
     if not head.text or not tail.text:
         return None
     confidence = _confidence(item, default=min(head.confidence, tail.confidence))
-    return _RelationRaw(head, predicate, tail, confidence)
+    return _RelationRaw(
+        head,
+        predicate,
+        tail,
+        confidence,
+        observed_at=_temporal_value(item.get("observed_at")),
+        valid_from=_temporal_value(item.get("valid_from")),
+        valid_to=_temporal_value(item.get("valid_to")),
+        historical=str(item.get("status") or "").casefold() == "historical",
+    )
+
+
+def _temporal_value(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _span(item: object) -> _Span:
@@ -566,10 +594,15 @@ def _resolve_relation(
         extraction_method=method,
         schema_id=schema_id,
         status=(
-            "active"
+            "historical"
+            if relation.historical and relation.confidence >= promotion_floor and not ambiguous
+            else "active"
             if relation.confidence >= promotion_floor and not ambiguous
             else "candidate"
         ),
+        observed_at=relation.observed_at,
+        valid_from=relation.valid_from,
+        valid_to=relation.valid_to,
     )
 
 

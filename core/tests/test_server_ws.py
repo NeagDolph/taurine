@@ -256,8 +256,9 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
                     "type": "topic",
                     "weight": 0.7,
                     "shared": ["roadmap"],
-                    "fact": "",
-                    "fact_provenance": "",
+                        "fact": "",
+                        "fact_provenance": "",
+                        "fact_ids": [],
                 }
             ],
         }
@@ -307,6 +308,7 @@ def test_index_sync_uses_enabled_connector_sync_callable() -> None:
 
 def test_connector_rest_endpoints_and_single_flight_sync() -> None:
     registry = FakeConnectorRegistry()
+    regenerations: list[str] = []
     runtime = Runtime(
         index=GraphIndex(),
         sync_once=lambda: SyncReport(0, 0, 0, 0),
@@ -319,6 +321,7 @@ def test_connector_rest_endpoints_and_single_flight_sync() -> None:
         ),
         connector_registry=registry,
         connector_llm=object(),
+        regenerate_knowledge=lambda: regenerations.append("regenerated"),
     )
 
     with TestClient(create_app(runtime)) as client:
@@ -343,7 +346,9 @@ def test_connector_rest_endpoints_and_single_flight_sync() -> None:
         assert client.post("/connectors/fake/disable").status_code == 200
         assert registry.enabled_calls == [("fake", True), ("fake", False)]
         assert client.post("/connectors/fake/data/delete").status_code == 200
+        assert registry.enabled_calls[-1] == ("fake", False)
         assert registry.purge_calls == ["fake"]
+        assert regenerations == ["regenerated", "regenerated", "regenerated"]
 
         assert client.put("/connectors/fake/config", json={"path": "/tmp/new"}).status_code == 200
         assert registry.config_calls == [("fake", {"path": "/tmp/new"})]
@@ -519,6 +524,7 @@ def test_session_routes_binary_frames_and_serializes_schema_events() -> None:
                     }
                 ],
                 "facts": [],
+                "evidence": None,
                 "updated_at": 123.0,
             }
             assert ws.receive_json() == {
@@ -591,6 +597,7 @@ def test_summary_route_returns_empty_or_active_live_summary() -> None:
             "actionables": [],
             "grounding": [],
             "facts": [],
+            "evidence": None,
             "updated_at": 0.0,
         }
         with client.websocket_connect("/session") as ws:

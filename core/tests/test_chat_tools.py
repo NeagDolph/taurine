@@ -3,180 +3,121 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-import pytest
-
-from taurine_core import config
-from taurine_core.chat.tools import execute_tool
-from taurine_core.schemas import GraphEdge, GraphNode, GraphResponse, GroundingItem, NoteRecord
+from taurine_core.chat.tools import TOOL_DEFINITIONS, execute_tool
+from taurine_core.retrieval.types import (
+    EvidenceFact,
+    EvidenceNote,
+    EvidencePack,
+    EvidencePassage,
+    RetrievalDecision,
+    RetrievalQuery,
+    RetrievalTrace,
+)
 
 
 @dataclass
 class ToolRetriever:
-    search_rows: list[GroundingItem] = field(default_factory=list)
-    refs: dict[str, str] = field(default_factory=dict)
-    searches: list[tuple[str, int, float]] = field(default_factory=list)
+    calls: list[tuple] = field(default_factory=list)
 
-    def search(self, query: str, k: int, *, now: float) -> list[GroundingItem]:
-        self.searches.append((query, k, now))
-        return self.search_rows[:k]
-
-    def resolve(self, ref: str) -> str | None:
-        return self.refs.get(ref)
-
-
-@dataclass
-class ToolIndex:
-    notes: dict[str, NoteRecord]
-    edges: list[GraphEdge] = field(default_factory=list)
-
-    def note(self, note_id: str) -> NoteRecord | None:
-        return self.notes.get(note_id)
-
-    def neighbor_edges(self, note_id: str) -> list[tuple[str, float, str]]:
-        rows: list[tuple[str, float, str]] = []
-        for edge in self.edges:
-            if edge.src == note_id:
-                rows.append((edge.dst, edge.weight, edge.fact))
-            elif edge.dst == note_id:
-                rows.append((edge.src, edge.weight, edge.fact))
-        return sorted(rows, key=lambda row: row[1], reverse=True)
-
-    def graph(self) -> GraphResponse:
-        return GraphResponse(
-            nodes=[
-                GraphNode(note_id=note.note_id, title=note.title, degree=0, source=note.source)
-                for note in self.notes.values()
-            ],
-            edges=self.edges,
+    def search_evidence(self, query: str, *, k: int, temporal: str, now: float) -> EvidencePack:
+        self.calls.append(("search", query, k, temporal, now))
+        return EvidencePack(
+            decision=RetrievalDecision(True, .91, "accepted", ("dense", "triple")),
+            query=RetrievalQuery(query, "tool", now),
+            passages=(
+                EvidencePassage("E1", "p1", "n1", "Roadmap", "obsidian", "Launch moved to July 18.", 4, 28, 1, 2, .7, .9),
+            ),
+            facts=(
+                EvidenceFact("F1", ("f1",), "Roadmap", "launch_date", "July 18", "forward", "active", 2, None, None, .9, ("E1",)),
+            ),
+            paths=(),
+            notes=(EvidenceNote("N1", "n1", "Roadmap", "obsidian", 2, .9, ("E1",)),),
+            trace=RetrievalTrace(original_query=query, rewritten_query=query, read_ids=("N1", "E1", "F1"), active_build_id="b1"),
         )
 
+    def read_note(self, note: str, *, query: str, cursor: str | None, max_chars: int):
+        self.calls.append(("read", note, query, cursor, max_chars))
+        return {
+            "note": note, "title": "Roadmap", "source": "obsidian",
+            "passages": [{"evidence_id": "E2", "text": "Armaan owns review.", "char_start": 40, "char_end": 59}],
+            "truncated": True, "next_cursor": "cursor-2",
+        }
 
-def _note(note_id: str, title: str, text: str = "body") -> NoteRecord:
-    return NoteRecord(
-        note_id=note_id,
-        title=title,
-        modified=86_400.0,
-        content_hash=f"hash-{note_id}",
-        text=text,
-        gist=f"Gist for {title}",
-        source="obsidian",
+    def expand_evidence(self, evidence: str, *, direction: str, max_hops: int, limit: int):
+        self.calls.append(("expand", evidence, direction, max_hops, limit))
+        return {
+            "from": evidence,
+            "results": [{"evidence_id": "E3", "note": "N2", "text": "Review depends on API.", "fact_refs": ["F2"], "path": "P1"}],
+            "paths": [{"path_id": "P1", "edge_kinds": ["fact:depends_on"], "fact_refs": ["F2"]}],
+        }
+
+    def resolve_note(self, ref: str) -> str | None:
+        return {"N1": "n1", "N2": "n2"}.get(ref)
+
+
+def test_tool_registration_is_evidence_native() -> None:
+    definitions = {row["function"]["name"]: row for row in TOOL_DEFINITIONS}
+
+    assert set(definitions) == {"search_evidence", "read_note", "expand_evidence"}
+    assert definitions["search_evidence"]["function"]["parameters"]["properties"]["temporal"]["enum"] == ["current", "historical", "any"]
+    assert set(definitions["read_note"]["function"]["parameters"]["required"]) == {"note", "query"}
+    assert definitions["expand_evidence"]["function"]["parameters"]["properties"]["direction"]["enum"] == ["outgoing", "incoming", "both"]
+
+
+def test_search_evidence_returns_exact_registered_evidence() -> None:
+    retriever = ToolRetriever()
+
+    result_json, step = execute_tool(
+        "search_evidence", {"query": "roadmap", "k": 4, "temporal": "current"}, retriever, now=10.0,
     )
 
-
-def test_search_notes_returns_compact_rows_and_activity_shape() -> None:
-    retriever = ToolRetriever(
-        search_rows=[
-            GroundingItem(
-                note_id="n1",
-                short_id="N1",
-                title="Roadmap",
-                source="obsidian",
-                age_days=1.234,
-                score=0.98765,
-                gist="Roadmap gist",
-            )
-        ]
-    )
-    index = ToolIndex(notes={})
-
-    result_json, step = execute_tool("search_notes", {"query": "roadmap"}, retriever, index, now=10.0)
-
-    assert ": " not in result_json
-    assert json.loads(result_json) == {
-        "rows": [
-            {
-                "short_id": "N1",
-                "title": "Roadmap",
-                "source": "obsidian",
-                "age_days": 1.2,
-                "score": 0.988,
-                "gist": "Roadmap gist",
-            }
-        ]
-    }
-    assert retriever.searches == [("roadmap", config.CHAT_SEARCH_TOOL_K, 10.0)]
+    payload = json.loads(result_json)
+    assert payload["decision"]["accepted"] is True
+    assert payload["passages"][0]["evidence_id"] == "E1"
+    assert payload["passages"][0]["text"] == "Launch moved to July 18."
+    assert payload["facts"][0]["fact_ref"] == "F1"
+    assert retriever.calls == [("search", "roadmap", 4, "current", 10.0)]
     assert step.kind == "search"
-    assert step.status == "done"
-    assert step.label == 'Searched "roadmap" → 1 notes'
     assert step.note_ids == ["n1"]
 
 
-def test_read_note_resolves_caps_text_and_includes_neighbor_facts(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(config, "CHAT_NOTE_READ_MAX_CHARS", 12)
-    retriever = ToolRetriever(refs={"N1": "n1"})
-    index = ToolIndex(
-        notes={
-            "n1": _note("n1", "Alpha", "abcdefghijklmnop"),
-            "n2": _note("n2", "Beta"),
-        },
-        edges=[GraphEdge(src="n1", dst="n2", type="topic", weight=0.7, fact="Alpha relates to Beta.")],
+def test_read_note_requires_query_and_exposes_pagination_truthfully() -> None:
+    retriever = ToolRetriever()
+
+    result_json, step = execute_tool(
+        "read_note", {"note": "N1", "query": "owner", "max_chars": 1200}, retriever, now=0.0,
     )
 
-    result_json, step = execute_tool("read_note", {"note": "N1"}, retriever, index, now=172_800.0)
-
-    assert json.loads(result_json) == {
-        "note_id": "n1",
-        "title": "Alpha",
-        "source": "obsidian",
-        "age_days": 1.0,
-        "text": "abcdefghijkl",
-        "neighbors": [
-            {
-                "note_id": "n2",
-                "title": "Beta",
-                "source": "obsidian",
-                "weight": 0.7,
-                "fact": "Alpha relates to Beta.",
-            }
-        ],
-    }
-    assert step.label == "Read: Alpha"
-    assert step.note_ids == ["n1"]
+    payload = json.loads(result_json)
+    assert payload["passages"][0]["evidence_id"] == "E2"
+    assert payload["truncated"] is True
+    assert payload["next_cursor"] == "cursor-2"
+    assert retriever.calls == [("read", "N1", "owner", None, 1200)]
+    assert step.kind == "read"
 
 
-def test_expand_note_returns_weight_sorted_neighbors_with_type_and_cap() -> None:
-    retriever = ToolRetriever(refs={"N1": "n1"})
-    notes = {"n1": _note("n1", "Hub")}
-    edges: list[GraphEdge] = []
-    for i in range(14):
-        note_id = f"n{i + 2}"
-        notes[note_id] = _note(note_id, f"Neighbor {i + 2}")
-        edges.append(
-            GraphEdge(
-                src="n1",
-                dst=note_id,
-                type="mixed" if i == 13 else "semantic",
-                weight=i / 10,
-                fact=f"Fact {i}",
-            )
-        )
-    index = ToolIndex(notes=notes, edges=edges)
+def test_expand_evidence_preserves_direction_and_registered_paths() -> None:
+    retriever = ToolRetriever()
 
-    result_json, step = execute_tool("expand_note", {"note": "N1"}, retriever, index, now=0.0)
+    result_json, step = execute_tool(
+        "expand_evidence", {"evidence": "F1", "direction": "incoming", "max_hops": 2, "limit": 5}, retriever, now=0.0,
+    )
 
-    rows = json.loads(result_json)["neighbors"]
-    assert len(rows) == 12
-    assert rows[0] == {
-        "note_id": "n15",
-        "title": "Neighbor 15",
-        "source": "obsidian",
-        "weight": 1.3,
-        "type": "mixed",
-        "fact": "Fact 13",
-    }
-    assert rows[-1]["weight"] == 0.2
-    assert step.label == "Expanded: Hub"
-    assert step.note_ids == ["n1"]
+    payload = json.loads(result_json)
+    assert payload["results"][0]["evidence_id"] == "E3"
+    assert payload["results"][0]["fact_refs"] == ["F2"]
+    assert payload["paths"][0]["path_id"] == "P1"
+    assert retriever.calls == [("expand", "F1", "incoming", 2, 5)]
+    assert step.kind == "expand"
 
 
-def test_tool_errors_return_error_json_and_failed_step() -> None:
-    retriever = ToolRetriever(refs={})
-    index = ToolIndex(notes={})
+def test_tool_errors_are_model_visible_and_do_not_raise() -> None:
+    retriever = ToolRetriever()
 
-    unknown_json, unknown_step = execute_tool("missing_tool", {}, retriever, index, now=0.0)
-    missing_json, missing_step = execute_tool("read_note", {"note": "N404"}, retriever, index, now=0.0)
+    result_json, step = execute_tool("missing", {}, retriever, now=0.0)
+    bad_read_json, bad_step = execute_tool("read_note", {"note": "N1"}, retriever, now=0.0)
 
-    assert json.loads(unknown_json) == {"error": "unknown tool: missing_tool"}
-    assert unknown_step.label == "Failed: unknown tool: missing_tool"
-    assert json.loads(missing_json) == {"error": "could not resolve note: N404"}
-    assert missing_step.label == "Failed: could not resolve note: N404"
+    assert json.loads(result_json) == {"error": "unknown tool: missing"}
+    assert json.loads(bad_read_json) == {"error": "query is required"}
+    assert step.label.startswith("Failed:")
+    assert bad_step.label.startswith("Failed:")

@@ -40,6 +40,8 @@ class BuildRecord:
     source_snapshot: str
     calibration_hash: str
     graph_hash: str
+    model_manifest: dict[str, str]
+    config_manifest: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,38 @@ class BM25PassageHit:
 
 
 @dataclass(frozen=True)
+class PassageContext:
+    passage_id: str
+    note_id: str
+    title: str
+    source: str
+    text: str
+    char_start: int
+    char_end: int
+    created: float
+    modified: float
+    build_id: str
+
+
+@dataclass(frozen=True)
+class NoteContext:
+    note_id: str
+    title: str
+    source: str
+    modified: float
+    build_id: str
+
+
+@dataclass(frozen=True)
+class EntityContext:
+    entity_id: str
+    canonical: str
+    etype: str
+    traversal_eligible: bool
+    build_id: str
+
+
+@dataclass(frozen=True)
 class FactContext:
     fact_id: str
     subject_entity_id: str
@@ -100,6 +134,7 @@ class FactContext:
     assertion_start: int
     assertion_end: int
     assertion: str
+    confidence: float
     observed_at: float
     valid_from: float | None
     valid_to: float | None
@@ -214,6 +249,8 @@ class KnowledgeStore:
             source_snapshot=row["source_snapshot"],
             calibration_hash=row["calibration_hash"],
             graph_hash=row["graph_hash"],
+            model_manifest=json.loads(str(row["model_manifest"])),
+            config_manifest=json.loads(str(row["config_manifest"])),
         )
 
     def completed_build(self, build_id: str | None = None) -> BuildRecord | None:
@@ -431,6 +468,85 @@ class KnowledgeStore:
             for row in rows
         )
 
+    def passage_contexts(
+        self,
+        passage_ids: Sequence[str],
+        *,
+        build_id: str | None = None,
+    ) -> tuple[PassageContext, ...]:
+        """Load exact source passages and their user-facing note metadata."""
+
+        requested = tuple(dict.fromkeys(str(value) for value in passage_ids))
+        if not requested:
+            return ()
+        clauses = [f"p.passage_id IN ({','.join('?' for _ in requested)})"]
+        parameters: list[Any] = list(requested)
+        if build_id is not None:
+            clauses.append("p.build_id = ?")
+            parameters.append(build_id)
+        rows = self._conn.execute(
+            f"""
+            SELECT p.passage_id, p.note_id, n.title, n.source, p.text,
+                   p.char_start, p.char_end, p.created, p.modified, p.build_id
+            FROM passages p
+            JOIN notes n ON n.note_id = p.note_id
+            WHERE {' AND '.join(clauses)}
+            """,
+            tuple(parameters),
+        ).fetchall()
+        by_id = {
+            str(row["passage_id"]): PassageContext(
+                passage_id=str(row["passage_id"]),
+                note_id=str(row["note_id"]),
+                title=str(row["title"]),
+                source=str(row["source"]),
+                text=str(row["text"]),
+                char_start=int(row["char_start"]),
+                char_end=int(row["char_end"]),
+                created=float(row["created"]),
+                modified=float(row["modified"]),
+                build_id=str(row["build_id"]),
+            )
+            for row in rows
+        }
+        return tuple(by_id[value] for value in requested if value in by_id)
+
+    def note_contexts(
+        self,
+        note_ids: Sequence[str],
+        *,
+        build_id: str | None = None,
+    ) -> tuple[NoteContext, ...]:
+        """Load bounded note metadata without reading note bodies."""
+
+        requested = tuple(dict.fromkeys(str(value) for value in note_ids))
+        if not requested:
+            return ()
+        clauses = [f"note_id IN ({','.join('?' for _ in requested)})"]
+        parameters: list[Any] = list(requested)
+        if build_id is not None:
+            clauses.append("build_id = ?")
+            parameters.append(build_id)
+        rows = self._conn.execute(
+            f"""
+            SELECT note_id, title, source, modified, build_id
+            FROM notes
+            WHERE {' AND '.join(clauses)}
+            """,
+            tuple(parameters),
+        ).fetchall()
+        by_id = {
+            str(row["note_id"]): NoteContext(
+                note_id=str(row["note_id"]),
+                title=str(row["title"]),
+                source=str(row["source"]),
+                modified=float(row["modified"]),
+                build_id=str(row["build_id"]),
+            )
+            for row in rows
+        }
+        return tuple(by_id[value] for value in requested if value in by_id)
+
     def write_fact_embeddings(self, embeddings: Sequence[FactEmbedding]) -> None:
         self._writable()
         ordered = sorted(embeddings, key=lambda row: row.fact_id)
@@ -624,6 +740,27 @@ class KnowledgeStore:
         ).fetchall()
         return {str(row["note_id"]): float(row["quality_rank"]) for row in rows}
 
+    def set_note_ranks(
+        self,
+        quality_ranks: dict[str, float],
+        value_scores: dict[str, float],
+        *,
+        build_id: str,
+    ) -> None:
+        self._writable()
+        with self._conn:
+            for note_id in sorted(set(quality_ranks) | set(value_scores)):
+                self._conn.execute(
+                    "UPDATE notes SET quality_rank = ?, value_score = ? "
+                    "WHERE note_id = ? AND build_id = ?",
+                    (
+                        float(quality_ranks.get(note_id, 0.0)),
+                        float(value_scores.get(note_id, 0.0)),
+                        note_id,
+                        build_id,
+                    ),
+                )
+
     def search_passages_bm25(self, query: str, k: int) -> tuple[BM25PassageHit, ...]:
         if not query.strip() or k <= 0:
             return ()
@@ -732,6 +869,55 @@ class KnowledgeStore:
                 target_ids.append(entity_id)
         return {surface: tuple(target_ids) for surface, target_ids in grouped.items()}
 
+    def entity_contexts(
+        self,
+        entity_ids: Sequence[str],
+        *,
+        build_id: str | None = None,
+    ) -> tuple[EntityContext, ...]:
+        if not entity_ids:
+            return ()
+        clauses = [f"entity_id IN ({','.join('?' for _ in entity_ids)})"]
+        parameters: list[Any] = list(entity_ids)
+        if build_id is not None:
+            clauses.append("build_id = ?")
+            parameters.append(build_id)
+        rows = self._conn.execute(
+            "SELECT entity_id, canonical, etype, traversal_eligible, build_id "
+            f"FROM entities WHERE {' AND '.join(clauses)} ORDER BY entity_id",
+            tuple(parameters),
+        ).fetchall()
+        return tuple(
+            EntityContext(
+                entity_id=str(row["entity_id"]),
+                canonical=str(row["canonical"]),
+                etype=str(row["etype"]),
+                traversal_eligible=bool(row["traversal_eligible"]),
+                build_id=str(row["build_id"]),
+            )
+            for row in rows
+        )
+
+    def passage_ids_for_entities(
+        self,
+        entity_ids: Sequence[str],
+        *,
+        build_id: str | None = None,
+    ) -> tuple[str, ...]:
+        if not entity_ids:
+            return ()
+        clauses = [f"entity_id IN ({','.join('?' for _ in entity_ids)})"]
+        parameters: list[Any] = list(entity_ids)
+        if build_id is not None:
+            clauses.append("build_id = ?")
+            parameters.append(build_id)
+        rows = self._conn.execute(
+            "SELECT DISTINCT passage_id FROM entity_mentions "
+            f"WHERE {' AND '.join(clauses)} ORDER BY passage_id",
+            tuple(parameters),
+        ).fetchall()
+        return tuple(str(row["passage_id"]) for row in rows)
+
     def insert_mention(
         self,
         *,
@@ -785,6 +971,33 @@ class KnowledgeStore:
                     fact.object_end, fact.confidence, fact.extraction_method, fact.schema_id,
                     fact.observed_at, fact.valid_from, fact.valid_to, fact.invalidated_at,
                     fact.superseded_by, fact.status, fact.build_id,
+                ),
+            )
+
+    def insert_predicate_proposal(self, proposal: Any) -> None:
+        self._writable()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO predicate_proposals(
+                    proposal_id, proposed_predicate, description,
+                    subject_entity_id, object_entity_id, source_passage_id,
+                    assertion_start, assertion_end, confidence,
+                    extraction_method, build_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal.proposal_id,
+                    proposal.proposed_predicate,
+                    proposal.description,
+                    proposal.subject_entity_id,
+                    proposal.object_entity_id,
+                    proposal.source_passage_id,
+                    proposal.assertion_start,
+                    proposal.assertion_end,
+                    proposal.confidence,
+                    proposal.extraction_method,
+                    proposal.build_id,
                 ),
             )
 
@@ -861,6 +1074,7 @@ class KnowledgeStore:
                     assertion_start=start,
                     assertion_end=end,
                     assertion=assertion,
+                    confidence=float(row["confidence"]),
                     observed_at=float(row["observed_at"]),
                     valid_from=_optional_float(row["valid_from"]),
                     valid_to=_optional_float(row["valid_to"]),

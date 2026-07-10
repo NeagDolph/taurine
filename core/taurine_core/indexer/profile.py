@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from taurine_core import config
-from taurine_core.chat.retrieval import ChatRetriever
 from taurine_core.chat.tools import TOOL_DEFINITIONS, execute_tool
 from taurine_core.indexer.store import Index
 from taurine_core.llm import OpenRouterClient
@@ -76,11 +75,11 @@ class ProfileGenerator:
         index: Index,
         llm: OpenRouterClient,
         *,
-        retriever: Any | None = None,
+        retriever: Any,
     ) -> None:
         self.index = index
         self.llm = llm
-        self.retriever = retriever or ChatRetriever(index, "__profile_generation__")
+        self.retriever = retriever
 
     async def generate(
         self,
@@ -172,7 +171,6 @@ class ProfileGenerator:
                     name,
                     arguments,
                     self.retriever,
-                    self.index,
                     now=time.time(),
                 )
                 touched_nodes.update(step.note_ids)
@@ -234,19 +232,19 @@ def _phase_for_tool(
         for term in ("project", "people", "person", "relationship", "client", "collabor", "work")
     ):
         return "projects_people"
-    if name in {"read_note", "expand_note"} and current == "surveying":
+    if name in {"read_note", "expand_evidence"} and current == "surveying":
         return "projects_people"
     return current
 
 
 def _running_activity(name: str, arguments: dict[str, Any]) -> str:
-    if name == "search_notes":
+    if name == "search_evidence":
         query = str(arguments.get("query") or "").strip()
         return f'Searching for "{query}"' if query else "Searching the knowledge graph"
-    ref = str(arguments.get("note") or "").strip()
+    ref = str(arguments.get("note") or arguments.get("evidence") or "").strip()
     if name == "read_note":
         return f"Reading {ref}" if ref else "Reading a source node"
-    if name == "expand_note":
+    if name == "expand_evidence":
         return f"Following connections from {ref}" if ref else "Following graph connections"
     return "Researching the knowledge graph"
 

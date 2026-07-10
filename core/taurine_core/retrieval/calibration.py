@@ -91,6 +91,30 @@ class HeadCalibrator:
     def bm25_min_token_coverage(self) -> float:
         return self.mode_calibration.bm25_min_token_coverage
 
+    @property
+    def head_weights(self) -> Mapping[str, float]:
+        return self.mode_calibration.head_weights
+
+    @property
+    def rrf_k(self) -> int:
+        return self.mode_calibration.rrf_k
+
+    @property
+    def mmr_lambda(self) -> float:
+        return self.mode_calibration.mmr_lambda
+
+    @property
+    def source_diversity_penalty(self) -> float:
+        return self.mode_calibration.source_diversity_penalty
+
+    @property
+    def note_support_bonus(self) -> float:
+        return self.mode_calibration.note_support_bonus
+
+    @property
+    def note_support_bonus_cap(self) -> float:
+        return self.mode_calibration.note_support_bonus_cap
+
     def _curve(self, head: str) -> CalibrationCurve:
         try:
             return self.mode_calibration.heads[head]
@@ -167,6 +191,7 @@ class AbstentionPolicy:
         rejected_hits: Sequence[HeadHit] = (),
         *,
         recognized_triple_confidence: float = 0.0,
+        evidence_target_ids: Sequence[str] | None = None,
     ) -> RetrievalDecision:
         qualified, disqualified = self._qualified(accepted_hits)
         heads = _head_names(qualified)
@@ -188,7 +213,21 @@ class AbstentionPolicy:
 
         independent_heads = set(heads)
         high_precision = bool(independent_heads & {"exact", "entity"})
-        if len(independent_heads) >= self.rules.minimum_independent_heads:
+        if evidence_target_ids is None:
+            has_agreement = (
+                len(independent_heads) >= self.rules.minimum_independent_heads
+            )
+        else:
+            selected = set(evidence_target_ids)
+            heads_by_target: dict[str, set[str]] = {}
+            for hit in qualified:
+                if hit.target_kind == "passage" and hit.target_id in selected:
+                    heads_by_target.setdefault(hit.target_id, set()).add(hit.head)
+            has_agreement = any(
+                len(target_heads) >= self.rules.minimum_independent_heads
+                for target_heads in heads_by_target.values()
+            )
+        if has_agreement:
             reason = "accepted_independent_head_agreement"
         elif high_precision:
             reason = "accepted_high_precision_head"

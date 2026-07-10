@@ -22,19 +22,27 @@ from taurine_core import config
 from taurine_core import session_log
 from taurine_core.asr import ASRClient, ChunkCallback, IndexStatusProvider, StatusCallback
 from taurine_core.chat.engine import ChatEngine
+from taurine_core.chat.retrieval import ChatRetriever
 from taurine_core.connectors.registry import ConnectorRegistry
 from taurine_core.indexer.notes import open_note
+from taurine_core.indexer.build import BuildCoordinator, BuildDependencies
+from taurine_core.indexer.embed import embed_texts
+from taurine_core.indexer.extract import extract_notes
+from taurine_core.indexer.facts import PREDICATES
+from taurine_core.indexer.knowledge_store import KnowledgeSchemaError
+from taurine_core.models_local import passage_tokenizer
 from taurine_core.indexer.profile import ProfileGenerator, ProfileProgress
-from taurine_core.indexer.reenrich import reenrich_all
 from taurine_core.indexer.store import Index
 from taurine_core.indexer.sync import SyncReport
 from taurine_core.live.ambient import AmbientRetriever
-from taurine_core.live.exact import ExactCollector
+from taurine_core.live.grounding import GroundingEngine
 from taurine_core.live.ingest import Event, EventSink, LiveSession
 from taurine_core.live.spans import Gliner2SpanExtractor
 from taurine_core.live.summarizer import Summarizer
 from taurine_core.live.trigger import SummaryTrigger
 from taurine_core.llm import OpenRouterClient
+from taurine_core.retrieval.registry import EvidenceRegistry
+from taurine_core.retrieval.runtime import RetrievalRuntime
 from taurine_core.session_log import NullSessionLogger, SessionLogger
 from taurine_core.schemas import (
     ActionableStatusMsg,
@@ -43,9 +51,12 @@ from taurine_core.schemas import (
     ChatRegenerateMsg,
     ChatSendMsg,
     ConnectorInfo,
+    GraphEdge,
+    GraphNode,
     GraphResponse,
     IndexStatus,
     MeetingSummary,
+    NeighborRef,
     NotePreview,
     OpenNoteMsg,
     ProfileGenerationStatus,
@@ -155,6 +166,8 @@ class Runtime:
         default_factory=ProfileGenerationStatus
     )
     profile_generation_task: asyncio.Task[Any] | None = None
+    knowledge_runtime: Any = None
+    regenerate_knowledge: Callable[[], Any] | None = None
 
 
 class _MonotonicClock:
@@ -179,18 +192,12 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             active_runtime.connector_registry.on_change = lambda: active_runtime.updates.publish(
                 "connectors"
             )
-        # embedding-dimension migration runs in the background so the app can
-        # connect immediately; dense search serves the already-migrated rows
-        # (load() skips wrong-dim vectors) and reloads fully when done
-        reembed_task = asyncio.create_task(_migrate_embeddings(active_runtime))
         periodic_task: asyncio.Task[None] | None = None
         if active_runtime.enable_periodic_sync:
             periodic_task = asyncio.create_task(_periodic_sync(active_runtime))
         try:
             yield
         finally:
-            reembed_task.cancel()
-            await asyncio.gather(reembed_task, return_exceptions=True)
             if periodic_task is not None:
                 periodic_task.cancel()
                 await asyncio.gather(periodic_task, return_exceptions=True)
@@ -214,6 +221,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             close = getattr(chat_logger, "close", None)
             if callable(close):
                 close()
+            close_knowledge = getattr(active_runtime.knowledge_runtime, "close", None)
+            if callable(close_knowledge):
+                close_knowledge()
 
     app = FastAPI(lifespan=lifespan)
     # localhost-bound service consumed by the Electron renderer (vite origin
@@ -228,13 +238,17 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.get("/graph")
     async def graph() -> GraphResponse:
         active_runtime: Runtime = app.state.runtime
-        return active_runtime.index.graph()
+        if active_runtime.knowledge_runtime is None:
+            return active_runtime.index.graph()
+        return _knowledge_graph(active_runtime.knowledge_runtime)
 
     @app.post("/index/sync")
     async def index_sync() -> Any:
         active_runtime: Runtime = app.state.runtime
         sync = active_runtime.sync_all_enabled or active_runtime.sync_once
         report = await asyncio.to_thread(sync)
+        if active_runtime.regenerate_knowledge is not None:
+            await asyncio.to_thread(active_runtime.regenerate_knowledge)
         _bump_graph(active_runtime)
         return _report_payload(report)
 
@@ -252,6 +266,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             registry.set_enabled(active_runtime.index, connector_id, True)
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
+        if active_runtime.regenerate_knowledge is not None:
+            await asyncio.to_thread(active_runtime.regenerate_knowledge)
         _bump_graph(active_runtime)
         return _connector_info(active_runtime, connector_id)
 
@@ -263,6 +279,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             registry.set_enabled(active_runtime.index, connector_id, False)
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
+        if active_runtime.regenerate_knowledge is not None:
+            await asyncio.to_thread(active_runtime.regenerate_knowledge)
         _bump_graph(active_runtime)
         return _connector_info(active_runtime, connector_id)
 
@@ -273,9 +291,14 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if connector_id in registry.syncing:
             raise HTTPException(status_code=409, detail="connector sync running — wait for it to finish")
         try:
+            # Deletion is a privacy boundary: keep the source disabled so the
+            # clean rebuild cannot immediately re-extract the deleted records.
+            registry.set_enabled(active_runtime.index, connector_id, False)
             await asyncio.to_thread(registry.purge_data, active_runtime.index, connector_id)
         except KeyError:
             raise HTTPException(status_code=404, detail="connector not found") from None
+        if active_runtime.regenerate_knowledge is not None:
+            await asyncio.to_thread(active_runtime.regenerate_knowledge)
         _bump_graph(active_runtime)
         return _connector_info(active_runtime, connector_id)
 
@@ -314,7 +337,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.get("/notes/{note_id:path}")
     async def note_preview(note_id: str) -> NotePreview:
         active_runtime: Runtime = app.state.runtime
-        preview = active_runtime.index.preview(note_id)
+        preview = (
+            _knowledge_note_preview(active_runtime.knowledge_runtime, note_id)
+            if active_runtime.knowledge_runtime is not None
+            else active_runtime.index.preview(note_id)
+        )
         if preview is None:
             raise HTTPException(status_code=404, detail="note not found")
         return preview
@@ -638,20 +665,91 @@ def build_runtime() -> Runtime:
     connector_registry = ConnectorRegistry()
     connector_registry.reconcile_ledger(index)
 
+    def complete_relations(notes: Any) -> object:
+        payload = {
+            "predicates": {
+                name: spec.description for name, spec in sorted(PREDICATES.items())
+            },
+            "notes": [
+                {
+                    "note_id": note.note_id,
+                    "observed_at": note.observed_at,
+                    "entities": [asdict(entity) for entity in note.entities],
+                    "passages": [asdict(passage) for passage in note.passages],
+                }
+                for note in notes
+            ],
+        }
+        return asyncio.run(
+            llm.complete_json(
+                config.CHAT_MODEL,
+                (
+                    "Return JSON {facts:[...]}. Find only relations directly supported by the "
+                    "supplied passage text. Reuse entity_id and passage_id exactly, select a "
+                    "registered predicate when possible, and provide source-exact assertion_start "
+                    "and assertion_end offsets plus confidence. For an unregistered predicate, "
+                    "also provide predicate_description. Do not infer unsupported relations."
+                ),
+                json.dumps(payload, ensure_ascii=False),
+                timeout_s=config.SUMMARY_TIMEOUT_S,
+            )
+        )
+
+    knowledge_builder = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=passage_tokenizer(),
+            embedder=embed_texts,
+            extractor=extract_notes,
+            relation_completer=complete_relations,
+        )
+    )
+    knowledge_database = Path("taurine-knowledge.db")
+    try:
+        knowledge_runtime = RetrievalRuntime(knowledge_database)
+    except (FileNotFoundError, ValueError, KnowledgeSchemaError):
+        knowledge_builder.build(
+            connector_registry.extract_all_enabled(index),
+            knowledge_database,
+            replace_derived=True,
+        )
+        knowledge_runtime = RetrievalRuntime(knowledge_database)
+
+    def regenerate_knowledge() -> Any:
+        records = connector_registry.extract_all_enabled(index)
+        report = knowledge_builder.build(
+            records,
+            knowledge_runtime.knowledge_database,
+            replace_derived=True,
+        )
+        knowledge_runtime.activate_from_disk()
+        return report
+
+    async def rebuild_knowledge(progress: Any, source: str | None = None) -> Any:
+        del source  # Graph finalization is intentionally global and deterministic.
+        progress(ReenrichStatus(running=True, phase="clean_build", done=0, total=1))
+        report = await asyncio.to_thread(regenerate_knowledge)
+        progress(ReenrichStatus(running=False, phase="idle", done=1, total=1))
+        return report
+
     def make_live_session(emit: EventSink, logger: SessionLogger) -> LiveSession:
         clock = _MonotonicClock()
+        registry = EvidenceRegistry()
+        grounding = GroundingEngine(registry)
         return LiveSession(
-            index=index,
-            exact=ExactCollector(index),
+            registry=registry,
             ambient=AmbientRetriever(
-                index,
+                knowledge_runtime.make_engine("live", registry),
                 clock,
                 span_extractor=span_extractor,
             ),
+            grounding=grounding,
             trigger=SummaryTrigger(clock.now),
-            summarizer=Summarizer(llm, index),
+            summarizer=Summarizer(
+                llm,
+                index,
+                knowledge_runtime.make_validator(registry),
+            ),
             emit=emit,
-            clock=clock,
             logger=logger,
         )
 
@@ -678,14 +776,42 @@ def build_runtime() -> Runtime:
         enable_periodic_sync=True,
         connector_registry=connector_registry,
         connector_llm=llm,
-        reenrich_all=lambda progress, source=None: reenrich_all(index, llm, progress, source=source),
+        reenrich_all=rebuild_knowledge,
         make_chat_engine=lambda: ChatEngine(
             index,
             llm,
             SessionLogger.create(session_log.SESSIONS_DIR),
             span_extractor=span_extractor,
+            retriever_factory=lambda chat_id: ChatRetriever(
+                index,
+                chat_id,
+                engine_factory=lambda registry: knowledge_runtime.make_engine(
+                    "chat", registry
+                ),
+                tool_engine_factory=lambda registry: knowledge_runtime.make_engine(
+                    "tool", registry
+                ),
+                span_extractor=span_extractor,
+            ),
+            validator_factory=knowledge_runtime.make_validator,
         ),
-        make_profile_generator=lambda: ProfileGenerator(index, llm),
+        make_profile_generator=lambda: ProfileGenerator(
+            index,
+            llm,
+            retriever=ChatRetriever(
+                index,
+                f"__profile_generation__-{uuid4().hex}",
+                engine_factory=lambda registry: knowledge_runtime.make_engine(
+                    "tool", registry
+                ),
+                tool_engine_factory=lambda registry: knowledge_runtime.make_engine(
+                    "tool", registry
+                ),
+                span_extractor=span_extractor,
+            ),
+        ),
+        knowledge_runtime=knowledge_runtime,
+        regenerate_knowledge=regenerate_knowledge,
     )
 
 
@@ -698,6 +824,97 @@ def required_secrets(env: Mapping[str, str | None] | None = None) -> dict[str, s
             raise RuntimeError(f"Missing required secret: {key}")
         secrets[key] = value
     return secrets
+
+
+def _knowledge_graph(knowledge_runtime: RetrievalRuntime) -> GraphResponse:
+    snapshot = knowledge_runtime.snapshot
+    store = snapshot.open_knowledge_store()
+    try:
+        notes = {row.note_id: row for row in store.source_notes()}
+    finally:
+        store.close()
+    degree = {note_id: 0 for note_id in notes}
+    edges: list[GraphEdge] = []
+    for row in snapshot.projection:
+        if row.src_note_id not in notes or row.dst_note_id not in notes:
+            continue
+        degree[row.src_note_id] += 1
+        degree[row.dst_note_id] += 1
+        edges.append(
+            GraphEdge(
+                src=row.src_note_id,
+                dst=row.dst_note_id,
+                type=row.edge_type,
+                weight=row.weight,
+                shared=list(row.shared),
+                fact_ids=list(row.fact_ids),
+                fact_provenance=(
+                    "directed_facts" if row.fact_ids else ""
+                ),
+            )
+        )
+    return GraphResponse(
+        nodes=[
+            GraphNode(
+                note_id=note.note_id,
+                title=note.title,
+                degree=degree[note.note_id],
+                source=note.source,
+                gist=note.display_line,
+            )
+            for note in notes.values()
+        ],
+        edges=edges,
+    )
+
+
+def _knowledge_note_preview(
+    knowledge_runtime: RetrievalRuntime,
+    note_id: str,
+) -> NotePreview | None:
+    snapshot = knowledge_runtime.snapshot
+    store = snapshot.open_knowledge_store()
+    try:
+        notes = {row.note_id: row for row in store.source_notes()}
+        note = notes.get(note_id)
+        if note is None:
+            return None
+        fact_rows = {row.fact_id: row for row in store.fact_contexts()}
+        neighbors: list[NeighborRef] = []
+        for edge in snapshot.projection:
+            if note_id not in {edge.src_note_id, edge.dst_note_id}:
+                continue
+            neighbor_id = (
+                edge.dst_note_id if edge.src_note_id == note_id else edge.src_note_id
+            )
+            neighbor = notes.get(neighbor_id)
+            if neighbor is None:
+                continue
+            facts = [
+                fact_rows[fact_id].canonical_text
+                for fact_id in edge.fact_ids
+                if fact_id in fact_rows
+            ]
+            neighbors.append(
+                NeighborRef(
+                    note_id=neighbor.note_id,
+                    title=neighbor.title,
+                    source=neighbor.source,
+                    weight=edge.weight,
+                    fact="; ".join(facts),
+                )
+            )
+        neighbors.sort(key=lambda row: (-row.weight, row.note_id))
+        return NotePreview(
+            note_id=note.note_id,
+            title=note.title,
+            source=note.source,
+            gist=note.display_line,
+            text=note.text,
+            neighbors=neighbors,
+        )
+    finally:
+        store.close()
 
 
 def split_audio_frame(frame: bytes) -> tuple[int, bytes]:
@@ -781,28 +998,6 @@ async def _send_events(
         await websocket.send_text(event.model_dump_json())
 
 
-async def _migrate_embeddings(runtime: Runtime) -> None:
-    from taurine_core.indexer.reembed import needs_reembed, reembed_all
-
-    if not hasattr(runtime.index, "_embedding_rows_raw"):
-        return  # test doubles without a real embeddings table
-    logger = logging.getLogger("taurine.session")
-    try:
-        if not await asyncio.to_thread(needs_reembed, runtime.index):
-            return
-        logger.info("embedding migration starting (stale rows re-encode in background)")
-        count = await asyncio.to_thread(reembed_all, runtime.index)
-        logger.info("embedding migration done: %d rows", count)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("embedding migration failed")
-        return
-    _bump_graph(runtime)
-    runtime.updates.publish("connectors")
-    await _emit_index_status(runtime)
-
-
 async def _periodic_sync(runtime: Runtime) -> None:
     while True:
         await asyncio.sleep(config.SYNC_INTERVAL_S)
@@ -812,6 +1007,8 @@ async def _periodic_sync(runtime: Runtime) -> None:
 async def run_sync_once_safely(runtime: Runtime) -> None:
     try:
         await asyncio.to_thread(runtime.sync_once)
+        if runtime.regenerate_knowledge is not None:
+            await asyncio.to_thread(runtime.regenerate_knowledge)
     except Exception:
         pass
 
@@ -825,6 +1022,8 @@ async def _run_connector_sync(runtime: Runtime, connector_id: str) -> None:
             runtime.index,
             runtime.connector_llm,
         )
+        if runtime.regenerate_knowledge is not None:
+            await asyncio.to_thread(runtime.regenerate_knowledge)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -874,7 +1073,7 @@ async def _run_reenrich(runtime: Runtime, source: str | None = None) -> None:
             )
         else:
             await _emit_index_status(runtime)
-        # re-enrichment refreshes extraction/display lines/edges only
+        # The compatibility endpoint now performs one complete clean build.
         _bump_graph(runtime)
         runtime.updates.publish("connectors")
 

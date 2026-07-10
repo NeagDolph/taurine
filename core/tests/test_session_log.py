@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from taurine_core.live.grounding import GroundingUpdate
-from taurine_core.schemas import GroundedFact, GroundingItem
+from taurine_core.retrieval.types import EvidenceFact, EvidencePassage, RetrievalDecision
 from taurine_core.session_log import (
     SessionLogger,
     console_line,
@@ -99,7 +99,7 @@ def test_chat_console_lines_are_compact() -> None:
             "chat_id": "chat-1234abcd",
             "message_id": 7,
             "model": "z-ai/glm-5.2",
-            "tools": [{"name": "search_notes"}],
+            "tools": [{"name": "search_evidence"}],
             "usage": {"prompt": 10, "completion": 20, "reasoning": 5},
             "total_ms": 1234.5,
             "cancelled": False,
@@ -114,17 +114,16 @@ def test_chat_console_lines_are_compact() -> None:
 def test_grounding_and_summary_helpers_write_canonical_payloads(tmp_path) -> None:
     logger = SessionLogger.create(tmp_path)
     update = GroundingUpdate(
+        decision=RetrievalDecision(True, 0.9, "accepted"),
         revision=7,
-        items=[
-            GroundingItem(
-                note_id="n1",
-                short_id="N1",
-                title="Timeline",
-                gist="Timeline gist",
-                score=0.91,
-            )
-        ],
-        facts=[GroundedFact(fact_id="F1", src="n1", dst="n2", text="related")],
+        passages=(EvidencePassage("E1", "p1", "n1", "Timeline", "test", "Timeline gist", 0, 13, 1.0, 1.0, 0.9, 0.91),),
+        facts=(EvidenceFact("F1", ("f1",), "n1", "related_to", "n2", "forward", "active", 1.0, None, None, 0.9, ("E1",)),),
+        paths=(),
+        notes=(),
+        display_passages=(EvidencePassage("E1", "p1", "n1", "Timeline", "test", "Timeline gist", 0, 13, 1.0, 1.0, 0.9, 0.91),),
+        display_notes=(),
+        no_new_evidence=False,
+        new_support_ids=("E1", "F1"),
     )
 
     log_grounding(logger, update, decision=True, reason="jaccard")
@@ -146,7 +145,7 @@ def test_grounding_and_summary_helpers_write_canonical_payloads(tmp_path) -> Non
         "ts": records[0]["ts"],
         "kind": "grounding",
         "revision": 7,
-        "items": [{"note_id": "n1", "short_id": "N1", "score": 0.91}],
+        "items": [{"note_id": "n1", "evidence_id": "E1", "score": 0.91}],
         "fact_ids": ["F1"],
         "trigger_decision": True,
         "trigger_reason": "jaccard",

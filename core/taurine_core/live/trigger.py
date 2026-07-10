@@ -141,10 +141,11 @@ class SummaryTrigger:
 
 
 def _top_ids(update: GroundingUpdate) -> set[str]:
-    return {
-        item.note_id
-        for item in update.items[: config.SUMMARY_CHANGE_TOP_K]
-    }
+    support = [
+        *(row.evidence_id for row in update.passages),
+        *(row.fact_ref for row in update.facts),
+    ]
+    return set(support[: config.SUMMARY_CHANGE_TOP_K])
 
 
 def _normalize(vector: np.ndarray) -> np.ndarray | None:

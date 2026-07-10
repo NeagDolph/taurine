@@ -48,20 +48,16 @@ from ..schemas import (
     ChatRetrievalEvent,
     ChatThinkingEvent,
     ChatUsage,
-    GroundedFact,
-    GroundingItem,
+    EvidencePackPayload,
 )
+from ..retrieval.types import EvidencePack
+from ..retrieval.validate import EvidenceValidator
 from .retrieval import ChatRetriever
 from .tools import TOOL_DEFINITIONS, execute_tool
 
 # async callback the server provides: emits one ws event dict/model to the client
 EmitFn = Callable[[Any], Coroutine[Any, Any, None]]
 
-_CITATION_RE = re.compile(r"\[(N|F)\d+\]")
-# strip variant consumes one adjacent leading space so removals don't leave
-# double spaces — a global space-collapse would mangle code indentation and
-# markdown hard breaks (re-review finding)
-_CITATION_STRIP_RE = re.compile(r" ?\[(N|F)\d+\]")
 # GLM-5.2 leaks its native tool-call markup as plain text when it wants a
 # tool on the forced no-tools round (live smoke 2026-07-08) — never render it
 _TOOL_CALL_REMNANT_RE = re.compile(r"<tool_call>.*?(?:</tool_call>|\Z)", re.DOTALL)
@@ -69,6 +65,20 @@ _TOOL_CALL_REMNANT_RE = re.compile(r"<tool_call>.*?(?:</tool_call>|\Z)", re.DOTA
 
 def _strip_tool_call_remnants(content: str) -> str:
     return _TOOL_CALL_REMNANT_RE.sub("", content).rstrip()
+
+
+def _preserves_named_entities(original: str, rewritten: str) -> bool:
+    ignored = {
+        "and", "how", "i", "it", "my", "tell", "the", "that", "this",
+        "what", "when", "where", "who", "why",
+    }
+    named = {
+        token.casefold()
+        for token in re.findall(r"\b[A-Z][\w'-]*\b", original)
+        if token.casefold() not in ignored
+    }
+    lowered = rewritten.casefold()
+    return all(re.search(rf"\b{re.escape(token)}\b", lowered) for token in named)
 
 
 @dataclass
@@ -98,11 +108,15 @@ class ChatEngine:
         logger: Any,
         *,
         span_extractor: SpanExtractorPort | None = None,
+        retriever_factory: Callable[[str], ChatRetriever] | None = None,
+        validator_factory: Callable[[Any], EvidenceValidator] | None = None,
     ) -> None:
         self.index = index
         self.llm = llm
         self.logger = logger
         self._span_extractor = span_extractor
+        self._retriever_factory = retriever_factory
+        self._validator_factory = validator_factory
         self._lock = asyncio.Lock()
         self._active: dict[str, asyncio.Task[Any]] = {}
         self._active_count = 0
@@ -160,6 +174,7 @@ class ChatEngine:
                 created_meta=None,
                 persist_user=False,
                 user_message_id=last_user.id,
+                restore_pre_turn=True,
             )
         finally:
             await self._release(chat_id)
@@ -201,6 +216,7 @@ class ChatEngine:
         created_meta: ChatMeta | None,
         persist_user: bool,
         user_message_id: int | None = None,
+        restore_pre_turn: bool = False,
     ) -> None:
         turn_started = time.monotonic()
         wall_now = time.time()
@@ -222,18 +238,22 @@ class ChatEngine:
             )
         )
 
-        retriever_kwargs: dict[str, Any] = {}
-        if self._span_extractor is not None:
-            retriever_kwargs["span_extractor"] = self._span_extractor
-        retriever = ChatRetriever(self.index, chat_id, **retriever_kwargs)
-        context_items: list[GroundingItem] = []
-        context_facts: list[GroundedFact] = []
+        if self._retriever_factory is not None:
+            retriever = self._retriever_factory(chat_id)
+        else:
+            # Test seams may replace ChatRetriever. Production wiring supplies
+            # a factory bound to the active immutable knowledge snapshot.
+            retriever = ChatRetriever(self.index, chat_id)  # type: ignore[call-arg]
+        if restore_pre_turn:
+            restore = getattr(retriever, "restore_pre_turn", None)
+            if callable(restore):
+                restore()
+        context_pack: EvidencePack | None = None
         content_parts: list[str] = []
         thinking_parts: list[str] = []
         activity: list[ChatActivityStep] = []
         usage = {"prompt": 0, "completion": 0, "reasoning": 0}
         ttft_ms: float | None = None
-        tool_sources: dict[str, GroundingItem] = {}
         tool_summaries: list[dict[str, Any]] = []
         stripped_citations = 0
         model = config.CHAT_MODEL
@@ -261,13 +281,17 @@ class ChatEngine:
             nonlocal stripped_citations, persisted_message
             if persisted_message is not None:
                 return persisted_message
-            final_content, sources, facts, stripped_citations = _finalize_grounding(
-                _strip_tool_call_remnants("".join(content_parts)),
-                context_items,
-                context_facts,
-                tool_sources,
+            raw_content = _strip_tool_call_remnants("".join(content_parts))
+            turn_pack_fn = getattr(retriever, "turn_pack", None)
+            audit_pack = turn_pack_fn() if callable(turn_pack_fn) else context_pack
+            final_content, cited_ids, stripped_citations = _finalize_evidence(
+                raw_content,
                 retriever,
+                self._validator_factory,
+                audit_pack,
             )
+            retrieved_ids = list(audit_pack.trace.selected_ids) if audit_pack is not None else []
+            consulted_ids = list(audit_pack.trace.read_ids) if audit_pack is not None else []
             total_ms = (time.monotonic() - turn_started) * 1000.0
             message = ChatMessage(
                 id=assistant_id,
@@ -275,8 +299,15 @@ class ChatEngine:
                 role="assistant",
                 content=final_content,
                 thinking="".join(thinking_parts),
-                sources=sources,
-                facts=facts,
+                evidence=EvidencePackPayload.from_domain(audit_pack) if audit_pack is not None else None,
+                retrieved_ids=retrieved_ids,
+                consulted_ids=consulted_ids,
+                cited_ids=list(cited_ids),
+                original_query=audit_pack.trace.original_query if audit_pack is not None else text,
+                rewritten_query=audit_pack.trace.rewritten_query if audit_pack is not None else text,
+                retrieval_decision=audit_pack.decision.reason if audit_pack is not None else "missing",
+                retrieval_confidence=audit_pack.decision.confidence if audit_pack is not None else 0.0,
+                active_build_id=audit_pack.trace.active_build_id if audit_pack is not None else "",
                 activity=activity,
                 usage=ChatUsage(
                     prompt=usage["prompt"],
@@ -295,7 +326,14 @@ class ChatEngine:
                 chat_id=chat_id,
                 message_id=assistant_id,
                 model=model,
-                retrieval={"sources": len(context_items), "facts": len(context_facts)},
+                retrieval={
+                    "passages": len(context_pack.passages) if context_pack is not None else 0,
+                    "facts": len(context_pack.facts) if context_pack is not None else 0,
+                    "decision": context_pack.decision.reason if context_pack is not None else "missing",
+                    "retrieved_ids": retrieved_ids,
+                    "consulted_ids": consulted_ids,
+                    "cited_ids": list(cited_ids),
+                },
                 tools=tool_summaries,
                 usage=message.usage.model_dump(mode="json"),
                 ttft_ms=message.usage.ttft_ms,
@@ -307,6 +345,8 @@ class ChatEngine:
             return message
 
         async def finish_done(*, cancelled: bool) -> None:
+            if not cancelled:
+                await self._repair_once(content_parts, retriever, context_pack)
             message = persist_turn(cancelled=cancelled)
             await emit(ChatDoneEvent(chat_id=chat_id, message_id=assistant_id, message=message))
             if not cancelled:
@@ -340,27 +380,45 @@ class ChatEngine:
             await emit(event)
 
         try:
-            context_items, context_facts = retriever.context_pack(text, now=wall_now)
+            history_for_rewrite = tuple(
+                message.content
+                for message in self.index.chat_messages(chat_id)
+                if message.role == "user" and message.id != user_message_id
+            )[-2:]
+            rewritten_query = await self._rewrite_query_for_retrieval(
+                retriever,
+                text,
+                history_for_rewrite,
+            )
+            context_pack = retriever.context_pack(
+                text,
+                now=wall_now,
+                conversation_context=history_for_rewrite,
+                rewritten_query=rewritten_query,
+            )
             self.logger.log(
                 "chat_retrieval",
                 chat_id=chat_id,
-                query=text,
-                top=[{"id": item.short_id, "score": item.score} for item in context_items],
-                facts=[fact.fact_id for fact in context_facts],
+                original_query=context_pack.trace.original_query,
+                rewritten_query=context_pack.trace.rewritten_query,
+                decision=context_pack.decision.reason,
+                confidence=context_pack.decision.confidence,
+                selected_ids=list(context_pack.trace.selected_ids),
+                active_build_id=context_pack.trace.active_build_id,
             )
             await emit(
                 ChatRetrievalEvent(
                     chat_id=chat_id,
                     message_id=assistant_id,
-                    sources=context_items,
-                    facts=context_facts,
+                    evidence=EvidencePackPayload.from_domain(context_pack),
+                    retrieved_ids=list(context_pack.trace.selected_ids),
+                    consulted_ids=list(context_pack.trace.read_ids),
                 )
             )
             messages = self._build_messages(
                 chat_id,
                 text,
-                context_items,
-                context_facts,
+                context_pack,
                 current_user_id=user_message_id,
                 assistant_id=assistant_id,
             )
@@ -435,6 +493,12 @@ class ChatEngine:
                         kind=_tool_kind(call.get("name", "")),
                         label=_running_label(call),
                         status="running",
+                        tool_name=str(call.get("name") or ""),
+                        arguments=(
+                            call.get("arguments")
+                            if isinstance(call.get("arguments"), dict)
+                            else {}
+                        ),
                     )
                     await emit(
                         ChatActivityEvent(
@@ -449,11 +513,18 @@ class ChatEngine:
                         str(call.get("name") or ""),
                         call.get("arguments") if isinstance(call.get("arguments"), dict) else {},
                         retriever,
-                        self.index,
                         now=time.time(),
                     )
                     latency_ms = (time.monotonic() - started) * 1000.0
                     done_step.status = "done"
+                    done_step.tool_name = str(call.get("name") or "")
+                    done_step.arguments = (
+                        call.get("arguments")
+                        if isinstance(call.get("arguments"), dict)
+                        else {}
+                    )
+                    done_step.evidence_ids = list(_tool_result_evidence_ids(result_json))
+                    done_step.latency_ms = latency_ms
                     activity.append(done_step)
                     tool_summaries.append(
                         {
@@ -463,7 +534,6 @@ class ChatEngine:
                             "note_ids": done_step.note_ids,
                         }
                     )
-                    _capture_tool_sources(result_json, done_step, tool_sources)
                     await emit(
                         ChatActivityEvent(
                             chat_id=chat_id,
@@ -535,6 +605,93 @@ class ChatEngine:
             )
             return
 
+    async def _repair_once(
+        self,
+        content_parts: list[str],
+        retriever: Any,
+        context_pack: EvidencePack | None,
+    ) -> None:
+        """Run at most one evidence-constrained repair before final persistence."""
+
+        if self._validator_factory is None:
+            return
+        registry = getattr(retriever, "registry", None)
+        if registry is None:
+            return
+        draft = _strip_tool_call_remnants("".join(content_parts))
+        validator = self._validator_factory(registry)
+        turn_pack_fn = getattr(retriever, "turn_pack", None)
+        pack = turn_pack_fn() if callable(turn_pack_fn) else context_pack
+        supplied_ids = pack.trace.read_ids if pack is not None else ()
+        initial = validator.validate(
+            draft,
+            mode="chat",
+            supplied_ids=supplied_ids,
+            available_ids=supplied_ids,
+        )
+        if initial.accepted or not initial.repair_required:
+            return
+        try:
+            result = await self.llm.complete_json(
+                config.CHAT_MODEL,
+                (
+                    "Return JSON with one key, answer. Repair the draft using only the supplied "
+                    "evidence. Remove unsupported claims. Every factual sentence must cite E# or F#."
+                ),
+                f"<evidence>\n{_evidence_block(pack) if pack is not None else 'none'}\n</evidence>\n\n<draft>\n{draft}\n</draft>",
+                timeout_s=config.SUMMARY_TIMEOUT_S,
+            )
+        except Exception:
+            return
+        repaired = str(result.get("answer") or "").strip()
+        if not repaired:
+            return
+        checked = validator.validate(
+            repaired,
+            mode="chat",
+            supplied_ids=supplied_ids,
+            available_ids=supplied_ids,
+        )
+        if checked.accepted:
+            content_parts[:] = [checked.accepted_output]
+
+    async def _rewrite_query_for_retrieval(
+        self,
+        retriever: Any,
+        message: str,
+        context: tuple[str, ...],
+    ) -> str | None:
+        dependent_fn = getattr(retriever, "is_dependent_query", None)
+        if not callable(dependent_fn) or not dependent_fn(message, context):
+            return None
+        fallback_fn = getattr(retriever, "fallback_rewrite", None)
+        fallback = (
+            str(fallback_fn(message, context))
+            if callable(fallback_fn)
+            else "\n".join((*context, message))
+        )
+        try:
+            result = await self.llm.complete_json(
+                config.SUMMARY_MODEL,
+                (
+                    "Return JSON with one key, query. Rewrite the final user message into one "
+                    "self-contained retrieval query using the preceding user turns. Preserve "
+                    "intent and every named entity. Do not answer the question."
+                ),
+                json.dumps(
+                    {"previous_user_turns": list(context), "original": message},
+                    ensure_ascii=False,
+                ),
+                timeout_s=config.SUMMARY_TIMEOUT_S,
+            )
+        except Exception:
+            return fallback
+        rewritten = str(result.get("query") or "").strip()
+        source_text = "\n".join((*context, message))
+        if not rewritten or not _preserves_named_entities(source_text, rewritten):
+            return fallback
+        return rewritten
+
     async def _stream_round(
         self,
         model: str,
@@ -588,8 +745,7 @@ class ChatEngine:
         self,
         chat_id: str,
         user_text: str,
-        context_items: list[GroundingItem],
-        context_facts: list[GroundedFact],
+        context_pack: EvidencePack,
         *,
         current_user_id: int,
         assistant_id: int,
@@ -610,7 +766,7 @@ class ChatEngine:
         messages.append(
             {
                 "role": "user",
-                "content": f"<context>\n{_grounding_block(context_items, context_facts)}\n</context>\n\n{user_text}",
+                "content": f"<evidence>\n{_evidence_block(context_pack)}\n</evidence>\n\n{user_text}",
             }
         )
         return messages
@@ -648,9 +804,11 @@ class ChatEngine:
 
 def _system_prompt(profile_block: str = "") -> str:
     prompt = (
-        "You answer questions over the user's personal notes. Cite only [N#] and [F#] ids "
-        "that appear in the supplied context block or tool results. Use tools when the "
-        "context is insufficient. Be direct and write markdown."
+        "You answer questions over the user's personal knowledge base. Every factual "
+        "sentence must cite an exact [E#] passage, a supported [F#] fact, or both. [N#] "
+        "is navigation metadata and cannot ground a factual claim. Cite only identifiers "
+        "in supplied evidence or tool results. If retrieval abstained or evidence is "
+        "insufficient, use tools or state the gap. Be direct and write markdown."
     )
     if not profile_block:
         return prompt
@@ -658,24 +816,33 @@ def _system_prompt(profile_block: str = "") -> str:
         f"{prompt}\n\n"
         "The user profile below is background context for interpreting names, relationships, "
         "interests, and likely referents. It is not citable evidence. Ground factual answers "
-        "in the supplied [N#] and [F#] sources.\n\n"
+        "in the supplied [E#] passages and [F#] facts.\n\n"
         f"{profile_block}"
     )
 
 
-def _grounding_block(items: list[GroundingItem], facts: list[GroundedFact]) -> str:
-    note_ids = {item.note_id: item.short_id for item in items}
-    lines: list[str] = []
-    for item in items:
-        lines.append(
-            f'[{item.short_id}] "{item.title}" '
-            f"({item.source}, age {_age_label(item.age_days)}, score {item.score:.2f}) "
-            f"— {item.gist}"
+def _evidence_block(pack: EvidencePack) -> str:
+    if not pack.decision.accepted:
+        return (
+            "Knowledge-base retrieval abstained: "
+            f"{pack.decision.reason} (confidence {pack.decision.confidence:.2f})."
         )
-    for fact in facts:
-        src = note_ids.get(fact.src, fact.src)
-        dst = note_ids.get(fact.dst, fact.dst)
-        lines.append(f'[{fact.fact_id}] ({src}<->{dst}) "{fact.text}"')
+    lines: list[str] = []
+    notes = {row.note_id: row.note_ref for row in pack.notes}
+    for item in pack.passages:
+        lines.append(
+            f'[{item.evidence_id}] [{notes.get(item.note_id, item.note_id)}] "{item.title}" '
+            f"({item.source}, chars {item.char_start}-{item.char_end})\n{item.text}"
+        )
+    for fact in pack.facts:
+        valid = f"; valid={fact.valid_from or '?'}..{fact.valid_to or '?'}"
+        sources = " ".join(f"[{ref}]" for ref in fact.source_evidence_ids)
+        lines.append(
+            f"[{fact.fact_ref}] {fact.subject} — {fact.predicate} → {fact.object}; "
+            f"status={fact.status}{valid}; supported by {sources}"
+        )
+    for path in pack.paths:
+        lines.append(f"[{path.path_id}] {path.rendered}")
     return "\n".join(lines) if lines else "none"
 
 
@@ -690,7 +857,7 @@ def _age_label(age_days: float) -> str:
 def _tool_kind(name: str) -> str:
     if name == "read_note":
         return "read"
-    if name == "expand_note":
+    if name == "expand_evidence":
         return "expand"
     return "search"
 
@@ -698,194 +865,94 @@ def _tool_kind(name: str) -> str:
 def _running_label(call: dict[str, Any]) -> str:
     name = str(call.get("name") or "tool")
     arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
-    if name == "search_notes":
+    if name == "search_evidence":
         return f'Searching "{arguments.get("query", "")}"'
     if name == "read_note":
         return f'Reading {arguments.get("note", "")}'
-    if name == "expand_note":
-        return f'Expanding {arguments.get("note", "")}'
+    if name == "expand_evidence":
+        return f'Expanding {arguments.get("evidence", "")}'
     return f"Running {name}"
 
 
-def _capture_tool_sources(
-    result_json: str,
-    step: ChatActivityStep,
-    target: dict[str, GroundingItem],
-) -> None:
+def _tool_result_evidence_ids(result_json: str) -> tuple[str, ...]:
     try:
         payload = json.loads(result_json)
     except json.JSONDecodeError:
-        return
-    rows = payload.get("rows") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        return
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict):
-            continue
-        short_id = str(row.get("short_id") or "")
-        if not short_id:
-            continue
-        note_id = step.note_ids[index] if index < len(step.note_ids) else short_id
-        target[short_id] = GroundingItem(
-            note_id=note_id,
-            short_id=short_id,
-            title=str(row.get("title") or ""),
-            gist=str(row.get("gist") or ""),
-            source=str(row.get("source") or "apple_notes"),
-            age_days=float(row.get("age_days") or 0.0),
-            score=float(row.get("score") or 0.0),
-        )
+        return ()
+    refs = re.findall(r'"(?:N|E|F|P)\d+"', json.dumps(payload, sort_keys=True))
+    return tuple(dict.fromkeys(ref.strip('"') for ref in refs))
 
 
-def _finalize_grounding(
+def _finalize_evidence(
     content: str,
-    context_items: list[GroundingItem],
-    context_facts: list[GroundedFact],
-    tool_sources: dict[str, GroundingItem],
     retriever: Any,
-) -> tuple[str, list[GroundingItem], list[GroundedFact], int]:
-    item_by_id = {item.short_id: item for item in context_items}
-    item_by_id.update(tool_sources)
-    fact_by_id = {fact.fact_id: fact for fact in context_facts}
-    note_registry, fact_registry = _registry_maps(retriever)
-    cited_refs = [match.group(0)[1:-1] for match in _CITATION_RE.finditer(content)]
+    validator_factory: Callable[[Any], EvidenceValidator] | None,
+    pack: EvidencePack | None,
+) -> tuple[str, tuple[str, ...], int]:
+    """Validate whole claims; unsupported citations never leave a bare claim."""
 
-    for ref in cited_refs:
-        if ref.startswith("N") and ref not in item_by_id and ref in note_registry:
-            item = _materialize_registry_note(ref, retriever)
-            if item is not None:
-                item_by_id[ref] = item
-        elif ref.startswith("F") and ref not in fact_by_id:
-            key = fact_registry.get(ref)
-            if key is None:
-                continue
-            fact = _materialize_registry_fact(ref, key, retriever)
-            if fact is not None:
-                fact_by_id[ref] = fact
+    registry = getattr(retriever, "registry", None)
+    if registry is None:
+        # Fake-only seam for streaming/control-flow unit tests. Runtime chat
+        # retrievers always own an EvidenceRegistry.
+        return content, (), 0
+    validator = (
+        validator_factory(registry)
+        if validator_factory is not None
+        else EvidenceValidator(registry, None, entailment_floor=1.0)
+    )
+    supplied = pack.trace.read_ids if pack is not None else ()
+    result = validator.validate(
+        content,
+        mode="chat",
+        supplied_ids=supplied,
+        available_ids=supplied,
+    )
+    if result.accepted:
+        return result.accepted_output, result.cited_ids, 0
 
-    valid_ids = set(item_by_id) | set(fact_by_id)
-    cited: list[str] = []
-    stripped = 0
+    repaired = _remove_unsupported_sentences(
+        content,
+        (*result.unsupported_sentences, *result.invalid_citations),
+    )
+    if repaired.strip() and repaired != content:
+        repaired_result = validator.validate(
+            repaired,
+            mode="chat",
+            supplied_ids=supplied,
+            available_ids=supplied,
+        )
+        if repaired_result.accepted:
+            removed = len(result.unsupported_sentences) + len(result.invalid_citations)
+            return repaired_result.accepted_output, repaired_result.cited_ids, removed
 
-    def replace(match: re.Match[str]) -> str:
-        nonlocal stripped
-        ref = match.group(0).lstrip()[1:-1]
-        if ref in valid_ids:
-            cited.append(ref)
-            return match.group(0)
-        stripped += 1
-        return ""
-
-    stripped_content = _CITATION_STRIP_RE.sub(replace, content)
-    source_ids = [ref for ref in cited if ref.startswith("N") and ref in item_by_id]
-    source_ids.extend(item.short_id for item in context_items if item.short_id not in source_ids)
-    fact_ids = [ref for ref in cited if ref.startswith("F") and ref in fact_by_id]
-    fact_ids.extend(fact.fact_id for fact in context_facts if fact.fact_id not in fact_ids)
-    sources = [item_by_id[ref] for ref in _unique(source_ids)[: config.CHAT_CONTEXT_NOTES] if ref in item_by_id]
-    facts = [fact_by_id[ref] for ref in _unique(fact_ids)[: config.CHAT_CONTEXT_FACTS] if ref in fact_by_id]
-    return stripped_content, sources, facts, stripped
-
-
-def _registry_maps(retriever: Any) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
-    grounding = getattr(retriever, "_grounding", None)
-    note_by_short: dict[str, str] = {}
-    fact_by_short: dict[str, tuple[str, str]] = {}
-    note_ids_fn = getattr(grounding, "note_short_ids", None)
-    note_ids = note_ids_fn() if callable(note_ids_fn) else {}
-    if isinstance(note_ids, dict):
-        note_by_short = {str(short_id): str(note_id) for note_id, short_id in note_ids.items()}
-    fact_ids_fn = getattr(grounding, "fact_short_ids", None)
-    fact_ids = fact_ids_fn() if callable(fact_ids_fn) else {}
-    if isinstance(fact_ids, dict):
-        for key, short_id in fact_ids.items():
-            if not isinstance(key, tuple) or len(key) != 2:
-                continue
-            fact_by_short[str(short_id)] = (str(key[0]), str(key[1]))
-    return note_by_short, fact_by_short
-
-
-def _materialize_registry_note(ref: str, retriever: Any) -> GroundingItem | None:
-    resolve = getattr(retriever, "resolve", None)
-    if not callable(resolve):
-        return None
-    note_id = resolve(ref)
-    if note_id is None:
-        return None
-    index = getattr(retriever, "index", None)
-    note_fn = getattr(index, "note", None)
-    if not callable(note_fn):
-        return None
-    note = note_fn(note_id)
-    if note is None:
-        return None
-    age_days = (time.time() - float(getattr(note, "modified", time.time()))) / 86_400.0
-    return GroundingItem(
-        note_id=str(getattr(note, "note_id", note_id)),
-        short_id=ref,
-        title=str(getattr(note, "title", "")),
-        gist=_display_line_with_entities(
-            index,
-            str(getattr(note, "note_id", note_id)),
-            str(getattr(note, "gist", "")),
-        ),
-        source=str(getattr(note, "source", "apple_notes")),
-        age_days=age_days,
-        score=0.0,
+    excerpt, excerpt_ids = _evidence_excerpt(pack, registry)
+    return excerpt, excerpt_ids, max(
+        1,
+        len(result.unsupported_sentences) + len(result.invalid_citations),
     )
 
 
-def _materialize_registry_fact(
-    ref: str,
-    key: tuple[str, str],
-    retriever: Any,
-) -> GroundedFact | None:
-    index = getattr(retriever, "index", None)
-    neighbor_edges = getattr(index, "neighbor_edges", None)
-    if not callable(neighbor_edges):
-        return None
-    src, dst = key
-    for other_id, _weight, fact in neighbor_edges(src):
-        if tuple(sorted((src, str(other_id)))) != tuple(sorted(key)):
+def _remove_unsupported_sentences(content: str, unsupported: tuple[str, ...]) -> str:
+    repaired = content
+    for rendered in unsupported:
+        if rendered in repaired:
+            repaired = repaired.replace(rendered, "")
+        elif rendered.startswith(("N", "E", "F", "P")):
+            # Invalid bare references are removed only as part of their sentence
+            # by the validator; never strip a marker and preserve its claim.
             continue
-        fact_text = str(fact or "").strip()
-        if not fact_text:
-            return None
-        return GroundedFact(fact_id=ref, src=src, dst=dst, text=fact_text)
-    return None
+    return "\n".join(line.rstrip() for line in repaired.splitlines() if line.strip()).strip()
 
 
-def _display_line_with_entities(index: Any, note_id: str, display_line: str) -> str:
-    entity_surfaces_for = getattr(index, "entity_surfaces_for", None)
-    if callable(entity_surfaces_for):
-        surfaces = [
-            str(surface).strip()
-            for surface in entity_surfaces_for(note_id, limit=3)
-            if str(surface).strip()
-        ]
-        if surfaces:
-            return f"{display_line} [{', '.join(surfaces)}]"
-        return display_line
-    enrichment_for = getattr(index, "enrichment_for", None)
-    if not callable(enrichment_for):
-        return display_line
-    enrichment = enrichment_for(note_id)
-    entities = getattr(enrichment, "entities", []) if enrichment is not None else []
-    surfaces = [
-        str(getattr(entity, "surface", "")).strip()
-        for entity in entities
-        if str(getattr(entity, "surface", "")).strip()
-    ][:3]
-    if not surfaces:
-        return display_line
-    return f"{display_line} [{', '.join(surfaces)}]"
-
-
-def _unique(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        ordered.append(value)
-    return ordered
+def _evidence_excerpt(pack: EvidencePack | None, registry: Any) -> tuple[str, tuple[str, ...]]:
+    passages = pack.passages if pack is not None else ()
+    if not passages:
+        return "I couldn't find enough validated knowledge-base evidence to answer that.", ()
+    lines = [
+        "I couldn't validate a synthesized answer, but these source excerpts were retrieved:",
+    ]
+    for passage in passages[:3]:
+        registry.mark_cited(passage.evidence_id)
+        lines.append(f"> {passage.text}\n> [{passage.evidence_id}]")
+    return "\n\n".join(lines), tuple(row.evidence_id for row in passages[:3])

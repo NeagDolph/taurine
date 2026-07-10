@@ -19,14 +19,13 @@ from taurine_core.schemas import (
     ChatMessage,
     ChatMeta,
     ChatUsage,
+    EvidencePackPayload,
     Enrichment,
     EntityMention,
     Extraction,
     GraphEdge,
     GraphNode,
     GraphResponse,
-    GroundedFact,
-    GroundingItem,
     NeighborRef,
     NotePreview,
     NoteRecord,
@@ -339,6 +338,67 @@ class Index:
             self._set_last_sync(time.time())
         self._doc_frequency_cache.clear()
         self.load()
+
+    def replace_source_records(
+        self,
+        source_id: str,
+        records: Sequence[NoteRecord],
+    ) -> tuple[int, int, int]:
+        """Refresh the product/source cache without building a legacy graph."""
+
+        incoming = {
+            note.note_id: note.model_copy(update={"source": source_id})
+            for note in records
+        }
+        existing = {note.note_id: note for note in self.notes(source_id)}
+        removed = sorted(set(existing) - set(incoming))
+        added = sorted(set(incoming) - set(existing))
+        changed = sorted(
+            note_id
+            for note_id in set(incoming) & set(existing)
+            if incoming[note_id].content_hash != existing[note_id].content_hash
+        )
+        replaced = (*removed, *changed)
+        with self._conn:
+            for note_id in replaced:
+                self._conn.execute("DELETE FROM notes WHERE note_id = ?", (note_id,))
+                self._conn.execute("DELETE FROM notes_fts WHERE note_id = ?", (note_id,))
+                self._conn.execute("DELETE FROM aliases WHERE note_id = ?", (note_id,))
+                self._conn.execute("DELETE FROM embeddings WHERE note_id = ?", (note_id,))
+                self._conn.execute("DELETE FROM note_entities WHERE note_id = ?", (note_id,))
+                self._conn.execute("DELETE FROM entity_relations WHERE note_id = ?", (note_id,))
+                self._conn.execute(
+                    "DELETE FROM edges WHERE src = ? OR dst = ?", (note_id, note_id)
+                )
+            for note_id in (*added, *changed):
+                note = incoming[note_id]
+                self._conn.execute(
+                    """
+                    INSERT INTO notes(
+                        note_id, title, folder, modified, created, content_hash,
+                        text, gist, source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        note.note_id,
+                        note.title,
+                        note.folder,
+                        note.modified,
+                        note.created or note.modified,
+                        note.content_hash,
+                        note.text,
+                        _display_line(note),
+                        source_id,
+                    ),
+                )
+                self._conn.execute(
+                    "INSERT INTO notes_fts(note_id, title, body) VALUES (?, ?, ?)",
+                    (note.note_id, note.title, note.text),
+                )
+            self._set_last_sync(time.time())
+        self._doc_frequency_cache.clear()
+        self.load()
+        return len(added), len(changed), len(removed)
 
     def apply_slim_enrichment(
         self,
@@ -1030,17 +1090,27 @@ class Index:
         with self._conn:
             cursor = self._conn.execute(
                 """
-                INSERT INTO chat_messages(chat_id, role, content, thinking, sources_json,
-                                          facts_json, activity_json, usage_json, cancelled, created)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_messages(chat_id, role, content, thinking, evidence_json, retrieved_ids_json,
+                                          consulted_ids_json, cited_ids_json, original_query,
+                                          rewritten_query, retrieval_decision, retrieval_confidence,
+                                          active_build_id, activity_json,
+                                          usage_json, cancelled, created)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.chat_id,
                     message.role,
                     message.content,
                     message.thinking,
-                    json.dumps([item.model_dump(mode="json") for item in message.sources]),
-                    json.dumps([item.model_dump(mode="json") for item in message.facts]),
+                    message.evidence.model_dump_json() if message.evidence is not None else "null",
+                    json.dumps(message.retrieved_ids),
+                    json.dumps(message.consulted_ids),
+                    json.dumps(message.cited_ids),
+                    message.original_query,
+                    message.rewritten_query,
+                    message.retrieval_decision,
+                    message.retrieval_confidence,
+                    message.active_build_id,
                     json.dumps([item.model_dump(mode="json") for item in message.activity]),
                     message.usage.model_dump_json(),
                     int(message.cancelled),
@@ -1058,15 +1128,25 @@ class Index:
         with self._conn:
             self._conn.execute(
                 """
-                UPDATE chat_messages SET content = ?, thinking = ?, sources_json = ?,
-                    facts_json = ?, activity_json = ?, usage_json = ?, cancelled = ?
+                UPDATE chat_messages SET content = ?, thinking = ?, evidence_json = ?, retrieved_ids_json = ?,
+                    consulted_ids_json = ?, cited_ids_json = ?, original_query = ?,
+                    rewritten_query = ?, retrieval_decision = ?, retrieval_confidence = ?,
+                    active_build_id = ?, activity_json = ?,
+                    usage_json = ?, cancelled = ?
                 WHERE id = ?
                 """,
                 (
                     message.content,
                     message.thinking,
-                    json.dumps([item.model_dump(mode="json") for item in message.sources]),
-                    json.dumps([item.model_dump(mode="json") for item in message.facts]),
+                    message.evidence.model_dump_json() if message.evidence is not None else "null",
+                    json.dumps(message.retrieved_ids),
+                    json.dumps(message.consulted_ids),
+                    json.dumps(message.cited_ids),
+                    message.original_query,
+                    message.rewritten_query,
+                    message.retrieval_decision,
+                    message.retrieval_confidence,
+                    message.active_build_id,
                     json.dumps([item.model_dump(mode="json") for item in message.activity]),
                     message.usage.model_dump_json(),
                     int(message.cancelled),
@@ -1077,7 +1157,10 @@ class Index:
     def chat_messages(self, chat_id: str) -> list[ChatMessage]:
         rows = self._conn.execute(
             """
-            SELECT id, chat_id, role, content, thinking, sources_json, facts_json,
+            SELECT id, chat_id, role, content, thinking, evidence_json,
+                   retrieved_ids_json, consulted_ids_json, cited_ids_json,
+                   original_query, rewritten_query, retrieval_decision,
+                   retrieval_confidence, active_build_id,
                    activity_json, usage_json, cancelled, created
             FROM chat_messages WHERE chat_id = ? ORDER BY id
             """,
@@ -1090,8 +1173,19 @@ class Index:
                 role=row["role"],
                 content=row["content"],
                 thinking=row["thinking"],
-                sources=[GroundingItem(**item) for item in json.loads(row["sources_json"])],
-                facts=[GroundedFact(**item) for item in json.loads(row["facts_json"])],
+                evidence=(
+                    EvidencePackPayload(**json.loads(row["evidence_json"]))
+                    if row["evidence_json"] and row["evidence_json"] != "null"
+                    else None
+                ),
+                retrieved_ids=list(json.loads(row["retrieved_ids_json"])),
+                consulted_ids=list(json.loads(row["consulted_ids_json"])),
+                cited_ids=list(json.loads(row["cited_ids_json"])),
+                original_query=str(row["original_query"]),
+                rewritten_query=str(row["rewritten_query"]),
+                retrieval_decision=str(row["retrieval_decision"]),
+                retrieval_confidence=float(row["retrieval_confidence"]),
+                active_build_id=str(row["active_build_id"]),
                 activity=[ChatActivityStep(**item) for item in json.loads(row["activity_json"])],
                 usage=ChatUsage(**json.loads(row["usage_json"] or "{}")),
                 cancelled=bool(row["cancelled"]),
@@ -1548,11 +1642,6 @@ class Index:
 
         rebuild_all(self)
 
-    def rebuild_for(self, note_id: str) -> None:
-        from .graph import rebuild_for
-
-        rebuild_for(self, note_id)
-
     def _init_schema(self) -> None:
         with self._conn:
             self._conn.executescript(
@@ -1670,8 +1759,15 @@ class Index:
                     role TEXT NOT NULL CHECK(role IN ('user','assistant')),
                     content TEXT NOT NULL,
                     thinking TEXT NOT NULL DEFAULT '',
-                    sources_json TEXT NOT NULL DEFAULT '[]',
-                    facts_json TEXT NOT NULL DEFAULT '[]',
+                    evidence_json TEXT NOT NULL DEFAULT 'null',
+                    retrieved_ids_json TEXT NOT NULL DEFAULT '[]',
+                    consulted_ids_json TEXT NOT NULL DEFAULT '[]',
+                    cited_ids_json TEXT NOT NULL DEFAULT '[]',
+                    original_query TEXT NOT NULL DEFAULT '',
+                    rewritten_query TEXT NOT NULL DEFAULT '',
+                    retrieval_decision TEXT NOT NULL DEFAULT '',
+                    retrieval_confidence REAL NOT NULL DEFAULT 0,
+                    active_build_id TEXT NOT NULL DEFAULT '',
                     activity_json TEXT NOT NULL DEFAULT '[]',
                     usage_json TEXT NOT NULL DEFAULT '{}',
                     cancelled INTEGER NOT NULL DEFAULT 0,

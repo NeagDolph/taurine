@@ -208,16 +208,9 @@ CHAT_FALLBACK_MODEL = "deepseek/deepseek-v4-pro"
 CHAT_TIMEOUT_S = 120.0                   # whole-stream budget per round trip
 CHAT_MAX_TOOL_CALLS = 6
 CHAT_MAX_CONCURRENT_TURNS = 2
-CHAT_CONTEXT_NOTES = 16                  # Stage-A pack: broad recall posture
-CHAT_CONTEXT_FACTS = 24
-CHAT_SEED_DECAY = 0.7                    # per-turn accumulator decay (chats pivot fast)
-CHAT_SEARCH_TOOL_K = 8                   # default k for the search_notes tool
+CHAT_SEARCH_TOOL_K = 8                   # default k for search_evidence
 CHAT_NOTE_READ_MAX_CHARS = 6000
 CHAT_HISTORY_MAX_TURNS = 12
-CHAT_EMBED_QUERY_PROMPT = (
-    "Instruct: Given a question about the user's personal notes, retrieve "
-    "notes relevant to answering it\nQuery: "
-)
 CHAT_TITLE_MAX_WORDS = 6
 
 # ── shared retrieval, rerank, and evidence ────────────────────────────
@@ -235,20 +228,12 @@ CHAT_EVIDENCE_PASSAGES = 12
 EVIDENCE_NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
 
 # ── grounding / graph traversal (latent retrieval, no LLM) ─────────────
-GROUNDING_TOP_K = 12                     # grounding-set size
-GROUNDING_FACTS_MAX = 20                 # edge facts carried per pass
 GROUNDING_HYSTERESIS = 1.15              # challenger must beat incumbent by this factor
-GROUNDING_PPR_POOL_K = 30                # PPR candidates blended with direct fused hits
-GROUNDING_FACT_SEED_TOP_K = 5            # seed-neighbor edge facts carried for grounding notes
-SEED_TOP_K = 10                          # fused candidates entering the seed accumulator per pass
-SEED_ACCUM_DECAY = 0.85                  # per-pass decay of the meeting seed accumulator
 PPR_DAMPING = 0.5                        # HippoRAG value: mass stays within ~2 hops of seeds
 PPR_TOL = 1e-8                           # L1 convergence tolerance
 PPR_MAX_ITERS = 50
-PPR_BLEND = 0.35                         # rel = (1-β)·norm(fused RRF) + β·norm(PPR mass)
 PPR_PASSAGE_RESET_W = 1.0                # note-seed reset weight
 PPR_ENTITY_RESET_W = 1.0                 # entity-seed reset weight
-ENTITY_SEED_W = 0.8                      # GLiNER entity seed weight
 FACT_EDGE_BOOST = 1.5                    # traversal weight multiplier for adjudicated fact edges
 SHARED_EDGE_BOOST = 1.35                 # entity/topic/mixed edges (audit F3.1 correction)
 DUP_EDGE_SIM = 0.95                      # same-source mean chunk cosine ≥ this → edge excluded from quality rank

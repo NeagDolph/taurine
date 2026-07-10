@@ -83,6 +83,7 @@ class EvidenceValidator:
         *,
         mode: ValidationMode,
         supplied_ids: Collection[str] = (),
+        available_ids: Collection[str] | None = None,
     ) -> ValidationResult:
         if mode not in {"live", "chat", "tool"}:
             raise ValueError(f"unsupported validation mode: {mode}")
@@ -92,7 +93,11 @@ class EvidenceValidator:
         )
         records = {ref: self.registry.resolve(ref) for ref in cited_ids}
         invalid: set[str] = {ref for ref, record in records.items() if record is None}
-        available = set(supplied_ids) | set(self.registry.refs("read"))
+        available = (
+            set(available_ids)
+            if available_ids is not None
+            else set(supplied_ids) | set(self.registry.refs("read"))
+        )
         unavailable = {
             ref
             for ref, record in records.items()

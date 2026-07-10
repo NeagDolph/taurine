@@ -9,28 +9,43 @@ from tests.conftest import enrichment, fixture_units, make_note, unit_vec
 from taurine_core import config
 from taurine_core.llm import StreamEvent
 from taurine_core.ports import LLMError
-from taurine_core.schemas import GroundingItem
+from taurine_core.retrieval.types import (
+    EvidenceNote,
+    EvidencePack,
+    EvidencePassage,
+    RetrievalDecision,
+    RetrievalQuery,
+    RetrievalTrace,
+)
 
 
 @dataclass
 class ProfileRetriever:
     searches: list[tuple[str, int, float]] = field(default_factory=list)
 
-    def search(self, query: str, k: int, *, now: float) -> list[GroundingItem]:
+    def search_evidence(self, query: str, *, k: int, temporal: str, now: float) -> EvidencePack:
         self.searches.append((query, k, now))
-        return [
-            GroundingItem(
-                note_id="alpha",
-                short_id="N1",
-                title="Taurine roadmap",
-                source="apple_notes",
-                age_days=1.0,
-                score=0.91,
-                gist="Current Taurine product roadmap.",
-            )
-        ]
+        del temporal
+        return EvidencePack(
+            decision=RetrievalDecision(True, .91, "accepted"),
+            query=RetrievalQuery(query, "tool", now),
+            passages=(EvidencePassage(
+                "E1", "p1", "alpha", "Taurine roadmap", "apple_notes",
+                "Current Taurine product roadmap.", 0, 32, 0, now, .8, .91,
+            ),), facts=(), paths=(),
+            notes=(EvidenceNote("N1", "alpha", "Taurine roadmap", "apple_notes", now, .91, ("E1",)),),
+            trace=RetrievalTrace(original_query=query, rewritten_query=query, read_ids=("N1", "E1")),
+        )
 
-    def resolve(self, ref: str) -> str | None:
+    def read_note(self, note: str, *, query: str, cursor: str | None, max_chars: int):
+        del query, cursor, max_chars
+        return {"note": note, "passages": [{"evidence_id": "E1", "text": "Current Taurine product roadmap."}], "truncated": False, "next_cursor": None}
+
+    def expand_evidence(self, evidence: str, *, direction: str, max_hops: int, limit: int):
+        del direction, max_hops, limit
+        return {"from": evidence, "results": [], "paths": []}
+
+    def resolve_note(self, ref: str) -> str | None:
         return "alpha" if ref in {"N1", "alpha"} else None
 
 
@@ -83,9 +98,9 @@ async def test_profile_generator_researches_with_graph_tools_before_synthesis(st
     llm = ProfileLLM(
         [
             [
-                _tool("call-1", "search_notes", {"query": "current projects", "k": 8}),
-                _tool("call-2", "read_note", {"note": "N1"}),
-                _tool("call-3", "expand_note", {"note": "N1"}),
+                _tool("call-1", "search_evidence", {"query": "current projects", "k": 8}),
+                _tool("call-2", "read_note", {"note": "N1", "query": "current projects"}),
+                _tool("call-3", "expand_evidence", {"evidence": "E1"}),
                 StreamEvent(kind="done"),
             ],
             [
@@ -114,9 +129,9 @@ async def test_profile_generator_researches_with_graph_tools_before_synthesis(st
         message for message in llm.calls[1]["messages"] if message["role"] == "tool"
     ]
     assert [message["name"] for message in tool_messages] == [
-        "search_notes",
+        "search_evidence",
         "read_note",
-        "expand_note",
+        "expand_evidence",
     ]
     assert retriever.searches[0][:2] == ("current projects", 8)
     assert progress[-1].phase == "synthesizing"
@@ -134,7 +149,7 @@ async def test_profile_generator_forces_synthesis_when_tool_budget_is_exhausted(
     llm = ProfileLLM(
         [
             [
-                _tool("call-1", "search_notes", {"query": "interests"}),
+                _tool("call-1", "search_evidence", {"query": "interests"}),
                 StreamEvent(kind="done"),
             ],
             [StreamEvent(kind="content", text="## Interests\nKnowledge systems."), StreamEvent(kind="done")],

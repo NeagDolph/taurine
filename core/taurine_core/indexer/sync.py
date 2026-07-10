@@ -129,8 +129,6 @@ def sync_source(
         report("indexing", position, len(pending))
 
     report("finalizing", len(pending), len(pending))
-    for note_id in rebuilt:
-        index.rebuild_for(note_id)
     index.load()
     from .rank import compute_quality_ranks, compute_value_scores, refresh_fact_embeddings
 
@@ -138,8 +136,6 @@ def sync_source(
     value_scores = compute_value_scores(index)
     if llm is not None:
         _run_async(_apply_slim_enrichment(index, pending, enrichments, llm, value_scores))
-        for note_id in rebuilt:
-            index.rebuild_for(note_id)
         index.load()
         compute_quality_ranks(index)
         compute_value_scores(index)

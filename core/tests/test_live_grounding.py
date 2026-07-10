@@ -1,319 +1,212 @@
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-
 import pytest
 
-from taurine_core import config
 from taurine_core.live.grounding import GroundingEngine
-from taurine_core.schemas import GraphEdge, GraphNode, GraphResponse, NoteRecord
+from taurine_core.retrieval.registry import EvidenceRegistry
+from taurine_core.retrieval.types import (
+    EvidenceFact,
+    EvidenceNote,
+    EvidencePack,
+    EvidencePassage,
+    RetrievalDecision,
+    RetrievalQuery,
+    RetrievalTrace,
+)
 
-DAY = 24.0 * 60.0 * 60.0
+
+def test_accumulates_only_new_registered_evidence_without_local_ids() -> None:
+    registry = EvidenceRegistry()
+    first = _pack(registry, "one", passages=(("p1", "n1", 0.9),), fact="f1")
+    second = _pack(
+        registry,
+        "two",
+        passages=(("p1", "n1", 0.8), ("p2", "n2", 0.95)),
+        fact="f2",
+    )
+    engine = GroundingEngine(registry)
+
+    one = engine.on_pack(first)
+    two = engine.on_pack(second)
+
+    assert one.new_support_ids == ("E1", "F1")
+    assert one.revision == 1
+    assert two.new_support_ids == ("E2", "F2")
+    assert two.revision == 2
+    assert {row.evidence_id for row in two.passages} == {"E1", "E2"}
+    assert {row.fact_ref for row in two.facts} == {"F1", "F2"}
+    assert {row.note_ref for row in two.notes} == {"N1", "N2"}
+    assert registry.refs("read") == ("N1", "N2", "E1", "E2", "F1", "F2")
 
 
-def _note(
-    note_id: str,
-    *,
-    source: str = "apple_notes",
-    modified: float = 1_000.0,
-    quality_rank: float = 0.0,
-) -> NoteRecord:
-    return NoteRecord(
-        note_id=note_id,
-        title=f"Title {note_id}",
-        modified=modified,
-        created=modified,
-        content_hash=f"hash-{note_id}",
-        text=f"Body {note_id}",
-        gist=f"Gist {note_id}",
-        source=source,
-        quality_rank=quality_rank,
+def test_abstention_does_not_add_decay_or_relabel_prior_evidence() -> None:
+    registry = EvidenceRegistry()
+    engine = GroundingEngine(registry)
+    accepted = engine.on_pack(
+        _pack(registry, "one", passages=(("p1", "n1", 0.9),), fact="f1")
+    )
+    state_before = engine.evidence_ids()
+    abstained_pack = EvidencePack.abstained(
+        RetrievalQuery("filler", "live", now=2.0), "below_live_floor"
     )
 
+    abstained = engine.on_pack(abstained_pack)
 
-@dataclass
-class GroundingFakeIndex:
-    note_rows: dict[str, NoteRecord]
-    edge_rows: list[GraphEdge] = field(default_factory=list)
-    fact_hits: list[tuple[str, str, float, str]] = field(default_factory=list)
-    version: int = 1
-    notes_calls: int = 0
+    assert abstained.no_new_evidence
+    assert abstained.new_support_ids == ()
+    assert abstained.revision == accepted.revision
+    assert engine.evidence_ids() == state_before
+    assert abstained.passages == accepted.passages
+    assert abstained.display_passages == accepted.display_passages
+    assert abstained.support_passages == ()
+    assert abstained.support_facts == ()
+    assert abstained.decision.reason == "below_live_floor"
 
-    def notes(self) -> list[NoteRecord]:
-        self.notes_calls += 1
-        return [self.note_rows[note_id] for note_id in sorted(self.note_rows)]
 
-    def note(self, note_id: str) -> NoteRecord | None:
-        return self.note_rows.get(note_id)
+def test_confirmed_topic_shift_clears_prior_accumulator_and_display() -> None:
+    registry = EvidenceRegistry()
+    engine = GroundingEngine(registry)
+    first = engine.on_pack(
+        _pack(registry, "one", passages=(("p1", "n1", 0.9),), fact="f1")
+    )
+    shifted_pack = _pack(
+        registry, "two", passages=(("p2", "n2", 0.85),), fact="f2"
+    )
 
-    def graph_version(self) -> int:
-        return self.version
+    shifted = engine.on_pack(shifted_pack, topic_shift=True)
 
-    def graph(self) -> GraphResponse:
-        active = set(self.note_rows)
-        degree = {note_id: 0 for note_id in active}
-        edges: list[GraphEdge] = []
-        for edge in self.edge_rows:
-            if edge.src not in active or edge.dst not in active:
-                continue
-            degree[edge.src] += 1
-            degree[edge.dst] += 1
-            edges.append(edge)
-        return GraphResponse(
-            nodes=[
-                GraphNode(
-                    note_id=note.note_id,
-                    title=note.title,
-                    degree=degree[note.note_id],
-                    source=note.source,
-                )
-                for note in self.note_rows.values()
-            ],
-            edges=edges,
+    assert shifted.revision == first.revision + 1
+    assert {row.evidence_id for row in shifted.passages} == {"E2"}
+    assert {row.fact_ref for row in shifted.facts} == {"F2"}
+    assert [row.evidence_id for row in shifted.display_passages] == ["E2"]
+    assert shifted.new_support_ids == ("E2", "F2")
+    assert registry.resolve("E1") is not None
+
+
+def test_hysteresis_changes_display_only_not_evidence_or_support_revision() -> None:
+    registry = EvidenceRegistry()
+    engine = GroundingEngine(registry, display_limit=1, hysteresis=1.15)
+    first = engine.on_pack(
+        _pack(registry, "one", passages=(("p1", "n1", 0.9),))
+    )
+    close = engine.on_pack(
+        _pack(
+            registry,
+            "two",
+            passages=(("p1", "n1", 0.8), ("p2", "n2", 0.85)),
         )
+    )
+    decisive = engine.on_pack(
+        _pack(
+            registry,
+            "three",
+            passages=(("p1", "n1", 0.8), ("p2", "n2", 1.0)),
+        )
+    )
 
-    def neighbor_edges(self, note_id: str) -> list[tuple[str, float, str]]:
-        rows: list[tuple[str, float, str]] = []
-        for edge in self.edge_rows:
-            if edge.src == note_id and edge.dst in self.note_rows:
-                rows.append((edge.dst, edge.weight, edge.fact))
-            elif edge.dst == note_id and edge.src in self.note_rows:
-                rows.append((edge.src, edge.weight, edge.fact))
-        return sorted(rows, key=lambda row: row[1], reverse=True)
-
-    def fact_dense_search(self, text: str, k: int) -> list[tuple[str, str, float, str]]:
-        del text
-        return self.fact_hits[:k]
+    assert [row.evidence_id for row in first.display_passages] == ["E1"]
+    assert [row.evidence_id for row in close.display_passages] == ["E1"]
+    assert [row.evidence_id for row in close.passages] == ["E2", "E1"]
+    assert close.new_support_ids == ("E2",)
+    assert [row.evidence_id for row in decisive.display_passages] == ["E2"]
+    assert decisive.new_support_ids == ()
+    assert decisive.no_new_evidence
+    assert decisive.revision == close.revision
 
 
-def _ids(engine: GroundingEngine, fused: list[tuple[str, float]], now: float) -> list[str]:
-    return [item.note_id for item in engine.on_pass("window", fused, [], now).items]
-
-
-def test_seed_accumulator_decays_exact_hits_and_prunes(monkeypatch) -> None:
-    monkeypatch.setattr(config, "GROUNDING_TOP_K", 3)
-    index = GroundingFakeIndex(
+def test_rejects_accepted_pack_whose_evidence_was_not_registered_as_read() -> None:
+    registry = EvidenceRegistry()
+    pack = _pack(registry, "one", passages=(("p1", "n1", 0.9),))
+    record = registry.resolve("E1")
+    assert record is not None
+    registry = EvidenceRegistry.from_snapshot(
         {
-            "dense": _note("dense"),
-            "other": _note("other"),
-            "exact": _note("exact"),
+            **registry.snapshot(),
+            "entries": [
+                {**row, "states": ["retrieved"]} if row["ref"] == "E1" else row
+                for row in registry.snapshot()["entries"]  # type: ignore[index]
+            ],
         }
     )
-    engine = GroundingEngine(index)  # type: ignore[arg-type]
 
-    engine.on_pass(
-        "window",
-        [("dense", 0.5), ("other", 0.25)],
-        [("exact", "exact alias")],
-        1_000.0,
+    with pytest.raises(ValueError, match="supplied/read"):
+        GroundingEngine(registry).on_pack(pack)
+
+
+def _pack(
+    registry: EvidenceRegistry,
+    text: str,
+    *,
+    passages: tuple[tuple[str, str, float], ...],
+    fact: str | None = None,
+) -> EvidencePack:
+    note_refs: dict[str, str] = {}
+    evidence_passages: list[EvidencePassage] = []
+    evidence_notes: list[EvidenceNote] = []
+    for passage_id, note_id, score in passages:
+        passage_text = f"Evidence {passage_id}"
+        note_ref = note_refs.get(note_id)
+        if note_ref is None:
+            note_ref = registry.register("note", note_id, {"note_id": note_id})
+            registry.mark_read(note_ref)
+            note_refs[note_id] = note_ref
+            evidence_notes.append(
+                EvidenceNote(note_ref, note_id, f"Title {note_id}", "apple_notes", 2.0, score)
+            )
+        evidence_id = registry.register(
+            "passage",
+            passage_id,
+            {"passage_id": passage_id, "note_id": note_id, "text": passage_text},
+        )
+        registry.mark_read(evidence_id)
+        evidence_passages.append(
+            EvidencePassage(
+                evidence_id,
+                passage_id,
+                note_id,
+                f"Title {note_id}",
+                "apple_notes",
+                passage_text,
+                0,
+                len(passage_text),
+                1.0,
+                2.0,
+                score,
+                score,
+            )
+        )
+    evidence_facts: list[EvidenceFact] = []
+    if fact is not None:
+        source_ids = tuple(row.evidence_id for row in evidence_passages)
+        fact_ref = registry.register(
+            "fact",
+            fact,
+            {"fact_ids": [fact], "source_evidence_ids": list(source_ids), "status": "active"},
+        )
+        registry.mark_read(fact_ref)
+        evidence_facts.append(
+            EvidenceFact(
+                fact_ref,
+                (fact,),
+                "Maya",
+                "owns_or_has",
+                "Launch",
+                "forward",
+                "active",
+                2.0,
+                None,
+                None,
+                0.9,
+                source_ids,
+            )
+        )
+    query = RetrievalQuery(text, "live", now=2.0)
+    return EvidencePack(
+        RetrievalDecision(True, 0.9, "accepted"),
+        query,
+        tuple(evidence_passages),
+        tuple(evidence_facts),
+        (),
+        tuple(evidence_notes),
+        RetrievalTrace(original_query=text),
     )
-    assert engine._seeds["dense"] == pytest.approx(0.5)
-    assert engine._seeds["other"] == pytest.approx(0.25)
-    assert engine._seeds["exact"] == pytest.approx(0.5)
-
-    engine._seeds["tiny"] = 1e-7
-    engine.on_pass("window", [], [], 1_001.0)
-
-    assert engine._seeds["dense"] == pytest.approx(0.5 * config.SEED_ACCUM_DECAY)
-    assert engine._seeds["exact"] == pytest.approx(0.5 * config.SEED_ACCUM_DECAY)
-    assert "tiny" not in engine._seeds
-
-    engine.on_pass("window", [], [("exact", "exact alias")], 1_002.0)
-    assert engine._seeds["exact"] >= 1.0
-
-
-def test_ppr_lifts_note_connected_to_two_seeds_above_equal_relevance_note(monkeypatch) -> None:
-    monkeypatch.setattr(config, "GROUNDING_TOP_K", 4)
-    now = 10_000.0
-    index = GroundingFakeIndex(
-        {
-            "seed-a": _note("seed-a", modified=now),
-            "seed-b": _note("seed-b", modified=now),
-            "bridge": _note("bridge", modified=now),
-            "unlinked": _note("unlinked", modified=now),
-        },
-        [
-            GraphEdge(src="bridge", dst="seed-a", type="semantic", weight=1.0),
-            GraphEdge(src="bridge", dst="seed-b", type="semantic", weight=1.0),
-        ],
-    )
-    engine = GroundingEngine(index)  # type: ignore[arg-type]
-
-    update = engine.on_pass(
-        "window",
-        [("seed-a", 1.0), ("seed-b", 1.0), ("bridge", 0.5), ("unlinked", 0.5)],
-        [],
-        now,
-    )
-    scores = {item.note_id: item.score for item in update.items}
-
-    assert scores["bridge"] > scores["unlinked"]
-    assert next(item for item in update.items if item.note_id == "bridge").why.ppr_mass > 0
-
-
-def test_blend_applies_recency_source_quality_and_degenerate_minmax(monkeypatch) -> None:
-    monkeypatch.setattr(config, "GROUNDING_TOP_K", 4)
-    now = 5_000_000.0
-    index = GroundingFakeIndex(
-        {
-            "fresh-imessage": _note("fresh-imessage", source="imessage", modified=now),
-            "old-imessage": _note("old-imessage", source="imessage", modified=now - 365 * DAY),
-            "fresh-apple": _note("fresh-apple", source="apple_notes", modified=now),
-            "quality": _note(
-                "quality",
-                source="apple_notes",
-                modified=now,
-                quality_rank=1.0,
-            ),
-        }
-    )
-    engine = GroundingEngine(index)  # type: ignore[arg-type]
-
-    update = engine.on_pass(
-        "window",
-        [
-            ("fresh-imessage", 1.0),
-            ("old-imessage", 1.0),
-            ("fresh-apple", 1.0),
-            ("quality", 1.0),
-        ],
-        [],
-        now,
-    )
-    scores = {item.note_id: item.score for item in update.items}
-
-    assert engine.last_blend["fresh-imessage"]["rel"] == pytest.approx(1.0)
-    assert scores["fresh-imessage"] > scores["old-imessage"]
-    assert scores["fresh-apple"] > scores["fresh-imessage"]
-    assert scores["quality"] > scores["fresh-apple"]
-    assert engine.last_blend["quality"]["quality"] == pytest.approx(
-        math.exp(config.QUALITY_LAMBDA)
-    )
-
-
-def test_hysteresis_keeps_incumbent_until_threshold_and_drops_deleted(monkeypatch) -> None:
-    monkeypatch.setattr(config, "GROUNDING_TOP_K", 1)
-    monkeypatch.setattr(config, "PPR_BLEND", 0.0)
-    now = 20_000.0
-    index = GroundingFakeIndex(
-        {
-            "incumbent": _note("incumbent", modified=now),
-            "challenger": _note("challenger", modified=now, quality_rank=0.5),
-        }
-    )
-    engine = GroundingEngine(index)  # type: ignore[arg-type]
-
-    assert _ids(engine, [("incumbent", 1.0)], now) == ["incumbent"]
-    assert _ids(engine, [("incumbent", 1.0), ("challenger", 1.0)], now) == [
-        "incumbent"
-    ]
-
-    index.note_rows["challenger"] = index.note_rows["challenger"].model_copy(
-        update={"quality_rank": 1.0}
-    )
-    assert _ids(engine, [("incumbent", 1.0), ("challenger", 1.0)], now) == [
-        "challenger"
-    ]
-
-    del index.note_rows["challenger"]
-    index.version += 1
-    assert _ids(engine, [("incumbent", 1.0), ("challenger", 1.0)], now) == [
-        "incumbent"
-    ]
-
-
-def test_short_ids_are_stable_and_fact_ids_are_never_reused(monkeypatch) -> None:
-    monkeypatch.setattr(config, "GROUNDING_TOP_K", 2)
-    monkeypatch.setattr(config, "PPR_BLEND", 0.0)
-    now = 30_000.0
-    index = GroundingFakeIndex(
-        {
-            "alpha": _note("alpha", modified=now),
-            "beta": _note("beta", modified=now),
-            "gamma": _note("gamma", modified=now),
-        },
-        [GraphEdge(src="alpha", dst="beta", type="semantic", weight=1.0, fact="AB fact")],
-    )
-    engine = GroundingEngine(index)  # type: ignore[arg-type]
-
-    first = engine.on_pass("window", [("alpha", 1.0), ("beta", 1.0)], [], now)
-    assert [(item.note_id, item.short_id) for item in first.items] == [
-        ("alpha", "N1"),
-        ("beta", "N2"),
-    ]
-    assert [(fact.src, fact.dst, fact.fact_id) for fact in first.facts] == [
-        ("alpha", "beta", "F1")
-    ]
-
-    index.edge_rows = [
-        GraphEdge(src="alpha", dst="gamma", type="semantic", weight=1.0, fact="AC fact")
-    ]
-    index.version += 1
-    second = engine.on_pass("window", [("alpha", 1.0), ("gamma", 1.0)], [], now)
-    assert [(fact.src, fact.dst, fact.fact_id) for fact in second.facts] == [
-        ("alpha", "gamma", "F2")
-    ]
-
-    index.edge_rows = [
-        GraphEdge(src="alpha", dst="beta", type="semantic", weight=1.0, fact="AB fact")
-    ]
-    index.version += 1
-    third = engine.on_pass("window", [("alpha", 1.0), ("beta", 1.0)], [], now)
-    assert next(item.short_id for item in third.items if item.note_id == "beta") == "N2"
-    assert [(fact.src, fact.dst, fact.fact_id) for fact in third.facts] == [
-        ("alpha", "beta", "F1")
-    ]
-
-
-def test_facts_payload_prioritizes_dense_hits_then_within_set_edges_and_caps(monkeypatch) -> None:
-    monkeypatch.setattr(config, "GROUNDING_TOP_K", 3)
-    monkeypatch.setattr(config, "GROUNDING_FACTS_MAX", 2)
-    monkeypatch.setattr(config, "PPR_BLEND", 0.0)
-    now = 40_000.0
-    index = GroundingFakeIndex(
-        {
-            "alpha": _note("alpha", modified=now),
-            "beta": _note("beta", modified=now),
-            "gamma": _note("gamma", modified=now),
-        },
-        [
-            GraphEdge(src="alpha", dst="beta", type="semantic", weight=0.9, fact="AB edge"),
-            GraphEdge(src="alpha", dst="gamma", type="semantic", weight=0.8, fact="AC edge"),
-        ],
-        fact_hits=[("beta", "gamma", 0.99, "BC dense")],
-    )
-    engine = GroundingEngine(index)  # type: ignore[arg-type]
-
-    update = engine.on_pass(
-        "window",
-        [("alpha", 1.0), ("beta", 1.0), ("gamma", 1.0)],
-        [],
-        now,
-    )
-
-    assert [(fact.src, fact.dst, fact.text) for fact in update.facts] == [
-        ("beta", "gamma", "BC dense"),
-        ("alpha", "beta", "AB edge"),
-    ]
-
-
-def test_revision_only_changes_when_membership_or_order_changes(monkeypatch) -> None:
-    monkeypatch.setattr(config, "GROUNDING_TOP_K", 2)
-    monkeypatch.setattr(config, "PPR_BLEND", 0.0)
-    now = 50_000.0
-    index = GroundingFakeIndex(
-        {
-            "alpha": _note("alpha", modified=now),
-            "beta": _note("beta", modified=now),
-        }
-    )
-    engine = GroundingEngine(index)  # type: ignore[arg-type]
-
-    first = engine.on_pass("window", [("alpha", 1.0), ("beta", 1.0)], [], now)
-    second = engine.on_pass("window", [("alpha", 1.0), ("beta", 1.0)], [], now)
-    third = engine.on_pass("window", [("beta", 2.0), ("alpha", 1.0)], [], now)
-
-    assert first.revision == 1
-    assert second.revision == first.revision
-    assert third.revision == first.revision + 1

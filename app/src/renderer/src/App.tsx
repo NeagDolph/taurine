@@ -9,12 +9,12 @@ import { PcmAudioCapture } from './lib/audio'
 import {
   SidecarClient,
   type Actionable,
-  type AmbientItem,
   type AsrState,
   type ConnectorInfo,
   type IndexStatus,
   type ProfileState,
   type RetrievalEvent,
+  type LiveGroundingEvent,
   type SidecarConnectionState,
   type SummaryEvent,
   type TriggerEvent,
@@ -59,8 +59,8 @@ function App(): React.JSX.Element {
   const [chunks, setChunks] = useState<FeedTranscript[]>([])
   const [interimsByChannel, setInterimsByChannel] = useState<Record<number, TranscriptEvent>>({})
   const [triggersBySeq, setTriggersBySeq] = useState<Map<number, TriggerEvent[]>>(new Map())
-  const [inspectedTrigger, setInspectedTrigger] = useState<TriggerEvent | null>(null)
-  const [ambientItems, setAmbientItems] = useState<AmbientItem[]>([])
+  const [inspectGrounding, setInspectGrounding] = useState(false)
+  const [liveGrounding, setLiveGrounding] = useState<LiveGroundingEvent | null>(null)
   const [summary, setSummary] = useState<SummaryEvent | null>(null)
   const [actionables, setActionables] = useState<Actionable[]>([])
   const [groundedNoteIds, setGroundedNoteIds] = useState<string[]>([])
@@ -92,15 +92,20 @@ function App(): React.JSX.Element {
           [event.channel]: event
         }))
       }),
-      client.onAmbient((event) => {
-        setAmbientItems(event.items)
+      client.onGrounding((event) => {
+        setLiveGrounding(event)
+        setGroundedNoteIds((current) => {
+          const next = new Set(current)
+          event.notes.forEach((item) => next.add(item.note_id))
+          return next.size === current.length ? current : [...next]
+        })
       }),
       client.onSummary((event) => {
         setSummary(event)
         setActionables(event.actionables)
         setGroundedNoteIds((current) => {
           const next = new Set(current)
-          event.grounding.forEach((item) => next.add(item.note_id))
+          event.evidence?.notes.forEach((item) => next.add(item.note_id))
           return next.size === current.length ? current : [...next]
         })
       }),
@@ -257,7 +262,7 @@ function App(): React.JSX.Element {
           reenrich: status
         }))
       } catch (error) {
-        setReenrichError(error instanceof Error ? error.message : 'Re-enrich failed')
+        setReenrichError(error instanceof Error ? error.message : 'Knowledge rebuild failed')
       } finally {
         setReenriching(false)
       }
@@ -312,8 +317,7 @@ function App(): React.JSX.Element {
               <SummaryPanel summary={summary} onOpenNote={openNote} />
               <ActionableRail
                 actionables={actionables}
-                grounding={summary?.grounding ?? []}
-                facts={summary?.facts ?? []}
+                evidence={summary?.evidence ?? null}
                 onStatus={actionableStatus}
                 onOpenNote={openNote}
               />
@@ -324,11 +328,17 @@ function App(): React.JSX.Element {
                   chunks={chunks}
                   interims={interims}
                   triggersBySeq={triggersBySeq}
-                  onInspectTrigger={setInspectedTrigger}
+                  onInspectTrigger={() => undefined}
                 />
               </main>
 
-              <AmbientList items={ambientItems} onOpenNote={openNote} />
+              <AmbientList
+                notes={liveGrounding?.display_notes ?? []}
+                passages={liveGrounding?.display_passages ?? []}
+                noNewEvidence={liveGrounding?.no_new_evidence}
+                onInspect={liveGrounding ? () => setInspectGrounding(true) : undefined}
+                onOpenNote={openNote}
+              />
             </div>
           </div>
         </div>
@@ -366,8 +376,8 @@ function App(): React.JSX.Element {
       </div>
 
       <TriggerInspector
-        trigger={inspectedTrigger}
-        onClose={() => setInspectedTrigger(null)}
+        grounding={inspectGrounding ? liveGrounding : null}
+        onClose={() => setInspectGrounding(false)}
         onOpenNote={openNote}
       />
 

@@ -76,38 +76,6 @@ def rebuild_all(index: object) -> None:
     index.replace_edges(edges)  # type: ignore[attr-defined]
 
 
-def rebuild_for(index: object, note_id: str) -> None:
-    existing = [
-        edge
-        for edge in index.graph().edges  # type: ignore[attr-defined]
-        if note_id not in (edge.src, edge.dst)
-    ]
-    existing_degree: dict[str, int] = defaultdict(int)
-    for edge in existing:
-        existing_degree[edge.src] += 1
-        existing_degree[edge.dst] += 1
-
-    kept, margin = _candidates(index)
-    candidate_edges = _apply_judgments(index, kept, margin, _valid_judgments(index))
-    incident = [edge for edge in candidate_edges if note_id in (edge.src, edge.dst)]
-    incident.sort(key=lambda edge: edge.weight, reverse=True)
-
-    selected: list[GraphEdge] = []
-    target_degree = 0
-    other_degree = dict(existing_degree)
-    for edge in incident:
-        other = edge.dst if edge.src == note_id else edge.src
-        if target_degree >= config.GRAPH_MAX_DEGREE:
-            break
-        if other_degree.get(other, 0) >= config.GRAPH_MAX_DEGREE:
-            continue
-        selected.append(edge)
-        target_degree += 1
-        other_degree[other] = other_degree.get(other, 0) + 1
-
-    index.replace_edges(selected, incident_note_id=note_id)  # type: ignore[attr-defined]
-
-
 def _candidate_edges(index: object) -> list[GraphEdge]:
     kept, _margin = _candidates(index)
     return [candidate.edge() for candidate in kept]

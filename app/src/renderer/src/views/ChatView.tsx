@@ -40,8 +40,9 @@ const EMPTY_STREAM: Omit<StreamingTurn, 'messageId'> = {
   thinkingEndedAt: null,
   activity: [],
   content: '',
-  sources: [],
-  facts: [],
+  evidence: null,
+  retrievedIds: [],
+  consultedIds: [],
   error: ''
 }
 
@@ -64,8 +65,10 @@ function reducer(state: ChatState, action: ChatAction): ChatState {
         role: 'user',
         content: action.text,
         thinking: '',
-        sources: [],
-        facts: [],
+        evidence: null,
+        retrieved_ids: [],
+        consulted_ids: [],
+        cited_ids: [],
         activity: [],
         usage: { prompt: 0, completion: 0, reasoning: 0, ttft_ms: 0, total_ms: 0 },
         cancelled: false,
@@ -114,8 +117,10 @@ function applyEvent(state: ChatState, event: ChatEvent, now: number): ChatState 
             role: 'user',
             content: state.pendingSend,
             thinking: '',
-            sources: [],
-            facts: [],
+            evidence: null,
+            retrieved_ids: [],
+            consulted_ids: [],
+            cited_ids: [],
             activity: [],
             usage: { prompt: 0, completion: 0, reasoning: 0, ttft_ms: 0, total_ms: 0 },
             cancelled: false,
@@ -137,8 +142,9 @@ function applyEvent(state: ChatState, event: ChatEvent, now: number): ChatState 
     case 'chat_retrieval':
       return patchStream(state, event.chat_id, event.message_id, (turn) => ({
         ...turn,
-        sources: event.sources,
-        facts: event.facts
+        evidence: event.evidence,
+        retrievedIds: event.retrieved_ids,
+        consultedIds: event.consulted_ids
       }))
     case 'chat_thinking':
       return patchStream(state, event.chat_id, event.message_id, (turn) => ({

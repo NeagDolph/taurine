@@ -13,7 +13,7 @@ interface MessageMarkdownProps {
   streaming?: boolean
 }
 
-const CITATION_RE = /\[((?:N|F)\d+)\]/g
+const CITATION_RE = /\[((?:N|E|F|P|T)\d+)\]/g
 
 // [N3]/[F7] tokens become markdown links with a citation: scheme so the
 // standard link renderer can turn them into chips without a custom parser.
@@ -37,13 +37,13 @@ export function MessageMarkdown({
             if (href?.startsWith('citation:')) {
               const id = href.slice('citation:'.length)
               const target = citations.get(id)
-              const kind = id.startsWith('F') ? 'fact' : 'note'
+              const kind = id.startsWith('F') ? 'fact' : id.startsWith('E') ? 'passage' : 'note'
               return (
                 <button
                   className={`citation-chip citation-${kind}`}
                   type="button"
                   title={target?.title ?? id}
-                  onClick={() => target && onOpenNote(target.noteId)}
+                  onClick={() => target?.noteId && onOpenNote(target.noteId)}
                 >
                   {id}
                 </button>

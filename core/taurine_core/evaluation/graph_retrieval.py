@@ -55,6 +55,12 @@ class CalibrationCurve(_StrictModel):
 
 class ModeCalibration(_StrictModel):
     heads: dict[str, CalibrationCurve]
+    head_weights: dict[str, float]
+    rrf_k: int = Field(ge=0)
+    mmr_lambda: float = Field(ge=0.0, le=1.0)
+    source_diversity_penalty: float = Field(ge=0.0, le=1.0)
+    note_support_bonus: float = Field(ge=0.0, le=1.0)
+    note_support_bonus_cap: float = Field(ge=0.0, le=1.0)
     evidence_floor: float = Field(ge=0.0, le=1.0)
     single_head_override: float = Field(ge=0.0, le=1.0)
     minimum_independent_heads: int = Field(ge=1)
@@ -66,6 +72,12 @@ class ModeCalibration(_StrictModel):
         missing = sorted(required - set(self.heads))
         if missing:
             raise ValueError(f"missing calibration heads: {', '.join(missing)}")
+        if set(self.head_weights) != set(self.heads):
+            raise ValueError("head weights must match calibrated heads exactly")
+        if any(value < 0.0 for value in self.head_weights.values()):
+            raise ValueError("head weights must be non-negative")
+        if self.note_support_bonus_cap < self.note_support_bonus:
+            raise ValueError("note support bonus cap cannot be below one bonus step")
         return self
 
 

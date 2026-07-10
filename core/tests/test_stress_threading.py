@@ -217,4 +217,4 @@ def test_flaky_extraction_reports_failures_without_crashing(tmp_path, monkeypatc
     report = registry.sync_connector("src_a", index, None)  # type: ignore[arg-type]
     assert report.error == ""
     assert report.added == 12                      # failed extraction still indexes raw text
-    assert report.enrich_failures > 0
+    assert report.enrich_failures == 0  # clean build owns extraction; source sync is raw only

@@ -33,6 +33,7 @@ def test_ppr_redistributes_dangling_mass_and_preserves_total_probability() -> No
     assert result.ranks["p2"] == pytest.approx(0.0)
     assert result.passage_mass == pytest.approx(1.0)
     assert result.entity_mass == pytest.approx(0.0)
+    assert result.contributions["p1"][0][0] == "reset"
 
 
 def test_typed_reset_weights_compose_one_normalized_teleport() -> None:

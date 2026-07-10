@@ -34,6 +34,12 @@ def test_curve_interpolates_clamps_and_applies_acceptance_floor() -> None:
     assert calibrator.probability("dense", 0.67) == pytest.approx(0.75)
     assert calibrator.accepts("dense", 0.67)
     assert not calibrator.accepts("dense", 0.58)
+    assert calibrator.rrf_k == 60
+    assert calibrator.head_weights["dense"] == pytest.approx(1.0)
+    assert calibrator.mmr_lambda == pytest.approx(0.2)
+    assert calibrator.note_support_bonus == pytest.approx(0.05)
+    assert calibrator.note_support_bonus_cap == pytest.approx(0.1)
+    assert calibrator.source_diversity_penalty == pytest.approx(0.05)
 
 
 @pytest.mark.parametrize(
@@ -136,6 +142,31 @@ def test_post_abstention_requires_evidence_floor_and_allows_exact_override() -> 
     )
     assert high_precision.accepted
     assert high_precision.reason == "accepted_high_precision_head"
+
+
+def test_post_abstention_requires_independent_heads_to_agree_on_selected_evidence() -> None:
+    artifact = load_calibration(_ARTIFACT)
+    policy = AbstentionPolicy(artifact, mode="chat")
+    hits = (
+        _hit("dense", "p1", 0.8, 1),
+        _hit("bm25", "p2", 0.8, 1),
+    )
+
+    rejected = policy.post_rerank(
+        hits,
+        (0.8,),
+        evidence_target_ids=("p1",),
+    )
+    accepted = policy.post_rerank(
+        hits + (_hit("bm25", "p1", 0.8, 2),),
+        (0.8,),
+        evidence_target_ids=("p1",),
+    )
+
+    assert not rejected.accepted
+    assert rejected.reason == "single_head_without_override"
+    assert accepted.accepted
+    assert accepted.reason == "accepted_independent_head_agreement"
 
 
 def _hit(

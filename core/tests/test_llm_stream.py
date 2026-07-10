@@ -72,7 +72,7 @@ async def test_stream_chat_parses_reasoning_content_usage_done_and_reasoning_ove
     events = await _collect(
         client,
         reasoning={"enabled": True},
-        tools=[{"type": "function", "function": {"name": "search_notes"}}],
+        tools=[{"type": "function", "function": {"name": "search_evidence"}}],
     )
 
     assert [(event.kind, event.text, event.usage) for event in events] == [
@@ -86,7 +86,7 @@ async def test_stream_chat_parses_reasoning_content_usage_done_and_reasoning_ove
     assert body["stream"] is True
     assert body["provider"] == {"require_parameters": True}
     assert body["reasoning"] == {"enabled": True}
-    assert body["tools"] == [{"type": "function", "function": {"name": "search_notes"}}]
+    assert body["tools"] == [{"type": "function", "function": {"name": "search_evidence"}}]
 
 
 @pytest.mark.asyncio
@@ -122,7 +122,7 @@ async def test_stream_chat_accumulates_interleaved_tool_call_fragments_in_index_
                                                 "index": 1,
                                                 "id": "call-b",
                                                 "function": {
-                                                    "name": "search_notes",
+                                                    "name": "search_evidence",
                                                     "arguments": '{"query":"road',
                                                 },
                                             },
@@ -166,7 +166,7 @@ async def test_stream_chat_accumulates_interleaved_tool_call_fragments_in_index_
 
     assert [event.tool_call for event in events if event.kind == "tool_call"] == [
         {"id": "call-a", "name": "read_note", "arguments": {"note": "N1"}},
-        {"id": "call-b", "name": "search_notes", "arguments": {"query": "roadmap", "k": 2}},
+        {"id": "call-b", "name": "search_evidence", "arguments": {"query": "roadmap", "k": 2}},
     ]
     assert events[-1].kind == "done"
 

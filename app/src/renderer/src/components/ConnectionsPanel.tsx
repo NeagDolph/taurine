@@ -187,12 +187,12 @@ export function ConnectionsPanel({
             type="button"
             disabled={reenrichDisabled}
             onClick={() => onReenrich()}
-            title="Regenerate the user card, then re-enrich every document from every connector"
+            title="Regenerate and atomically replace the complete knowledge graph"
           >
             {reenriching && reenrichTarget === 'all' ? (
               <span className="inline-spinner" aria-hidden="true" />
             ) : null}
-            {reenriching && reenrichTarget === 'all' ? 'Re-enriching all' : 'Re-enrich all'}
+            {reenriching && reenrichTarget === 'all' ? 'Rebuilding knowledge' : 'Rebuild knowledge'}
           </button>
         </div>
       </div>
@@ -481,10 +481,10 @@ function ConnectorRow({
               type="button"
               disabled={reenrichDisabled || !connector.enabled || connector.docs === 0}
               onClick={onReenrich}
-              title={`Re-run enrichment for the ${connector.docs} ${connector.label} document${connector.docs === 1 ? '' : 's'} already indexed`}
+              title="Regenerate and atomically replace the complete knowledge graph"
             >
               {reenriching ? <span className="inline-spinner" aria-hidden="true" /> : null}
-              {reenriching ? 'Re-enriching' : 'Re-enrich'}
+              {reenriching ? 'Rebuilding' : 'Rebuild knowledge'}
             </button>
             <span className="connector-detail-spacer" />
             <button

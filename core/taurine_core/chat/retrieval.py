@@ -1,126 +1,833 @@
-"""Stage A — latent context pack for typed prompts (spec chat §1.2).
+"""Chat policy adapter for the shared evidence retrieval engine."""
 
-Reuses the live pipeline's machinery with chat posture:
-- heads: dense(message, CHAT_EMBED_QUERY_PROMPT), BM25, exact aliases at
-  rank 1, fact_dense_search, GLiNER entity spans as transient PPR seeds
-  (typed text has no ASR fuzzy snapping);
-- RRF fusion (RRF_K), per-chat seed accumulator (CHAT_SEED_DECAY per turn),
-  PPR (warm-started per chat, matrix cached on graph_version), blend with
-  the same recency/source/quality priors;
-- pack: CHAT_CONTEXT_NOTES notes + CHAT_CONTEXT_FACTS facts, NO hysteresis
-  (continuity lives in the accumulator, not set stickiness).
-
-Per-chat N#/F# registries and the accumulator persist via
-Index.chat_registry / set_chat_registry so citations in old messages keep
-resolving after restart.
-
-Implementation note (Stage A refactor): extract the shared head-running +
-RRF from AmbientRetriever into a reusable helper, and parameterize
-GroundingEngine (top_k, facts_max, seed_decay, hysteresis: float | None,
-query_prompt) rather than duplicating it. No LLM calls in this module.
-"""
 from __future__ import annotations
 
-from .. import config
-from ..indexer.store import Index
-from ..live.ambient import run_head_fusion
-from ..live.exact import ExactCollector
-from ..live.grounding import GroundingEngine
-from ..ports import SpanExtractorPort
-from ..schemas import Chunk, GroundedFact, GroundingItem
+import base64
+import json
+import re
+from dataclasses import replace
+from typing import Any, Callable, Literal, Mapping, Sequence
+
+from taurine_core.indexer.store import Index
+from taurine_core.ports import SpanExtractorPort
+from taurine_core.retrieval.evidence import SharedRetrievalEngine
+from taurine_core.retrieval.registry import EvidenceRegistry
+from taurine_core.retrieval.rerank import PassageRerankCandidate
+from taurine_core.retrieval.types import (
+    EvidenceFact,
+    EvidenceNote,
+    EvidencePack,
+    EvidencePassage,
+    EvidencePath,
+    RetrievalQuery,
+    TemporalIntent,
+)
+
+
+EngineFactory = Callable[[EvidenceRegistry], SharedRetrievalEngine]
+TemporalFilter = Literal["current", "historical", "any"]
+Direction = Literal["outgoing", "incoming", "both"]
+
+_DEPENDENT = re.compile(
+    r"(?:\b(?:it|its|they|them|their|that|this|those|these|he|she|his|her)\b|"
+    r"^(?:and|also|what about|how about|when|where|why|who)\b)",
+    re.IGNORECASE,
+)
+_PRONOUN = re.compile(
+    r"\b(?:it|its|they|them|their|that|this|those|these|he|she|his|her)\b",
+    re.IGNORECASE,
+)
+_TOKEN = re.compile(r"[\w'-]+", re.UNICODE)
+_QUERY_STOPWORDS = frozenset(
+    {"a", "an", "and", "about", "does", "how", "is", "me", "of", "the", "to", "what", "when", "where", "why", "who"}
+)
 
 
 class ChatRetriever:
-    """One instance per chat_id; state restored from the chat registry."""
+    """One per chat, owning stable evidence identities and accepted-turn state."""
 
     def __init__(
         self,
         index: Index,
         chat_id: str,
         *,
+        engine_factory: EngineFactory,
+        tool_engine_factory: EngineFactory,
         span_extractor: SpanExtractorPort | None = None,
     ) -> None:
         self.index = index
         self.chat_id = chat_id
+        self._engine_factory = engine_factory
+        self._tool_engine_factory = tool_engine_factory
         self._span_extractor = span_extractor
-        self._exact = ExactCollector(index)
-        self._grounding = GroundingEngine(
-            index,
-            top_k=config.CHAT_CONTEXT_NOTES,
-            facts_max=config.CHAT_CONTEXT_FACTS,
-            seed_decay=config.CHAT_SEED_DECAY,
-            hysteresis=None,
-            query_prompt=config.CHAT_EMBED_QUERY_PROMPT,
+        persisted = index.chat_registry(chat_id)
+        current = persisted.get("current") if isinstance(persisted, dict) else None
+        initial = current if isinstance(current, dict) else persisted
+        self.registry = _restore_registry(initial)
+        self._accepted_reset = _float_map(
+            initial.get("accepted_reset") if isinstance(initial, dict) else None
         )
-        registry = index.chat_registry(chat_id)
-        if isinstance(registry, dict) and registry:
-            self._grounding.restore_state(registry)
+        self._accepted_turn = _integer(
+            initial.get("accepted_turn") if isinstance(initial, dict) else None
+        )
+        pre_turn = persisted.get("pre_turn") if isinstance(persisted, dict) else None
+        self._persisted_pre_turn = pre_turn if isinstance(pre_turn, dict) else None
+        self._pre_turn: dict[str, object] | None = None
+        self._turn_base: EvidencePack | None = None
+        self._turn_read_ids: list[str] = []
+        self.engine = engine_factory(self.registry)
+        self._tool_engine: SharedRetrievalEngine | None = None
 
     def context_pack(
-        self, message: str, *, now: float
-    ) -> tuple[list[GroundingItem], list[GroundedFact]]:
-        """Advance the per-turn accumulator and return the Stage-A pack."""
-        update = self._run(message, now=now, decay_seeds=True)
-        return update.items, update.facts
+        self,
+        message: str,
+        *,
+        now: float,
+        conversation_context: Sequence[str] = (),
+        rewritten_query: str | None = None,
+    ) -> EvidencePack:
+        """Run Stage A and advance state exactly once for an accepted user turn."""
 
-    def search(
-        self, query: str, k: int, *, now: float
-    ) -> list[GroundingItem]:
-        """The search_notes tool body: full latent pipeline on a
-        model-formulated query, seeded by accumulator ∪ this query.
-        New notes join the chat's citation registry."""
-        if k <= 0:
-            return []
-        update = self._run(query, now=now, decay_seeds=False)
-        return update.items[:k]
+        self._pre_turn = self.snapshot()
+        self._turn_read_ids = []
+        context = tuple(str(row) for row in conversation_context[-2:] if str(row).strip())
+        rewritten = (
+            str(rewritten_query).strip()
+            if rewritten_query and self.is_dependent_query(message, context)
+            else _rewrite_query(message, context)
+        )
+        dependent = rewritten != message
+        query = RetrievalQuery(
+            text=rewritten,
+            mode="chat",
+            now=now,
+            conversation_context=context,
+            temporal_intent=TemporalIntent("any"),
+        )
+        pack = self.engine.retrieve(
+            query,
+            entity_spans=self._entity_spans(message),
+            session_reset=self._accepted_reset if dependent and self._accepted_reset else None,
+        )
+        public_query = replace(query, text=message)
+        pack = replace(
+            pack,
+            query=public_query,
+            trace=replace(
+                pack.trace,
+                original_query=message,
+                rewritten_query=rewritten,
+            ),
+        )
+        self._turn_base = pack
+        self._record_turn_read(pack.trace.read_ids)
+        if pack.decision.accepted:
+            self._accepted_reset = {
+                passage.passage_id: float(passage.rerank_score)
+                for passage in pack.passages
+            }
+        elif not dependent:
+            self._accepted_reset = {}
+        self._accepted_turn += 1
+        return pack
 
-    def resolve(self, ref: str) -> str | None:
-        """short_id ("N3") or raw note_id → note_id, if known to this chat."""
-        for note_id, short_id in self._grounding.note_short_ids().items():
-            if short_id == ref:
-                return note_id
-        if self.index.note(ref) is not None:
-            return ref
-        return None
+    def is_dependent_query(self, message: str, context: Sequence[str]) -> bool:
+        normalized = tuple(str(row) for row in context[-2:] if str(row).strip())
+        return _rewrite_query(message, normalized) != message
+
+    def fallback_rewrite(self, message: str, context: Sequence[str]) -> str:
+        normalized = tuple(str(row) for row in context[-2:] if str(row).strip())
+        return _rewrite_query(message, normalized)
+
+    def search_evidence(
+        self,
+        query: str,
+        *,
+        k: int,
+        temporal: TemporalFilter,
+        now: float,
+    ) -> EvidencePack:
+        """Run a tool query without advancing accepted-turn state."""
+
+        intent = TemporalIntent(temporal)
+        request = RetrievalQuery(
+            text=query,
+            mode="tool",
+            now=now,
+            temporal_intent=intent,
+        )
+        if self._tool_engine is None:
+            self._tool_engine = self._tool_engine_factory(self.registry)
+        pack = self._tool_engine.retrieve(
+            request,
+            entity_spans=self._entity_spans(query),
+            session_reset=self._accepted_reset or None,
+            passage_limit=max(0, int(k)),
+        )
+        self._record_turn_read(pack.trace.read_ids)
+        if self._turn_base is None:
+            self._turn_base = pack
+        elif not self._turn_base.decision.accepted and pack.decision.accepted:
+            stage_a = self._turn_base
+            self._turn_base = replace(
+                pack,
+                trace=replace(
+                    pack.trace,
+                    original_query=stage_a.trace.original_query,
+                    rewritten_query=stage_a.trace.rewritten_query,
+                    debug={
+                        **dict(pack.trace.debug),
+                        "stage_a_abstention": stage_a.decision.reason,
+                        "tool_query": query,
+                    },
+                ),
+            )
+        return pack
+
+    def resolve_note(self, ref: str) -> str | None:
+        record = self.registry.resolve(ref)
+        if record is None or record.kind != "note":
+            return None
+        return record.source_id
+
+    def _entity_spans(self, text: str) -> tuple[tuple[str, str | None], ...]:
+        if self._span_extractor is None:
+            return ()
+        try:
+            rows = self._span_extractor.extract(text)
+        except Exception:
+            return ()
+        return tuple(
+            (str(surface), str(etype) if etype else None)
+            for surface, confidence, etype in rows
+            if str(surface).strip() and float(confidence) > 0.0
+        )
+
+    def turn_pack(self) -> EvidencePack | None:
+        """Materialize every passage exposed during this turn for auditing/UI."""
+
+        base = self._turn_base
+        if base is None:
+            return None
+        passages = {row.evidence_id: row for row in base.passages}
+        notes = {row.note_ref: row for row in base.notes}
+        facts = {row.fact_ref: row for row in base.facts}
+        paths = {row.path_id: row for row in base.paths}
+        read_refs = tuple(self._turn_read_ids)
+
+        missing_passage_records = [
+            (ref, record)
+            for ref in read_refs
+            if (record := self.registry.resolve(ref)) is not None
+            and record.kind == "passage"
+            and ref not in passages
+        ]
+        original_ids = tuple(
+            str(record.payload.get("passage_id") or record.source_id)
+            for _ref, record in missing_passage_records
+        )
+        context_by_id = {
+            str(row.passage_id): row
+            for row in self.engine.store.passage_contexts(original_ids)
+        }
+        for ref, record in missing_passage_records:
+            passage_id = str(record.payload.get("passage_id") or record.source_id)
+            row = context_by_id.get(passage_id)
+            if row is None:
+                continue
+            is_excerpt = bool(record.payload.get("excerpt"))
+            passages[ref] = EvidencePassage(
+                evidence_id=ref,
+                passage_id=passage_id,
+                note_id=str(row.note_id),
+                title=str(row.title),
+                source=str(row.source),
+                text=(
+                    str(record.payload.get("text") or "")
+                    if is_excerpt
+                    else str(row.text)
+                ),
+                char_start=(
+                    int(record.payload.get("char_start") or 0)
+                    if is_excerpt
+                    else int(row.char_start)
+                ),
+                char_end=(
+                    int(record.payload.get("char_end") or 0)
+                    if is_excerpt
+                    else int(row.char_end)
+                ),
+                created=float(row.created),
+                modified=float(row.modified),
+                retrieval_score=0.0,
+                rerank_score=0.0,
+            )
+
+        missing_note_ids = [
+            record.source_id
+            for ref in read_refs
+            if (record := self.registry.resolve(ref)) is not None
+            and record.kind == "note"
+            and ref not in notes
+        ]
+        evidence_by_note: dict[str, list[str]] = {}
+        for passage in passages.values():
+            evidence_by_note.setdefault(passage.note_id, []).append(passage.evidence_id)
+        for row in self.engine.store.note_contexts(missing_note_ids):
+            ref = self.registry.ref_for("note", str(row.note_id))
+            if ref is None:
+                continue
+            notes[ref] = EvidenceNote(
+                note_ref=ref,
+                note_id=str(row.note_id),
+                title=str(row.title),
+                source=str(row.source),
+                modified=float(row.modified),
+                score=0.0,
+                evidence_ids=tuple(evidence_by_note.get(str(row.note_id), ())),
+            )
+
+        for ref in read_refs:
+            record = self.registry.resolve(ref)
+            if record is None:
+                continue
+            payload = record.payload
+            if record.kind == "fact" and ref not in facts:
+                logical = payload.get("logical_key")
+                if not isinstance(logical, list) or len(logical) != 3:
+                    continue
+                facts[ref] = EvidenceFact(
+                    fact_ref=ref,
+                    fact_ids=tuple(str(value) for value in payload.get("fact_ids", ())),
+                    subject=str(payload.get("subject") or logical[0]),
+                    predicate=str(payload.get("predicate") or logical[1]),
+                    object=str(payload.get("object") or logical[2]),
+                    direction=str(payload.get("direction") or "forward"),
+                    status=str(payload.get("status") or "candidate"),
+                    observed_at=float(payload.get("observed_at") or 0.0),
+                    valid_from=_optional_float(payload.get("valid_from")),
+                    valid_to=_optional_float(payload.get("valid_to")),
+                    confidence=0.0,
+                    source_evidence_ids=tuple(str(value) for value in payload.get("source_evidence_ids", ())),
+                )
+            elif record.kind == "path" and ref not in paths:
+                nodes = tuple(str(value) for value in payload.get("node_ids", ()))
+                paths[ref] = EvidencePath(
+                    path_id=ref,
+                    node_ids=nodes,
+                    edge_kinds=tuple(str(value) for value in payload.get("edge_kinds", ())),
+                    fact_ids=tuple(str(value) for value in payload.get("fact_ids", ())),
+                    weight=0.0,
+                    rendered=str(payload.get("rendered") or " -> ".join(nodes)),
+                )
+        return replace(
+            base,
+            passages=tuple(passages[ref] for ref in read_refs if ref in passages),
+            facts=tuple(facts[ref] for ref in read_refs if ref in facts),
+            paths=tuple(paths[ref] for ref in read_refs if ref in paths),
+            notes=tuple(notes[ref] for ref in read_refs if ref in notes),
+            trace=replace(base.trace, selected_ids=read_refs, read_ids=read_refs),
+        )
+
+    def read_note(
+        self,
+        note_ref: str,
+        *,
+        query: str,
+        cursor: str | None = None,
+        max_chars: int,
+    ) -> dict[str, object]:
+        """Return registered passages, ranked by query or paged sequentially."""
+
+        note_id = self.resolve_note(note_ref)
+        if note_id is None:
+            raise ValueError(f"could not resolve note: {note_ref}")
+        all_rows = tuple(
+            row
+            for row in self.engine.store.passage_contexts(self.engine.snapshot.passage_ids)
+            if str(row.note_id) == note_id
+        )
+        offset, sequential, char_offset, cursor_order = _decode_cursor(cursor)
+        if cursor_order:
+            row_by_id = {str(row.passage_id): row for row in all_rows}
+            ordered = [row_by_id[row_id] for row_id in cursor_order if row_id in row_by_id]
+        elif sequential:
+            ordered = sorted(all_rows, key=lambda row: (int(row.char_start), str(row.passage_id)))
+        else:
+            terms = _terms(query)
+            lexical = sorted(
+                all_rows,
+                key=lambda row: (
+                    -len(terms & _terms(str(row.text))),
+                    int(row.char_start),
+                    str(row.passage_id),
+                ),
+            )
+            ordered = lexical
+            if self._tool_engine is None:
+                self._tool_engine = self._tool_engine_factory(self.registry)
+            reranker = getattr(self._tool_engine, "reranker", None)
+            if reranker is not None:
+                candidates = tuple(
+                    PassageRerankCandidate(
+                        passage_id=str(row.passage_id),
+                        note_id=str(row.note_id),
+                        title=str(row.title),
+                        source=str(row.source),
+                        text=str(row.text),
+                        recall_score=float(len(terms & _terms(str(row.text)))) / max(1, len(terms)),
+                    )
+                    for row in lexical
+                )
+                reranked = reranker.rerank(query, candidates)
+                if not reranked.degraded:
+                    row_by_id = {str(row.passage_id): row for row in all_rows}
+                    ordered = [
+                        row_by_id[decision.candidate.passage_id]
+                        for decision in reranked.decisions
+                    ]
+                    ranked_ids = {str(row.passage_id) for row in ordered}
+                    ordered.extend(
+                        row for row in lexical if str(row.passage_id) not in ranked_ids
+                    )
+        budget = max(1, int(max_chars))
+        consumed = 0
+        passages: list[dict[str, object]] = []
+        index = offset
+        while index < len(ordered):
+            row = ordered[index]
+            full_text = str(row.text)
+            local_start = char_offset if index == offset else 0
+            if local_start >= len(full_text):
+                index += 1
+                char_offset = 0
+                continue
+            remaining_budget = budget - consumed
+            if remaining_budget <= 0:
+                break
+            if passages and len(full_text) - local_start > remaining_budget:
+                break
+            text = full_text[local_start : local_start + remaining_budget]
+            absolute_start = int(row.char_start) + local_start
+            absolute_end = absolute_start + len(text)
+            partial = local_start > 0 or len(text) < len(full_text)
+            source_id = (
+                f"{row.passage_id}:excerpt:{absolute_start}:{absolute_end}"
+                if partial
+                else str(row.passage_id)
+            )
+            evidence_ref = self.registry.register(
+                "passage",
+                source_id,
+                {
+                    "passage_id": str(row.passage_id),
+                    "note_id": note_id,
+                    "text": text,
+                    "char_start": absolute_start,
+                    "char_end": absolute_end,
+                    "excerpt": partial,
+                },
+            )
+            self.registry.mark_read(note_ref)
+            self.registry.mark_read(evidence_ref)
+            self._record_turn_read((note_ref, evidence_ref))
+            passages.append(
+                {
+                    "evidence_id": evidence_ref,
+                    "text": text,
+                    "char_start": absolute_start,
+                    "char_end": absolute_end,
+                }
+            )
+            consumed += len(text)
+            local_end = local_start + len(text)
+            if local_end < len(full_text):
+                char_offset = local_end
+                break
+            index += 1
+            char_offset = 0
+            if consumed >= budget:
+                break
+        truncated = char_offset > 0 or index < len(ordered)
+        return {
+            "note": note_ref,
+            "title": str(all_rows[0].title) if all_rows else "",
+            "source": str(all_rows[0].source) if all_rows else "",
+            "passages": passages,
+            "truncated": truncated,
+            "next_cursor": (
+                _encode_cursor(
+                    index,
+                    sequential=True,
+                    char_offset=char_offset,
+                    order=tuple(str(row.passage_id) for row in ordered),
+                )
+                if truncated
+                else None
+            ),
+        }
+
+    def expand_evidence(
+        self,
+        ref: str,
+        *,
+        direction: Direction,
+        max_hops: int,
+        limit: int,
+    ) -> dict[str, object]:
+        """Traverse the directed base graph and return only registered evidence."""
+
+        record = self.registry.resolve(ref)
+        if record is None:
+            raise ValueError(f"could not resolve evidence: {ref}")
+        if record.kind not in {"note", "passage", "fact"}:
+            raise ValueError("expansion requires a registered N#, E#, or F# reference")
+        if record.kind == "note":
+            seeds = tuple(
+                str(row.passage_id)
+                for row in self.engine.store.passage_contexts(self.engine.snapshot.passage_ids)
+                if str(row.note_id) == record.source_id
+            )
+        else:
+            seeds = _record_graph_seeds(record, direction)
+        if not seeds:
+            return {"from": ref, "results": [], "paths": []}
+        edges = tuple(self.engine.snapshot.base_graph.edges)
+        queue = [(seed, (seed,), (), ()) for seed in seeds]
+        visited = set(seeds)
+        results: list[dict[str, object]] = []
+        paths: list[dict[str, object]] = []
+        supporting_passages: dict[str, dict[str, object]] = {}
+        passage_ids = set(self.engine.snapshot.passage_ids)
+        max_hops = min(4, max(1, int(max_hops)))
+        while queue and len(results) < max(0, int(limit)):
+            node, nodes, kinds, fact_ids = queue.pop(0)
+            if len(kinds) >= max_hops:
+                continue
+            for edge in edges:
+                target = _directed_target(edge, node, direction)
+                if target is None or target in visited:
+                    continue
+                visited.add(target)
+                next_nodes = (*nodes, target)
+                next_kinds = (*kinds, str(edge.kind))
+                next_facts = (*fact_ids, *(str(value) for value in edge.fact_ids))
+                queue.append((target, next_nodes, next_kinds, next_facts))
+                if target not in passage_ids:
+                    continue
+                context = self.engine.store.passage_contexts((target,))
+                if not context:
+                    continue
+                row = context[0]
+                evidence_ref = self.registry.register(
+                    "passage", target,
+                    {"passage_id": target, "note_id": str(row.note_id), "text": str(row.text), "char_start": int(row.char_start), "char_end": int(row.char_end)},
+                )
+                note_ref = self.registry.ref_for("note", str(row.note_id))
+                if note_ref is None:
+                    note_ref = self.registry.register("note", str(row.note_id), {"note_id": str(row.note_id)})
+                matching_facts, fact_support, fact_contexts = self._register_traversed_facts(
+                    next_facts
+                )
+                supporting_passages.update(
+                    {str(item["evidence_id"]): item for item in fact_support}
+                )
+                rendered_path = _render_expansion_path(
+                    next_nodes, next_kinds, fact_contexts, self.engine.store
+                )
+                path_key = "\x1f".join((*next_nodes, *next_kinds, *next_facts))
+                path_ref = self.registry.register(
+                    "path", path_key,
+                    {"node_ids": list(next_nodes), "edge_kinds": list(next_kinds), "fact_ids": list(next_facts), "rendered": rendered_path},
+                )
+                for cite_ref in (evidence_ref, note_ref, path_ref):
+                    self.registry.mark_read(cite_ref)
+                for fact_ref in matching_facts:
+                    self.registry.mark_read(fact_ref)
+                self._record_turn_read(
+                    (evidence_ref, note_ref, path_ref, *matching_facts)
+                )
+                results.append(
+                    {"evidence_id": evidence_ref, "note": note_ref, "title": str(row.title), "source": str(row.source), "text": str(row.text), "fact_refs": matching_facts, "path": path_ref}
+                )
+                paths.append({"path_id": path_ref, "rendered": rendered_path, "node_ids": list(next_nodes), "edge_kinds": list(next_kinds), "fact_refs": matching_facts})
+                if len(results) >= limit:
+                    break
+        return {"from": ref, "results": results, "supporting_passages": list(supporting_passages.values()), "paths": paths}
+
+    def _register_traversed_facts(
+        self, fact_ids: Sequence[str]
+    ) -> tuple[list[str], list[dict[str, object]], tuple[Any, ...]]:
+        reader = getattr(self.engine.store, "fact_contexts", None)
+        contexts = (
+            reader(tuple(sorted(set(fact_ids)))) if callable(reader) else ()
+        )
+        refs: list[str] = _fact_refs(self.registry, set(fact_ids))
+        support: list[dict[str, object]] = []
+        for fact in contexts:
+            passage_rows = self.engine.store.passage_contexts(
+                (str(fact.source_passage_id),)
+            )
+            if not passage_rows:
+                continue
+            passage = passage_rows[0]
+            evidence_ref = self.registry.register(
+                "passage",
+                str(passage.passage_id),
+                {
+                    "passage_id": str(passage.passage_id),
+                    "note_id": str(passage.note_id),
+                    "text": str(passage.text),
+                    "char_start": int(passage.char_start),
+                    "char_end": int(passage.char_end),
+                },
+            )
+            note_ref = self.registry.ref_for("note", str(passage.note_id))
+            if note_ref is None:
+                note_ref = self.registry.register(
+                    "note", str(passage.note_id), {"note_id": str(passage.note_id)}
+                )
+            identity = "\x1f".join(
+                (
+                    self.engine.snapshot.build_id,
+                    *fact.logical_key,
+                    str(fact.status),
+                    repr(fact.valid_from),
+                    repr(fact.valid_to),
+                )
+            )
+            fact_ref = self.registry.register(
+                "fact",
+                identity,
+                {
+                    "logical_key": list(fact.logical_key),
+                    "fact_ids": [str(fact.fact_id)],
+                    "subject_entity_id": str(fact.subject_entity_id),
+                    "object_entity_id": str(fact.object_entity_id),
+                    "subject": str(fact.subject),
+                    "predicate": str(fact.predicate),
+                    "object": str(fact.object),
+                    "direction": "forward",
+                    "status": str(fact.status),
+                    "observed_at": float(fact.observed_at),
+                    "valid_from": fact.valid_from,
+                    "valid_to": fact.valid_to,
+                    "source_evidence_ids": [evidence_ref],
+                },
+            )
+            self.registry.merge_payload(
+                fact_ref,
+                {
+                    "fact_ids": [str(fact.fact_id)],
+                    "source_evidence_ids": [evidence_ref],
+                },
+                append_list_fields=frozenset({"fact_ids", "source_evidence_ids"}),
+            )
+            for current_ref in (note_ref, evidence_ref, fact_ref):
+                self.registry.mark_read(current_ref)
+            self._record_turn_read((note_ref, evidence_ref, fact_ref))
+            if fact_ref not in refs:
+                refs.append(fact_ref)
+            support.append(
+                {
+                    "evidence_id": evidence_ref,
+                    "note": note_ref,
+                    "title": str(passage.title),
+                    "source": str(passage.source),
+                    "text": str(passage.text),
+                }
+            )
+        return refs, support, contexts
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "registry": self.registry.snapshot(),
+            "accepted_reset": dict(sorted(self._accepted_reset.items())),
+            "accepted_turn": self._accepted_turn,
+        }
+
+    def restore(self, state: Mapping[str, object]) -> None:
+        self.registry = _restore_registry(state)
+        self._accepted_reset = _float_map(state.get("accepted_reset"))
+        self._accepted_turn = _integer(state.get("accepted_turn"))
+        self.engine = self._engine_factory(self.registry)
+        self._tool_engine = None
+        self._turn_base = None
+        self._turn_read_ids = []
+
+    def restore_pre_turn(self) -> None:
+        state = self._persisted_pre_turn
+        if state is not None:
+            self.restore(state)
 
     def save(self) -> None:
-        """Persist registries + accumulator to Index.set_chat_registry."""
-        self.index.set_chat_registry(self.chat_id, self._grounding.export_state())
-
-    def _run(self, text: str, *, now: float, decay_seeds: bool):
-        exact_hits = self._exact_hits(text, now)
-        gliner_spans = self._extract_spans(text)
-        heads = run_head_fusion(
-            self.index,
-            text,
-            exact_hits=exact_hits,
-            query_prompt=config.CHAT_EMBED_QUERY_PROMPT,
-        )
-        return self._grounding.on_pass(
-            text,
-            heads.fused,
-            exact_hits,
-            now,
-            head_hits=heads.head_hits,
-            gliner_spans=gliner_spans,
-            decay_seeds=decay_seeds,
+        self.index.set_chat_registry(
+            self.chat_id,
+            {
+                "version": 1,
+                "current": self.snapshot(),
+                "pre_turn": self._pre_turn or self.snapshot(),
+            },
         )
 
-    def _extract_spans(self, text: str) -> list[tuple[str, float, str]]:
-        if self._span_extractor is None:
-            return []
-        try:
-            return self._span_extractor.extract(text)
-        except Exception:
-            return []
+    def _record_turn_read(self, refs: Sequence[str]) -> None:
+        for ref in refs:
+            value = str(ref)
+            if value and value not in self._turn_read_ids:
+                self._turn_read_ids.append(value)
 
-    def _exact_hits(self, text: str, now: float) -> list[tuple[str, str]]:
-        chunk = Chunk(channel=0, text=text, ts=now, final=True)
-        hits: list[tuple[str, str]] = []
-        seen: set[str] = set()
-        for note_id, alias, _is_title in self._exact.on_chunk(chunk):
-            if note_id in seen:
-                continue
-            seen.add(note_id)
-            hits.append((note_id, alias))
-        return hits
+
+def _rewrite_query(message: str, context: tuple[str, ...]) -> str:
+    if not context or _DEPENDENT.search(message) is None:
+        return message
+    if _PRONOUN.search(message) is None:
+        message_terms = _terms(message) - _QUERY_STOPWORDS
+        context_terms = _terms("\n".join(context)) - _QUERY_STOPWORDS
+        if message_terms and not message_terms.intersection(context_terms):
+            return message
+    if not message.strip():
+        return message
+    return "\n".join((*context, message))
+
+
+def _restore_registry(state: object) -> EvidenceRegistry:
+    if not isinstance(state, Mapping):
+        return EvidenceRegistry()
+    snapshot = state.get("registry")
+    if not isinstance(snapshot, Mapping):
+        return EvidenceRegistry()
+    return EvidenceRegistry.from_snapshot(snapshot)
+
+
+def _float_map(value: object) -> dict[str, float]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(key): float(score) for key, score in value.items()}
+
+
+def _integer(value: object) -> int:
+    return int(value) if isinstance(value, int) and value >= 0 else 0
+
+
+def _optional_float(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _terms(text: str) -> set[str]:
+    return {match.group(0).casefold() for match in _TOKEN.finditer(text)}
+
+
+def _encode_cursor(
+    offset: int,
+    *,
+    sequential: bool,
+    char_offset: int = 0,
+    order: tuple[str, ...] = (),
+) -> str:
+    payload = json.dumps(
+        {
+            "offset": offset,
+            "sequential": sequential,
+            "char_offset": char_offset,
+            "order": list(order),
+        },
+        separators=(",", ":"),
+    )
+    return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str | None) -> tuple[int, bool, int, tuple[str, ...]]:
+    if not cursor:
+        return 0, False, 0, ()
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode())
+        order = payload.get("order", ())
+        if not isinstance(order, list) or not all(isinstance(row, str) for row in order):
+            raise ValueError
+        return (
+            max(0, int(payload["offset"])),
+            bool(payload.get("sequential", True)),
+            max(0, int(payload.get("char_offset", 0))),
+            tuple(order),
+        )
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise ValueError("invalid read cursor") from None
+
+
+def _record_graph_seeds(record: Any, direction: Direction) -> tuple[str, ...]:
+    if record.kind == "passage":
+        return (str(record.payload.get("passage_id") or record.source_id),)
+    if record.kind == "fact":
+        subject = str(record.payload.get("subject_entity_id") or "")
+        object_id = str(record.payload.get("object_entity_id") or "")
+        if direction == "outgoing":
+            return (subject,) if subject else ()
+        if direction == "incoming":
+            return (object_id,) if object_id else ()
+        return tuple(value for value in (subject, object_id) if value)
+    return ()
+
+
+def _directed_target(edge: Any, node: str, direction: Direction) -> str | None:
+    if direction in {"outgoing", "both"} and str(edge.src_id) == node:
+        return str(edge.dst_id)
+    if direction in {"incoming", "both"} and str(edge.dst_id) == node:
+        return str(edge.src_id)
+    return None
+
+
+def _fact_refs(registry: EvidenceRegistry, fact_ids: set[str]) -> list[str]:
+    refs: list[str] = []
+    for ref in registry.refs("retrieved"):
+        record = registry.resolve(ref)
+        if record is None or record.kind != "fact":
+            continue
+        registered = record.payload.get("fact_ids")
+        if isinstance(registered, list) and fact_ids.intersection(str(value) for value in registered):
+            refs.append(ref)
+    return refs
+
+
+def _render_expansion_path(
+    nodes: Sequence[str],
+    kinds: Sequence[str],
+    facts: Sequence[Any],
+    store: Any,
+) -> str:
+    passage_rows = store.passage_contexts(tuple(nodes))
+    passage_labels = {
+        str(row.passage_id): f'"{row.title}" passage' for row in passage_rows
+    }
+    entity_labels: dict[str, str] = {}
+    for fact in facts:
+        entity_labels[str(fact.subject_entity_id)] = str(fact.subject)
+        entity_labels[str(fact.object_entity_id)] = str(fact.object)
+
+    def label(node: str) -> str:
+        return passage_labels.get(node, entity_labels.get(node, node))
+
+    if not nodes:
+        return ""
+    rendered = label(str(nodes[0]))
+    for index, kind in enumerate(kinds):
+        left, right = str(nodes[index]), str(nodes[index + 1])
+        relation = str(kind)
+        matching = next(
+            (
+                fact
+                for fact in facts
+                if {str(fact.subject_entity_id), str(fact.object_entity_id)}
+                == {left, right}
+            ),
+            None,
+        )
+        if matching is not None:
+            relation = str(matching.predicate)
+        elif relation == "contains":
+            relation = "mentions"
+        elif relation == "semantic":
+            relation = "semantically_related"
+        rendered += f" --{relation}--> {label(right)}"
+    return rendered

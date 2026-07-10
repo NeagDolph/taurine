@@ -45,15 +45,33 @@ def test_clean_build_is_atomic_deterministic_and_order_independent(tmp_path: Pat
 
     assert first.graph_hash == second.graph_hash
     assert first.source_snapshot == second.source_snapshot
+    assert first.invariant_counts["notes"] == 2
+    assert first.invariant_counts["passages"] == 2
+    assert first.entity_count == 0
+    assert first.fact_count == 0
+    assert first.extraction_failure_count == 2
+    assert first.failed_notes == (
+        ("a", "extractor unavailable"),
+        ("b", "extractor unavailable"),
+    )
+    assert first.component_count >= 1
+    assert first.dangling_node_count >= 0
+    assert set(first.stage_timings_ms) == set(first.stages)
+    assert all(value >= 0.0 for value in first.stage_timings_ms.values())
+    assert first.calibration_hash == "sha256:initial-conservative-2026-07-09"
+    assert first.release_ready is False
+    assert "uncalibrated_retrieval_head:live:dense" in first.release_blockers
     assert first.stages == (
         "source",
         "passages",
         "embeddings",
         "extraction",
         "entities",
+        "relation_completion",
         "facts",
         "base_graph",
         "projection",
+        "ranks",
         "fact_embeddings",
         "validation",
         "activation",
@@ -146,6 +164,48 @@ def test_build_finalizes_extracted_entities_mentions_and_directed_facts(tmp_path
         assert store.fact_contexts()[0].canonical_text == (
             "Maya — owns_or_has (owns or has) — Launch"
         )
-        assert report.health == "healthy"
+        assert report.health == "degraded"
+    finally:
+        store.close()
+
+
+def test_build_preserves_extracted_observed_and_valid_time(tmp_path: Path) -> None:
+    note = make_note("n1", "Launch", "Maya owns Launch.")
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {
+            "n1": Extraction(
+                mentions=[
+                    ExtractedMention(surface="Maya", etype="person", confidence=.95, char_start=0, char_end=4, extractor="fake", schema_id="s1"),
+                    ExtractedMention(surface="Launch", etype="project", confidence=.9, char_start=10, char_end=16, extractor="fake", schema_id="s1"),
+                ],
+                fact_candidates=[
+                    ExtractedRelation(
+                        head="Maya", predicate="owns_or_has", tail="Launch",
+                        confidence=.9, subject_start=0, subject_end=4,
+                        object_start=10, object_end=16, assertion_start=0,
+                        assertion_end=17, extraction_method="fake", schema_id="s1",
+                        status="historical", observed_at=100.0,
+                        valid_from=50.0, valid_to=90.0,
+                    )
+                ],
+                schema_id="s1",
+            )
+        }
+
+    target = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+        )
+    ).build([note], target, replace_derived=True)
+
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        fact = store.fact_contexts()[0]
+        assert (fact.status, fact.observed_at, fact.valid_from, fact.valid_to) == (
+            "historical", 100.0, 50.0, 90.0
+        )
     finally:
         store.close()

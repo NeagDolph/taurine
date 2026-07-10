@@ -1,77 +1,65 @@
-"""Rolling meeting summarizer — ONE deepseek-v4-flash pass per trigger (spec §5).
+"""Evidence-first rolling live summarization with fail-closed validation."""
 
-Input (ReSum-style bounded state, never the whole transcript):
-previous MeetingSummary JSON (or "none") + transcript delta since the last
-*accepted* pass (≤ SUMMARY_DELTA_MAX_CHARS) + grounding block
-(``[N3] "title" (source, age) — display line`` / ``[F7] (N3↔N9) "fact"``) + open
-actionables with status.
-
-Output: MeetingSummary delta or no_update (a first-class, correct answer).
-
-Validation (§5.4, constrained citation — engineering guarantees):
-- unknown [N#]/[F#] citations stripped; > SUMMARY_INVALID_CITATION_MAX of
-  citations invalid → whole pass rejected (previous summary kept, logged);
-- actionables: quote must fuzzy-match the transcript delta
-  (rapidfuzz ≥ ACTIONABLE_QUOTE_MIN_RATIO), confidence ≥ ACTIONABLE_MIN_CONF,
-  ≤ ACTIONABLE_MAX_PER_PASS accepted, title-embedding cosine ≥
-  ACTIONABLE_DEDUPE_SIM vs an open actionable → update not new;
-- single fallback-model retry (SUMMARY_FALLBACK_MODEL); on double failure the
-  pass is skipped silently — no summary change is acceptable.
-"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
-import re
 import time
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
 import numpy as np
 from rapidfuzz import fuzz
 
-from .. import config
-from ..indexer import store
-from ..indexer.store import Index
-from ..llm import OpenRouterClient
-from ..ports import LLMError
-from ..profile_context import user_profile_block
-from ..schemas import Actionable, MeetingSummary, SummaryHighlight
+from taurine_core import config
+from taurine_core.indexer import store
+from taurine_core.indexer.store import Index
+from taurine_core.llm import OpenRouterClient
+from taurine_core.ports import LLMError
+from taurine_core.profile_context import user_profile_block
+from taurine_core.retrieval.validate import EvidenceValidator, ValidationResult
+from taurine_core.schemas import (
+    Actionable,
+    EvidenceFactPayload,
+    EvidenceNotePayload,
+    EvidencePackPayload,
+    EvidencePassagePayload,
+    EvidencePathPayload,
+    MeetingSummary,
+    RetrievalDecisionPayload,
+    SummaryHighlight,
+)
+
 from .grounding import GroundingUpdate
 
 
-CITATION_RE = re.compile(r"\[(?:N|F)\d+\]")
+SYSTEM_PROMPT = """You are Taurine's rolling live-meeting summarizer.
 
-SYSTEM_PROMPT = """You are the rolling-meeting-summarizer for a live meeting.
+Update the prior summary using only the supplied transcript and knowledge-base
+evidence. Every factual sentence must cite its support. Use [T#] for transcript
+claims and [E#] or [F#] for knowledge-base claims. [N#] is navigation metadata
+and [P#] explains a path; neither supports a factual sentence by itself.
 
-Update the markdown summary of the meeting so far using only the provided
-previous summary, transcript delta, grounding notes, grounded facts, and open
-actionables. Cite every factual claim with [N#] or [F#] ids from the grounding
-block ONLY. Be conservative: create an actionable only when the transcript
-contains an explicit commitment with an assignee, a verb, and a deliverable,
-and include the verbatim quote. Prefer {"no_update": true} when nothing
-material changed. Note ages are supplied; discount stale evidence.
+The optional <user_profile> is uncitable background for resolving names only.
+It is not evidence. Never cite it. Preserve temporal qualifiers and conflicts. If there
+is no material supported update, return {"no_update": true}.
 
-The optional <user_profile> block is background context for interpreting names,
-relationships, interests, and continuity. It is not meeting evidence. Never use
-it by itself to add a meeting claim or actionable.
-
-Return only a JSON object in one of these shapes:
+Return JSON only:
 {"no_update": true}
 or
 {"no_update": false,
- "summary_md": "markdown with [N#]/[F#] citations",
- "highlights": [{"fact_id": "F1", "why": "why this fact matters now"}],
- "actionables": [{"title": "deliverable", "quote": "verbatim transcript quote",
-                  "assignee": "owner", "due": "date or empty",
-                  "grounding": ["N1", "F1"], "why_new": "why this is new",
-                  "confidence": 0.9}]}
+ "summary_md": "markdown with sentence-level citations",
+ "highlights": [{"fact_id": "F1", "why": "why it matters"}],
+ "actionables": [{"title": "deliverable", "quote": "verbatim transcript",
+   "assignee": "owner", "due": "date or empty",
+   "grounding": ["T1", "E1", "F1"], "why_new": "reason",
+   "confidence": 0.9}]}
 """
 
 
 @dataclass
 class SummaryResult:
-    summary: MeetingSummary | None       # None when no_update or rejected
+    summary: MeetingSummary | None
     no_update: bool
     new_actionables: list[Actionable] = field(default_factory=list)
     updated_actionables: list[Actionable] = field(default_factory=list)
@@ -80,36 +68,43 @@ class SummaryResult:
     rejected: bool = False
     reject_reason: str = ""
     citation_stats: dict[str, float] = field(default_factory=dict)
+    validation: ValidationResult | None = None
 
 
 class Summarizer:
-    def __init__(self, llm: OpenRouterClient, index: Index) -> None:
+    def __init__(
+        self,
+        llm: OpenRouterClient,
+        index: Index,
+        validator: EvidenceValidator,
+    ) -> None:
         self.llm = llm
         self.index = index
+        self.validator = validator
 
     async def summarize(
         self,
         state: MeetingSummary | None,
-        transcript_delta: str,
+        transcript_evidence: str,
         update: GroundingUpdate,
         open_actionables: list[Actionable],
     ) -> SummaryResult | None:
-        """One LLM pass; returns None only when both models fail."""
+        """Generate once (plus model fallback) and accept only validated output."""
+
         started = time.monotonic()
-        prompt_delta = _truncate_newest(transcript_delta, config.SUMMARY_DELTA_MAX_CHARS)
-        user_prompt = _build_user_prompt(
+        transcript = transcript_evidence
+        prompt = _build_user_prompt(
             state,
-            prompt_delta,
+            transcript,
             update,
             open_actionables,
             profile_block=user_profile_block(self.index),
         )
-
         try:
             raw = await self.llm.complete_json(
                 config.SUMMARY_MODEL,
                 SYSTEM_PROMPT,
-                user_prompt,
+                prompt,
                 timeout_s=config.SUMMARY_TIMEOUT_S,
             )
             model = config.SUMMARY_MODEL
@@ -118,7 +113,7 @@ class Summarizer:
                 raw = await self.llm.complete_json(
                     config.SUMMARY_FALLBACK_MODEL,
                     SYSTEM_PROMPT,
-                    user_prompt,
+                    prompt,
                     timeout_s=config.SUMMARY_TIMEOUT_S,
                 )
                 model = config.SUMMARY_FALLBACK_MODEL
@@ -134,36 +129,46 @@ class Summarizer:
                 model=model,
             )
 
-        valid_ids = _valid_grounding_ids(update)
-        valid_fact_ids = {fact.fact_id for fact in update.facts}
-        summary_md, citation_stats = _validated_summary_md(
-            str(raw.get("summary_md") or ""),
-            valid_ids,
+        valid_ids = _valid_evidence_ids(transcript, update)
+        actionables = _validated_actionables(
+            raw.get("actionables"), transcript, valid_ids
         )
-        if _citation_rejects(citation_stats):
+        summary_md = str(raw.get("summary_md") or "").strip()
+        validation_text = _validation_text(summary_md, actionables)
+        validation = self.validator.validate(
+            validation_text,
+            mode="live",
+            supplied_ids=valid_ids,
+            available_ids=valid_ids,
+        )
+        citation_stats = {
+            "total": float(len(validation.cited_ids)),
+            "valid": float(len(validation.cited_ids) - len(validation.invalid_citations)),
+            "invalid": float(len(validation.invalid_citations)),
+        }
+        if not validation.accepted:
             return SummaryResult(
                 summary=None,
                 no_update=False,
                 latency_ms=latency_ms,
                 model=model,
                 rejected=True,
-                reject_reason="invalid_citations",
+                reject_reason=validation.degraded_reason or "unsupported_claim",
                 citation_stats=citation_stats,
+                validation=validation,
             )
 
-        candidates = _validated_actionables(raw.get("actionables"), prompt_delta, valid_ids)
         new_actionables, updated_actionables, merged_actionables = _merge_actionables(
-            candidates,
-            open_actionables,
+            actionables, open_actionables
         )
         next_rev = (state.rev if state is not None else 0) + 1
+        evidence = _evidence_payload(update)
         summary = MeetingSummary(
             rev=next_rev,
             summary_md=summary_md,
-            highlights=_validated_highlights(raw.get("highlights"), valid_fact_ids),
+            highlights=_validated_highlights(raw.get("highlights"), valid_ids),
             actionables=merged_actionables,
-            grounding=update.items,
-            facts=update.facts,
+            evidence=evidence,
             updated_at=time.time(),
         )
         return SummaryResult(
@@ -174,195 +179,200 @@ class Summarizer:
             latency_ms=latency_ms,
             model=model,
             citation_stats=citation_stats,
+            validation=validation,
         )
 
 
 def _build_user_prompt(
     state: MeetingSummary | None,
-    transcript_delta: str,
+    transcript: str,
     update: GroundingUpdate,
     open_actionables: list[Actionable],
     *,
     profile_block: str = "",
 ) -> str:
     previous = "none" if state is None else json.dumps(state.model_dump(mode="json"))
-    grounding = _grounding_block(update)
-    open_rows = _open_actionables_block(open_actionables)
-    prompt = (
-        "<previous_summary>\n"
-        f"{previous}\n"
-        "</previous_summary>\n\n"
-        "<transcript_delta>\n"
-        f"{transcript_delta}\n"
-        "</transcript_delta>\n\n"
-        "<grounding>\n"
-        f"{grounding}\n"
-        "</grounding>\n\n"
+    sections = (
+        f"<previous_summary>\n{previous}\n</previous_summary>",
+        f"<transcript_evidence>\n{transcript or 'none'}\n</transcript_evidence>",
+        f"<knowledge_evidence>\n{_grounding_block(update)}\n</knowledge_evidence>",
         "<open_actionables>\n"
-        f"{open_rows}\n"
-        "</open_actionables>"
+        f"{_open_actionables_block(open_actionables)}\n"
+        "</open_actionables>",
     )
-    return f"{profile_block}\n\n{prompt}" if profile_block else prompt
+    body = "\n\n".join(sections)
+    return f"{profile_block}\n\n{body}" if profile_block else body
 
 
 def _grounding_block(update: GroundingUpdate) -> str:
-    note_ids = {item.note_id: item.short_id for item in update.items}
     lines: list[str] = []
-    for item in update.items:
+    for row in update.support_passages:
         lines.append(
-            f'[{item.short_id}] "{item.title}" '
-            f"({item.source}, age {_age_label(item.age_days)}, score {item.score:.2f}) "
-            f"— {item.gist}"
+            f'[{row.evidence_id}] [{_note_ref(row.note_id, update)}] '
+            f'"{row.title}" ({row.source}) — {row.text}'
         )
-    for fact in update.facts:
-        src = note_ids.get(fact.src, fact.src)
-        dst = note_ids.get(fact.dst, fact.dst)
-        lines.append(f'[{fact.fact_id}] ({src}<->{dst}) "{fact.text}"')
+    for row in update.support_facts:
+        validity = f"valid {row.valid_from or 'unknown'}..{row.valid_to or 'open'}"
+        lines.append(
+            f"[{row.fact_ref}] {row.subject} --{row.predicate}--> {row.object} "
+            f"({row.status}; {validity}; sources {','.join(row.source_evidence_ids)})"
+        )
+    for row in update.support_paths:
+        lines.append(f"[{row.path_id}] {row.rendered}")
+    for row in update.support_notes:
+        lines.append(f'[{row.note_ref}] note "{row.title}" ({row.source})')
     return "\n".join(lines) if lines else "none"
 
 
-def _open_actionables_block(open_actionables: list[Actionable]) -> str:
-    if not open_actionables:
+def _note_ref(note_id: str, update: GroundingUpdate) -> str:
+    return next(
+        (row.note_ref for row in update.support_notes if row.note_id == note_id),
+        "N?",
+    )
+
+
+def _open_actionables_block(rows: list[Actionable]) -> str:
+    if not rows:
         return "none"
-    rows = [
-        {
-            "id": item.id,
-            "title": item.title,
-            "status": item.status,
-            "assignee": item.assignee,
-            "due": item.due,
-        }
-        for item in open_actionables
-    ]
-    return json.dumps(rows, ensure_ascii=False)
+    return json.dumps(
+        [
+            {
+                "id": row.id,
+                "title": row.title,
+                "status": row.status,
+                "assignee": row.assignee,
+                "due": row.due,
+            }
+            for row in rows
+        ],
+        ensure_ascii=False,
+    )
 
 
-def _age_label(age_days: float) -> str:
-    if age_days < 1.0:
-        return "today"
-    if age_days < 60.0:
-        return f"{int(round(age_days))}d"
-    return f"{int(round(age_days / 30.0))}mo"
+def _valid_evidence_ids(transcript: str, update: GroundingUpdate) -> set[str]:
+    refs = {
+        *(row.evidence_id for row in update.support_passages),
+        *(row.fact_ref for row in update.support_facts),
+        *(row.path_id for row in update.support_paths),
+        *(row.note_ref for row in update.support_notes),
+    }
+    refs.update(
+        token[1:-1]
+        for token in transcript.split()
+        if len(token) > 3 and token.startswith("[T") and token.endswith("]")
+    )
+    return refs
 
 
-def _truncate_newest(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[-max_chars:]
+def _validation_text(summary_md: str, actionables: list[Actionable]) -> str:
+    rows = [summary_md]
+    rows.extend(
+        f"{row.title.rstrip('.')} . " + "".join(f"[{ref}]" for ref in row.grounding)
+        for row in actionables
+    )
+    return "\n".join(row for row in rows if row.strip())
 
 
-def _valid_grounding_ids(update: GroundingUpdate) -> set[str]:
-    return {item.short_id for item in update.items} | {fact.fact_id for fact in update.facts}
+def _evidence_payload(update: GroundingUpdate) -> EvidencePackPayload:
+    event_decision = RetrievalDecisionPayload(
+        accepted=update.decision.accepted,
+        confidence=update.decision.confidence,
+        reason=update.decision.reason,
+        accepted_heads=list(update.decision.accepted_heads),
+        rejected_heads=list(update.decision.rejected_heads),
+    )
+    return EvidencePackPayload(
+        decision=event_decision,
+        passages=[
+            EvidencePassagePayload(**_listified(vars(row)))
+            for row in update.support_passages
+        ],
+        facts=[
+            EvidenceFactPayload(**_listified(vars(row)))
+            for row in update.support_facts
+        ],
+        paths=[
+            EvidencePathPayload(**_listified(vars(row)))
+            for row in update.support_paths
+        ],
+        notes=[
+            EvidenceNotePayload(**_listified(vars(row)))
+            for row in update.support_notes
+        ],
+    )
 
 
-def _validated_summary_md(
-    summary_md: str,
-    valid_ids: set[str],
-) -> tuple[str, dict[str, float]]:
-    total = 0
-    valid = 0
-
-    def replace(match: re.Match[str]) -> str:
-        nonlocal total, valid
-        total += 1
-        citation_id = match.group(0)[1:-1]
-        if citation_id in valid_ids:
-            valid += 1
-            return match.group(0)
-        return ""
-
-    stripped = CITATION_RE.sub(replace, summary_md)
-    invalid = total - valid
-    ratio = 1.0 if total == 0 else valid / total
-    return stripped, {
-        "total": float(total),
-        "valid": float(valid),
-        "invalid": float(invalid),
-        "valid_ratio": ratio,
+def _listified(values: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: list(value) if isinstance(value, tuple) else value
+        for key, value in values.items()
     }
 
 
-def _citation_rejects(stats: dict[str, float]) -> bool:
-    total = stats.get("total", 0.0)
-    if total <= 0.0:
-        return False
-    return stats.get("valid_ratio", 1.0) < (1.0 - config.SUMMARY_INVALID_CITATION_MAX)
-
-
-def _validated_highlights(rows: Any, valid_fact_ids: set[str]) -> list[SummaryHighlight]:
+def _validated_highlights(rows: Any, valid_ids: set[str]) -> list[SummaryHighlight]:
     if not isinstance(rows, list):
         return []
-    highlights: list[SummaryHighlight] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        fact_id = str(row.get("fact_id") or "")
-        if fact_id not in valid_fact_ids:
-            continue
-        highlights.append(SummaryHighlight(fact_id=fact_id, why=str(row.get("why") or "")))
-    return highlights
+    return [
+        SummaryHighlight(
+            fact_id=str(row.get("fact_id")), why=str(row.get("why") or "")
+        )
+        for row in rows
+        if isinstance(row, dict) and str(row.get("fact_id")) in valid_ids
+        and str(row.get("fact_id")).startswith("F")
+    ]
 
 
 def _validated_actionables(
     rows: Any,
-    transcript_delta: str,
+    transcript: str,
     valid_ids: set[str],
 ) -> list[Actionable]:
     if not isinstance(rows, list):
         return []
-    transcript_norm = _normalize_text(transcript_delta)
+    transcript_norm = _normalize_text(transcript)
     accepted: list[Actionable] = []
     for row in rows:
-        actionable = _validated_actionable(row, transcript_norm, valid_ids)
-        if actionable is not None:
-            accepted.append(actionable)
-    accepted.sort(key=lambda item: item.confidence, reverse=True)
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "").strip()
+        quote = str(row.get("quote") or "").strip()
+        confidence = _float(row.get("confidence"))
+        grounding = [
+            str(ref)
+            for ref in row.get("grounding") or []
+            if str(ref) in valid_ids and str(ref)[:1] in {"T", "E", "F"}
+        ]
+        if (
+            not title
+            or not quote
+            or not grounding
+            or confidence < config.ACTIONABLE_MIN_CONF
+            or _quote_ratio(quote, transcript_norm) < config.ACTIONABLE_QUOTE_MIN_RATIO
+        ):
+            continue
+        accepted.append(
+            Actionable(
+                id="",
+                title=title,
+                quote=quote,
+                assignee=str(row.get("assignee") or ""),
+                due=str(row.get("due") or ""),
+                grounding=grounding,
+                why_new=str(row.get("why_new") or ""),
+                confidence=confidence,
+            )
+        )
+    accepted.sort(key=lambda row: row.confidence, reverse=True)
     return accepted[: config.ACTIONABLE_MAX_PER_PASS]
 
 
-def _validated_actionable(
-    row: Any,
-    transcript_norm: str,
-    valid_ids: set[str],
-) -> Actionable | None:
-    if not isinstance(row, dict):
-        return None
-
-    title = str(row.get("title") or "").strip()
-    quote = str(row.get("quote") or "").strip()
-    confidence = _float(row.get("confidence"))
-    if not title or not quote:
-        return None
-    if confidence < config.ACTIONABLE_MIN_CONF:
-        return None
-    if _quote_ratio(quote, transcript_norm) < config.ACTIONABLE_QUOTE_MIN_RATIO:
-        return None
-
-    grounding = [
-        str(item)
-        for item in row.get("grounding") or []
-        if isinstance(item, str) and item in valid_ids
-    ]
-    if not grounding:
-        return None
-
-    return Actionable(
-        id="",
-        title=title,
-        quote=quote,
-        assignee=str(row.get("assignee") or ""),
-        due=str(row.get("due") or ""),
-        grounding=grounding,
-        why_new=str(row.get("why_new") or ""),
-        confidence=confidence,
-    )
-
-
-def _quote_ratio(quote: str, transcript_norm: str) -> float:
+def _quote_ratio(quote: str, transcript: str) -> float:
     quote_norm = _normalize_text(quote)
-    if not quote_norm or not transcript_norm:
-        return 0.0
-    return fuzz.partial_ratio(quote_norm, transcript_norm) / 100.0
+    return (
+        fuzz.partial_ratio(quote_norm, transcript) / 100.0
+        if quote_norm and transcript
+        else 0.0
+    )
 
 
 def _normalize_text(text: str) -> str:
@@ -380,56 +390,40 @@ def _merge_actionables(
     candidates: list[Actionable],
     open_actionables: list[Actionable],
 ) -> tuple[list[Actionable], list[Actionable], list[Actionable]]:
-    new_actionables: list[Actionable] = []
-    updated_by_id: dict[str, Actionable] = {}
-
+    new_rows: list[Actionable] = []
+    updated: dict[str, Actionable] = {}
     for candidate in candidates:
         existing = _matching_open_actionable(candidate.title, open_actionables)
-        if existing is not None:
-            if existing.id in updated_by_id:
-                continue
-            updated_by_id[existing.id] = candidate.model_copy(
+        if existing is None:
+            new_rows.append(candidate.model_copy(update={"id": _new_actionable_id()}))
+        elif existing.id not in updated:
+            updated[existing.id] = candidate.model_copy(
                 update={"id": existing.id, "status": existing.status}
             )
-            continue
-
-        new_actionables.append(candidate.model_copy(update={"id": _new_actionable_id()}))
-
-    merged: list[Actionable] = []
-    for item in open_actionables:
-        merged.append(updated_by_id.get(item.id, item))
-    merged.extend(new_actionables)
-    return new_actionables, list(updated_by_id.values()), merged
+    merged = [updated.get(row.id, row) for row in open_actionables]
+    merged.extend(new_rows)
+    return new_rows, list(updated.values()), merged
 
 
 def _matching_open_actionable(
-    title: str,
-    open_actionables: list[Actionable],
+    title: str, rows: list[Actionable]
 ) -> Actionable | None:
-    if not open_actionables:
+    if not rows:
         return None
-
-    embeddings = store.embed_texts([title] + [item.title for item in open_actionables])
-    if len(embeddings) != len(open_actionables) + 1:
+    embeddings = store.embed_texts([title, *(row.title for row in rows)])
+    if len(embeddings) != len(rows) + 1:
         return None
-    query = embeddings[0]
-    best: tuple[float, Actionable] | None = None
-    for vector, item in zip(embeddings[1:], open_actionables, strict=True):
-        cosine = _cosine(query, vector)
-        if best is None or cosine > best[0]:
-            best = (cosine, item)
-
-    if best is None or best[0] < config.ACTIONABLE_DEDUPE_SIM:
-        return None
-    return best[1]
+    best = max(
+        ((_cosine(embeddings[0], vector), row) for vector, row in zip(embeddings[1:], rows, strict=True)),
+        key=lambda item: item[0],
+        default=None,
+    )
+    return best[1] if best is not None and best[0] >= config.ACTIONABLE_DEDUPE_SIM else None
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    a_norm = float(np.linalg.norm(a))
-    b_norm = float(np.linalg.norm(b))
-    if a_norm <= 0.0 or b_norm <= 0.0:
-        return 0.0
-    return float(np.dot(a, b) / (a_norm * b_norm))
+    denominator = float(np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.dot(a, b) / denominator) if denominator > 0.0 else 0.0
 
 
 def _new_actionable_id() -> str:

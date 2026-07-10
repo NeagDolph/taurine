@@ -1,67 +1,46 @@
-import { useEffect, useMemo } from 'react'
-import type { TriggerAction, TriggerEvent, TriggerMatch } from '../lib/sidecar'
+import { useEffect } from 'react'
+import type { LiveGroundingEvent } from '../lib/sidecar'
 
 interface TriggerInspectorProps {
-  trigger: TriggerEvent | null
+  grounding: LiveGroundingEvent | null
   onClose: () => void
   onOpenNote: (noteId: string) => void
 }
 
-const actionLabels: Record<TriggerAction, string> = {
-  grounded: 'Grounded',
-  none: 'No action'
-}
-
-const exactActionContext: Record<TriggerAction, string> = {
-  grounded: 'entered the grounding set',
-  none: 'no action'
-}
-
 export function TriggerInspector({
-  trigger,
+  grounding,
   onClose,
   onOpenNote
 }: TriggerInspectorProps): React.JSX.Element | null {
   useEffect(() => {
-    if (!trigger) {
-      return undefined
+    if (!grounding) return undefined
+    const close = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') onClose()
     }
+    window.addEventListener('keydown', close)
+    return () => window.removeEventListener('keydown', close)
+  }, [grounding, onClose])
 
-    const handleKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') {
-        onClose()
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [onClose, trigger])
-
-  const matches = useMemo(() => (trigger ? orderedMatches(trigger) : []), [trigger])
-  const titleByNoteId = useMemo(() => {
-    const titles = new Map<string, string>()
-    trigger?.matches.forEach((match) => titles.set(match.note_id, match.title))
-    return titles
-  }, [trigger])
-
-  if (!trigger) {
-    return null
-  }
-
-  const isSearch = trigger.kind === 'search'
-  const columnCount = isSearch ? 4 : 3
+  if (!grounding) return null
+  const trace = grounding.trace
+  const headHits = arrayRows(trace.head_hits)
+  const rejected = arrayRows(trace.rejected_hits)
+  const triples = arrayRows(trace.triple_decisions)
+  const paths = arrayRows(trace.paths)
+  const rerank = arrayRows(trace.rerank)
+  const latency = objectRows(trace.latency_ms)
 
   return (
-    <aside className="trigger-inspector" role="dialog" aria-label="Trigger inspector">
+    <aside className="trigger-inspector" role="dialog" aria-label="Retrieval inspector">
       <div className="trigger-inspector-header">
         <div>
-          <span className="section-label">Trigger</span>
-          <h2>{trigger.kind === 'exact' ? 'Exact match' : 'Search window'}</h2>
+          <span className="section-label">Retrieval trace</span>
+          <h2>{grounding.decision.accepted ? 'Evidence accepted' : 'Retrieval abstained'}</h2>
         </div>
         <button
           className="icon-button"
           type="button"
-          aria-label="Close trigger inspector"
+          aria-label="Close retrieval inspector"
           onClick={onClose}
         >
           &times;
@@ -69,129 +48,102 @@ export function TriggerInspector({
       </div>
 
       <div className="trigger-inspector-badges">
-        <span className={`trigger-kind-badge trigger-kind-${trigger.kind}`}>{trigger.kind}</span>
-        <span className={`trigger-action-badge trigger-action-${trigger.action}`}>
-          {actionLabels[trigger.action]}
+        <span
+          className={`trigger-action-badge trigger-action-${grounding.decision.accepted ? 'grounded' : 'none'}`}
+        >
+          {grounding.decision.reason}
         </span>
+        <span className="meta-chip confidence">
+          {Math.round(grounding.decision.confidence * 100)}%
+        </span>
+        {trace.debug &&
+        typeof trace.debug === 'object' &&
+        (trace.debug as Record<string, unknown>).rerank_degraded ? (
+          <span className="meta-chip">degraded</span>
+        ) : null}
       </div>
 
-      <div className="trigger-heard">
-        <span>heard</span>
-        <p>{trigger.span}</p>
-      </div>
+      <TraceSection title="Accepted heads" rows={headHits} />
+      <TraceSection title="Rejected heads" rows={rejected} />
+      <TraceSection title="Triple recognition" rows={triples} />
+      <TraceSection title="Explanatory paths" rows={paths} />
+      <TraceSection
+        title="Reranking and MMR"
+        rows={[...rerank, ...arrayRows(trace.mmr_exclusions)]}
+      />
+      <TraceSection title="Stage latency" rows={latency} />
 
       <div className="trigger-match-table-wrap">
         <table className="trigger-match-table">
           <thead>
             <tr>
-              <th scope="col">Title</th>
-              {isSearch ? <th scope="col">Rank</th> : null}
-              <th scope="col">Score</th>
-              <th scope="col">
-                <span className="sr-only">Actions</span>
-              </th>
+              <th>Evidence</th>
+              <th>Source note</th>
+              <th />
             </tr>
           </thead>
           <tbody>
-            {matches.length === 0 ? (
-              <tr>
-                <td className="trigger-empty-cell" colSpan={columnCount}>
-                  No matches
+            {grounding.passages.map((passage) => (
+              <tr key={passage.evidence_id}>
+                <td>{passage.evidence_id}</td>
+                <td>{passage.title}</td>
+                <td>
+                  <button
+                    className="secondary-button compact"
+                    type="button"
+                    onClick={() => onOpenNote(passage.note_id)}
+                  >
+                    Open in Notes
+                  </button>
                 </td>
               </tr>
-            ) : (
-              matches.map((match) => {
-                const viaTitle = match.via_note_id
-                  ? (titleByNoteId.get(match.via_note_id) ?? match.via_note_id)
-                  : ''
-
-                return (
-                  <tr
-                    className={
-                      isExpandedSearchMatch(trigger, match) ? 'trigger-match-expanded' : ''
-                    }
-                    key={matchKey(match)}
-                  >
-                    <td>
-                      <div className="trigger-match-title">{match.title}</div>
-                      {match.via_note_id ? (
-                        <div className="trigger-match-via">
-                          via {viaTitle} (hop {match.hop ?? 1})
-                        </div>
-                      ) : null}
-                      {trigger.kind === 'exact' ? (
-                        <div className="trigger-match-context">
-                          {exactActionContext[trigger.action]}
-                        </div>
-                      ) : null}
-                    </td>
-                    {isSearch ? (
-                      <td>{typeof match.rank === 'number' ? `#${match.rank}` : 'linked'}</td>
-                    ) : null}
-                    <td>{formatScore(match.score)}</td>
-                    <td>
-                      <button
-                        className="secondary-button compact"
-                        type="button"
-                        onClick={() => onOpenNote(match.note_id)}
-                      >
-                        Open in Notes
-                      </button>
-                    </td>
-                  </tr>
-                )
-              })
-            )}
+            ))}
           </tbody>
         </table>
       </div>
 
       <footer className="trigger-inspector-footer">
-        <code>{trigger.trigger_id}</code>
-        <code>seqs {trigger.seqs.join(', ')}</code>
+        <code>{String(trace.active_build_id ?? '')}</code>
+        <code>{String(trace.calibration_hash ?? '')}</code>
       </footer>
     </aside>
   )
 }
 
-function orderedMatches(trigger: TriggerEvent): TriggerMatch[] {
-  if (trigger.kind !== 'search') {
-    return trigger.matches
-  }
-
-  return [...trigger.matches].sort((left, right) => {
-    const leftHasRank = typeof left.rank === 'number'
-    const rightHasRank = typeof right.rank === 'number'
-
-    if (leftHasRank && rightHasRank) {
-      return (left.rank ?? 0) - (right.rank ?? 0)
-    }
-
-    if (leftHasRank !== rightHasRank) {
-      return leftHasRank ? -1 : 1
-    }
-
-    return right.score - left.score || left.title.localeCompare(right.title)
-  })
+function TraceSection({
+  title,
+  rows
+}: {
+  title: string
+  rows: string[]
+}): React.JSX.Element | null {
+  if (rows.length === 0) return null
+  return (
+    <section className="retrieval-trace-section">
+      <h3>{title}</h3>
+      <ul>
+        {rows.slice(0, 20).map((row, index) => (
+          <li key={`${title}-${index}`}>
+            <code>{row}</code>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
 }
 
-function isExpandedSearchMatch(trigger: TriggerEvent, match: TriggerMatch): boolean {
-  return trigger.kind === 'search' && typeof match.rank !== 'number'
+function arrayRows(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((row) => compact(row)) : []
 }
 
-function matchKey(match: TriggerMatch): string {
-  return [
-    match.note_id,
-    match.rank ?? 'linked',
-    match.via_note_id ?? 'direct',
-    match.hop ?? 0
-  ].join('-')
+function objectRows(value: unknown): string[] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+  return Object.entries(value as Record<string, unknown>).map(
+    ([key, row]) => `${key}: ${compact(row)}`
+  )
 }
 
-function formatScore(score: number): string {
-  if (score >= 10) {
-    return score.toFixed(0)
-  }
-
-  return score.toFixed(2)
+function compact(value: unknown): string {
+  const rendered = typeof value === 'string' ? value : JSON.stringify(value)
+  return rendered.length > 240 ? `${rendered.slice(0, 237)}…` : rendered
 }

@@ -1,22 +1,23 @@
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
-import numpy as np
 import pytest
 
 from taurine_core import config
 from taurine_core.live.grounding import GroundingUpdate
 from taurine_core.live.summarizer import Summarizer
 from taurine_core.ports import LLMError
-from taurine_core.schemas import (
-    Actionable,
-    GroundedFact,
-    GroundingItem,
-    MeetingSummary,
+from taurine_core.retrieval.registry import EvidenceRegistry
+from taurine_core.retrieval.types import (
+    EvidenceFact,
+    EvidenceNote,
+    EvidencePassage,
+    EvidencePath,
+    RetrievalDecision,
 )
+from taurine_core.retrieval.validate import EvidenceValidator
 
 from tests.fakes import FakeIndex
 
@@ -48,282 +49,184 @@ class FakeLLM:
         return response
 
 
-async def test_live_summary_injects_bounded_profile_as_background_not_evidence(
+class Entails:
+    def score(self, premise: str, hypothesis: str) -> float:
+        del premise, hypothesis
+        return 0.99
+
+
+class Contradicts:
+    def score(self, premise: str, hypothesis: str) -> float:
+        del premise, hypothesis
+        return 0.01
+
+
+async def test_prompt_supplies_exact_t_e_f_p_n_and_uncitable_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(config, "PROFILE_CONTEXT_MAX_CHARS", 24)
     index = FakeIndex()
     index.user_card = lambda: "Neil builds Taurine and studies knowledge graphs."  # type: ignore[attr-defined,method-assign]
     llm = FakeLLM([{"no_update": True}])
+    registry, update = _evidence()
 
-    await Summarizer(llm, index).summarize(None, "minor chatter", _grounding(), [])  # type: ignore[arg-type]
+    result = await Summarizer(
+        llm,
+        index,  # type: ignore[arg-type]
+        EvidenceValidator(registry, Entails(), entailment_floor=0.8),
+    ).summarize(None, '[T1] [channel 0] "Maya owns launch."', update, [])
 
-    assert "<user_profile>\nNeil builds Taurine and\n</user_profile>" in llm.calls[0].user
-    assert "background context" in llm.calls[0].system
-    assert "not meeting evidence" in llm.calls[0].system
-
-
-async def test_no_update_passthrough_records_model_and_latency() -> None:
-    llm = FakeLLM([{"no_update": True}])
-    summarizer = Summarizer(llm, FakeIndex())  # type: ignore[arg-type]
-
-    result = await summarizer.summarize(None, "minor chatter", _grounding(), [])
-
-    assert result is not None
-    assert result.summary is None
-    assert result.no_update is True
-    assert result.model == config.SUMMARY_MODEL
-    assert result.latency_ms >= 0.0
-    assert [(call.model, call.timeout_s) for call in llm.calls] == [
-        (config.SUMMARY_MODEL, config.SUMMARY_TIMEOUT_S)
-    ]
+    assert result is not None and result.no_update
+    prompt = llm.calls[0].user
+    assert "<user_profile>\nNeil builds Taurine and\n</user_profile>" in prompt
+    assert "[T1]" in prompt
+    for ref in ("E1", "F1", "P1", "N1"):
+        assert f"[{ref}]" in prompt
+    assert "not evidence" in llm.calls[0].system
 
 
-async def test_unknown_citations_are_stripped_without_rejecting_when_under_limit() -> None:
+async def test_accepts_sentence_level_validated_summary_and_evidence_snapshot() -> None:
+    registry, update = _evidence()
     llm = FakeLLM(
         [
             {
-                "summary_md": "Valid [N1] fact [F1] other [N2] bad [N99]",
-                "highlights": [{"fact_id": "F1", "why": "relevant"}],
+                "summary_md": "Maya owns the launch. [F1]",
+                "highlights": [{"fact_id": "F1", "why": "ownership"}],
                 "actionables": [],
             }
         ]
     )
-    summarizer = Summarizer(llm, FakeIndex())  # type: ignore[arg-type]
 
-    result = await summarizer.summarize(None, "delta", _grounding(), [])
+    result = await _summarizer(llm, registry, Entails()).summarize(
+        None, '[T1] [channel 0] "Maya owns the launch."', update, []
+    )
 
-    assert result is not None
-    assert result.no_update is False
+    assert result is not None and not result.rejected
     assert result.summary is not None
-    assert "[N99]" not in result.summary.summary_md
-    assert result.summary.summary_md.count("[") == 3
-    assert result.summary.rev == 1
-    assert result.summary.highlights[0].fact_id == "F1"
+    assert result.summary.summary_md == "Maya owns the launch. [F1]"
+    assert result.summary.evidence is not None
+    assert result.summary.evidence.passages[0].evidence_id == "E1"
+    assert registry.refs("cited") == ("F1",)
 
 
-async def test_invalid_citation_ratio_rejects_pass_distinct_from_no_update() -> None:
-    llm = FakeLLM(
-        [
-            {
-                "summary_md": "Bad [N999] worse [F999] good [N1]",
-                "highlights": [{"fact_id": "F404", "why": "unknown"}],
-                "actionables": [],
-            }
-        ]
+async def test_abstained_pass_cannot_reuse_accumulated_session_evidence() -> None:
+    registry, accepted = _evidence()
+    abstained = replace(
+        accepted,
+        decision=RetrievalDecision(False, 0.1, "below_live_floor"),
+        support_passages=(),
+        support_facts=(),
+        support_paths=(),
+        support_notes=(),
     )
-    summarizer = Summarizer(llm, FakeIndex())  # type: ignore[arg-type]
+    llm = FakeLLM([{"summary_md": "Maya owns the launch. [F1]", "actionables": []}])
 
-    result = await summarizer.summarize(None, "delta", _grounding(), [])
-
-    assert result is not None
-    assert result.summary is None
-    assert result.no_update is False
-    assert result.rejected is True
-    assert result.reject_reason == "invalid_citations"
-
-
-async def test_actionables_apply_quote_confidence_grounding_gates_and_cap() -> None:
-    transcript = (
-        "I'll send Ashish the integration timeline before Friday. "
-        "Maya will draft the launch checklist today. "
-        "Jordan will update the rollout tracker tomorrow. "
-        "Taylor will write the QA plan by Monday."
+    result = await _summarizer(llm, registry, Entails()).summarize(
+        None, '[T1] [channel 0] "A different topic."', abstained, []
     )
-    llm = FakeLLM(
-        [
-            {
-                "summary_md": "Timeline is now owned [N1][F1]",
-                "highlights": [],
-                "actionables": [
-                    _actionable_payload(
-                        title="Send Ashish the integration timeline",
-                        quote="I'll send Ashish the integration timeline before Friday",
-                        confidence=0.95,
-                        grounding=["N1", "BAD", "F1"],
-                    ),
-                    _actionable_payload(
-                        title="Draft launch checklist",
-                        quote="Maya will draft the launch checklist today",
-                        confidence=0.91,
-                        grounding=["N2"],
-                    ),
-                    _actionable_payload(
-                        title="Update rollout tracker",
-                        quote="Jordan will update the rollout tracker tomorrow",
-                        confidence=0.89,
-                        grounding=["N1"],
-                    ),
-                    _actionable_payload(
-                        title="Fabricated commitment",
-                        quote="This quote was never said in the transcript",
-                        confidence=0.99,
-                        grounding=["N1"],
-                    ),
-                    _actionable_payload(
-                        title="Low confidence",
-                        quote="Taylor will write the QA plan by Monday",
-                        confidence=config.ACTIONABLE_MIN_CONF - 0.01,
-                        grounding=["N1"],
-                    ),
-                    _actionable_payload(
-                        title="Unknown grounding",
-                        quote="Taylor will write the QA plan by Monday",
-                        confidence=0.92,
-                        grounding=["NOPE"],
-                    ),
-                ],
-            }
-        ]
-    )
-    summarizer = Summarizer(llm, FakeIndex())  # type: ignore[arg-type]
 
-    result = await summarizer.summarize(None, transcript, _grounding(), [])
-
-    assert result is not None
-    assert result.summary is not None
-    assert [item.title for item in result.new_actionables] == [
-        "Send Ashish the integration timeline",
-        "Draft launch checklist",
-    ]
-    assert result.new_actionables[0].grounding == ["N1", "F1"]
-    assert all(re.fullmatch(r"act-[0-9a-f]{8}", item.id) for item in result.new_actionables)
-    assert [item.id for item in result.summary.actionables] == [
-        item.id for item in result.new_actionables
-    ]
+    assert result is not None and result.rejected
+    assert result.reject_reason == "fact_provenance"
+    assert "[F1]" not in llm.calls[0].user
 
 
-async def test_dedupe_updates_existing_actionable_and_open_items_persist(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("summary", "scorer", "reason"),
+    [
+        ("Maya owns the launch.", Entails(), "citation_coverage"),
+        ("Maya owns the launch. [E99]", Entails(), "invalid_citation"),
+        ("Maya owns the launch. [E1]", Contradicts(), "entailment_below_floor"),
+        ("Maya owns the launch. [E1]", None, "nli_unavailable_live_fail_closed"),
+    ],
+)
+async def test_rejects_unsupported_unknown_contradicted_and_unvalidated_claims(
+    summary: str,
+    scorer: object | None,
+    reason: str,
 ) -> None:
-    def fake_embed_texts(texts: list[str]) -> np.ndarray:
-        vectors = [
-            [1.0, 0.0] if "timeline" in text.lower() else [0.0, 1.0]
-            for text in texts
-        ]
-        return np.array(vectors, dtype=np.float32)
+    registry, update = _evidence()
+    llm = FakeLLM([{"summary_md": summary, "actionables": []}])
 
-    monkeypatch.setattr("taurine_core.indexer.store.embed_texts", fake_embed_texts)
-    open_items = [
-        Actionable(
-            id="act-existing",
-            title="Send Ashish the integration timeline",
-            quote="old quote",
-            status="open",
-        ),
-        Actionable(
-            id="act-other",
-            title="Confirm launch room",
-            quote="old room quote",
-            status="confirmed",
-        ),
-    ]
-    llm = FakeLLM(
-        [
-            {
-                "summary_md": "Timeline is updated [N1]",
-                "highlights": [],
-                "actionables": [
-                    _actionable_payload(
-                        title="Send Ashish the integration timeline",
-                        quote="I'll send Ashish the integration timeline before Friday",
-                        confidence=0.95,
-                        grounding=["N1"],
-                    )
-                ],
-            }
-        ]
-    )
-    summarizer = Summarizer(llm, FakeIndex())  # type: ignore[arg-type]
-
-    result = await summarizer.summarize(
-        MeetingSummary(rev=4, summary_md="old"),
-        "I'll send Ashish the integration timeline before Friday",
-        _grounding(),
-        open_items,
+    result = await _summarizer(llm, registry, scorer).summarize(
+        None, '[T1] [channel 0] "Maya owns the launch."', update, []
     )
 
-    assert result is not None
-    assert result.summary is not None
-    assert result.summary.rev == 5
-    assert result.new_actionables == []
-    assert [item.id for item in result.updated_actionables] == ["act-existing"]
-    assert [(item.id, item.status) for item in result.summary.actionables] == [
-        ("act-existing", "open"),
-        ("act-other", "confirmed"),
-    ]
-    assert result.summary.actionables[0].quote == (
-        "I'll send Ashish the integration timeline before Friday"
+    assert result is not None and result.rejected
+    assert result.summary is None
+    assert result.reject_reason == reason
+    assert summary not in (result.validation.accepted_output if result.validation else "")
+
+
+async def test_fallback_model_is_single_retry_and_double_failure_returns_none() -> None:
+    registry, update = _evidence()
+    fallback = FakeLLM([LLMError("primary"), {"no_update": True}])
+    result = await _summarizer(fallback, registry, Entails()).summarize(
+        None, '[T1] [channel 0] "hello"', update, []
+    )
+    assert result is not None and result.model == config.SUMMARY_FALLBACK_MODEL
+
+    failed = FakeLLM([LLMError("primary"), LLMError("fallback")])
+    assert (
+        await _summarizer(failed, registry, Entails()).summarize(
+            None, '[T1] [channel 0] "hello"', update, []
+        )
+        is None
     )
 
 
-async def test_fallback_model_is_used_after_primary_llm_error() -> None:
-    llm = FakeLLM(
-        [
-            LLMError("primary unavailable"),
-            {"summary_md": "Fallback summary [N1]", "highlights": [], "actionables": []},
-        ]
+def _summarizer(llm: FakeLLM, registry: EvidenceRegistry, scorer: object | None) -> Summarizer:
+    return Summarizer(
+        llm,  # type: ignore[arg-type]
+        FakeIndex(),  # type: ignore[arg-type]
+        EvidenceValidator(registry, scorer, entailment_floor=0.8),  # type: ignore[arg-type]
     )
-    summarizer = Summarizer(llm, FakeIndex())  # type: ignore[arg-type]
-
-    result = await summarizer.summarize(None, "delta", _grounding(), [])
-
-    assert result is not None
-    assert result.summary is not None
-    assert result.model == config.SUMMARY_FALLBACK_MODEL
-    assert [call.model for call in llm.calls] == [
-        config.SUMMARY_MODEL,
-        config.SUMMARY_FALLBACK_MODEL,
-    ]
 
 
-async def test_both_models_fail_returns_none() -> None:
-    llm = FakeLLM([LLMError("primary"), LLMError("fallback")])
-    summarizer = Summarizer(llm, FakeIndex())  # type: ignore[arg-type]
-
-    assert await summarizer.summarize(None, "delta", _grounding(), []) is None
-
-
-def _grounding() -> GroundingUpdate:
-    return GroundingUpdate(
-        revision=3,
-        items=[
-            GroundingItem(
-                note_id="n1",
-                short_id="N1",
-                title="Integration timeline",
-                gist="Timeline details",
-                source="apple_notes",
-                age_days=12.0,
-                score=0.92,
+def _evidence() -> tuple[EvidenceRegistry, GroundingUpdate]:
+    registry = EvidenceRegistry()
+    registry.register("transcript", "chunk-1", {"text": "Maya owns the launch."})
+    registry.mark_read("T1")
+    registry.register("note", "n1", {"title": "Launch"})
+    registry.mark_read("N1")
+    registry.register(
+        "passage", "p1", {"text": "Maya owns the launch.", "note_id": "n1"}
+    )
+    registry.mark_read("E1")
+    registry.register(
+        "fact",
+        "fact-1",
+        {"source_evidence_ids": ["E1"], "status": "active"},
+    )
+    registry.mark_read("F1")
+    registry.register("path", "path-1", {"rendered": "E1 -> F1"})
+    registry.mark_read("P1")
+    passage = EvidencePassage(
+        "E1", "p1", "n1", "Launch", "obsidian", "Maya owns the launch.",
+        0, 21, 1.0, 2.0, 0.9, 0.95,
+    )
+    return registry, GroundingUpdate(
+        decision=RetrievalDecision(True, 0.95, "accepted", ("dense", "triple")),
+        passages=(passage,),
+        facts=(
+            EvidenceFact(
+                "F1", ("fact-1",), "Maya", "owns", "launch", "forward",
+                "active", 2.0, None, None, 0.95, ("E1",),
             ),
-            GroundingItem(
-                note_id="n2",
-                short_id="N2",
-                title="Launch checklist",
-                gist="Checklist details",
-                source="obsidian",
-                age_days=90.0,
-                score=0.81,
+        ),
+        paths=(EvidencePath("P1", ("E1", "F1"), ("supports",), ("fact-1",), 0.9, "E1 -> F1"),),
+        notes=(EvidenceNote("N1", "n1", "Launch", "obsidian", 2.0, 0.95, ("E1",)),),
+        display_passages=(passage,),
+        display_notes=(EvidenceNote("N1", "n1", "Launch", "obsidian", 2.0, 0.95, ("E1",)),),
+        no_new_evidence=False,
+        new_support_ids=("E1", "F1"),
+        revision=1,
+        support_passages=(passage,),
+        support_facts=(
+            EvidenceFact(
+                "F1", ("fact-1",), "Maya", "owns", "launch", "forward",
+                "active", 2.0, None, None, 0.95, ("E1",),
             ),
-        ],
-        facts=[GroundedFact(fact_id="F1", src="n1", dst="n2", text="Timeline feeds launch")],
+        ),
+        support_paths=(EvidencePath("P1", ("E1", "F1"), ("supports",), ("fact-1",), 0.9, "E1 -> F1"),),
+        support_notes=(EvidenceNote("N1", "n1", "Launch", "obsidian", 2.0, 0.95, ("E1",)),),
     )
-
-
-def _actionable_payload(
-    *,
-    title: str,
-    quote: str,
-    confidence: float,
-    grounding: list[str],
-) -> dict[str, Any]:
-    return {
-        "title": title,
-        "quote": quote,
-        "assignee": "me",
-        "due": "Friday",
-        "grounding": grounding,
-        "why_new": "explicit commitment",
-        "confidence": confidence,
-    }

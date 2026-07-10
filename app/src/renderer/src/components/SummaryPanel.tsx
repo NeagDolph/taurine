@@ -7,7 +7,7 @@ interface SummaryPanelProps {
   onOpenNote: (noteId: string) => void
 }
 
-const CITATION_RE = /\[((?:N|F)\d+)\]/g
+const CITATION_RE = /\[((?:N|E|F|P|T)\d+)\]/g
 
 // [N3]/[F7] tokens become markdown links with a citation: scheme so the
 // standard link renderer can turn them into chips without a custom parser.
@@ -21,11 +21,23 @@ export function SummaryPanel({ summary, onOpenNote }: SummaryPanelProps): React.
     if (!summary) {
       return map
     }
-    for (const item of summary.grounding) {
-      map.set(item.short_id, { title: item.title, noteId: item.note_id })
+    for (const item of summary.evidence?.notes ?? []) {
+      map.set(item.note_ref, { title: item.title, noteId: item.note_id })
     }
-    for (const fact of summary.facts) {
-      map.set(fact.fact_id, { title: fact.text, noteId: fact.src })
+    for (const passage of summary.evidence?.passages ?? []) {
+      map.set(passage.evidence_id, { title: passage.text, noteId: passage.note_id })
+    }
+    for (const fact of summary.evidence?.facts ?? []) {
+      const source = summary.evidence?.passages.find((row) =>
+        fact.source_evidence_ids.includes(row.evidence_id)
+      )
+      map.set(fact.fact_ref, {
+        title: `${fact.subject} ${fact.predicate} ${fact.object}`,
+        noteId: source?.note_id ?? ''
+      })
+    }
+    for (const path of summary.evidence?.paths ?? []) {
+      map.set(path.path_id, { title: path.rendered, noteId: '' })
     }
     return map
   }, [summary])
@@ -51,13 +63,13 @@ export function SummaryPanel({ summary, onOpenNote }: SummaryPanelProps): React.
                 if (href?.startsWith('citation:')) {
                   const id = href.slice('citation:'.length)
                   const target = byShortId.get(id)
-                  const kind = id.startsWith('F') ? 'fact' : 'note'
+                  const kind = id.startsWith('F') ? 'fact' : id.startsWith('E') ? 'passage' : 'note'
                   return (
                     <button
                       className={`citation-chip citation-${kind}`}
                       type="button"
                       title={target?.title ?? id}
-                      onClick={() => target && onOpenNote(target.noteId)}
+                      onClick={() => target?.noteId && onOpenNote(target.noteId)}
                     >
                       {id}
                     </button>
@@ -79,11 +91,13 @@ export function SummaryPanel({ summary, onOpenNote }: SummaryPanelProps): React.
       {summary && summary.highlights.length > 0 ? (
         <ul className="summary-highlights">
           {summary.highlights.map((highlight) => {
-            const fact = summary.facts.find((item) => item.fact_id === highlight.fact_id)
+            const fact = summary.evidence?.facts.find((item) => item.fact_ref === highlight.fact_id)
             return (
               <li key={highlight.fact_id}>
                 <span className="citation-chip citation-fact">{highlight.fact_id}</span>
-                <span className="highlight-fact">{fact?.text ?? ''}</span>
+                <span className="highlight-fact">
+                  {fact ? `${fact.subject} ${fact.predicate} ${fact.object}` : ''}
+                </span>
                 <span className="highlight-why">{highlight.why}</span>
               </li>
             )

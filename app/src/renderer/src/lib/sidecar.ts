@@ -9,7 +9,7 @@ export type TriggerAction = 'grounded' | 'none'
 export type TriggerKind = 'exact' | 'search'
 export type ActionableStatus = 'open' | 'confirmed' | 'dismissed'
 export type ActionableOp = 'new' | 'update' | 'dismiss'
-export type ReenrichPhase = 'idle' | 'notes' | 'finalizing'
+export type ReenrichPhase = 'idle' | 'notes' | 'finalizing' | 'clean_build'
 export type ConnectorKind = 'local' | 'oauth'
 export type ProfileGenerationPhase =
   | 'idle'
@@ -67,6 +67,82 @@ export interface AmbientEvent {
   items: AmbientItem[]
 }
 
+export interface RetrievalDecision {
+  accepted: boolean
+  confidence: number
+  reason: string
+  accepted_heads: string[]
+  rejected_heads: string[]
+}
+
+export interface EvidencePassage {
+  evidence_id: string
+  passage_id: string
+  note_id: string
+  title: string
+  source: string
+  text: string
+  char_start: number
+  char_end: number
+  created: number
+  modified: number
+  retrieval_score: number
+  rerank_score: number
+  path_ids: string[]
+}
+
+export interface EvidenceFact {
+  fact_ref: string
+  fact_ids: string[]
+  subject: string
+  predicate: string
+  object: string
+  direction: string
+  status: string
+  observed_at: number
+  valid_from: number | null
+  valid_to: number | null
+  confidence: number
+  source_evidence_ids: string[]
+}
+
+export interface EvidencePath {
+  path_id: string
+  node_ids: string[]
+  edge_kinds: string[]
+  fact_ids: string[]
+  weight: number
+  rendered: string
+}
+
+export interface EvidenceNote {
+  note_ref: string
+  note_id: string
+  title: string
+  source: string
+  modified: number
+  score: number
+  evidence_ids: string[]
+}
+
+export interface EvidencePack {
+  decision: RetrievalDecision
+  passages: EvidencePassage[]
+  facts: EvidenceFact[]
+  paths: EvidencePath[]
+  notes: EvidenceNote[]
+}
+
+export interface LiveGroundingEvent extends EvidencePack {
+  type: 'grounding'
+  display_passages: EvidencePassage[]
+  display_notes: EvidenceNote[]
+  revision: number
+  no_new_evidence: boolean
+  new_support_ids: string[]
+  trace: Record<string, unknown>
+}
+
 export interface GroundingItem {
   note_id: string
   short_id: string
@@ -110,6 +186,7 @@ export interface SummaryEvent {
   actionables: Actionable[]
   grounding: GroundingItem[]
   facts: GroundedFact[]
+  evidence: EvidencePack | null
   updated_at: number
 }
 
@@ -225,7 +302,7 @@ export interface StatusEvent {
 
 export type SidecarEvent =
   | TranscriptEvent
-  | AmbientEvent
+  | LiveGroundingEvent
   | SummaryEvent
   | ActionableEvent
   | RetrievalEvent
@@ -263,7 +340,7 @@ export class SidecarClient {
   private readonly restBaseUrl: string
 
   private readonly transcriptCallbacks = new Set<Callback<TranscriptEvent>>()
-  private readonly ambientCallbacks = new Set<Callback<AmbientEvent>>()
+  private readonly groundingCallbacks = new Set<Callback<LiveGroundingEvent>>()
   private readonly summaryCallbacks = new Set<Callback<SummaryEvent>>()
   private readonly actionableCallbacks = new Set<Callback<ActionableEvent>>()
   private readonly retrievalCallbacks = new Set<Callback<RetrievalEvent>>()
@@ -349,8 +426,8 @@ export class SidecarClient {
     return this.addCallback(this.transcriptCallbacks, callback)
   }
 
-  onAmbient(callback: Callback<AmbientEvent>): Unsubscribe {
-    return this.addCallback(this.ambientCallbacks, callback)
+  onGrounding(callback: Callback<LiveGroundingEvent>): Unsubscribe {
+    return this.addCallback(this.groundingCallbacks, callback)
   }
 
   onSummary(callback: Callback<SummaryEvent>): Unsubscribe {
@@ -460,8 +537,8 @@ export class SidecarClient {
       case 'transcript':
         this.emit(this.transcriptCallbacks, event)
         break
-      case 'ambient':
-        this.emit(this.ambientCallbacks, event)
+      case 'grounding':
+        this.emit(this.groundingCallbacks, event)
         break
       case 'summary':
         this.emit(this.summaryCallbacks, event)
@@ -666,8 +743,8 @@ function parseSidecarEvent(raw: string): SidecarEvent | null {
   switch (record.type) {
     case 'transcript':
       return parseTranscript(record)
-    case 'ambient':
-      return parseAmbient(record)
+    case 'grounding':
+      return parseLiveGrounding(record)
     case 'summary':
       return parseSummary(record)
     case 'actionable':
@@ -704,41 +781,153 @@ function parseTranscript(record: Record<string, unknown>): TranscriptEvent | nul
   }
 }
 
-function parseAmbient(record: Record<string, unknown>): AmbientEvent | null {
-  if (!Array.isArray(record.items)) {
-    return null
-  }
-
-  const items = record.items.map(parseAmbientItem)
-  if (items.some((item) => item === null)) {
-    return null
-  }
-
-  return { type: 'ambient', items: items as AmbientItem[] }
-}
-
-function parseAmbientItem(value: unknown): AmbientItem | null {
-  const record = asRecord(value)
+function parseLiveGrounding(record: Record<string, unknown>): LiveGroundingEvent | null {
+  const pack = parseEvidencePack(record)
+  const displayPassages = parseEvidenceArray(record.display_passages, parseEvidencePassage)
+  const displayNotes = parseEvidenceArray(record.display_notes, parseEvidenceNote)
   if (
-    !record ||
-    typeof record.note_id !== 'string' ||
-    typeof record.title !== 'string' ||
-    typeof record.gist !== 'string' ||
-    typeof record.score !== 'number'
+    !pack ||
+    !displayPassages ||
+    !displayNotes ||
+    typeof record.revision !== 'number' ||
+    typeof record.no_new_evidence !== 'boolean'
   ) {
     return null
   }
-
   return {
-    note_id: record.note_id,
-    title: record.title,
-    gist: record.gist,
-    score: record.score,
-    short_id: typeof record.short_id === 'string' ? record.short_id : '',
-    source: typeof record.source === 'string' ? record.source : 'apple_notes',
-    age_days: typeof record.age_days === 'number' ? record.age_days : 0,
-    why: parseGroundingWhy(record.why)
+    type: 'grounding',
+    ...pack,
+    display_passages: displayPassages,
+    display_notes: displayNotes,
+    revision: record.revision,
+    no_new_evidence: record.no_new_evidence,
+    new_support_ids: stringArray(record.new_support_ids),
+    trace: asRecord(record.trace) ?? {}
   }
+}
+
+export function parseEvidencePack(value: unknown): EvidencePack | null {
+  const record = asRecord(value)
+  if (!record) return null
+  const decision = parseRetrievalDecision(record.decision)
+  const passages = parseEvidenceArray(record.passages, parseEvidencePassage)
+  const facts = parseEvidenceArray(record.facts, parseEvidenceFact)
+  const paths = parseEvidenceArray(record.paths, parseEvidencePath)
+  const notes = parseEvidenceArray(record.notes, parseEvidenceNote)
+  return decision && passages && facts && paths && notes
+    ? { decision, passages, facts, paths, notes }
+    : null
+}
+
+function parseRetrievalDecision(value: unknown): RetrievalDecision | null {
+  const record = asRecord(value)
+  if (
+    !record ||
+    typeof record.accepted !== 'boolean' ||
+    typeof record.confidence !== 'number' ||
+    typeof record.reason !== 'string'
+  )
+    return null
+  return {
+    accepted: record.accepted,
+    confidence: record.confidence,
+    reason: record.reason,
+    accepted_heads: stringArray(record.accepted_heads),
+    rejected_heads: stringArray(record.rejected_heads)
+  }
+}
+
+function parseEvidencePassage(value: unknown): EvidencePassage | null {
+  const record = asRecord(value)
+  if (
+    !record ||
+    !hasStrings(record, ['evidence_id', 'passage_id', 'note_id', 'title', 'source', 'text'])
+  )
+    return null
+  return {
+    evidence_id: record.evidence_id as string,
+    passage_id: record.passage_id as string,
+    note_id: record.note_id as string,
+    title: record.title as string,
+    source: record.source as string,
+    text: record.text as string,
+    char_start: numberOr(record.char_start),
+    char_end: numberOr(record.char_end),
+    created: numberOr(record.created),
+    modified: numberOr(record.modified),
+    retrieval_score: numberOr(record.retrieval_score),
+    rerank_score: numberOr(record.rerank_score),
+    path_ids: stringArray(record.path_ids)
+  }
+}
+
+function parseEvidenceFact(value: unknown): EvidenceFact | null {
+  const record = asRecord(value)
+  if (
+    !record ||
+    !hasStrings(record, ['fact_ref', 'subject', 'predicate', 'object', 'direction', 'status'])
+  )
+    return null
+  return {
+    fact_ref: record.fact_ref as string,
+    fact_ids: stringArray(record.fact_ids),
+    subject: record.subject as string,
+    predicate: record.predicate as string,
+    object: record.object as string,
+    direction: record.direction as string,
+    status: record.status as string,
+    observed_at: numberOr(record.observed_at),
+    valid_from: typeof record.valid_from === 'number' ? record.valid_from : null,
+    valid_to: typeof record.valid_to === 'number' ? record.valid_to : null,
+    confidence: numberOr(record.confidence),
+    source_evidence_ids: stringArray(record.source_evidence_ids)
+  }
+}
+
+function parseEvidencePath(value: unknown): EvidencePath | null {
+  const record = asRecord(value)
+  if (!record || typeof record.path_id !== 'string' || typeof record.rendered !== 'string')
+    return null
+  return {
+    path_id: record.path_id,
+    node_ids: stringArray(record.node_ids),
+    edge_kinds: stringArray(record.edge_kinds),
+    fact_ids: stringArray(record.fact_ids),
+    weight: numberOr(record.weight),
+    rendered: record.rendered
+  }
+}
+
+function parseEvidenceNote(value: unknown): EvidenceNote | null {
+  const record = asRecord(value)
+  if (!record || !hasStrings(record, ['note_ref', 'note_id', 'title', 'source'])) return null
+  return {
+    note_ref: record.note_ref as string,
+    note_id: record.note_id as string,
+    title: record.title as string,
+    source: record.source as string,
+    modified: numberOr(record.modified),
+    score: numberOr(record.score),
+    evidence_ids: stringArray(record.evidence_ids)
+  }
+}
+
+function parseEvidenceArray<T>(value: unknown, parse: (row: unknown) => T | null): T[] | null {
+  if (!Array.isArray(value)) return null
+  const rows = value.map(parse)
+  return rows.some((row) => row === null) ? null : (rows as T[])
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((row): row is string => typeof row === 'string') : []
+}
+
+function numberOr(value: unknown, fallback = 0): number {
+  return typeof value === 'number' ? value : fallback
+}
+
+function hasStrings(record: Record<string, unknown>, keys: string[]): boolean {
+  return keys.every((key) => typeof record[key] === 'string')
 }
 
 function parseGroundingWhy(value: unknown): GroundingWhy | null {
@@ -775,6 +964,13 @@ function parseSummary(record: Record<string, unknown>): SummaryEvent | null {
   const facts = Array.isArray(record.facts)
     ? record.facts.map(parseGroundedFact).filter(isNotNull)
     : []
+  const evidence =
+    record.evidence === null || record.evidence === undefined
+      ? null
+      : parseEvidencePack(record.evidence)
+  if (record.evidence !== null && record.evidence !== undefined && !evidence) {
+    return null
+  }
 
   return {
     type: 'summary',
@@ -784,6 +980,7 @@ function parseSummary(record: Record<string, unknown>): SummaryEvent | null {
     actionables,
     grounding,
     facts,
+    evidence,
     updated_at: typeof record.updated_at === 'number' ? record.updated_at : 0
   }
 }
@@ -1173,7 +1370,7 @@ function isActionableOp(value: unknown): value is ActionableOp {
 }
 
 function isReenrichPhase(value: unknown): value is ReenrichPhase {
-  return value === 'idle' || value === 'notes' || value === 'finalizing'
+  return value === 'idle' || value === 'notes' || value === 'finalizing' || value === 'clean_build'
 }
 
 function isProfileGenerationPhase(value: unknown): value is ProfileGenerationPhase {

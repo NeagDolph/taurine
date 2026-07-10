@@ -1,11 +1,13 @@
 """Pydantic models: ws protocol, REST payloads, and cross-unit data shapes."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Optional
+from dataclasses import asdict
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
+    from taurine_core.live.grounding import GroundingUpdate
     from taurine_core.retrieval.types import EvidencePack
 
 
@@ -55,7 +57,10 @@ class ExtractedRelation(BaseModel):
     assertion_end: int
     extraction_method: str
     schema_id: str
-    status: Literal["active", "candidate"]
+    status: Literal["active", "historical", "candidate"]
+    observed_at: Optional[float] = None
+    valid_from: Optional[float] = None
+    valid_to: Optional[float] = None
 
 
 # ── index shapes ───────────────────────────────────────────────────────
@@ -102,6 +107,7 @@ class GraphEdge(BaseModel):
     shared: list[str] = []         # canonical topics/entities behind the edge
     fact: str = ""                 # LLM-written one-sentence relationship (adjudicated edges)
     fact_provenance: str = ""      # "llm" or "gliner" when fact is populated
+    fact_ids: list[str] = []        # directed fact provenance in the fresh projection
 
 
 class GraphNode(BaseModel):
@@ -305,6 +311,7 @@ class MeetingSummary(BaseModel):
     actionables: list[Actionable] = []
     grounding: list[GroundingItem] = []
     facts: list[GroundedFact] = []
+    evidence: Optional[EvidencePackPayload] = None
     updated_at: float = 0.0
 
 
@@ -334,6 +341,70 @@ class AmbientEvent(BaseModel):
     items: list[AmbientItem]
 
 
+class LiveGroundingEvent(BaseModel):
+    """Evidence-first live retrieval state exposed to the renderer."""
+
+    type: Literal["grounding"] = "grounding"
+    decision: RetrievalDecisionPayload
+    passages: list[EvidencePassagePayload] = []
+    facts: list[EvidenceFactPayload] = []
+    paths: list[EvidencePathPayload] = []
+    notes: list[EvidenceNotePayload] = []
+    display_passages: list[EvidencePassagePayload] = []
+    display_notes: list[EvidenceNotePayload] = []
+    revision: int = 0
+    no_new_evidence: bool = True
+    new_support_ids: list[str] = []
+    trace: dict[str, Any] = {}
+
+    @classmethod
+    def from_domain(cls, update: "GroundingUpdate") -> "LiveGroundingEvent":
+        def passage(row: object) -> EvidencePassagePayload:
+            values = dict(vars(row))
+            values["path_ids"] = list(values.get("path_ids", ()))
+            return EvidencePassagePayload(**values)
+
+        def fact(row: object) -> EvidenceFactPayload:
+            values = dict(vars(row))
+            values["fact_ids"] = list(values.get("fact_ids", ()))
+            values["source_evidence_ids"] = list(
+                values.get("source_evidence_ids", ())
+            )
+            return EvidenceFactPayload(**values)
+
+        def path(row: object) -> EvidencePathPayload:
+            values = dict(vars(row))
+            values["node_ids"] = list(values.get("node_ids", ()))
+            values["edge_kinds"] = list(values.get("edge_kinds", ()))
+            values["fact_ids"] = list(values.get("fact_ids", ()))
+            return EvidencePathPayload(**values)
+
+        def note(row: object) -> EvidenceNotePayload:
+            values = dict(vars(row))
+            values["evidence_ids"] = list(values.get("evidence_ids", ()))
+            return EvidenceNotePayload(**values)
+
+        return cls(
+            decision=RetrievalDecisionPayload(
+                accepted=update.decision.accepted,
+                confidence=update.decision.confidence,
+                reason=update.decision.reason,
+                accepted_heads=list(update.decision.accepted_heads),
+                rejected_heads=list(update.decision.rejected_heads),
+            ),
+            passages=[passage(row) for row in update.passages],
+            facts=[fact(row) for row in update.facts],
+            paths=[path(row) for row in update.paths],
+            notes=[note(row) for row in update.notes],
+            display_passages=[passage(row) for row in update.display_passages],
+            display_notes=[note(row) for row in update.display_notes],
+            revision=update.revision,
+            no_new_evidence=update.no_new_evidence,
+            new_support_ids=list(update.new_support_ids),
+            trace=asdict(update.trace) if update.trace is not None else {},
+        )
+
+
 class SummaryEvent(BaseModel):
     type: Literal["summary"] = "summary"
     rev: int
@@ -342,6 +413,7 @@ class SummaryEvent(BaseModel):
     actionables: list[Actionable] = []
     grounding: list[GroundingItem] = []
     facts: list[GroundedFact] = []
+    evidence: Optional[EvidencePackPayload] = None
     updated_at: float = 0.0
 
     @classmethod
@@ -353,6 +425,7 @@ class SummaryEvent(BaseModel):
             actionables=summary.actionables,
             grounding=summary.grounding,
             facts=summary.facts,
+            evidence=summary.evidence,
             updated_at=summary.updated_at,
         )
 
@@ -438,7 +511,7 @@ class NotePreview(BaseModel):
 
 class ReenrichStatus(BaseModel):
     running: bool
-    phase: Literal["idle", "notes", "finalizing"] = "idle"
+    phase: Literal["idle", "notes", "finalizing", "clean_build"] = "idle"
     done: int = 0
     total: int = 0
 
@@ -510,6 +583,10 @@ class ChatActivityStep(BaseModel):
     label: str                     # e.g. 'Searched "shopify timeline" → 8 notes'
     status: Literal["running", "done"] = "done"
     note_ids: list[str] = []
+    tool_name: str = ""
+    arguments: dict[str, Any] = {}
+    evidence_ids: list[str] = []
+    latency_ms: float = 0.0
 
 
 class ChatUsage(BaseModel):
@@ -526,8 +603,15 @@ class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str                   # markdown (assistant) / raw text (user)
     thinking: str = ""             # full reasoning transcript (assistant)
-    sources: list[GroundingItem] = []
-    facts: list[GroundedFact] = []
+    evidence: Optional[EvidencePackPayload] = None
+    retrieved_ids: list[str] = []
+    consulted_ids: list[str] = []
+    cited_ids: list[str] = []
+    original_query: str = ""
+    rewritten_query: str = ""
+    retrieval_decision: str = ""
+    retrieval_confidence: float = 0.0
+    active_build_id: str = ""
     activity: list[ChatActivityStep] = []
     usage: ChatUsage = ChatUsage()
     cancelled: bool = False
@@ -547,8 +631,9 @@ class ChatRetrievalEvent(BaseModel):
     type: Literal["chat_retrieval"] = "chat_retrieval"
     chat_id: str
     message_id: int
-    sources: list[GroundingItem] = []
-    facts: list[GroundedFact] = []
+    evidence: EvidencePackPayload
+    retrieved_ids: list[str] = []
+    consulted_ids: list[str] = []
 
 
 class ChatThinkingEvent(BaseModel):

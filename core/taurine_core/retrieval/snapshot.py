@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType
@@ -29,6 +29,8 @@ class IndexSnapshot:
     base_graph: BaseGraph
     projection: tuple[Any, ...]
     quality_ranks: Mapping[str, float]
+    model_manifest: Mapping[str, str] = field(default_factory=dict)
+    config_manifest: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         passage_matrix = np.asarray(self.passage_matrix, dtype=np.float32).copy()
@@ -58,6 +60,8 @@ class IndexSnapshot:
         object.__setattr__(self, "base_graph", graph)
         object.__setattr__(self, "alias_index", MappingProxyType(dict(self.alias_index)))
         object.__setattr__(self, "quality_ranks", MappingProxyType(dict(self.quality_ranks)))
+        object.__setattr__(self, "model_manifest", MappingProxyType(dict(self.model_manifest)))
+        object.__setattr__(self, "config_manifest", MappingProxyType(dict(self.config_manifest)))
 
     def open_knowledge_store(self) -> "KnowledgeStore":
         """Open this generation's immutable DB for lexical/public row reads."""
@@ -132,6 +136,8 @@ def load_index_snapshot(
             base_graph=store.base_graph(build.build_id),
             projection=store.projection(build.build_id),
             quality_ranks=store.quality_ranks(build.build_id),
+            model_manifest=build.model_manifest,
+            config_manifest=build.config_manifest,
         )
     finally:
         store.close()

@@ -40,6 +40,22 @@ def test_rejects_unknown_and_unsupplied_citations_without_stripping_claim() -> N
     assert unsupplied.repair_required
 
 
+def test_explicit_turn_availability_excludes_evidence_read_on_prior_turns() -> None:
+    registry = EvidenceRegistry()
+    ref = registry.register("passage", "p1", {"text": "Launch is July 18."})
+    registry.mark_read(ref)
+    validator = EvidenceValidator(registry, FakeNLI({}), entailment_floor=0.8)
+
+    result = validator.validate(
+        "Launch is July 18. [E1]",
+        mode="chat",
+        available_ids=(),
+    )
+
+    assert not result.accepted
+    assert result.invalid_citations == ("E1",)
+
+
 @pytest.mark.parametrize("citation", ["", " [N1]", " [P1]"])
 def test_factual_sentence_requires_e_f_or_t_coverage(citation: str) -> None:
     registry = EvidenceRegistry()
@@ -109,6 +125,25 @@ def test_fact_requires_supplied_passage_provenance_and_uses_it_for_nli() -> None
     ).validate(f"{claim} [F1]", mode="chat")
     assert not invalid.accepted
     assert "F1" in invalid.invalid_citations
+
+
+def test_fact_support_group_needs_at_least_one_supplied_source_not_every_source() -> None:
+    evidence = "Maya owns Launch."
+    registry = _read_passage(evidence)
+    registry.register("passage", "p2", {"text": "A duplicate unsupplied assertion."})
+    registry.register(
+        "fact",
+        "owns-launch",
+        {"source_evidence_ids": ["E1", "E2"], "status": "active"},
+    )
+
+    result = EvidenceValidator(
+        registry,
+        FakeNLI({(evidence, "Maya owns Launch."): 0.95}),
+        entailment_floor=0.8,
+    ).validate("Maya owns Launch. [F1]", mode="chat")
+
+    assert result.accepted
 
 
 def test_current_claim_cannot_rely_only_on_superseded_fact() -> None:

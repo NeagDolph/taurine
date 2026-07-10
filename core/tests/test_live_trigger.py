@@ -6,7 +6,10 @@ import pytest
 from taurine_core import config
 from taurine_core.live.grounding import GroundingUpdate
 from taurine_core.live.trigger import SummaryTrigger
-from taurine_core.schemas import GroundingItem
+from taurine_core.retrieval.types import (
+    EvidencePassage,
+    RetrievalDecision,
+)
 
 from tests.fakes import FakeClock
 
@@ -127,16 +130,32 @@ def test_rejected_pass_records_min_interval_without_accepting_or_backoff(clock: 
 
 
 def _update(note_ids: list[str], *, revision: int) -> GroundingUpdate:
+    passages = tuple(
+        EvidencePassage(
+            f"E{sum(ord(char) for char in note_id)}",
+            f"p-{note_id}",
+            note_id,
+            f"Note {note_id}",
+            "test",
+            f"Evidence {note_id}",
+            0,
+            10,
+            1.0,
+            1.0,
+            float(len(note_ids) - i),
+            float(len(note_ids) - i),
+        )
+        for i, note_id in enumerate(note_ids, start=1)
+    )
     return GroundingUpdate(
-        items=[
-            GroundingItem(
-                note_id=note_id,
-                short_id=f"N{i}",
-                title=f"Note {note_id}",
-                gist=f"Gist {note_id}",
-                score=float(len(note_ids) - i),
-            )
-            for i, note_id in enumerate(note_ids, start=1)
-        ],
+        decision=RetrievalDecision(True, 0.9, "accepted"),
+        passages=passages,
+        facts=(),
+        paths=(),
+        notes=(),
+        display_passages=passages,
+        display_notes=(),
+        no_new_evidence=False,
+        new_support_ids=tuple(row.evidence_id for row in passages),
         revision=revision,
     )

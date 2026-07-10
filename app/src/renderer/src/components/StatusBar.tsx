@@ -27,14 +27,27 @@ export function StatusBar({
   return (
     <footer className="status-bar">
       <div className="status-group">
-        <StatusPill label="Sidecar" state={connection} tone={connection === 'connected' ? 'good' : 'warn'} />
-        <StatusPill label="ASR" state={asr} tone={asr === 'connected' ? 'good' : asr === 'error' ? 'bad' : 'warn'} />
+        <StatusPill
+          label="Sidecar"
+          state={connection}
+          tone={connection === 'connected' ? 'good' : 'warn'}
+        />
+        <StatusPill
+          label="ASR"
+          state={asr}
+          tone={asr === 'connected' ? 'good' : asr === 'error' ? 'bad' : 'warn'}
+        />
         <span className="status-metric">{index.notes} notes</span>
         <span className="status-metric">Last sync {formatLastSync(index.last_sync)}</span>
       </div>
       <div className="status-group status-group-right">
         {detailText ? <span className="status-detail">{detailText}</span> : null}
-        <button className="secondary-button compact" type="button" onClick={onSync} disabled={controlsDisabled}>
+        <button
+          className="secondary-button compact"
+          type="button"
+          onClick={onSync}
+          disabled={controlsDisabled}
+        >
           {isSyncing ? 'Syncing' : 'Sync now'}
         </button>
       </div>
@@ -78,7 +91,7 @@ function reenrichDetail(index: IndexStatus): string {
   }
 
   if (status.total > 0) {
-    return `Re-enriching ${status.done}/${status.total} (${status.phase})`
+    return `Rebuilding knowledge ${status.done}/${status.total} (${status.phase})`
   }
-  return `Re-enriching (${status.phase})`
+  return `Rebuilding knowledge (${status.phase})`
 }

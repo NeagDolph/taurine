@@ -110,6 +110,7 @@ class RetrievalTrace:
     triple_decisions: tuple[Mapping[str, object], ...] = ()
     teleport: Mapping[str, float] = field(default_factory=dict)
     ppr: Mapping[str, object] = field(default_factory=dict)
+    paths: tuple[Mapping[str, object], ...] = ()
     rerank: tuple[Mapping[str, object], ...] = ()
     mmr_exclusions: tuple[Mapping[str, object], ...] = ()
     prior_contributions: Mapping[str, float] = field(default_factory=dict)

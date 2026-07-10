@@ -12,8 +12,18 @@ from taurine_core.chat import engine as engine_module
 from taurine_core.chat.engine import ChatEngine
 from taurine_core.llm import StreamEvent
 from taurine_core.ports import LLMError
-from taurine_core.schemas import ChatActivityStep, GroundedFact, GroundingItem
-from tests.fakes import note as fake_note
+from taurine_core.schemas import ChatActivityStep, ChatMessage
+from taurine_core.retrieval.types import (
+    EvidenceFact,
+    EvidenceNote,
+    EvidencePack,
+    EvidencePassage,
+    RetrievalDecision,
+    RetrievalQuery,
+    RetrievalTrace,
+)
+from taurine_core.retrieval.registry import EvidenceRegistry
+from taurine_core.retrieval.validate import EvidenceValidator
 
 
 class MemoryLogger:
@@ -33,19 +43,35 @@ class FakeRetriever:
         self.saved = 0
         FakeRetriever.instances.append(self)
 
-    def context_pack(self, message: str, *, now: float) -> tuple[list[GroundingItem], list[GroundedFact]]:
-        del message, now
-        return (
-            [
-                GroundingItem(
-                    note_id="n1",
-                    short_id="N1",
-                    title="Roadmap",
-                    gist="Roadmap gist",
-                    score=0.9,
-                )
-            ],
-            [GroundedFact(fact_id="F1", src="n1", dst="n2", text="Roadmap relates to Beta.")],
+    def context_pack(
+        self,
+        message: str,
+        *,
+        now: float,
+        conversation_context: tuple[str, ...] = (),
+        rewritten_query: str | None = None,
+    ) -> EvidencePack:
+        del conversation_context, rewritten_query
+        return EvidencePack(
+            decision=RetrievalDecision(True, .9, "accepted", ("dense",)),
+            query=RetrievalQuery(message, "chat", now),
+            passages=(EvidencePassage(
+                "E1", "p1", "n1", "Roadmap", "obsidian", "Roadmap gist", 0, 12,
+                now, now, .8, .9,
+            ),),
+            facts=(EvidenceFact(
+                "F1", ("f1",), "Roadmap", "relates_to", "Beta", "forward",
+                "active", now, None, None, .9, ("E1",),
+            ),),
+            paths=(),
+            notes=(EvidenceNote("N1", "n1", "Roadmap", "obsidian", now, .9, ("E1",)),),
+            trace=RetrievalTrace(
+                original_query=message,
+                rewritten_query=message,
+                selected_ids=("N1", "E1", "F1"),
+                read_ids=("N1", "E1", "F1"),
+                active_build_id="build-test",
+            ),
         )
 
     def resolve(self, ref: str) -> str | None:
@@ -53,6 +79,53 @@ class FakeRetriever:
 
     def save(self) -> None:
         self.saved += 1
+
+
+class EvidenceRetriever(FakeRetriever):
+    def __init__(self, index: Any, chat_id: str) -> None:
+        super().__init__(index, chat_id)
+        self.registry = EvidenceRegistry()
+        self.registry.register("note", "n1", {"note_id": "n1"})
+        self.registry.register(
+            "passage",
+            "p1",
+            {"passage_id": "p1", "note_id": "n1", "text": "The launch is July 18.", "char_start": 0, "char_end": 22},
+        )
+        for ref in ("N1", "E1"):
+            self.registry.mark_read(ref)
+
+    def context_pack(
+        self,
+        message: str,
+        *,
+        now: float,
+        conversation_context: tuple[str, ...] = (),
+        rewritten_query: str | None = None,
+    ) -> EvidencePack:
+        del conversation_context, rewritten_query
+        return EvidencePack(
+            decision=RetrievalDecision(True, .9, "accepted", ("dense",)),
+            query=RetrievalQuery(message, "chat", now),
+            passages=(EvidencePassage(
+                "E1", "p1", "n1", "Roadmap", "obsidian", "The launch is July 18.", 0, 22,
+                now, now, .8, .9,
+            ),),
+            facts=(), paths=(),
+            notes=(EvidenceNote("N1", "n1", "Roadmap", "obsidian", now, .9, ("E1",)),),
+            trace=RetrievalTrace(
+                original_query=message, rewritten_query=message,
+                selected_ids=("N1", "E1"), read_ids=("N1", "E1"), active_build_id="build-test",
+            ),
+        )
+
+
+class FixedNLI:
+    def __init__(self, score: float) -> None:
+        self.value = score
+
+    def score(self, premise: str, hypothesis: str) -> float:
+        del premise, hypothesis
+        return self.value
 
 
 @dataclass
@@ -180,8 +253,8 @@ async def test_turn_event_order_tool_round_trip_budget_no_tools_and_citation_str
     monkeypatch.setattr(
         engine_module,
         "execute_tool",
-        lambda name, arguments, retriever, index, now: (
-            '{"rows":[{"short_id":"N2","title":"Beta","source":"apple_notes","age_days":0.0,"score":0.8,"gist":"Beta gist"}]}',
+        lambda name, arguments, retriever, now: (
+            '{"passages":[{"evidence_id":"E2","note_id":"n2","title":"Beta","text":"Beta gist"}]}',
             tool_step,
         ),
     )
@@ -189,13 +262,13 @@ async def test_turn_event_order_tool_round_trip_budget_no_tools_and_citation_str
         streams=[
             [
                 StreamEvent(kind="reasoning", text="thinking"),
-                StreamEvent(kind="tool_call", tool_call={"id": "call-1", "name": "search_notes", "arguments": {"query": "roadmap"}}),
+                StreamEvent(kind="tool_call", tool_call={"id": "call-1", "name": "search_evidence", "arguments": {"query": "roadmap"}}),
                 StreamEvent(kind="usage", usage={"prompt": 2, "completion": 3, "reasoning": 4}),
                 StreamEvent(kind="done"),
             ],
             [
                 StreamEvent(kind="reasoning", text="again"),
-                StreamEvent(kind="content", text="Answer [N1] [N404] [F1] [F404]"),
+                StreamEvent(kind="content", text="Answer [E1] [F1]"),
                 StreamEvent(kind="usage", usage={"prompt": 5, "completion": 7, "reasoning": 11}),
                 StreamEvent(kind="done"),
             ],
@@ -221,12 +294,16 @@ async def test_turn_event_order_tool_round_trip_budget_no_tools_and_citation_str
     assert events[-1]["type"] == "chat_meta"
     done = events[-2]["message"]
     assert _terminal_types(events) == ["chat_done"]
-    assert done["content"] == "Answer [N1] [F1]"
+    assert done["content"] == "Answer [E1] [F1]"
     assert done["usage"]["prompt"] == 7
     assert done["usage"]["completion"] == 10
     assert done["usage"]["reasoning"] == 15
     assert done["usage"]["ttft_ms"] >= 0
     assert done["usage"]["total_ms"] >= done["usage"]["ttft_ms"]
+    assert done["activity"][0]["tool_name"] == "search_evidence"
+    assert done["activity"][0]["arguments"] == {"query": "roadmap"}
+    assert done["activity"][0]["evidence_ids"] == ["E2"]
+    assert done["activity"][0]["latency_ms"] >= 0
     assert [call["model"] for call in llm.calls] == [config.CHAT_MODEL, config.CHAT_MODEL]
     assert llm.calls[0]["tools"] is not None
     assert llm.calls[1]["tools"] is None
@@ -237,8 +314,13 @@ async def test_turn_event_order_tool_round_trip_budget_no_tools_and_citation_str
     budget_notice = llm.calls[1]["messages"][-1]
     assert budget_notice["role"] == "user"
     assert budget_notice["content"] != "What changed?"
-    assert store.chat_messages(done["chat_id"])[1].content == "Answer [N1] [F1]"
-    assert ("chat_retrieval", {"chat_id": done["chat_id"], "query": "What changed?", "top": [{"id": "N1", "score": 0.9}], "facts": ["F1"]}) in logger.records
+    assert store.chat_messages(done["chat_id"])[1].content == "Answer [E1] [F1]"
+    assert any(
+        kind == "chat_retrieval"
+        and payload["original_query"] == "What changed?"
+        and payload["active_build_id"] == "build-test"
+        for kind, payload in logger.records
+    )
     assert any(kind == "chat_turn" and payload["usage"]["prompt"] == 7 for kind, payload in logger.records)
 
 
@@ -250,8 +332,8 @@ async def test_pre_tool_narration_is_separated_from_the_answer(
     monkeypatch.setattr(
         engine_module,
         "execute_tool",
-        lambda name, arguments, retriever, index, now: (
-            '{"rows":[]}',
+        lambda name, arguments, retriever, now: (
+            '{"passages":[]}',
             ChatActivityStep(kind="search", label="Searched", note_ids=[]),
         ),
     )
@@ -259,7 +341,7 @@ async def test_pre_tool_narration_is_separated_from_the_answer(
         streams=[
             [
                 StreamEvent(kind="content", text="Let me look that up for full detail."),
-                StreamEvent(kind="tool_call", tool_call={"id": "c1", "name": "search_notes", "arguments": {"query": "x"}}),
+                StreamEvent(kind="tool_call", tool_call={"id": "c1", "name": "search_evidence", "arguments": {"query": "x"}}),
                 StreamEvent(kind="done"),
             ],
             [
@@ -472,9 +554,10 @@ async def test_context_pack_exception_emits_error_persists_empty_partial_and_doe
 ) -> None:
     class RaisingRetriever(FakeRetriever):
         def context_pack(
-            self, message: str, *, now: float
-        ) -> tuple[list[GroundingItem], list[GroundedFact]]:
-            del message, now
+            self, message: str, *, now: float, conversation_context: tuple[str, ...] = (),
+            rewritten_query: str | None = None,
+        ) -> EvidencePack:
+            del message, now, conversation_context, rewritten_query
             raise RuntimeError("context exploded")
 
     monkeypatch.setattr(engine_module, "ChatRetriever", RaisingRetriever, raising=False)
@@ -501,86 +584,181 @@ async def test_context_pack_exception_emits_error_persists_empty_partial_and_doe
     )
 
 
-def test_finalize_grounding_materializes_prior_turn_note_citation() -> None:
-    class RegistryGrounding:
-        def note_short_ids(self) -> dict[str, str]:
-            return {"old-note": "N7"}
+@pytest.mark.asyncio
+async def test_final_answer_is_nli_validated_and_persists_cited_vs_consulted(
+    store: Any,
+) -> None:
+    llm = FakeLLM(
+        streams=[[StreamEvent(kind="content", text="The launch is July 18 [E1]."), StreamEvent(kind="done")]]
+    )
+    engine = ChatEngine(
+        store,
+        llm,
+        MemoryLogger(),
+        retriever_factory=lambda chat_id: EvidenceRetriever(store, chat_id),
+        validator_factory=lambda registry: EvidenceValidator(
+            registry, FixedNLI(1.0), entailment_floor=.8
+        ),
+    )
+    events: list[dict[str, Any]] = []
 
-        def fact_short_ids(self) -> dict[tuple[str, str], str]:
-            return {}
+    await engine.send("", "When is launch?", lambda event: _capture(event, events))
 
-    class RegistryIndex:
-        def note(self, note_id: str) -> Any:
-            if note_id != "old-note":
-                return None
-            return fake_note("old-note", "Old Note", "Old gist").model_copy(
-                update={"modified": 1_000.0}
+    done = next(event for event in events if event["type"] == "chat_done")["message"]
+    assert done["content"] == "The launch is July 18 [E1]."
+    assert done["cited_ids"] == ["E1"]
+    assert done["consulted_ids"] == ["N1", "E1"]
+    assert done["retrieved_ids"] == ["N1", "E1"]
+    assert done["evidence"]["passages"][0]["text"] == "The launch is July 18."
+    persisted = store.chat_messages(done["chat_id"])[1]
+    assert persisted.cited_ids == ["E1"]
+    assert persisted.consulted_ids == ["N1", "E1"]
+    assert persisted.evidence is not None
+    assert persisted.evidence.passages[0].evidence_id == "E1"
+    assert persisted.original_query == "When is launch?"
+    assert persisted.rewritten_query == "When is launch?"
+    assert persisted.retrieval_decision == "accepted"
+    assert persisted.active_build_id == "build-test"
+
+
+@pytest.mark.asyncio
+async def test_failed_chat_entailment_returns_source_excerpt_not_unsupported_claim(
+    store: Any,
+) -> None:
+    llm = FakeLLM(
+        streams=[[StreamEvent(kind="content", text="The launch is tomorrow [E1]."), StreamEvent(kind="done")]]
+    )
+    engine = ChatEngine(
+        store,
+        llm,
+        MemoryLogger(),
+        retriever_factory=lambda chat_id: EvidenceRetriever(store, chat_id),
+        validator_factory=lambda registry: EvidenceValidator(
+            registry, FixedNLI(0.0), entailment_floor=.8
+        ),
+    )
+    events: list[dict[str, Any]] = []
+
+    await engine.send("", "When is launch?", lambda event: _capture(event, events))
+
+    done = next(event for event in events if event["type"] == "chat_done")["message"]
+    assert "tomorrow" not in done["content"]
+    assert "The launch is July 18." in done["content"]
+    assert done["cited_ids"] == ["E1"]
+
+
+@pytest.mark.asyncio
+async def test_chat_runs_one_constrained_repair_and_revalidates_it(store: Any) -> None:
+    class ConditionalNLI:
+        def score(self, premise: str, hypothesis: str) -> float:
+            del premise
+            return 1.0 if "July 18" in hypothesis else 0.0
+
+    class RepairLLM(FakeLLM):
+        repair_calls = 0
+
+        async def complete_json(self, model, system, user, timeout_s=None):
+            del model, user, timeout_s
+            if "Repair the draft" in system:
+                self.repair_calls += 1
+                return {"answer": "The launch is July 18 [E1]."}
+            return {"title": "Launch date"}
+
+    llm = RepairLLM(
+        streams=[[StreamEvent(kind="content", text="The launch is tomorrow [E1]."), StreamEvent(kind="done")]]
+    )
+    engine = ChatEngine(
+        store,
+        llm,
+        MemoryLogger(),
+        retriever_factory=lambda chat_id: EvidenceRetriever(store, chat_id),
+        validator_factory=lambda registry: EvidenceValidator(
+            registry, ConditionalNLI(), entailment_floor=.8
+        ),
+    )
+    events: list[dict[str, Any]] = []
+
+    await engine.send("", "When is launch?", lambda event: _capture(event, events))
+
+    done = next(event for event in events if event["type"] == "chat_done")["message"]
+    assert done["content"] == "The launch is July 18 [E1]."
+    assert done["cited_ids"] == ["E1"]
+    assert llm.repair_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_dependent_query_uses_one_structured_flash_rewrite(store: Any) -> None:
+    rewrites: list[str | None] = []
+
+    class RewriteRetriever(EvidenceRetriever):
+        def is_dependent_query(self, message: str, context: tuple[str, ...]) -> bool:
+            return message == "When does it launch?" and bool(context)
+
+        def fallback_rewrite(self, message: str, context: tuple[str, ...]) -> str:
+            return "\n".join((*context, message))
+
+        def context_pack(self, message: str, *, now: float, conversation_context=(), rewritten_query=None):
+            rewrites.append(rewritten_query)
+            return super().context_pack(
+                message,
+                now=now,
+                conversation_context=conversation_context,
+                rewritten_query=rewritten_query,
             )
 
-        def neighbor_edges(self, note_id: str) -> list[tuple[str, float, str]]:
-            del note_id
-            return []
+    class RewriteLLM(FakeLLM):
+        rewrite_calls = 0
 
-    class RegistryRetriever:
-        index = RegistryIndex()
-        _grounding = RegistryGrounding()
+        async def complete_json(self, model, system, user, timeout_s=None):
+            del user, timeout_s
+            if "self-contained retrieval query" in system:
+                self.rewrite_calls += 1
+                assert model == config.SUMMARY_MODEL
+                return {"query": "When does the Mermaid roadmap launch?"}
+            return {"title": "Mermaid launch"}
 
-        def resolve(self, ref: str) -> str | None:
-            return {"N7": "old-note"}.get(ref)
-
-    content, sources, facts, stripped = engine_module._finalize_grounding(
-        "Prior source [N7]",
-        [],
-        [],
-        {},
-        RegistryRetriever(),
+    store.create_chat("chat-rewrite", now=1.0)
+    store.add_chat_message(ChatMessage(chat_id="chat-rewrite", role="user", content="Tell me about the Mermaid roadmap", created=1.0))
+    store.add_chat_message(ChatMessage(chat_id="chat-rewrite", role="assistant", content="It is documented.", created=2.0))
+    llm = RewriteLLM(
+        streams=[[StreamEvent(kind="content", text="The launch is July 18 [E1]."), StreamEvent(kind="done")]]
+    )
+    engine = ChatEngine(
+        store,
+        llm,
+        MemoryLogger(),
+        retriever_factory=lambda chat_id: RewriteRetriever(store, chat_id),
+        validator_factory=lambda registry: EvidenceValidator(registry, FixedNLI(1.0), entailment_floor=.8),
     )
 
-    assert content == "Prior source [N7]"
-    assert [(source.short_id, source.note_id, source.title, source.score) for source in sources] == [
-        ("N7", "old-note", "Old Note", 0.0)
-    ]
-    assert facts == []
-    assert stripped == 0
+    await engine.send("chat-rewrite", "When does it launch?", lambda _event: _capture(_event, []))
+
+    assert rewrites == ["When does the Mermaid roadmap launch?"]
+    assert llm.rewrite_calls == 1
 
 
-def test_finalize_grounding_strips_stale_prior_turn_fact_citation() -> None:
-    class RegistryGrounding:
-        def note_short_ids(self) -> dict[str, str]:
-            return {}
+@pytest.mark.asyncio
+async def test_regeneration_restores_pre_turn_retrieval_state(store: Any) -> None:
+    store.create_chat("chat-regen-state", now=1.0)
+    store.add_chat_message(ChatMessage(chat_id="chat-regen-state", role="user", content="Question", created=1.0))
+    store.add_chat_message(ChatMessage(chat_id="chat-regen-state", role="assistant", content="Old", created=2.0))
+    restored: list[str] = []
 
-        def fact_short_ids(self) -> dict[tuple[str, str], str]:
-            return {("alpha", "beta"): "F9"}
+    class RegenerationRetriever(FakeRetriever):
+        def restore_pre_turn(self) -> None:
+            restored.append(self.chat_id)
 
-    class RegistryIndex:
-        def note(self, note_id: str) -> None:
-            del note_id
-            return None
-
-        def neighbor_edges(self, note_id: str) -> list[tuple[str, float, str]]:
-            del note_id
-            return []
-
-    class RegistryRetriever:
-        index = RegistryIndex()
-        _grounding = RegistryGrounding()
-
-        def resolve(self, ref: str) -> None:
-            del ref
-            return None
-
-    content, sources, facts, stripped = engine_module._finalize_grounding(
-        "Stale fact [F9] remains",
-        [],
-        [],
-        {},
-        RegistryRetriever(),
+    llm = FakeLLM(streams=[[StreamEvent(kind="content", text="New"), StreamEvent(kind="done")]])
+    engine = ChatEngine(
+        store,
+        llm,
+        MemoryLogger(),
+        retriever_factory=lambda chat_id: RegenerationRetriever(store, chat_id),
     )
 
-    assert content == "Stale fact remains"
-    assert sources == []
-    assert facts == []
-    assert stripped == 1
+    await engine.regenerate("chat-regen-state", lambda _event: _capture(_event, []))
+
+    assert restored == ["chat-regen-state"]
 
 
 @pytest.mark.asyncio

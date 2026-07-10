@@ -92,6 +92,15 @@ def test_same_time_exclusive_contradiction_remains_explicit_conflict() -> None:
     assert all(row.superseded_by is None for row in rows)
 
 
+def test_recent_source_describing_older_validity_does_not_supersede_current_fact() -> None:
+    current = _fact("f1", "scheduled_for", "date-current", 10.0, valid_from=10.0)
+    recent_history = _fact("f2", "scheduled_for", "date-old", 20.0, valid_from=5.0)
+
+    rows = reconcile_temporal_facts((current, recent_history))
+
+    assert {row.status for row in rows} == {"conflicted"}
+
+
 def test_nonexclusive_facts_coexist_and_temporal_intent_filters_status() -> None:
     one = _fact("f1", "works_with", "person-1", 10.0)
     two = _fact("f2", "works_with", "person-2", 20.0)

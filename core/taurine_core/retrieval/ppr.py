@@ -110,6 +110,28 @@ class TypedPPR:
             for index, kind in enumerate(self.graph.node_kinds)
             if kind == "entity"
         )
+        dangling_mass = float(rank[dangling].sum()) if dangling.size else 0.0
+        contributions: dict[str, tuple[tuple[str, float], ...]] = {}
+        for target_index in np.argsort(-rank)[: min(20, len(rank))]:
+            target_id = self.graph.node_ids[int(target_index)]
+            row = self.graph.matrix.getrow(int(target_index))
+            rows = [
+                (
+                    self.graph.node_ids[int(source_index)],
+                    self.damping * float(weight) * float(rank[int(source_index)]),
+                )
+                for source_index, weight in zip(row.indices, row.data, strict=True)
+                if weight > 0.0 and rank[int(source_index)] > 0.0
+            ]
+            reset = (
+                (1.0 - self.damping) * float(teleport[int(target_index)])
+                + self.damping * dangling_mass * float(teleport[int(target_index)])
+            )
+            if reset > 0.0:
+                rows.append(("reset", reset))
+            contributions[target_id] = tuple(
+                sorted(rows, key=lambda item: (-item[1], item[0]))[:5]
+            )
         return PPRResult(
             accepted=True,
             reason="converged" if residual <= self.tolerance else "max_iterations",
@@ -120,7 +142,7 @@ class TypedPPR:
             entity_mass=float(entity_mass),
             iterations=iterations,
             residual=residual,
-            contributions={},
+            contributions=contributions,
         )
 
     def _add(
