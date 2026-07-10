@@ -1,11 +1,38 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from taurine_core import config
 from taurine_core.schemas import NoteRecord
+
+
+def collect_file_records(
+    paths: Iterable[Path],
+    record: Callable[[Path], NoteRecord | None],
+    *,
+    log: logging.Logger,
+) -> list[NoteRecord]:
+    """Per-file fault isolation: one unreadable file must not take its
+    connector — and with it the whole sync — down."""
+    records: list[NoteRecord] = []
+    skipped: list[str] = []
+    for path in paths:
+        try:
+            row = record(path)
+        except Exception as exc:
+            skipped.append(f"{path}: {exc}")
+            continue
+        if row is not None:
+            records.append(row)
+    if skipped:
+        log.warning(
+            "skipped %d unreadable files: %s", len(skipped), "; ".join(skipped[:5])
+        )
+    return records
 
 
 def markdown_file_to_note(

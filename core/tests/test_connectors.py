@@ -130,6 +130,59 @@ def test_apple_notes_connector_tags_records_and_wraps_access_errors(monkeypatch)
         failing.extract({})
 
 
+def test_extract_notes_isolates_per_note_applescript_failures():
+    from taurine_core.indexer.notes import extract_notes
+
+    class Folder:
+        @property
+        def name(self):
+            return "Notes"
+
+    class BrokenFolder:
+        @property
+        def name(self):
+            raise RuntimeError("Can't make container into type text. (-1700)")
+
+    class GoodNote:
+        name = "Good"
+        id = "x-coredata://good"
+        body = "<div>Good body</div>"
+        folder = Folder()
+        modification_date = 200.0
+        creation_date = 100.0
+
+    class FolderlessNote(GoodNote):
+        name = "Folderless"
+        id = "x-coredata://folderless"
+        folder = BrokenFolder()
+
+    class UnreadableNote:
+        name = "Broken"
+        id = "x-coredata://broken"
+        modification_date = 200.0
+        creation_date = 100.0
+
+        @property
+        def body(self):
+            raise RuntimeError("AppleScript timeout")
+
+    class Account:
+        notes = [GoodNote(), FolderlessNote(), UnreadableNote()]
+
+    class App:
+        default_account = Account()
+
+    records = extract_notes(App())
+
+    assert [record.note_id for record in records] == [
+        "x-coredata://good",
+        "x-coredata://folderless",
+    ]
+    assert records[0].folder == "Notes"
+    # the folder lookup failed but the note itself survives
+    assert records[1].folder == ""
+
+
 def test_extract_notes_converts_html_and_hashes_content():
     from taurine_core.indexer.notes import _record_from_raw
 
@@ -281,3 +334,44 @@ def test_registry_build_connectors_falls_back_to_apple_notes_when_catalog_missin
     connectors = registry.build_connectors()
 
     assert [connector.connector_id for connector in connectors] == ["apple_notes"]
+
+
+def test_collect_file_records_skips_unreadable_files(tmp_path):
+    import logging
+
+    from taurine_core.connectors.base import collect_file_records
+
+    good = tmp_path / "good.md"
+    good.write_text("# Good", encoding="utf-8")
+    bad = tmp_path / "bad.md"
+    bad.write_text("# Bad", encoding="utf-8")
+
+    def record(path):
+        if path.name == "bad.md":
+            raise PermissionError("unreadable")
+        return make_note(path.stem, path.stem.title(), path.read_text())
+
+    records = collect_file_records(
+        [good, bad], record, log=logging.getLogger("test.collect")
+    )
+    assert [row.note_id for row in records] == ["good"]
+
+
+def test_email_threads_to_records_isolates_per_thread_failures(monkeypatch):
+    from taurine_core.connectors import email_common
+
+    threads = [
+        type("Thread", (), {"thread_id": "t-ok"})(),
+        type("Thread", (), {"thread_id": "t-bad"})(),
+    ]
+    rendered = make_note("email:t-ok", "Thread", "body")
+
+    def fake_render(thread, connector_id):
+        if thread.thread_id == "t-bad":
+            raise RuntimeError("redaction model failed")
+        return rendered
+
+    monkeypatch.setattr(email_common, "thread_to_record", fake_render)
+
+    records = email_common.threads_to_records(threads, "gmail")
+    assert records == [rendered]

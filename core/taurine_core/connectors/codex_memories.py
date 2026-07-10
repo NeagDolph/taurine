@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import logging
 import re
 from pathlib import Path
 
 from taurine_core import config as taurine_config
+from taurine_core.connectors.base import collect_file_records
 from taurine_core.ports import ConnectorError
 from taurine_core.schemas import NoteRecord
 
 
 _HEADING_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
+_LOG = logging.getLogger("taurine.connectors.codex_mem")
 
 
 class CodexMemoriesConnector:
@@ -32,9 +35,10 @@ class CodexMemoriesConnector:
     def extract(self, config: dict) -> list[NoteRecord]:
         patterns = config.get("globs") or taurine_config.CODEX_MEMORY_GLOBS
         try:
-            return [_record(path) for path in _matching_paths(patterns)]
+            paths = _matching_paths(patterns)
         except OSError as exc:
             raise ConnectorError(f"Codex memories extraction failed: {exc}") from exc
+        return collect_file_records(paths, _record, log=_LOG)
 
 
 def _matching_paths(patterns: object) -> list[Path]:

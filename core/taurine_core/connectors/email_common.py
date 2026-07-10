@@ -198,6 +198,32 @@ def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
 # ── rendering ──────────────────────────────────────────────────────────
 
 
+def threads_to_records(
+    threads: list[EmailThread],
+    connector_id: str,
+) -> list[NoteRecord]:
+    """Render survivors with per-thread fault isolation: one malformed
+    thread (or a PII-redaction failure on it) must not fail the mailbox."""
+    records: list[NoteRecord] = []
+    skipped: list[str] = []
+    for thread in threads:
+        try:
+            record = thread_to_record(thread, connector_id)
+        except Exception as exc:
+            skipped.append(f"{getattr(thread, 'thread_id', '<unknown>')}: {exc}")
+            continue
+        if record is not None:
+            records.append(record)
+    if skipped:
+        _LOGGER.warning(
+            "%s: skipped %d unrenderable threads: %s",
+            connector_id,
+            len(skipped),
+            "; ".join(skipped[:5]),
+        )
+    return records
+
+
 def thread_to_record(thread: EmailThread, connector_id: str) -> NoteRecord | None:
     """Render a funnel survivor to a NoteRecord. Messages must already be
     oldest-first (funnel_threads guarantees it). Redaction happens per

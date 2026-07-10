@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import subprocess
 from datetime import datetime
 from html import unescape
@@ -8,6 +9,8 @@ from html.parser import HTMLParser
 from typing import Any
 
 from taurine_core.schemas import NoteRecord
+
+_LOG = logging.getLogger("taurine.connectors.apple_notes")
 
 
 class NotesAccessError(Exception):
@@ -23,12 +26,33 @@ def extract_notes(app: object | None = None) -> list[NoteRecord]:
         account = _value(getattr(app, "default_account"))
         if isinstance(account, str):
             account = app.account(account)  # macnotesapp: default_account is a name
-        raw_notes = _value(getattr(account, "notes"))
-        return [_record_from_raw(raw_note) for raw_note in raw_notes]
+        raw_notes = list(_value(getattr(account, "notes")))
     except Exception as exc:
         if isinstance(exc, NotesAccessError):
             raise
         raise NotesAccessError(str(exc)) from exc
+
+    # Per-note isolation: macnotesapp resolves attributes through AppleScript,
+    # which fails on individual notes (shared folders, odd containers, e.g.
+    # "Can't make container into type text"). One bad note must not take the
+    # whole account down.
+    records: list[NoteRecord] = []
+    skipped: list[str] = []
+    for raw_note in raw_notes:
+        try:
+            record = _record_from_raw(raw_note)
+        except Exception as exc:
+            skipped.append(f"{_safe_note_id(raw_note)}: {exc}")
+            continue
+        if record.note_id:
+            records.append(record)
+    if skipped:
+        _LOG.warning(
+            "apple notes: skipped %d unreadable notes: %s",
+            len(skipped),
+            "; ".join(skipped[:5]),
+        )
+    return records
 
 
 def open_note(note_id: str) -> None:
@@ -59,7 +83,10 @@ def _record_from_raw(raw_note: object) -> NoteRecord:
     note_id = str(_value(getattr(raw_note, "id", "")))
     body = str(_value(getattr(raw_note, "body", "")))
     text = html_to_text(body)
-    folder = _folder_name(getattr(raw_note, "folder", ""))
+    try:
+        folder = _folder_name(getattr(raw_note, "folder", ""))
+    except Exception:  # AppleScript container lookups fail on some notes
+        folder = ""
     modified = _timestamp(_value(getattr(raw_note, "modification_date", 0.0)))
     created = _timestamp(_value(getattr(raw_note, "creation_date", modified))) or modified
     content_hash = hashlib.sha256((title + text).encode("utf-8")).hexdigest()
@@ -76,6 +103,13 @@ def _record_from_raw(raw_note: object) -> NoteRecord:
 
 def _value(value: Any) -> Any:
     return value() if callable(value) else value
+
+
+def _safe_note_id(raw_note: object) -> str:
+    try:
+        return str(_value(getattr(raw_note, "id", ""))) or "<unknown>"
+    except Exception:
+        return "<unknown>"
 
 
 def _folder_name(folder: object) -> str:

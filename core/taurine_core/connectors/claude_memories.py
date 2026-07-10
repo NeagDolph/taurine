@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import logging
 import re
 from pathlib import Path
 
 from taurine_core import config as taurine_config
+from taurine_core.connectors.base import collect_file_records
 from taurine_core.ports import ConnectorError
 from taurine_core.schemas import NoteRecord
 
 
 _HEADING_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
+_LOG = logging.getLogger("taurine.connectors.claude_mem")
 
 
 class ClaudeMemoriesConnector:
@@ -30,9 +33,10 @@ class ClaudeMemoriesConnector:
     def extract(self, config: dict) -> list[NoteRecord]:
         pattern = str(config.get("glob") or taurine_config.CLAUDE_MEMORY_GLOB)
         try:
-            return [_record(path) for path in _matching_paths(pattern)]
+            paths = _matching_paths(pattern)
         except OSError as exc:
             raise ConnectorError(f"Claude memories extraction failed: {exc}") from exc
+        return collect_file_records(paths, _record, log=_LOG)
 
 
 def _matching_paths(pattern: str) -> list[Path]:

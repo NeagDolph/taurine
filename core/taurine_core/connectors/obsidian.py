@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 from taurine_core import config as taurine_config
+from taurine_core.connectors.base import collect_file_records
 from taurine_core.ports import ConnectorError
 from taurine_core.schemas import NoteRecord
+
+_LOG = logging.getLogger("taurine.connectors.obsidian")
 
 
 _HEADING_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
@@ -42,9 +46,10 @@ class ObsidianConnector:
         if not vault.is_dir():
             raise ConnectorError(f"Obsidian vault does not exist: {vault}")
         try:
-            return [_record(vault, path) for path in _markdown_paths(vault)]
+            paths = _markdown_paths(vault)
         except OSError as exc:
             raise ConnectorError(f"Obsidian extraction failed: {exc}") from exc
+        return collect_file_records(paths, lambda path: _record(vault, path), log=_LOG)
 
 
 def _discover_vault() -> Path | None:

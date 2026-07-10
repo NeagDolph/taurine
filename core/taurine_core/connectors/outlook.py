@@ -30,7 +30,7 @@ from taurine_core.connectors.email_common import (
     funnel_threads,
     html_to_text,
     log_funnel,
-    thread_to_record,
+    threads_to_records,
 )
 from taurine_core.connectors.imessage import _contact_names
 from taurine_core.ports import ConnectorError
@@ -96,8 +96,7 @@ class OutlookConnector:
             f"{self.connector_id}:{thread_id}": score
             for thread_id, score in report.scores.items()
         }
-        records = [thread_to_record(thread, self.connector_id) for thread in survivors]
-        self._cached_records = [record for record in records if record is not None]
+        self._cached_records = threads_to_records(survivors, self.connector_id)
         self._cached_at = now
         return self._cached_records
 
