@@ -1,7 +1,15 @@
 import type { CSSProperties } from 'react'
 import type { LinkObject, NodeObject } from 'react-force-graph-2d'
-import { NOW_NODE_ID, sourceColor, sourceLabel, type MapLink, type MapNode } from '../../lib/graph'
+import {
+  NOW_NODE_ID,
+  communityColor,
+  sourceColor,
+  sourceLabel,
+  type MapLink,
+  type MapNode
+} from '../../lib/graph'
 import { endpointNode } from './render'
+import type { ColorMode } from './storage'
 
 type GraphLinkObject = LinkObject<MapNode, MapLink>
 type GraphNodeObject = NodeObject<MapNode>
@@ -9,11 +17,14 @@ type GraphNodeObject = NodeObject<MapNode>
 export function MapHoverPanel({
   hoverNode,
   hoverLink,
-  nowLabel
+  nowLabel,
+  colorMode
 }: {
   hoverNode: GraphNodeObject | null
   hoverLink: GraphLinkObject | null
   nowLabel: string
+  /** active color mode; shows cluster info when set to 'community' */
+  colorMode?: ColorMode
 }): React.JSX.Element | null {
   if (hoverNode) {
     const isNow = String(hoverNode.id) === NOW_NODE_ID
@@ -43,6 +54,16 @@ export function MapHoverPanel({
             aria-hidden="true"
           />
           {sourceLabel(hoverNode.source)}
+          {colorMode === 'community' && hoverNode.community >= 0 ? (
+            <>
+              <span
+                className="map-hover-dot"
+                style={{ '--map-dot-color': communityColor(hoverNode.community) } as CSSProperties}
+                aria-hidden="true"
+              />
+              Cluster {hoverNode.community}
+            </>
+          ) : null}
         </div>
         <h3 className="map-hover-title">{hoverNode.title}</h3>
         <p className={`map-hover-gist${hoverNode.gist ? '' : ' muted'}`}>

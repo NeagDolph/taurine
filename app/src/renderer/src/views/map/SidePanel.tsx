@@ -1,4 +1,5 @@
 import { useEffect, useState, type CSSProperties } from 'react'
+import ReactMarkdown from 'react-markdown'
 import { communityColor, sourceColor, sourceLabel, type MapNode } from '../../lib/graph'
 import { fetchNotePreview, type NotePreview } from '../../lib/sidecar'
 import { formatTimestamp } from './render'
@@ -128,9 +129,15 @@ export function SidePanel({
           </div>
         ) : (
           <>
-            <section className="map-side-text" aria-label="Note text">
-              {note?.text || 'No text available'}
-            </section>
+            {note?.text ? (
+              <section className="map-side-text markdown-body" aria-label="Note text">
+                <ReactMarkdown>{note.text}</ReactMarkdown>
+              </section>
+            ) : (
+              <section className="map-side-text" aria-label="Note text">
+                No text available
+              </section>
+            )}
 
             <section className="map-side-neighbors" aria-label="Connected notes">
               <div className="map-side-section-head">

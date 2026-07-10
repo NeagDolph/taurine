@@ -454,10 +454,17 @@
   font-weight: 600;
   gap: 6px;
   left: 12px;
+  /* idles translucent, sharpens on hover (needs pointer-events for :hover) */
+  opacity: 0.5;
   padding: 9px 11px;
-  pointer-events: none;
+  pointer-events: auto;
   position: absolute;
+  transition: opacity 160ms ease;
   z-index: 3;
+}
+
+.map-legend:hover {
+  opacity: 1;
 }
 
 .map-legend-title {
@@ -539,6 +546,13 @@
   top: 12px;
   width: 300px;
   z-index: 4;
+}
+
+/* with the selection side panel open, shift the hover preview left of it
+   (panel width 332px + 12px gap) so the two never overlap */
+.map-stage.has-panel .map-hover-panel {
+  max-width: calc(100% - 356px);
+  right: 344px;
 }
 
 @keyframes map-hover-in {

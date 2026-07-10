@@ -13,6 +13,23 @@ export function rgba(hex: string, alpha: number): string {
   return `rgba(${r}, ${g}, ${b}, ${Math.max(0, Math.min(1, alpha))})`
 }
 
+/**
+ * Darkened stroke color derived from a node fill — used for the subtle
+ * outline ring on the hovered node's neighbors. Falls back to translucent
+ * black when the input is not a 6-digit hex color.
+ */
+export function darkenColor(color: string, factor: number): string {
+  const match = /^#([0-9a-f]{6})$/i.exec(color)
+  if (!match) {
+    return 'rgba(0, 0, 0, 0.55)'
+  }
+  const value = match[1]
+  const r = Math.round(Number.parseInt(value.slice(0, 2), 16) * factor)
+  const g = Math.round(Number.parseInt(value.slice(2, 4), 16) * factor)
+  const b = Math.round(Number.parseInt(value.slice(4, 6), 16) * factor)
+  return `rgba(${r}, ${g}, ${b}, 0.9)`
+}
+
 export function roundedRect(
   ctx: CanvasRenderingContext2D,
   x: number,

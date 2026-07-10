@@ -37,7 +37,15 @@ import { MapLegend } from './MapLegend'
 import { MapSearch, type SearchResult } from './MapSearch'
 import { SidePanel } from './SidePanel'
 import { MapTimeline, type TimeRange } from './Timeline'
-import { degreePercentile, drawNodeLabel, endpoint, endpointId, labelAlpha, rgba } from './render'
+import {
+  darkenColor,
+  degreePercentile,
+  drawNodeLabel,
+  endpoint,
+  endpointId,
+  labelAlpha,
+  rgba
+} from './render'
 import {
   applyPinnedPositions,
   loadColorMode,
@@ -97,6 +105,33 @@ const MAX_SEARCH_RESULTS = 8
 // zoomToFit on one or two nodes otherwise zooms in until a node fills the
 // screen — clamp the post-fit scale to keep the neighborhood readable
 const MAX_FIT_ZOOM = 3
+// double-click detection window for the neighborhood zoom gesture
+const DOUBLE_CLICK_MS = 300
+// background clicks that travelled further than this since pointerdown are
+// pan gestures, not deselect clicks
+const CLICK_MOVE_TOLERANCE_PX = 5
+// elastic drag: inside the attach radius the node rubber-bands (moves at a
+// fraction of the cursor delta); beyond it, it detaches and follows 1:1
+const RUBBER_BAND_FACTOR = 0.15
+const ATTACH_RADIUS_FACTOR = 2.75
+// screen-px floor so the attach zone stays usable when zoomed far out
+const MIN_ATTACH_RADIUS_PX = 30
+// island taming: singletons/pairs repel less and get pulled toward the
+// layout centroid so they settle in a band around the main cluster
+const BASE_CHARGE_STRENGTH = -30
+const ISLAND_CHARGE_STRENGTH = -8
+const ISLAND_PULL_STRENGTH = 0.05
+const CONNECTED_PULL_STRENGTH = 0.0015
+
+interface DragState {
+  nodeId: string
+  origin: { x: number; y: number }
+  originalFx?: number
+  originalFy?: number
+  detached: boolean
+  /** node other than the selected one: hold in place and restore on release */
+  restore: boolean
+}
 
 export function MapView({
   visible,
@@ -119,6 +154,9 @@ export function MapView({
   const glowTimerRef = useRef<number | null>(null)
   const heatByNodeRef = useRef<Map<string, number>>(new Map())
   const egoFitPendingRef = useRef(false)
+  const dragStateRef = useRef<DragState | null>(null)
+  const pointerDownPosRef = useRef<{ x: number; y: number } | null>(null)
+  const lastNodeClickRef = useRef<{ id: string; time: number }>({ id: '', time: 0 })
 
   const [baseGraph, setBaseGraph] = useState<MapGraphData>(EMPTY_GRAPH)
   const [liveLinks, setLiveLinks] = useState<LiveGraphLink[]>([])
@@ -183,6 +221,9 @@ export function MapView({
   // ── filtering ──────────────────────────────────────────────────────────
 
   const degreeFilterActive = !isEgoMode && minDegree > 0
+  // only referenced while the degree filter is on, so selection changes do
+  // not recompute graphData (a new graphData identity reheats the layout)
+  const degreeExemptId = degreeFilterActive ? selectedNodeId : null
   const visibleNodes = useMemo(() => {
     return displayedGraph.nodes.filter((node) => {
       if (node.kind !== 'note') {
@@ -191,12 +232,12 @@ export function MapView({
       if (hiddenNodeIds.has(node.id)) {
         return false
       }
-      if (degreeFilterActive && node.degree < minDegree && node.id !== selectedNodeId) {
+      if (degreeFilterActive && node.degree < minDegree && node.id !== degreeExemptId) {
         return false
       }
       return true
     })
-  }, [degreeFilterActive, displayedGraph.nodes, hiddenNodeIds, minDegree, selectedNodeId])
+  }, [degreeExemptId, degreeFilterActive, displayedGraph.nodes, hiddenNodeIds, minDegree])
 
   const graphData = useMemo(() => {
     const nodeIds = new Set(visibleNodes.map((node) => node.id))
@@ -364,6 +405,18 @@ export function MapView({
     return set
   }, [adjacency, hoverNodeId])
 
+  // while a node is selected everything outside its 1-hop neighborhood dims
+  const selectedNeighborhood = useMemo(() => {
+    if (!selectedNodeId) {
+      return null
+    }
+    const set = new Set<string>([selectedNodeId])
+    for (const neighbor of adjacency.get(selectedNodeId) ?? []) {
+      set.add(neighbor)
+    }
+    return set
+  }, [adjacency, selectedNodeId])
+
   // ── ego navigation ─────────────────────────────────────────────────────
 
   const enterEgo = useCallback((noteId: string, depth?: number) => {
@@ -521,12 +574,17 @@ export function MapView({
     })
   }, [])
 
+  // plain selection never moves the camera or re-centers the ego graph;
+  // explicit actions (search pick, side-panel neighbor click) pass center:true
   const selectNode = useCallback(
     (noteId: string, options: { center?: boolean } = {}) => {
       setSelectedNodeId(noteId)
+      if (!options.center) {
+        return
+      }
       if (egoNav) {
         enterEgo(noteId)
-      } else if (options.center) {
+      } else {
         centerOnNode(noteId)
       }
     },
@@ -677,6 +735,20 @@ export function MapView({
 
     observer.observe(element)
     return () => observer.disconnect()
+  }, [])
+
+  // track pointerdown so background "clicks" that were actually pans
+  // (moved further than the tolerance) never clear the selection
+  useEffect(() => {
+    const element = containerRef.current
+    if (!element) {
+      return
+    }
+    const onPointerDown = (event: PointerEvent): void => {
+      pointerDownPosRef.current = { x: event.clientX, y: event.clientY }
+    }
+    element.addEventListener('pointerdown', onPointerDown)
+    return () => element.removeEventListener('pointerdown', onPointerDown)
   }, [])
 
   useEffect(() => {
@@ -873,16 +945,110 @@ export function MapView({
   )
 
   const handleNodeClick = useCallback(
-    (node: GraphNodeObject) => {
+    (node: GraphNodeObject, event: MouseEvent) => {
       if (node.kind !== 'note') {
         return
       }
-      selectNode(String(node.id))
+      const id = String(node.id)
+      const now = Date.now()
+      const isDoubleClick =
+        event.detail === 2 ||
+        (lastNodeClickRef.current.id === id &&
+          now - lastNodeClickRef.current.time < DOUBLE_CLICK_MS)
+      lastNodeClickRef.current = { id, time: now }
+
+      if (isDoubleClick) {
+        // zoom to the node + its 1-hop neighborhood (first click already selected)
+        const neighborhood = new Set<string>([id, ...(adjacency.get(id) ?? [])])
+        graphRef.current?.zoomToFit(400, 80, (candidate) => neighborhood.has(String(candidate.id)))
+        window.setTimeout(() => clampZoom(graphRef.current), 460)
+        return
+      }
+      selectNode(id)
     },
-    [selectNode]
+    [adjacency, selectNode]
+  )
+
+  // drag is only enabled while a node is selected; the selected node drags
+  // elastically (rubber-band inside the attach radius, 1:1 once detached)
+  // and any other node is held in place and fully restored on release
+  const handleNodeDrag = useCallback(
+    (node: GraphNodeObject, translate: { x: number; y: number }) => {
+      if (typeof node.x !== 'number' || typeof node.y !== 'number') {
+        return
+      }
+      const id = String(node.id)
+      let drag = dragStateRef.current
+      if (!drag || drag.nodeId !== id) {
+        // force-graph stashes the pre-drag position/fixation on the node;
+        // fall back to reconstructing the origin from the cumulative translate
+        const init = (
+          node as { __initialDragPos?: { x: number; y: number; fx?: number; fy?: number } }
+        ).__initialDragPos
+        drag = {
+          nodeId: id,
+          origin: init
+            ? { x: init.x, y: init.y }
+            : { x: node.x - translate.x, y: node.y - translate.y },
+          originalFx: init?.fx,
+          originalFy: init?.fy,
+          detached: false,
+          restore: id !== selectedNodeId
+        }
+        dragStateRef.current = drag
+      }
+
+      if (drag.restore) {
+        // not the selected node: pin it back every event so it never moves
+        node.fx = node.x = drag.origin.x
+        node.fy = node.y = drag.origin.y
+        return
+      }
+
+      if (drag.detached) {
+        return // force-graph already moved the node 1:1 with the cursor
+      }
+
+      // node.x/y were just set by force-graph to the true cursor position,
+      // so the cumulative drag distance is simply (position − origin)
+      const dx = node.x - drag.origin.x
+      const dy = node.y - drag.origin.y
+      const distance = Math.hypot(dx, dy)
+      const radius = id === NOW_NODE_ID ? 14 : nodeRadius(node.degree)
+      const zoom = graphRef.current?.zoom() ?? 1
+      const attachRadius = Math.max(ATTACH_RADIUS_FACTOR * radius, MIN_ATTACH_RADIUS_PX / zoom)
+
+      if (distance <= attachRadius) {
+        node.fx = node.x = drag.origin.x + dx * RUBBER_BAND_FACTOR
+        node.fy = node.y = drag.origin.y + dy * RUBBER_BAND_FACTOR
+      } else {
+        drag.detached = true
+        graphRef.current?.d3ReheatSimulation()
+      }
+    },
+    [selectedNodeId]
   )
 
   const handleNodeDragEnd = useCallback((node: GraphNodeObject) => {
+    const drag = dragStateRef.current
+    dragStateRef.current = null
+    const id = String(node.id)
+
+    if (drag && drag.nodeId === id && drag.restore) {
+      // non-selected node: put it back exactly where it was, never pin it
+      node.x = drag.origin.x
+      node.y = drag.origin.y
+      const pin = pinsRef.current[id]
+      if (pin) {
+        node.fx = pin.x
+        node.fy = pin.y
+      } else {
+        node.fx = drag.originalFx
+        node.fy = drag.originalFy
+      }
+      return
+    }
+
     if (typeof node.x !== 'number' || typeof node.y !== 'number') {
       return
     }
@@ -934,6 +1100,7 @@ export function MapView({
       const opacity = nodeOpacityFor(
         node,
         id,
+        selectedNeighborhood,
         hoverNeighborhood,
         hasActiveMapFilter,
         matchedNodeIds,
@@ -1002,6 +1169,10 @@ export function MapView({
         ctx.stroke()
       }
 
+      const fillColor = isNow ? '#f5c518' : nodeFillColor(node)
+      const isHoverNeighbor =
+        !isNow && !isHovered && hoverNodeId !== null && hoverNeighborhood?.has(id) === true
+
       if (isSelected && !isNow) {
         ctx.beginPath()
         ctx.arc(x, y, radius + 3.5, 0, Math.PI * 2)
@@ -1014,11 +1185,18 @@ export function MapView({
         ctx.strokeStyle = 'rgba(236, 235, 230, 0.92)'
         ctx.lineWidth = Math.max(1.6 / globalScale, 1.1)
         ctx.stroke()
+      } else if (isHoverNeighbor) {
+        // neighbor of the hovered node: quiet darkened outline just outside the fill
+        ctx.beginPath()
+        ctx.arc(x, y, radius + 1.5, 0, Math.PI * 2)
+        ctx.strokeStyle = darkenColor(fillColor, 0.45)
+        ctx.lineWidth = Math.max(1.8 / globalScale, 1.1)
+        ctx.stroke()
       }
 
       ctx.beginPath()
       ctx.arc(x, y, radius, 0, Math.PI * 2)
-      ctx.fillStyle = isNow ? '#f5c518' : nodeFillColor(node)
+      ctx.fillStyle = fillColor
       ctx.fill()
 
       ctx.beginPath()
@@ -1066,6 +1244,7 @@ export function MapView({
       pins,
       queryActive,
       queryMatchedIds,
+      selectedNeighborhood,
       selectedNodeId,
       activeTimeRange
     ]
@@ -1081,15 +1260,20 @@ export function MapView({
 
       const isStatic = link.kind === 'static'
       const isHovered = link.id === hoverLinkId
+      const srcId = endpointId(link.source)
+      const dstId = endpointId(link.target)
+      // hover highlights (never dims): incident edges go bright white and
+      // punch through any selection dim
+      const hoverIncident = hoverNodeId !== null && (srcId === hoverNodeId || dstId === hoverNodeId)
+      const bright = isHovered || hoverIncident
       const baseOpacity = isStatic ? staticLinkOpacity(link.weight) : liveLinkOpacity(link)
       let opacity: number
-      if (isHovered) {
-        opacity = Math.max(baseOpacity, 0.85)
-      } else if (hoverNeighborhood && hoverNodeId) {
-        const srcId = endpointId(link.source)
-        const dstId = endpointId(link.target)
-        const incident = srcId === hoverNodeId || dstId === hoverNodeId
-        opacity = incident ? Math.max(baseOpacity, 0.5) : DIM_OPACITY * baseOpacity * 6
+      if (bright) {
+        opacity = Math.max(baseOpacity, 0.9)
+      } else if (selectedNodeId && selectedNeighborhood) {
+        // selection dim: only edges incident to the selected node stay lit
+        const selectedIncident = srcId === selectedNodeId || dstId === selectedNodeId
+        opacity = selectedIncident ? Math.max(baseOpacity, 0.5) : DIM_OPACITY * baseOpacity * 6
       } else {
         opacity = linkOpacityFor(
           link,
@@ -1109,26 +1293,58 @@ export function MapView({
       ctx.moveTo(source.x, source.y)
       ctx.lineTo(target.x, target.y)
       ctx.strokeStyle = isStatic
-        ? isHovered
+        ? bright
           ? `rgba(236, 235, 230, ${opacity})`
           : `rgba(108, 116, 128, ${opacity})`
         : rgba(link.color, opacity)
       ctx.lineWidth = isStatic
-        ? Math.max((isHovered ? 1.8 : 0.75) / globalScale, isHovered ? 0.9 : 0.35)
-        : Math.max((isHovered ? 3.4 : 2.6) / globalScale, 0.8)
+        ? Math.max((bright ? 1.8 : 0.75) / globalScale, bright ? 0.9 : 0.35)
+        : Math.max((bright ? 3.4 : 2.6) / globalScale, 0.8)
       ctx.stroke()
       ctx.restore()
     },
     [
       hasActiveMapFilter,
       hoverLinkId,
-      hoverNeighborhood,
       hoverNodeId,
       inTimeRange,
       matchedNodeIds,
+      selectedNeighborhood,
+      selectedNodeId,
       activeTimeRange
     ]
   )
+
+  // full-node hover hitbox: paint the pointer area at the drawn radius (the
+  // default derives from nodeVal and is far smaller than the visible disc);
+  // nodes paint after links on the shadow canvas, so nodes win over edges
+  const paintNodePointerArea = useCallback(
+    (node: GraphNodeObject, paintColor: string, ctx: CanvasRenderingContext2D) => {
+      const radius = (String(node.id) === NOW_NODE_ID ? 14 : nodeRadius(node.degree)) + 2
+      ctx.beginPath()
+      ctx.arc(node.x ?? 0, node.y ?? 0, radius, 0, Math.PI * 2)
+      ctx.fillStyle = paintColor
+      ctx.fill()
+    },
+    []
+  )
+
+  // ── layout forces ──────────────────────────────────────────────────────
+
+  // tame disconnected islands: weaker repulsion for degree<2 notes plus a
+  // gentle pull toward the connected cluster's centroid so singletons/pairs
+  // settle in a close band instead of a distant repulsion ring
+  useEffect(() => {
+    const graph = graphRef.current
+    if (!graph) {
+      return
+    }
+    const charge = graph.d3Force('charge')
+    charge?.strength?.((node: GraphNodeObject) =>
+      node.kind === 'note' && node.degree < 2 ? ISLAND_CHARGE_STRENGTH : BASE_CHARGE_STRENGTH
+    )
+    graph.d3Force('islandPull', makeIslandPullForce())
+  }, [graphData])
 
   // ── overlay text ───────────────────────────────────────────────────────
 
@@ -1283,7 +1499,7 @@ export function MapView({
           cooldownTicks={LAYOUT_COOLDOWN_TICKS}
           d3AlphaDecay={0.025}
           d3VelocityDecay={0.34}
-          enableNodeDrag={true}
+          enableNodeDrag={selectedNodeId !== null}
           graphData={graphData}
           height={size.height}
           linkCanvasObject={drawLink}
@@ -1296,11 +1512,19 @@ export function MapView({
           nodeCanvasObjectMode={() => 'replace'}
           nodeId="id"
           nodeLabel={() => ''}
+          nodePointerAreaPaint={paintNodePointerArea}
           nodeRelSize={1}
           nodeVal={(node) => node.val}
           showPointerCursor={(item) => isNoteNodeObject(item)}
-          onBackgroundClick={() => {
+          onBackgroundClick={(event) => {
             setMenuTarget(null)
+            const down = pointerDownPosRef.current
+            if (
+              down &&
+              Math.hypot(event.clientX - down.x, event.clientY - down.y) > CLICK_MOVE_TOLERANCE_PX
+            ) {
+              return // pan gesture, not a deselect click
+            }
             setSelectedNodeId(null)
           }}
           onBackgroundRightClick={() => setMenuTarget(null)}
@@ -1316,6 +1540,7 @@ export function MapView({
             }
           }}
           onNodeClick={handleNodeClick}
+          onNodeDrag={handleNodeDrag}
           onNodeDragEnd={handleNodeDragEnd}
           onNodeHover={(node) => {
             setHoverNode(node ?? null)
@@ -1331,8 +1556,13 @@ export function MapView({
           width={size.width}
         />
 
-        {!selectedNodeId ? (
-          <MapHoverPanel hoverLink={hoverLink} hoverNode={hoverNode} nowLabel={nowLabel} />
+        {!(hoverNode && String(hoverNode.id) === selectedNodeId) ? (
+          <MapHoverPanel
+            colorMode={colorMode}
+            hoverLink={hoverLink}
+            hoverNode={hoverNode}
+            nowLabel={nowLabel}
+          />
         ) : null}
 
         <div
@@ -1422,14 +1652,23 @@ function queryMatchKind(
 function nodeOpacityFor(
   node: GraphNodeObject,
   id: string,
+  selectedNeighborhood: Set<string> | null,
   hoverNeighborhood: Set<string> | null,
   hasActiveMapFilter: boolean,
   matchedNodeIds: Set<string>,
   timeFilterActive: boolean,
   inTimeRange: (node: MapNode) => boolean
 ): number {
-  if (hoverNeighborhood) {
-    return hoverNeighborhood.has(id) ? 1 : DIM_OPACITY
+  // hover only ever brightens: the hovered neighborhood punches through any
+  // selection or filter dim, and hovering never dims the rest of the graph
+  if (hoverNeighborhood?.has(id)) {
+    return 1
+  }
+
+  // dimming belongs to selection: everything outside the selected node's
+  // 1-hop neighborhood fades while a node is selected
+  if (selectedNeighborhood && !selectedNeighborhood.has(id)) {
+    return DIM_OPACITY
   }
 
   const dimByFilter = hasActiveMapFilter && !(node.kind === 'note' && matchedNodeIds.has(id))
@@ -1513,6 +1752,60 @@ function heatIntensity(nodeId: string, heatByNode: Map<string, number>): number 
 
   const age = Date.now() - touchedAt
   return age >= HEAT_TRAIL_MS ? 0 : 1 - age / HEAT_TRAIL_MS
+}
+
+type IslandPullForce = ((alpha: number) => void) & {
+  initialize?: (nodes: GraphNodeObject[], ...args: unknown[]) => void
+}
+
+/**
+ * Weak centering force toward the connected cluster's centroid. Strong-ish
+ * for degree<2 notes (isolated singletons/pairs), near-zero for connected
+ * nodes; fixed nodes (pins, the Now node) are skipped so d3's fx/fy clamping
+ * always wins.
+ */
+function makeIslandPullForce(): IslandPullForce {
+  let nodes: GraphNodeObject[] = []
+
+  const force: IslandPullForce = (alpha: number) => {
+    let cx = 0
+    let cy = 0
+    let count = 0
+    for (const node of nodes) {
+      if (
+        node.kind === 'note' &&
+        node.degree >= 2 &&
+        typeof node.x === 'number' &&
+        typeof node.y === 'number'
+      ) {
+        cx += node.x
+        cy += node.y
+        count += 1
+      }
+    }
+    if (count === 0) {
+      return
+    }
+    cx /= count
+    cy /= count
+
+    for (const node of nodes) {
+      if (typeof node.x !== 'number' || typeof node.y !== 'number') {
+        continue
+      }
+      if (node.fx !== undefined && node.fx !== null) {
+        continue
+      }
+      const strength =
+        node.kind === 'note' && node.degree < 2 ? ISLAND_PULL_STRENGTH : CONNECTED_PULL_STRENGTH
+      node.vx = (node.vx ?? 0) + (cx - node.x) * strength * alpha
+      node.vy = (node.vy ?? 0) + (cy - node.y) * strength * alpha
+    }
+  }
+  force.initialize = (initNodes: GraphNodeObject[]) => {
+    nodes = initNodes
+  }
+  return force
 }
 
 /** Copy simulated coordinates from prior graphs so new data starts in place. */

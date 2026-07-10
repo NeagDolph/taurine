@@ -1,11 +1,5 @@
 import type { CSSProperties } from 'react'
-import {
-  RECENCY_NEW_COLOR,
-  RECENCY_OLD_COLOR,
-  communityColor,
-  sourceColor,
-  sourceLabel
-} from '../../lib/graph'
+import { RECENCY_LEGEND_GRADIENT, communityColor, sourceColor, sourceLabel } from '../../lib/graph'
 import { formatTimestamp } from './render'
 import type { ColorMode } from './storage'
 
@@ -84,7 +78,7 @@ export function MapLegend({
             className="map-legend-gradient"
             style={
               {
-                background: `linear-gradient(90deg, ${RECENCY_OLD_COLOR}, ${RECENCY_NEW_COLOR})`
+                background: `linear-gradient(90deg, ${RECENCY_LEGEND_GRADIENT})`
               } as CSSProperties
             }
             aria-hidden="true"

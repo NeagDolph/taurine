@@ -476,19 +476,64 @@ export function communityColor(community: number): string {
   return COMMUNITY_PALETTE[community % COMMUNITY_PALETTE.length]
 }
 
-/** Recency lens: warm (recent) → cool (old). Unknown timestamps are neutral gray. */
+/**
+ * Recency lens with an exponential window: recency differences among the most
+ * recent notes dominate the palette (gray → dark yellow → bright warm accent)
+ * while everything older than roughly half the time range compresses into
+ * near-identical muted grays. Unknown timestamps are neutral gray.
+ */
 export function recencyColor(timestamp: number, minTs: number, maxTs: number): string {
   if (timestamp <= 0 || maxTs <= minTs) {
     return RECENCY_UNKNOWN_COLOR
   }
 
-  const t = clamp((timestamp - minTs) / (maxTs - minTs), 0, 1)
-  return mixHex(RECENCY_OLD_COLOR, RECENCY_NEW_COLOR, t)
+  const age = clamp((maxTs - timestamp) / (maxTs - minTs), 0, 1)
+  return mixStops(RECENCY_STOPS, recencyWeight(age))
 }
 
-export const RECENCY_OLD_COLOR = '#48628a'
+export const RECENCY_OLD_COLOR = '#46484d'
+export const RECENCY_MID_COLOR = '#8a7a3a'
 export const RECENCY_NEW_COLOR = '#ffb454'
 export const RECENCY_UNKNOWN_COLOR = '#55585f'
+
+// tau = span / 6.5 — the newest ~20% of the time range covers ~75% of the
+// color distance; ages beyond ~half the span land within a few percent of 0.
+const RECENCY_TAU = 1 / 6.5
+const RECENCY_WEIGHT_FLOOR = Math.exp(-1 / RECENCY_TAU)
+
+/** Maps normalized age (0 = newest, 1 = oldest) to a 0..1 palette weight. */
+function recencyWeight(age: number): number {
+  const w = (Math.exp(-age / RECENCY_TAU) - RECENCY_WEIGHT_FLOOR) / (1 - RECENCY_WEIGHT_FLOOR)
+  return clamp(w, 0, 1)
+}
+
+const RECENCY_STOPS: Array<[number, string]> = [
+  [0, RECENCY_OLD_COLOR],
+  [0.55, RECENCY_MID_COLOR],
+  [1, RECENCY_NEW_COLOR]
+]
+
+/**
+ * CSS gradient stop list for the recency legend, sampled along a *linear*
+ * time axis so the gradient itself shows the exponential window: mostly
+ * gray, with the bright ramp compressed against the right edge.
+ */
+export const RECENCY_LEGEND_GRADIENT = [0, 0.45, 0.65, 0.8, 0.88, 0.94, 1]
+  .map((t) => `${mixStops(RECENCY_STOPS, recencyWeight(1 - t))} ${Math.round(t * 100)}%`)
+  .join(', ')
+
+function mixStops(stops: Array<[number, string]>, t: number): string {
+  for (let i = 1; i < stops.length; i++) {
+    const [pos, color] = stops[i]
+    if (t <= pos) {
+      const [prevPos, prevColor] = stops[i - 1]
+      const local = pos <= prevPos ? 1 : (t - prevPos) / (pos - prevPos)
+      return mixHex(prevColor, color, local)
+    }
+  }
+
+  return stops[stops.length - 1][1]
+}
 
 const COMMUNITY_NONE_COLOR = '#5a5e66'
 const COMMUNITY_PALETTE = [
