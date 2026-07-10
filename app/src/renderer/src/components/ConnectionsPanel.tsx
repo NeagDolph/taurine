@@ -145,17 +145,20 @@ export function ConnectionsPanel({
   const staleIdle = !syncRunning && syncStatus?.stale === true
 
   return (
-    <section className="connections-panel" aria-label="Connections">
-      <div className="connections-panel-header">
-        <div className="connections-panel-heading">
+    <section
+      className="flex min-h-0 flex-col rounded-[10px] border border-white/[0.08] bg-surface-1/60 p-3.5"
+      aria-label="Connections"
+    >
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-baseline gap-2.5">
           <span className="section-label">Sources</span>
           {connectors !== null ? (
-            <span className="connections-panel-stats">
+            <span className="whitespace-nowrap text-[11px] font-medium text-fg/45">
               {activeCount} active · {formatCount(totalDocs)} docs indexed
             </span>
           ) : null}
         </div>
-        <div className="panel-card-actions">
+        <div className="flex flex-none gap-2">
           {syncRunning ? (
             <button
               className="secondary-button compact"
@@ -180,33 +183,42 @@ export function ConnectionsPanel({
       </div>
 
       {syncError || syncStatus?.error ? (
-        <div className="connections-panel-error" role="alert">
+        <div
+          className="mt-2.5 rounded-md border border-bad/40 bg-[rgba(60,20,20,0.72)] px-2.5 py-2 text-xs font-medium leading-snug text-[#ffc7c2]"
+          role="alert"
+        >
           {syncError || (syncStatus?.error ? `Last sync failed: ${syncStatus.error}` : '')}
         </div>
       ) : null}
 
       {staleIdle ? (
-        <div className="connections-panel-hint" role="status">
+        <div
+          className="mt-2.5 rounded-md border border-accent/50 bg-accent/10 px-2.5 py-2 text-xs font-medium leading-snug text-accent-hi"
+          role="status"
+        >
           Graph is out of date with the enabled sources — press Sync to rebuild.
         </div>
       ) : null}
 
       {connectors === null ? (
-        <div className="connector-list" aria-hidden="true">
+        <div className="mt-3 flex h-fit flex-col gap-2" aria-hidden="true">
           {[0, 1, 2, 3].map((index) => (
-            <div className="connector-row skeleton" key={index}>
-              <span className="connector-glyph" />
-              <span className="connector-skeleton-lines">
-                <span />
-                <span />
+            <div
+              className="flex items-center gap-3 rounded-lg border border-white/[0.08] bg-surface-2/60 px-3.5 py-2.5"
+              key={index}
+            >
+              <span className="h-8 w-8 flex-none animate-pulse rounded-lg border border-white/[0.08] bg-white/[0.04]" />
+              <span className="grid flex-1 gap-1.5">
+                <span className="h-2.5 animate-pulse rounded bg-white/[0.05]" />
+                <span className="h-2.5 w-[45%] animate-pulse rounded bg-white/[0.05]" />
               </span>
             </div>
           ))}
         </div>
       ) : sortedConnectors.length === 0 ? (
-        <div className="empty-surface">No connectors reported</div>
+        <div className="empty-surface mt-3">No connectors reported</div>
       ) : (
-        <div className="connector-list">
+        <div className="mt-3 flex h-fit flex-col gap-2">
           {sortedConnectors.map((connector) => (
             <ConnectorRow
               configDrafts={configDrafts[connector.connector_id] ?? {}}
@@ -294,9 +306,13 @@ function ConnectorRow({
       : null
 
   return (
-    <article className={`connector-row status-${status}${expanded ? ' expanded' : ''}`}>
+    <article
+      className={`overflow-hidden rounded-lg border bg-surface-2/60 transition-colors ${
+        expanded ? 'border-white/15' : 'border-white/[0.08]'
+      }`}
+    >
       <div
-        className="connector-row-head"
+        className="grid cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-3.5 py-2.5 hover:bg-white/[0.02] focus-visible:outline focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-accent/60"
         role="button"
         tabIndex={0}
         aria-expanded={expanded}
@@ -310,29 +326,36 @@ function ConnectorRow({
         }}
       >
         <span
-          className="connector-glyph"
+          className="flex h-8 w-8 flex-none items-center justify-center rounded-lg border border-[color-mix(in_srgb,var(--glyph-color,#8a8a8a)_24%,transparent)] bg-[color-mix(in_srgb,var(--glyph-color,#8a8a8a)_12%,transparent)] text-[color:var(--glyph-color,#8a8a8a)]"
           style={{ '--glyph-color': sourceColor(connector.connector_id) } as React.CSSProperties}
           aria-hidden="true"
         >
           <ConnectorGlyph connectorId={connector.connector_id} />
         </span>
 
-        <span className="connector-identity">
-          <span className="connector-name">
+        <span className="flex min-w-0 flex-col gap-0.5">
+          <span className="flex items-center gap-2 text-[13px] font-semibold leading-tight text-fg">
             {connector.label}
             {connector.kind === 'oauth' ? (
-              <span className="connector-oauth-badge">OAuth</span>
+              <span className="rounded-full border border-white/[0.08] px-1.5 py-[3px] text-[9px] font-extrabold uppercase leading-none tracking-wider text-fg/45">
+                OAuth
+              </span>
             ) : null}
           </span>
-          <span className="connector-subtitle">
-            <span className={`connector-status-dot ${status}`} aria-hidden="true" />
+          <span className="flex min-w-0 items-center gap-1.5 truncate text-xs text-fg/65">
+            <span
+              className={`h-[7px] w-[7px] flex-none rounded-full ${STATUS_DOT_CLASSES[status]}`}
+              aria-hidden="true"
+            />
             {subtitleFor(connector, status, signInRequired)}
           </span>
         </span>
 
-        <span className="connector-head-actions">
+        <span className="flex items-center gap-3">
           <button
-            className={`connector-switch${connector.enabled ? ' on' : ''}`}
+            className={`relative h-5 w-9 flex-none cursor-pointer rounded-full border p-0 transition-colors ${
+              connector.enabled ? 'border-ok/40 bg-ok/20' : 'border-white/[0.08] bg-white/[0.03]'
+            }`}
             type="button"
             role="switch"
             aria-checked={connector.enabled}
@@ -348,9 +371,17 @@ function ConnectorRow({
               onToggle()
             }}
           >
-            <span aria-hidden="true" />
+            <span
+              className={`absolute left-0.5 top-0.5 h-3.5 w-3.5 rounded-full transition-transform ${
+                connector.enabled ? 'translate-x-4 bg-ok' : 'bg-fg/40'
+              }`}
+              aria-hidden="true"
+            />
           </button>
-          <span className={`connector-chevron${expanded ? ' open' : ''}`} aria-hidden="true">
+          <span
+            className={`flex text-fg/45 transition-transform duration-150 ${expanded ? 'rotate-180' : ''}`}
+            aria-hidden="true"
+          >
             <svg viewBox="0 0 12 12" width="12" height="12">
               <path
                 d="M3 4.5 6 7.5 9 4.5"
@@ -366,9 +397,13 @@ function ConnectorRow({
       </div>
 
       {connector.syncing ? (
-        <div className="connector-progress" aria-hidden="true">
+        <div className="h-0.5 overflow-hidden bg-white/[0.06]" aria-hidden="true">
           <span
-            className={progressFraction === null ? 'indeterminate' : ''}
+            className={`block h-full bg-accent transition-[width] duration-300 ${
+              progressFraction === null
+                ? 'w-2/5 animate-[indeterminate_1.1s_ease-in-out_infinite]'
+                : ''
+            }`}
             style={
               progressFraction === null
                 ? undefined
@@ -379,9 +414,13 @@ function ConnectorRow({
       ) : null}
 
       {expanded ? (
-        <div className="connector-detail" id={detailId}>
+        <div className="grid gap-3 border-t border-white/[0.08] px-3.5 pb-3.5 pt-3" id={detailId}>
           {!signInRequired && connector.detail ? (
-            <p className={`connector-detail-note${status === 'attention' ? ' attention' : ''}`}>
+            <p
+              className={`m-0 text-xs leading-normal ${
+                status === 'attention' ? 'text-accent-hi' : 'text-fg/65'
+              }`}
+            >
               {connector.detail}
             </p>
           ) : null}
@@ -397,17 +436,23 @@ function ConnectorRow({
           ) : null}
 
           {configKeys.length > 0 ? (
-            <div className="connector-config">
-              <span className="connector-detail-label">Configuration</span>
+            <div className="grid gap-2">
+              <span className={DETAIL_LABEL}>Configuration</span>
               {configKeys.map((key) => {
                 const inputId = `connector-config-${connector.connector_id}-${key}`
                 const meta = configFieldMeta(key)
                 const draft = configDrafts[key] ?? formatConfigValue(connector.config[key])
 
                 return (
-                  <div className="connector-config-field" key={key}>
-                    <label htmlFor={inputId}>{meta.label}</label>
+                  <div
+                    className="grid grid-cols-[190px_minmax(0,1fr)] items-center gap-2.5"
+                    key={key}
+                  >
+                    <label className="text-[11px] font-semibold text-fg/45" htmlFor={inputId}>
+                      {meta.label}
+                    </label>
                     <input
+                      className="min-w-0 rounded-md border border-white/[0.08] bg-white/[0.03] px-2.5 py-1.5 text-xs text-fg outline-none transition-colors focus:border-accent/60"
                       id={inputId}
                       type="text"
                       value={draft}
@@ -423,7 +468,7 @@ function ConnectorRow({
                   </div>
                 )
               })}
-              <div className="connector-config-actions">
+              <div className="flex justify-end">
                 <button
                   className="secondary-button compact"
                   type="button"
@@ -436,8 +481,8 @@ function ConnectorRow({
             </div>
           ) : null}
 
-          <div className="connector-detail-actions">
-            <span className="connector-detail-spacer" />
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="flex-1" />
             <button
               className="secondary-button compact danger"
               type="button"
@@ -451,11 +496,11 @@ function ConnectorRow({
 
           {confirmDelete ? (
             <div
-              className="connector-confirm"
+              className="flex flex-wrap items-center gap-2 rounded-md border border-accent/50 bg-white/[0.03] p-2"
               role="group"
               aria-label={`Delete ${connector.label} data`}
             >
-              <span>
+              <span className="mr-0.5 text-xs font-bold text-accent-hi">
                 Delete all {formatCount(connector.docs)} stored document
                 {connector.docs === 1 ? '' : 's'}? A future sync can re-import them.
               </span>
@@ -480,13 +525,25 @@ function ConnectorRow({
       ) : null}
 
       {error ? (
-        <div className="connector-error" role="alert">
+        <div
+          className="rounded-md border border-bad/40 bg-[rgba(60,20,20,0.72)] px-2.5 py-2 text-xs font-medium leading-snug text-[#ffc7c2]"
+          role="alert"
+        >
           {error}
         </div>
       ) : null}
     </article>
   )
 }
+
+const STATUS_DOT_CLASSES: Record<ConnectorStatus, string> = {
+  active: 'bg-ok shadow-[0_0_0_3px_rgba(87,217,138,0.12)]',
+  attention: 'bg-accent-hi shadow-[0_0_0_3px_rgba(245,197,24,0.13)]',
+  off: 'bg-fg/40',
+  syncing: 'bg-accent animate-[ring-pulse_1.2s_ease-in-out_infinite] [--ring:rgba(245,197,24,0.2)]'
+}
+
+const DETAIL_LABEL = 'text-[10px] font-extrabold uppercase tracking-[0.07em] text-fg/45'
 
 function FolderManager({
   connector,
@@ -509,17 +566,20 @@ function FolderManager({
   }
 
   return (
-    <div className="connector-folders">
-      <span className="connector-detail-label">Attached folders</span>
+    <div className="grid gap-2">
+      <span className={DETAIL_LABEL}>Attached folders</span>
       {folders.length === 0 ? (
-        <p className="connector-folders-empty">
+        <p className="m-0 text-xs leading-normal text-fg/45">
           No folders attached yet. Documents inside attached folders (.md, .txt, .pdf, .docx, .rtf)
           are indexed into the corpus and re-synced automatically.
         </p>
       ) : (
-        <ul className="connector-folder-list">
+        <ul className="m-0 grid list-none gap-1.5 p-0">
           {folders.map((folder) => (
-            <li key={folder}>
+            <li
+              className="flex items-center gap-2 rounded-md border border-white/[0.08] bg-white/[0.03] py-1.5 pl-2.5 pr-2 text-fg/45"
+              key={folder}
+            >
               <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
                 <path
                   d="M2.5 6a2 2 0 0 1 2-2h3.2l1.6 2h6.2a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2Z"
@@ -529,7 +589,12 @@ function FolderManager({
                   strokeLinejoin="round"
                 />
               </svg>
-              <code title={folder}>{folder}</code>
+              <code
+                className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-fg"
+                title={folder}
+              >
+                {folder}
+              </code>
               <button
                 className="icon-button"
                 type="button"
@@ -544,7 +609,7 @@ function FolderManager({
           ))}
         </ul>
       )}
-      <div className="connector-folders-actions">
+      <div className="flex">
         <button
           className="secondary-button compact"
           type="button"
@@ -582,13 +647,15 @@ function SignInBlock({ connector }: { connector: ConnectorInfo }): React.JSX.Ele
   const command = signInCommand(connector)
 
   return (
-    <div className="connector-signin">
-      <p>
+    <div className="grid gap-2.5 rounded-md border border-white/[0.08] bg-white/[0.03] px-3 py-2.5">
+      <p className="m-0 text-xs leading-normal text-fg/65">
         Sign in runs a one-time local OAuth flow in your terminal and stores the tokens in{' '}
-        <code>core/.env</code>. Restart the sidecar afterwards.
+        <code className="text-[11.5px] text-fg">core/.env</code>. Restart the sidecar afterwards.
       </p>
-      <div className="connector-command">
-        <code>{command}</code>
+      <div className="flex items-center gap-2">
+        <code className="flex-1 overflow-x-auto whitespace-nowrap rounded-md border border-white/[0.08] bg-black/35 px-2.5 py-2 font-mono text-[11.5px] text-fg">
+          {command}
+        </code>
         <button
           className="secondary-button compact"
           type="button"

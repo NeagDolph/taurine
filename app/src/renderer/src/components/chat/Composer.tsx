@@ -66,10 +66,10 @@ export function Composer({
   }
 
   return (
-    <div className="composer">
+    <div className="flex items-end gap-2 px-4 pb-3.5 pt-2.5">
       <textarea
         ref={textareaRef}
-        className="composer-input"
+        className="max-h-52 flex-1 resize-none rounded-xl border border-white/10 bg-surface-2/70 px-3.5 py-2.5 text-[13px] leading-normal text-fg outline-none transition-colors placeholder:text-fg/35 focus:border-accent/70"
         placeholder="Ask your notes anything…"
         rows={1}
         value={text}
@@ -91,7 +91,7 @@ export function Composer({
       />
       {streaming ? (
         <button
-          className="composer-button stop"
+          className="flex h-9 w-10 flex-none cursor-pointer items-center justify-center rounded-[10px] border-0 bg-bad/20 text-sm text-bad transition-colors hover:bg-bad/30"
           type="button"
           aria-label="Stop generating"
           onClick={onStop}
@@ -100,7 +100,7 @@ export function Composer({
         </button>
       ) : (
         <button
-          className="composer-button send"
+          className="flex h-9 w-10 flex-none cursor-pointer items-center justify-center rounded-[10px] border-0 bg-accent text-sm text-accent-ink transition-colors hover:bg-accent-hi disabled:cursor-default"
           type="button"
           aria-label="Send"
           disabled={disabled || !text.trim()}

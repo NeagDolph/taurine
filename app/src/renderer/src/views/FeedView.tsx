@@ -72,16 +72,25 @@ export function FeedView({
   }, [computeAtBottom, isEmpty])
 
   return (
-    <section className="feed-view" aria-label="Transcript feed">
+    <section className="relative min-h-0 overflow-hidden" aria-label="Transcript feed">
       {isEmpty ? (
-        <div className="feed-empty">
-          <span className="empty-glyph" aria-hidden="true">◎</span>
-          <p className="empty-title">Listening…</p>
-          <p className="empty-hint">Transcript and matched notes appear here as you talk.</p>
+        <div className="flex h-full flex-col items-center justify-center gap-1.5 p-6 text-center text-fg/45">
+          <span className="text-3xl text-accent opacity-55" aria-hidden="true">
+            ◎
+          </span>
+          <p className="text-sm font-semibold text-fg">Listening…</p>
+          <p className="max-w-[300px] text-xs">
+            Transcript and matched notes appear here as you talk.
+          </p>
         </div>
       ) : (
-        <div className="transcript-scroll">
-          <div className="transcript-list" aria-live="polite" ref={listRef} onScroll={handleScroll}>
+        <div className="relative h-full min-h-0">
+          <div
+            className="flex h-full flex-col gap-2 overflow-y-auto scroll-smooth p-3"
+            aria-live="polite"
+            ref={listRef}
+            onScroll={handleScroll}
+          >
             {chunks.map((chunk) => (
               <TranscriptRow
                 chunk={chunk}
@@ -96,7 +105,7 @@ export function FeedView({
           </div>
           {atBottom ? null : (
             <button
-              className="jump-latest"
+              className="absolute bottom-3 left-1/2 z-[4] -translate-x-1/2 rounded-full bg-accent px-3 py-1.5 text-[11px] font-bold text-accent-ink shadow-[0_8px_22px_rgba(0,0,0,0.5)] transition-colors hover:bg-accent-hi"
               type="button"
               onClick={() => scrollToLatest()}
             >
@@ -122,22 +131,24 @@ function TranscriptRow({
 }): React.JSX.Element {
   const annotations = interim ? emptyAnnotations() : buildTriggerAnnotations(chunk, triggers)
   const rowClasses = [
-    'transcript-row',
-    interim ? 'transcript-interim' : '',
-    annotations.hasSearchTrigger ? 'transcript-row-search-accent' : ''
+    'relative rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2.5',
+    interim ? 'border-dashed opacity-50' : '',
+    annotations.hasSearchTrigger ? 'shadow-[inset_3px_0_0_var(--accent)]' : ''
   ]
     .filter(Boolean)
     .join(' ')
 
   return (
     <article className={rowClasses}>
-      <div className="transcript-meta">
+      <div className="mb-1 flex gap-2 text-[11px] text-fg/40">
         <span>{channelLabel(chunk.channel)}</span>
         <time>{formatTime(chunk.ts)}</time>
       </div>
-      <p className="transcript-text">{renderTranscriptText(chunk.text, annotations.ranges, onInspectTrigger)}</p>
+      <p className="text-[13.5px] leading-relaxed text-fg">
+        {renderTranscriptText(chunk.text, annotations.ranges, onInspectTrigger)}
+      </p>
       {annotations.chips.length > 0 ? (
-        <div className="trigger-chip-row" aria-label="Trigger annotations">
+        <div className="mt-2 flex flex-wrap gap-1.5" aria-label="Trigger annotations">
           {annotations.chips.map((trigger) => (
             <button
               className={`trigger-chip trigger-chip-${trigger.kind} trigger-action-${trigger.action}`}

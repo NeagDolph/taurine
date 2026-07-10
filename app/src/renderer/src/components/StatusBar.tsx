@@ -25,8 +25,8 @@ export function StatusBar({
   const controlsDisabled = isSyncing
 
   return (
-    <footer className="status-bar">
-      <div className="status-group">
+    <footer className="flex min-h-9 flex-none items-center justify-between gap-3 rounded-[10px] border border-white/[0.08] bg-surface-1/70 px-3 py-1.5 backdrop-blur-md">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
         <StatusPill
           label="Sidecar"
           state={connection}
@@ -37,11 +37,13 @@ export function StatusBar({
           state={asr}
           tone={asr === 'connected' ? 'good' : asr === 'error' ? 'bad' : 'warn'}
         />
-        <span className="status-metric">{index.notes} notes</span>
-        <span className="status-metric">Last sync {formatLastSync(index.last_sync)}</span>
+        <span className={METRIC_CLASSES}>{index.notes} notes</span>
+        <span className={METRIC_CLASSES}>Last sync {formatLastSync(index.last_sync)}</span>
       </div>
-      <div className="status-group status-group-right">
-        {detailText ? <span className="status-detail">{detailText}</span> : null}
+      <div className="flex flex-none flex-wrap items-center justify-end gap-2">
+        {detailText ? (
+          <span className="max-w-[340px] truncate text-[11px] text-fg/45">{detailText}</span>
+        ) : null}
         <button
           className="secondary-button compact"
           type="button"
@@ -55,6 +57,21 @@ export function StatusBar({
   )
 }
 
+const METRIC_CLASSES =
+  'inline-flex min-h-[22px] items-center gap-1.5 whitespace-nowrap rounded-full border border-white/[0.08] bg-white/[0.03] px-2.5 text-[11px] text-fg/65'
+
+const TONE_BORDER: Record<'good' | 'warn' | 'bad', string> = {
+  good: 'border-ok/40',
+  warn: 'border-accent/50',
+  bad: 'border-bad/40'
+}
+
+const TONE_TEXT: Record<'good' | 'warn' | 'bad', string> = {
+  good: 'text-ok',
+  warn: 'text-accent-hi',
+  bad: 'text-bad'
+}
+
 function StatusPill({
   label,
   state,
@@ -65,9 +82,11 @@ function StatusPill({
   tone: 'good' | 'warn' | 'bad'
 }): React.JSX.Element {
   return (
-    <span className={`status-pill status-${tone}`}>
+    <span
+      className={`inline-flex min-h-[22px] items-center gap-1.5 whitespace-nowrap rounded-full border bg-white/[0.03] px-2.5 text-[11px] text-fg/65 ${TONE_BORDER[tone]}`}
+    >
       <span>{label}</span>
-      <strong>{state}</strong>
+      <strong className={`text-[11px] font-bold ${TONE_TEXT[tone]}`}>{state}</strong>
     </span>
   )
 }

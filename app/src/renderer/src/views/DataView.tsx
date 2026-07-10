@@ -8,7 +8,10 @@ interface DataViewProps {
 
 export function DataView({ profile, onProfileChange }: DataViewProps): React.JSX.Element {
   return (
-    <div className="page data-page" aria-label="Data">
+    <div
+      className="flex h-full min-h-0 flex-col gap-2.5 overflow-y-auto px-px pb-4 pt-px"
+      aria-label="Data"
+    >
       <UserSummary profile={profile} onProfileChange={onProfileChange} />
     </div>
   )

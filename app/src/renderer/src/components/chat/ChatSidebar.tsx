@@ -21,11 +21,22 @@ export function ChatSidebar({
   onDelete
 }: ChatSidebarProps): React.JSX.Element {
   return (
-    <aside className="chat-sidebar" aria-label="Chats">
-      <button className="new-chat-button" type="button" onClick={onNewChat}>
+    <aside
+      className="flex min-h-0 flex-col gap-2 border-r border-white/15 py-2.5 pl-0.5 pr-2.5"
+      aria-label="Chats"
+    >
+      <button
+        className="cursor-pointer rounded-[10px] border border-white/10 bg-accent/15 px-3 py-2 text-left text-xs font-semibold text-accent-hi transition-colors hover:bg-accent/25"
+        type="button"
+        onClick={onNewChat}
+      >
         + New chat
       </button>
-      <nav className="chat-tabs" role="tablist" aria-label="Chat threads">
+      <nav
+        className="flex min-h-0 flex-col gap-0.5 overflow-y-auto"
+        role="tablist"
+        aria-label="Chat threads"
+      >
         {chats.map((chat) => (
           <ChatTab
             key={chat.chat_id}
@@ -37,7 +48,9 @@ export function ChatSidebar({
             onDelete={() => onDelete(chat.chat_id)}
           />
         ))}
-        {chats.length === 0 ? <div className="chat-tabs-empty">No chats yet</div> : null}
+        {chats.length === 0 ? (
+          <div className="px-2.5 py-3 text-xs text-fg/65">No chats yet</div>
+        ) : null}
       </nav>
     </aside>
   )
@@ -76,7 +89,9 @@ function ChatTab({
 
   return (
     <div
-      className={`chat-tab${active ? ' active' : ''}`}
+      className={`group flex min-h-[38px] cursor-pointer items-center justify-between gap-1.5 rounded-md border-l-2 py-1.5 pl-2 pr-1.5 ${
+        active ? 'border-l-accent bg-white/[0.07]' : 'border-l-transparent hover:bg-white/[0.045]'
+      }`}
       role="tab"
       aria-selected={active}
       onClick={onSelect}
@@ -84,7 +99,7 @@ function ChatTab({
     >
       {editing ? (
         <input
-          className="chat-tab-rename"
+          className="w-full rounded-md border border-accent bg-surface-2 px-2 py-1.5 text-xs text-fg outline-none"
           value={draft}
           autoFocus
           onClick={(event) => event.stopPropagation()}
@@ -102,22 +117,27 @@ function ChatTab({
         />
       ) : (
         <>
-          <div className="chat-tab-main">
-            <span className="chat-tab-title">
-              {streaming ? <span className="streaming-dot" aria-label="streaming" /> : null}
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <span className="flex items-center gap-1.5 truncate text-xs font-medium text-fg">
+              {streaming ? (
+                <span
+                  className="h-[7px] w-[7px] flex-none animate-pulse rounded-full bg-accent"
+                  aria-label="streaming"
+                />
+              ) : null}
               {chat.title || 'New chat'}
             </span>
-            <span className="chat-tab-time">{relativeTime(chat.updated)}</span>
+            <span className="text-[10px] text-fg/60">{relativeTime(chat.updated)}</span>
           </div>
-          <div className="chat-tab-actions" onClick={(event) => event.stopPropagation()}>
+          <div className="hidden gap-0.5 group-hover:flex" onClick={(event) => event.stopPropagation()}>
             {confirmingDelete ? (
-              <button className="chat-tab-action danger" type="button" onClick={onDelete}>
+              <button className={`${TAB_ACTION} text-[11px] font-bold !text-bad`} type="button" onClick={onDelete}>
                 Delete?
               </button>
             ) : (
               <>
                 <button
-                  className="chat-tab-action"
+                  className={TAB_ACTION}
                   type="button"
                   aria-label={`Rename ${chat.title || 'chat'}`}
                   onClick={() => {
@@ -128,7 +148,7 @@ function ChatTab({
                   ✎
                 </button>
                 <button
-                  className="chat-tab-action"
+                  className={TAB_ACTION}
                   type="button"
                   aria-label={`Delete ${chat.title || 'chat'}`}
                   onClick={() => setConfirmingDelete(true)}
@@ -143,6 +163,9 @@ function ChatTab({
     </div>
   )
 }
+
+const TAB_ACTION =
+  'cursor-pointer rounded border-0 bg-transparent px-1.5 py-1 text-xs text-fg/65 transition-colors hover:bg-white/[0.08] hover:text-fg'
 
 function relativeTime(unixSeconds: number): string {
   const deltaS = Math.max(0, Date.now() / 1000 - unixSeconds)

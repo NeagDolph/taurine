@@ -21,9 +21,9 @@ export function ActionableRail({
   }
 
   return (
-    <section className="actionable-rail" aria-label="Actionables">
+    <section className="flex min-h-0 flex-col gap-2 overflow-y-auto" aria-label="Actionables">
       <div className="section-label">Actionables</div>
-      <div className="actionable-cards">
+      <div className="flex flex-col gap-2.5">
         {open.map((item) => (
           <ActionableCard
             key={item.id}
@@ -61,18 +61,22 @@ function ActionableCard({
   }))
 
   return (
-    <article className={`actionable-card${item.status === 'confirmed' ? ' confirmed' : ''}`}>
-      <div className="card-header">
-        <div>
-          <h2>{item.title}</h2>
-          <div className="actionable-chips">
+    <article
+      className={`flex flex-col gap-2 rounded-[10px] border border-white/10 border-l-[3px] bg-surface-2/70 px-3.5 py-3 shadow-[0_16px_40px_rgba(0,0,0,0.4)] ${
+        item.status === 'confirmed' ? 'border-l-[#58c98d]' : 'border-l-[#e5b84a]'
+      }`}
+    >
+      <div className="flex items-start justify-between gap-2.5">
+        <div className="min-w-0">
+          <h2 className="text-[13px] font-bold leading-snug text-fg">{item.title}</h2>
+          <div className="mt-1.5 flex flex-wrap gap-1">
             {item.assignee ? <span className="meta-chip">{item.assignee}</span> : null}
             {item.due ? <span className="meta-chip due">{item.due}</span> : null}
             <span className="meta-chip confidence">{Math.round(item.confidence * 100)}%</span>
             {item.status === 'confirmed' ? <span className="meta-chip ok">confirmed</span> : null}
           </div>
         </div>
-        <div className="actionable-actions">
+        <div className="flex items-center gap-1.5">
           {item.status !== 'confirmed' ? (
             <button
               className="secondary-button"
@@ -93,7 +97,9 @@ function ActionableCard({
         </div>
       </div>
 
-      <blockquote className="actionable-quote">&ldquo;{item.quote}&rdquo;</blockquote>
+      <blockquote className="m-0 border-l-2 border-white/15 pl-2 text-xs italic leading-snug text-fg/65">
+        &ldquo;{item.quote}&rdquo;
+      </blockquote>
 
       <button
         className="link-button"
@@ -105,19 +111,19 @@ function ActionableCard({
       </button>
 
       {expanded ? (
-        <div className="grounding-drawer">
-          {item.why_new ? <p className="grounding-why-new">{item.why_new}</p> : null}
-          <ul>
+        <div className="border-t border-white/10 pt-2 text-xs">
+          {item.why_new ? <p className="mb-1.5 italic text-fg/65">{item.why_new}</p> : null}
+          <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
             {groundingRefs.map((ref) =>
               ref.fact ? (
-                <li key={ref.id}>
+                <li className="flex items-baseline gap-1.5" key={ref.id}>
                   <span className="citation-chip citation-fact">{ref.id}</span>
-                  <span className="grounding-text">
+                  <span className="inline-flex min-w-0 flex-wrap gap-1 text-fg/65">
                     {ref.fact.subject} {ref.fact.predicate} {ref.fact.object}
                   </span>
                 </li>
               ) : ref.passage ? (
-                <li key={ref.id}>
+                <li className="flex items-baseline gap-1.5" key={ref.id}>
                   <button
                     className="citation-chip citation-passage"
                     type="button"
@@ -125,10 +131,10 @@ function ActionableCard({
                   >
                     {ref.id}
                   </button>
-                  <span className="grounding-text">{ref.passage.text}</span>
+                  <span className="inline-flex min-w-0 flex-wrap gap-1 text-fg/65">{ref.passage.text}</span>
                 </li>
               ) : ref.note ? (
-                <li key={ref.id}>
+                <li className="flex items-baseline gap-1.5" key={ref.id}>
                   <button
                     className="citation-chip citation-note"
                     type="button"
@@ -136,17 +142,17 @@ function ActionableCard({
                   >
                     {ref.id}
                   </button>
-                  <span className="grounding-text">
-                    <strong>{ref.note.title}</strong>
+                  <span className="inline-flex min-w-0 flex-wrap gap-1 text-fg/65">
+                    <strong className="font-semibold text-fg">{ref.note.title}</strong>
                     <span className={`source-chip source-${ref.note.source}`}>
                       {sourceLabel(ref.note.source)}
                     </span>
                   </span>
                 </li>
               ) : ref.id.startsWith('T') ? (
-                <li key={ref.id}>
+                <li className="flex items-baseline gap-1.5" key={ref.id}>
                   <span className="citation-chip citation-transcript">{ref.id}</span>
-                  <span className="grounding-text">Transcript evidence</span>
+                  <span className="inline-flex min-w-0 flex-wrap gap-1 text-fg/65">Transcript evidence</span>
                 </li>
               ) : null
             )}
