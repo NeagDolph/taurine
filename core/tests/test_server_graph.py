@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
-from taurine_core.indexer.communities import projection_communities
+from taurine_core.indexer.communities import fallback_clusters
 from taurine_core.indexer.facts import FactRecord
 from taurine_core.indexer.knowledge_store import KnowledgeStore
 from taurine_core.indexer.passages import PassageDraft
@@ -252,6 +252,13 @@ def test_graph_payload_carries_metadata_communities_entities_and_mechanisms(
         assert cluster_one != cluster_two
         assert -1 not in cluster_one | cluster_two
         assert nodes["omega"]["community"] == -1
+        # snapshot has no persisted clusters: contiguous remapped fallback
+        assert cluster_one | cluster_two == {0, 1}
+        clusters = {cluster["id"]: cluster for cluster in payload["clusters"]}
+        assert set(clusters) == {0, 1}
+        assert clusters[0]["size"] == 3
+        assert clusters[0]["name"] == "Cluster 1 (3 notes)"
+        assert set(clusters[0]) == {"id", "name", "description", "size"}
 
         edges = {(edge["src"], edge["dst"]): edge for edge in payload["edges"]}
         assert edges[("alpha", "beta")]["mechanisms"] == {"semantic": 0.5, "fact": 0.9}
@@ -287,9 +294,14 @@ def test_graph_local_bfs_depth_membership_and_unknown_center(tmp_path: Path) -> 
             "zeta",
         ]
 
+        # local responses carry only clusters with a member in the result set
+        assert len(depth_one["clusters"]) == 1
+        assert depth_one["clusters"][0]["id"] == depth_one["nodes"][0]["community"]
+
         isolated = client.get("/graph/local", params={"center": "omega", "depth": 3}).json()
         assert [node["note_id"] for node in isolated["nodes"]] == ["omega"]
         assert isolated["edges"] == []
+        assert isolated["clusters"] == []
 
         assert client.get("/graph/local", params={"center": "missing"}).status_code == 404
         # out-of-range depths clamp into 1..3
@@ -326,18 +338,27 @@ def test_facts_endpoint_resolves_labels_and_drops_unknown_ids(tmp_path: Path) ->
         assert client.get("/facts", params={"ids": over_cap}).json() == {"facts": []}
 
 
-def test_retrieval_runtime_serves_cached_communities_per_snapshot(tmp_path: Path) -> None:
-    """community_labels returns the activation-time cache for the active
-    snapshot and recomputes for a stale generation a reader still holds."""
+def test_retrieval_runtime_serves_snapshot_clusters_with_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    """community_labels serves the snapshot's persisted note_clusters when
+    present and remaps legacy label propagation for snapshots without them."""
 
-    active = FakeSnapshot(tmp_path / "active.db", PROJECTION[:3])
-    stale = FakeSnapshot(tmp_path / "stale.db", PROJECTION[3:])
+    legacy = FakeSnapshot(tmp_path / "active.db", PROJECTION[:3])
+    persisted = SimpleNamespace(
+        projection=PROJECTION[3:],
+        note_clusters={"delta": 0, "epsilon": 0, "zeta": 0, "omega": -1},
+    )
 
     runtime = RetrievalRuntime.__new__(RetrievalRuntime)
     runtime._lock = RLock()
-    runtime._snapshot = active  # type: ignore[assignment]
-    runtime._communities = projection_communities(active.projection)
+    runtime._snapshot = legacy  # type: ignore[assignment]
 
-    assert runtime.community_labels() == projection_communities(PROJECTION[:3])
-    assert runtime.community_labels(active) is runtime._communities  # type: ignore[arg-type]
-    assert runtime.community_labels(stale) == projection_communities(PROJECTION[3:])  # type: ignore[arg-type]
+    assert runtime.community_labels() == fallback_clusters(PROJECTION[:3])[0]
+    assert runtime.community_labels(legacy) == fallback_clusters(PROJECTION[:3])[0]  # type: ignore[arg-type]
+    assert runtime.community_labels(persisted) == {  # type: ignore[arg-type]
+        "delta": 0,
+        "epsilon": 0,
+        "zeta": 0,
+        "omega": -1,
+    }

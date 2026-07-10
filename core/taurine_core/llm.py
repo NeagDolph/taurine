@@ -41,6 +41,7 @@ class OpenRouterClient:
         system: str,
         user: str,
         timeout_s: float | None = None,
+        temperature: float | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": model,
@@ -53,6 +54,8 @@ class OpenRouterClient:
             "provider": {"require_parameters": True},
             **_reasoning_for(model),
         }
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
         headers = {"Authorization": f"Bearer {self._api_key}"}
 
         try:

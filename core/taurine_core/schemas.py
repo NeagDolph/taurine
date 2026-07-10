@@ -126,9 +126,19 @@ class GraphNode(BaseModel):
     entities: list[str] = []       # top ≤8 traversal-eligible canonical labels, by mention count
 
 
+class ClusterInfo(BaseModel):
+    """One note cluster (persisted at build time, or a legacy fallback)."""
+
+    id: int                        # contiguous 0..N-1, size-ordered; GraphNode.community
+    name: str                      # LLM-specific or deterministic fallback name
+    description: str = ""          # 1-2 sentences when LLM-labeled
+    size: int
+
+
 class GraphResponse(BaseModel):
     nodes: list[GraphNode]
     edges: list[GraphEdge]
+    clusters: list[ClusterInfo] = []
 
 
 class LocalGraphResponse(BaseModel):
@@ -138,6 +148,30 @@ class LocalGraphResponse(BaseModel):
     depth: int
     nodes: list[GraphNode]
     edges: list[GraphEdge]         # included iff both endpoints are in nodes
+    clusters: list[ClusterInfo] = []  # clusters with a member among nodes
+
+
+class IdeaSearchRequest(BaseModel):
+    """POST /graph/idea — agentic concept search over the knowledge index."""
+
+    idea: str
+    limit: int = 40                # clamped into 5..80
+
+
+class IdeaMatch(BaseModel):
+    note_id: str
+    title: str
+    source: str
+    strength: float                # 0-1, how central the idea is to the note
+    reason: str                    # ≤18 words, concrete
+
+
+class IdeaSearchResponse(BaseModel):
+    idea: str
+    matches: list[IdeaMatch]       # aligned only, strength desc
+    considered: int                # notes adjudicated by the LLM
+    expanded: int                  # of those, notes reached via graph expansion
+    latency_ms: float
 
 
 class FactPayload(BaseModel):

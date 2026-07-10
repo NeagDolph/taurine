@@ -37,10 +37,12 @@ from taurine_core.indexer.build import (
     relation_completer_for,
     sweep_stale_build_files,
 )
+from taurine_core.indexer.cluster_labels import cluster_labeler_for
 from taurine_core.profile_context import owner_aliases as profile_owner_aliases
 from taurine_core.indexer.build_cache import BuildCache
 from taurine_core.indexer.embed import embed_texts
-from taurine_core.indexer.communities import projection_communities
+from taurine_core import idea_search
+from taurine_core.indexer.communities import fallback_clusters
 from taurine_core.indexer.extract import extract_notes
 from taurine_core.indexer.knowledge_store import KnowledgeSchemaError
 from taurine_core.models_local import passage_tokenizer
@@ -63,12 +65,15 @@ from taurine_core.schemas import (
     ChatMetaEvent,
     ChatRegenerateMsg,
     ChatSendMsg,
+    ClusterInfo,
     ConnectorInfo,
     FactPayload,
     FactsResponse,
     GraphEdge,
     GraphNode,
     GraphResponse,
+    IdeaSearchRequest,
+    IdeaSearchResponse,
     IndexStatus,
     LocalGraphResponse,
     MeetingSummary,
@@ -360,6 +365,26 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             _full_graph(active_runtime),
             center=center,
             depth=min(3, max(1, int(depth))),
+        )
+
+    @app.post("/graph/idea")
+    async def graph_idea(payload: IdeaSearchRequest) -> IdeaSearchResponse:
+        active_runtime = _ready_runtime(app)
+        if not payload.idea.strip():
+            raise HTTPException(status_code=400, detail="idea must not be empty")
+        if (
+            active_runtime.connector_llm is None
+            or active_runtime.knowledge_runtime is None
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="idea search requires a configured LLM and knowledge index",
+            )
+        return await idea_search.search_idea(
+            payload.idea,
+            snapshot=active_runtime.knowledge_runtime.snapshot,
+            llm=active_runtime.connector_llm,
+            limit=payload.limit,
         )
 
     @app.get("/facts")
@@ -867,6 +892,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
             embedder=build_cache.caching_embedder(config.EMBED_MODEL, embed_texts),
             extractor=build_cache.caching_extractor(extract_notes),
             relation_completer=complete_relations,
+            cluster_labeler=cluster_labeler_for(llm),
         )
     )
     knowledge_database = Path("taurine-knowledge.db")
@@ -1083,14 +1109,19 @@ def _local_graph(
         if not frontier:
             break
         visited.update(frontier)
+    local_nodes = [node for node in graph.nodes if node.note_id in visited]
+    present_clusters = {node.community for node in local_nodes if node.community >= 0}
     return LocalGraphResponse(
         center=center,
         depth=depth,
-        nodes=[node for node in graph.nodes if node.note_id in visited],
+        nodes=local_nodes,
         edges=[
             edge
             for edge in graph.edges
             if edge.src in visited and edge.dst in visited
+        ],
+        clusters=[
+            cluster for cluster in graph.clusters if cluster.id in present_clusters
         ],
     )
 
@@ -1116,12 +1147,12 @@ def _knowledge_graph(knowledge_runtime: RetrievalRuntime) -> GraphResponse:
         note_entities = store.note_entities()
     finally:
         store.close()
-    labels_fn = getattr(knowledge_runtime, "community_labels", None)
-    communities: Mapping[str, int] = (
-        labels_fn(snapshot)
-        if callable(labels_fn)
-        else projection_communities(snapshot.projection)
-    )
+    communities: Mapping[str, int] | None = getattr(snapshot, "note_clusters", None)
+    cluster_rows = getattr(snapshot, "clusters", None)
+    if communities is None or cluster_rows is None:
+        # Snapshot without cluster data (legacy fake/pre-cluster runtime):
+        # remap label propagation to the contiguous-cluster contract.
+        communities, cluster_rows = fallback_clusters(snapshot.projection)
     degree = {note_id: 0 for note_id in notes}
     edges: list[GraphEdge] = []
     for row in snapshot.projection:
@@ -1161,6 +1192,15 @@ def _knowledge_graph(knowledge_runtime: RetrievalRuntime) -> GraphResponse:
             for note in notes.values()
         ],
         edges=edges,
+        clusters=[
+            ClusterInfo(
+                id=int(row.cluster_id),
+                name=row.name,
+                description=row.description,
+                size=int(row.size),
+            )
+            for row in cluster_rows
+        ],
     )
 
 

@@ -280,6 +280,7 @@ def test_graph_and_sync_endpoints_use_runtime_services() -> None:
                         "mechanisms": {},
                 }
             ],
+            "clusters": [],
         }
         response = client.post("/index/sync")
         assert response.status_code == 202

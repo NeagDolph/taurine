@@ -118,8 +118,22 @@ EMAIL_SCORE_WEIGHTS = {
 EMAIL_RECENCY_SCORE_HALF_LIFE_DAYS = 30.0
 
 # ── note graph / map communities ───────────────────────────────────────
-COMMUNITY_LP_ITERS = 20                  # label-propagation passes (map communities)
+COMMUNITY_LP_ITERS = 20                  # label-propagation passes (legacy-DB fallback communities)
 PROJECTION_MAX_DEGREE = 12               # product map only; never retrieval
+
+# ── build-time note clusters (map lens; persisted per build) ──────────
+# Clustering edge weight re-weights projection mechanisms: the entity
+# mechanism noisy-or saturates (~76% of production edges ≥ 0.99), so it is
+# capped and down-weighted; semantic and fact stay discriminative.
+CLUSTER_W_SEMANTIC = 1.0
+CLUSTER_W_FACT = 0.7
+CLUSTER_W_ENTITY = 0.3
+CLUSTER_MIN_WEIGHT = 0.15                # combined weight below this: edge ignored for clustering
+CLUSTER_RESOLUTION = 1.0                 # modularity resolution (higher → smaller clusters)
+CLUSTER_MAX_SIZE = 35                    # clusters larger than this are recursively re-clustered
+CLUSTER_MIN_SIZE = 3                     # clusters smaller than this merge into their best neighbor
+CLUSTER_LABEL_BATCH = 12                 # clusters per naming call
+# CLUSTER_LABEL_MODEL / IDEA_SEARCH_MODEL live below SUMMARY_MODEL.
 
 # ── evidence-first passage/base graph ─────────────────────────────────
 PASSAGE_TARGET_TOKENS = 220
@@ -163,6 +177,8 @@ FUZZY_SNAP_LABELS = ("person", "organization", "project")  # spans eligible for 
 # ── summarizer (spec 2026-07-08: one pass, change-triggered) ───────────
 SUMMARY_MODEL = "deepseek/deepseek-v4-flash"
 SUMMARY_FALLBACK_MODEL = "deepseek/deepseek-chat"
+CLUSTER_LABEL_MODEL = SUMMARY_MODEL      # LLM cluster naming during sync (fallback names otherwise)
+IDEA_SEARCH_MODEL = SUMMARY_MODEL        # idea-lens per-note alignment adjudication
 SUMMARY_TIMEOUT_S = 20.0
 SUMMARY_MIN_INTERVAL_S = 25.0            # hard floor between summarizer passes
 SUMMARY_MAX_STALENESS_S = 240.0          # force a pass if new speech and this much elapsed

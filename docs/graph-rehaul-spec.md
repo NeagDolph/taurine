@@ -68,11 +68,40 @@ Server-side BFS over projection edges from `center`. Returns:
 
 Unknown ids are silently dropped.
 
-### Communities
+### Communities → persisted clusters (2026-07-10 update)
 
-Reuse `indexer/communities.py::label_propagation` over the projection (see how
-`rank.NoteGraphMatrix` is constructed). Compute once per snapshot activation and cache on
-the runtime/snapshot; ids must be stable for a given build (deterministic LP already is).
+Clustering now runs at build time (deterministic weighted greedy modularity over the
+projection with de-saturated entity weights) and persists to `clusters` /
+`note_clusters` tables. `GraphNode.community` is the persisted contiguous cluster id
+(0..N-1, size-ordered; -1 = unclustered). `GraphResponse` and `LocalGraphResponse`
+gain an additive field:
+
+```json
+"clusters": [ { "id": int, "name": str, "description": str, "size": int } ]
+```
+
+Names/descriptions are LLM-written during sync (specific, ≤5 words) with deterministic
+fallbacks ("Ernest Chae, Adi Yadhav +2", "Group Chats"). Against a pre-cluster database
+the server still boots: the snapshot falls back to activation-time label propagation
+remapped to contiguous ids with `"Cluster 1 (24 notes)"`-style names, so the contract
+always holds. `/graph` returns every cluster; `/graph/local` returns only clusters with
+a member among the returned nodes.
+
+### New: `POST /graph/idea` (idea lens — agentic concept search)
+
+Request: `{ "idea": str, "limit": int = 40 }` (limit clamped 5–80). Runs 5–20s:
+dense+BM25 seeding, 1-hop projection expansion, LLM per-note adjudication, and one
+agentic second hop around strong (≥0.7) matches. Response:
+
+```json
+{ "idea": str,
+  "matches": [ { "note_id": str, "title": str, "source": str,
+                 "strength": float, "reason": str } ],
+  "considered": int, "expanded": int, "latency_ms": float }
+```
+
+Matches are aligned-only, sorted by strength desc. Errors: 400 empty idea, 503 when no
+LLM/knowledge index is configured. Malformed LLM rows are skipped (fail-open).
 
 ### Chat seeding (for "Ask about this")
 

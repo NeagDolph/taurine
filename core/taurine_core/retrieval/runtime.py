@@ -19,7 +19,7 @@ from taurine_core.evaluation.graph_retrieval import (
     TripleRecognitionCalibration,
     load_calibration,
 )
-from taurine_core.indexer.communities import projection_communities
+from taurine_core.indexer.communities import fallback_clusters
 from taurine_core.indexer.embed import embed_queries
 from taurine_core.models_local import (
     LocalModelUnavailable,
@@ -150,9 +150,6 @@ class RetrievalRuntime:
         self.knowledge_database = Path(knowledge_database)
         self._lock = RLock()
         self._snapshot: IndexSnapshot = load_index_snapshot(self.knowledge_database)
-        self._communities: dict[str, int] = projection_communities(
-            self._snapshot.projection
-        )
         self._stores: dict[str, Any] = {}
         # H4/§11.3: verify the artifact's content hash on load. On a mismatch
         # fail closed to the in-code conservative floors and surface the
@@ -270,18 +267,18 @@ class RetrievalRuntime:
             return self._snapshot
 
     def community_labels(self, snapshot: IndexSnapshot | None = None) -> dict[str, int]:
-        """Cached label-propagation communities for the active snapshot.
+        """Contiguous cluster ids per note for one snapshot generation.
 
-        Computed once per snapshot activation. Passing an older snapshot (a
-        reader that raced a swap) recomputes for exactly that generation, so
-        node ids and community ids never mix across builds.
+        Persisted clusters ride the snapshot itself (loaded per activation),
+        so node ids and cluster ids never mix across builds; snapshots
+        without cluster data (legacy fakes) fall back to remapped label
+        propagation.
         """
-        with self._lock:
-            current = self._snapshot
-            cached = self._communities
-        if snapshot is None or snapshot is current:
-            return cached
-        return projection_communities(snapshot.projection)
+        target = self.snapshot if snapshot is None else snapshot
+        membership = getattr(target, "note_clusters", None)
+        if membership is not None:
+            return dict(membership)
+        return fallback_clusters(target.projection)[0]
 
     def activate_from_disk(self) -> IndexSnapshot:
         """Atomically publish a newly completed clean build for future sessions."""
@@ -295,10 +292,8 @@ class RetrievalRuntime:
             # the same build after in-place row deletion, which legitimately
             # diverges from the recorded hash until the next clean build.
             self._verify_installed_hash(snapshot.build_id)
-        communities = projection_communities(snapshot.projection)
         with self._lock:
             self._snapshot = snapshot
-            self._communities = communities
         return snapshot
 
     def _verify_installed_hash(self, build_id: str) -> None:

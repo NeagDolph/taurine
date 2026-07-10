@@ -8,7 +8,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence
 from urllib.parse import quote
 
 import numpy as np
@@ -20,6 +20,7 @@ from taurine_core.indexer.base_graph import (
     grouped_fact_edges,
     materialize_base_graph,
 )
+from taurine_core.indexer.communities import ClusterRecord
 from taurine_core.indexer.embed import FactEmbedding, PassageEmbedding
 from taurine_core.indexer.facts import PREDICATES, FactRecord
 from taurine_core.indexer.passages import PassageDraft
@@ -745,6 +746,86 @@ class KnowledgeStore:
             )
             for row in rows
         )
+
+    def has_cluster_tables(self) -> bool:
+        """False for databases built before persisted clusters existed.
+
+        The cluster tables are deliberately NOT in ``_REQUIRED_TABLES``: a
+        pre-cluster production DB must keep loading (the snapshot falls back
+        to activation-time label propagation) instead of being declared
+        schema-incompatible.
+        """
+        return {"clusters", "note_clusters"} <= self.table_names()
+
+    def write_clusters(
+        self,
+        records: Sequence[ClusterRecord],
+        membership: Mapping[str, int],
+        *,
+        build_id: str,
+    ) -> None:
+        """Persist one build's cluster records and full note membership
+        (unclustered notes carry cluster_id -1)."""
+        self._writable()
+        with self._conn:
+            self._conn.execute("DELETE FROM note_clusters WHERE build_id = ?", (build_id,))
+            self._conn.execute("DELETE FROM clusters WHERE build_id = ?", (build_id,))
+            for record in sorted(records, key=lambda row: row.cluster_id):
+                self._conn.execute(
+                    """
+                    INSERT INTO clusters(
+                        cluster_id, build_id, size, name, description,
+                        label_source, top_entities
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(record.cluster_id),
+                        build_id,
+                        int(record.size),
+                        record.name,
+                        record.description,
+                        record.label_source,
+                        json.dumps(list(record.top_entities)),
+                    ),
+                )
+            for note_id in sorted(membership):
+                self._conn.execute(
+                    "INSERT INTO note_clusters(note_id, cluster_id, build_id) VALUES (?, ?, ?)",
+                    (note_id, int(membership[note_id]), build_id),
+                )
+
+    def clusters(self, build_id: str) -> tuple[ClusterRecord, ...]:
+        if not self.has_cluster_tables():
+            return ()
+        rows = self._conn.execute(
+            """
+            SELECT cluster_id, size, name, description, label_source, top_entities
+            FROM clusters WHERE build_id = ? ORDER BY cluster_id
+            """,
+            (build_id,),
+        ).fetchall()
+        return tuple(
+            ClusterRecord(
+                cluster_id=int(row["cluster_id"]),
+                size=int(row["size"]),
+                name=str(row["name"]),
+                description=str(row["description"]),
+                label_source=str(row["label_source"]),
+                top_entities=tuple(
+                    str(value) for value in json.loads(row["top_entities"])
+                ),
+            )
+            for row in rows
+        )
+
+    def note_clusters(self, build_id: str) -> dict[str, int]:
+        if not self.has_cluster_tables():
+            return {}
+        rows = self._conn.execute(
+            "SELECT note_id, cluster_id FROM note_clusters WHERE build_id = ? ORDER BY note_id",
+            (build_id,),
+        ).fetchall()
+        return {str(row["note_id"]): int(row["cluster_id"]) for row in rows}
 
     def quality_ranks(self, build_id: str) -> dict[str, float]:
         rows = self._conn.execute(
@@ -1612,6 +1693,29 @@ CREATE TABLE note_projection_edges (
     build_id TEXT NOT NULL,
     PRIMARY KEY(src_note_id, dst_note_id),
     CHECK(src_note_id < dst_note_id)
+);
+
+-- Cluster tables are additive presentation data: membership derives
+-- deterministically from the projection (already covered by the graph hash)
+-- and names come from a non-deterministic LLM, so neither participates in
+-- graph-hash verification. Absent on pre-cluster databases (see
+-- has_cluster_tables).
+CREATE TABLE clusters (
+    cluster_id INTEGER NOT NULL,
+    build_id TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    label_source TEXT NOT NULL DEFAULT 'fallback',
+    top_entities TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY(cluster_id, build_id)
+);
+
+CREATE TABLE note_clusters (
+    note_id TEXT NOT NULL REFERENCES notes(note_id) ON DELETE CASCADE,
+    cluster_id INTEGER NOT NULL,
+    build_id TEXT NOT NULL,
+    PRIMARY KEY(note_id, build_id)
 );
 
 CREATE TABLE index_builds (

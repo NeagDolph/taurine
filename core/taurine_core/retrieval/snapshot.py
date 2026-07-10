@@ -31,6 +31,11 @@ class IndexSnapshot:
     quality_ranks: Mapping[str, float]
     model_manifest: Mapping[str, str] = field(default_factory=dict)
     config_manifest: Mapping[str, str] = field(default_factory=dict)
+    # Persisted note clusters (or the legacy label-propagation fallback when
+    # the database predates the cluster tables). Additive: existing
+    # constructors default to "no clusters".
+    clusters: tuple[Any, ...] = ()
+    note_clusters: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         passage_matrix = np.asarray(self.passage_matrix, dtype=np.float32).copy()
@@ -62,6 +67,14 @@ class IndexSnapshot:
         object.__setattr__(self, "quality_ranks", MappingProxyType(dict(self.quality_ranks)))
         object.__setattr__(self, "model_manifest", MappingProxyType(dict(self.model_manifest)))
         object.__setattr__(self, "config_manifest", MappingProxyType(dict(self.config_manifest)))
+        object.__setattr__(self, "clusters", tuple(self.clusters))
+        object.__setattr__(
+            self,
+            "note_clusters",
+            MappingProxyType(
+                {str(key): int(value) for key, value in dict(self.note_clusters).items()}
+            ),
+        )
 
     def open_knowledge_store(self) -> "KnowledgeStore":
         """Open this generation's immutable DB for lexical/public row reads."""
@@ -124,6 +137,17 @@ def load_index_snapshot(
             fact_matrix = np.empty((0, passage_matrix.shape[1]), dtype=np.float32)
         elif fact_matrix.shape[1]:
             passage_matrix = np.empty((0, fact_matrix.shape[1]), dtype=np.float32)
+        projection = store.projection(build.build_id)
+        if store.has_cluster_tables():
+            clusters = store.clusters(build.build_id)
+            note_clusters: Mapping[str, int] = store.note_clusters(build.build_id)
+        else:
+            # Pre-cluster production database: keep serving via the legacy
+            # activation-time label propagation, remapped to the contiguous
+            # cluster-id contract with fallback names.
+            from taurine_core.indexer.communities import fallback_clusters
+
+            note_clusters, clusters = fallback_clusters(projection)
         return IndexSnapshot(
             build_id=build.build_id,
             database_path=path,
@@ -134,10 +158,12 @@ def load_index_snapshot(
             fact_matrix=fact_matrix,
             alias_index=store.alias_index(build_id=build.build_id),
             base_graph=store.base_graph(build.build_id),
-            projection=store.projection(build.build_id),
+            projection=projection,
             quality_ranks=store.quality_ranks(build.build_id),
             model_manifest=build.model_manifest,
             config_manifest=build.config_manifest,
+            clusters=clusters,
+            note_clusters=note_clusters,
         )
     finally:
         store.close()

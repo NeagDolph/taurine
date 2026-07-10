@@ -22,6 +22,14 @@ from scipy.sparse.csgraph import connected_components
 from taurine_core import config
 from taurine_core.evaluation.graph_retrieval import load_calibration
 from taurine_core.indexer.base_graph import BaseGraphBuilder, EntityGraphInput, PassageEntityInput, PassageGraphInput
+from taurine_core.indexer.cluster_labels import (
+    ClusterSummary,
+    build_cluster_summaries,
+    cluster_labeler_for,
+    fallback_label,
+    label_clusters,
+)
+from taurine_core.indexer.communities import ClusterRecord, cluster_projection
 from taurine_core.indexer.embed import embed_facts, embed_passages, embed_texts
 from taurine_core.indexer.entities import EntityResolver, MentionInput
 from taurine_core.indexer.extract import extract_notes
@@ -62,6 +70,9 @@ class BuildDependencies:
     now: Callable[[], float] = time.time
     extractor: Callable[..., dict[str, Any]] | None = None
     relation_completer: Callable[[Sequence[CompletionNote]], object] | None = None
+    # optional like the relation-completion lane: server syncs wire an LLM,
+    # CLI builds may not — absence means fallback cluster names, never failure
+    cluster_labeler: Callable[[Sequence[ClusterSummary]], object] | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +113,10 @@ class BuildReport:
     salience_gated_count: int = 0
     salience_gated_by_source: dict[str, int] | None = None
     near_duplicate_note_pairs: tuple[tuple[str, str], ...] = ()
+    cluster_count: int = 0
+    cluster_size_histogram: dict[str, int] | None = None
+    cluster_labeled_count: int = 0
+    cluster_label_failed_batches: int = 0
 
 
 class BuildCoordinator:
@@ -584,6 +599,76 @@ class BuildCoordinator:
                 build_id=build_id,
             )
             stage_done("ranks")
+            announce("clusters")
+            # Membership is a pure function of the (already hashed) projection
+            # and names come from a non-deterministic LLM, so the cluster
+            # tables stay OUT of the graph hash — hashing them would break
+            # the L24 reproducibility verification. Graph-hash inputs are
+            # unchanged by this stage.
+            cluster_assignments = cluster_projection(projection)
+            cluster_membership = {
+                note.note_id: int(cluster_assignments.get(note.note_id, -1))
+                for note in ordered
+            }
+            eligible_entity_labels = {
+                entity.entity_id: entity.canonical
+                for entity in resolution.entities
+                if entity.traversal_eligible
+            }
+            note_entity_labels: dict[str, list[str]] = {}
+            for row in resolution.mentions:
+                label = eligible_entity_labels.get(row.entity_id)
+                if label is not None:
+                    note_entity_labels.setdefault(row.note_id, []).append(label)
+            stored_notes = store.source_notes()
+            cluster_summaries = build_cluster_summaries(
+                cluster_membership,
+                titles={note.note_id: note.title for note in stored_notes},
+                display_lines={
+                    note.note_id: note.display_line for note in stored_notes
+                },
+                sources={note.note_id: note.source for note in stored_notes},
+                value_scores=value_scores,
+                note_entities=note_entity_labels,
+            )
+            cluster_names: dict[int, tuple[str, str]] = {}
+            cluster_label_failures = 0
+            if self.dependencies.cluster_labeler is not None and cluster_summaries:
+                cluster_names, cluster_label_failures = label_clusters(
+                    cluster_summaries, self.dependencies.cluster_labeler
+                )
+            cluster_records = []
+            for summary in cluster_summaries:
+                named = cluster_names.get(summary.cluster_id)
+                if named is None:
+                    name, description = fallback_label(summary)
+                    label_source = "fallback"
+                else:
+                    name, description = named
+                    label_source = "llm"
+                cluster_records.append(
+                    ClusterRecord(
+                        cluster_id=summary.cluster_id,
+                        size=summary.size,
+                        name=name,
+                        description=description,
+                        label_source=label_source,
+                        top_entities=summary.top_entities,
+                    )
+                )
+            store.write_clusters(cluster_records, cluster_membership, build_id=build_id)
+            cluster_labeled = sum(
+                1 for record in cluster_records if record.label_source == "llm"
+            )
+            if cluster_records:
+                _LOG.info(
+                    "build %s: %d clusters (%d LLM-labeled, %d label batches failed)",
+                    build_id,
+                    len(cluster_records),
+                    cluster_labeled,
+                    cluster_label_failures,
+                )
+            stage_done("clusters")
             announce("fact_embeddings")
             fact_embeddings = embed_facts(
                 store.fact_contexts(),
@@ -726,6 +811,12 @@ class BuildCoordinator:
                 salience_gated_count=len(gated_note_ids),
                 salience_gated_by_source=_gated_by_source(ordered, gated_note_ids),
                 near_duplicate_note_pairs=near_duplicates,
+                cluster_count=len(cluster_records),
+                cluster_size_histogram=_cluster_size_histogram(
+                    [record.size for record in cluster_records]
+                ),
+                cluster_labeled_count=cluster_labeled,
+                cluster_label_failed_batches=cluster_label_failures,
             )
         except Exception as exc:
             if store is not None:
@@ -791,13 +882,17 @@ def main(
 
         def connector_loader() -> Sequence[NoteRecord]:
             return connector_registry.extract_all_enabled(source_index).records
+    cli_llm = None if dependencies is not None else _cli_llm_client()
     deps = dependencies or BuildDependencies(
         tokenizer=passage_tokenizer(),
         embedder=embed_texts,
         extractor=extract_notes,
         relation_completer=(
-            None if args.no_relation_completion else _cli_relation_completer()
+            None
+            if args.no_relation_completion or cli_llm is None
+            else relation_completer_for(cli_llm)
         ),
+        cluster_labeler=None if cli_llm is None else cluster_labeler_for(cli_llm),
     )
     sweep_stale_build_files(args.db)
     if args.no_relation_completion:
@@ -824,8 +919,8 @@ def main(
     return 0
 
 
-def _cli_relation_completer() -> Callable[[Sequence[CompletionNote]], object] | None:
-    """Reuse the server's LLM completer construction when a key is configured."""
+def _cli_llm_client() -> Any | None:
+    """Shared OpenRouter client for the CLI's optional LLM lanes."""
 
     try:
         from dotenv import load_dotenv
@@ -838,7 +933,25 @@ def _cli_relation_completer() -> Callable[[Sequence[CompletionNote]], object] | 
         return None
     from taurine_core.llm import OpenRouterClient
 
-    return relation_completer_for(OpenRouterClient(key))
+    return OpenRouterClient(key)
+
+
+def _cluster_size_histogram(sizes: Sequence[int]) -> dict[str, int]:
+    """Bucketed size distribution for the build report."""
+
+    buckets = {"1-2": 0, "3-9": 0, "10-19": 0, "20-35": 0, "36+": 0}
+    for size in sizes:
+        if size <= 2:
+            buckets["1-2"] += 1
+        elif size <= 9:
+            buckets["3-9"] += 1
+        elif size <= 19:
+            buckets["10-19"] += 1
+        elif size <= 35:
+            buckets["20-35"] += 1
+        else:
+            buckets["36+"] += 1
+    return buckets
 
 
 def _keep_failed_builds() -> bool:

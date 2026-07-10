@@ -77,6 +77,7 @@ def test_clean_build_is_atomic_deterministic_and_order_independent(tmp_path: Pat
         "base_graph",
         "projection",
         "ranks",
+        "clusters",
         "fact_embeddings",
         "validation",
         "activation",
