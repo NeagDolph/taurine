@@ -19,6 +19,7 @@ ASR_RECONNECT_MAX_S = 30.0
 # retrieval). Replaced bge-small-en-v1.5 (384-dim) — see 2026-07-07 upgrade.
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 EMBED_DIM = 1024
+EMBED_BATCH_SIZE = 64                     # per-forward-pass cap; bounds MPS peak
 EMBED_QUERY_PROMPT = (
     "Instruct: Given a snippet of spoken conversation, retrieve personal "
     "notes relevant to what is being discussed\nQuery: "
@@ -39,6 +40,11 @@ LLM_REASONING_BY_MODEL = {
     "z-ai/glm-5.2": {"enabled": False},
     "deepseek/deepseek-v4-pro": {"enabled": False},
     "deepseek/deepseek-v4-flash": {"enabled": False},
+    # Grounded edge adjudication is a bounded verify/label task, not open
+    # reasoning: gpt-oss defaults to medium effort (thousands of think-tokens
+    # per call → ~100s latency and runaway malformed JSON). Low effort is the
+    # right tier and cuts per-call cost several-fold.
+    "openai/gpt-oss-120b": {"effort": "low"},
 }
 
 # ── user information card (explicit agentic graph research) ───────────
@@ -141,14 +147,27 @@ PASSAGE_MAX_TOKENS = 300
 PASSAGE_OVERLAP_TOKENS = 40
 BASE_GRAPH_PASSAGE_K = 12
 FACT_REVERSE_WEIGHT_DEFAULT = 0.35
-# contains weight = clip01(idf × confidence × count_bonus / SCALE): realistic
-# max ≈ 3.2 × 1.0 × 2.1 ≈ 6.7 → ~1.0, typical mid values land 0.3-0.7 (H2 —
-# without the rescale every production edge clipped to exactly 1.0)
+# contains weight = clip01(idf × confidence × count_bonus × surprise / SCALE):
+# realistic max ≈ 3.2 × 1.0 × 2.1 ≈ 6.7 → ~1.0, typical mid values land 0.3-0.7
+# (H2 — without the rescale every production edge clipped to exactly 1.0)
 CONTAINS_WEIGHT_SCALE = 6.0
+# frequency-surprise soft cap (edge-quality item 3): entities seen in more
+# notes than this co-occur with any one passage roughly at chance, so their
+# contains weights carry surprise = 1/(1+log1p(df − cap)) beyond it
+DF_SOFT_CAP = 8
+# retrieval-matrix hub dampening (edge-quality item 3): entity nodes with more
+# than this many out-neighbors forward only HUB_DEGREE_CAP/degree of their
+# mass; the remainder parks on a self-loop so columns stay stochastic
+HUB_DEGREE_CAP = 50
 # note_salience = ingest_salience × content_quality; notes below this floor
 # skip GLiNER/mentions/facts/base-graph entity participation (§0.2). Passages,
 # FTS, and embeddings are ALWAYS built; the gate re-evaluates every build.
 EXTRACTION_SALIENCE_FLOOR = 0.35
+# Fail-safe: abort a build (clean BuildError, prior snapshot kept) if its
+# resident set crosses this. Local model inference on this corpus peaks well
+# under 2 GB with the MPS allocator watermark cap in taurine_core/__init__.py;
+# the ceiling is headroom that still fits the packaged desktop sidecar. 0 = off.
+BUILD_MEMORY_CEILING_GB = 16.0
 # explicit owner aliases (merged with the name parsed from the user card) —
 # owner/self entities above the df cap are traversal hubs (§10.5)
 OWNER_ALIASES: frozenset[str] = frozenset()
@@ -179,6 +198,9 @@ SUMMARY_MODEL = "deepseek/deepseek-v4-flash"
 SUMMARY_FALLBACK_MODEL = "deepseek/deepseek-chat"
 CLUSTER_LABEL_MODEL = SUMMARY_MODEL      # LLM cluster naming during sync (fallback names otherwise)
 IDEA_SEARCH_MODEL = SUMMARY_MODEL        # idea-lens per-note alignment adjudication
+CONTEXT_ENRICH_MODEL = SUMMARY_MODEL     # situating prefixes for episodic passages (empty on failure)
+CONTEXT_ENRICH_BATCH = 10                # passages per enrichment call, grouped by note
+CONTEXT_ENRICH_CONCURRENCY = 6           # bounded parallel enrichment calls
 SUMMARY_TIMEOUT_S = 20.0
 SUMMARY_MIN_INTERVAL_S = 25.0            # hard floor between summarizer passes
 SUMMARY_MAX_STALENESS_S = 240.0          # force a pass if new speech and this much elapsed
@@ -206,6 +228,38 @@ CHAT_SEARCH_TOOL_K = 8                   # default k for search_evidence
 CHAT_NOTE_READ_MAX_CHARS = 6000
 CHAT_HISTORY_MAX_TURNS = 12
 CHAT_TITLE_MAX_WORDS = 6
+
+# ── grounded edge adjudication (edge-quality spec items 1/5b/6) ────────
+# Optional build lane, same pattern as relation completion: absent LLM ⇒
+# skipped, adjudicated=0 everywhere, build completes. Temperature 0 always.
+ADJUDICATION_MODEL = "openai/gpt-oss-120b"
+ADJUDICATION_CONCURRENCY = 6             # bounded parallel judge calls (all lanes)
+ADJUDICATION_FACTS_PER_CALL = 25         # facts per judge call (grouped by note)
+ADJUDICATION_MAX_TOKENS = 4096           # cap runaway judge generations (fail-open)
+ADJUDICATION_TEXT_MAX_CHARS = 4000       # passage text supplied per fact-judge call
+ADJUDICATION_REJECT_BELOW = 0.3          # judged score < this ⇒ status 'rejected'
+ADJUDICATION_DOWNWEIGHT_BELOW = 0.7      # scores in [reject, this) multiply the fact edge weight
+SEMANTIC_REASON_BATCH = 20               # cross-note semantic pairs per judge call
+SEMANTIC_REASON_SNIPPET_CHARS = 300      # per-passage snippet supplied to the judge
+# Reasons are an optional retrieval hint on the strongest cross-note links, not
+# a per-edge requirement. Only the top-weighted cross-note semantic edges are
+# judged; the long tail keeps an empty reason (never dropped). This is the main
+# lever against adjudication call volume — ~8k cross-note edges would otherwise
+# be hundreds of judge calls per build for the lowest-value signal.
+SEMANTIC_REASON_MAX_EDGES = 600          # 0 = judge every cross-note edge
+# Intelligent fact gating: a fact is only worth an LLM grounding check when it
+# is genuinely risky. Facts that are high-confidence, from evergreen written
+# sources, and on a non-exclusive predicate are trusted (GLiNER already gated
+# them); episodic (chat) sources, low confidence, exclusive predicates, and
+# LLM-completed relations are always judged — that is where the garbage lives.
+ADJUDICATION_TRUST_CONF = 0.85           # ≥ this + evergreen + non-exclusive ⇒ skip judge
+ADJUDICATION_EVERGREEN_SOURCES = frozenset(
+    {"apple_notes", "local_folders", "claude_mem", "codex_mem", "obsidian", "gmail", "outlook"}
+)  # episodic sources (imessage) are always judged
+MERGE_GRAY_ZONE_CAP = 200                # gray-zone candidate pairs judged per build
+MERGE_GRAY_ZONE_EMBED_BAND = 0.03        # [ENTITY_EMBED_SIM − band, ENTITY_EMBED_SIM) emits a pair
+MERGE_ADJUDICATION_MIN_CONF = 0.8        # same_entity verdicts below this never merge
+MERGE_ADJUDICATION_BATCH = 16            # gray-zone pairs per judge call
 
 # ── shared retrieval, rerank, and evidence ────────────────────────────
 TRIPLE_RECALL_K = 20

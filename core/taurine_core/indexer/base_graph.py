@@ -10,7 +10,7 @@ import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix, diags
 
 from taurine_core import config
-from taurine_core.indexer.facts import FactRecord, PREDICATES
+from taurine_core.indexer.facts import FactRecord, PREDICATES, adjudication_multiplier
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,9 @@ class FactGraphInput:
     source_note_id: str
     confidence: float
     status: str
+    # facts.adjudication_multiplier output: mid-band adjudication scores
+    # multiply this fact's edge weight (edge-quality item 1)
+    adjudication_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -121,11 +124,22 @@ class BaseGraphBuilder:
                 continue
             idf = math.log((note_count + 1) / (max(0, edge.df) + 1)) + 1.0
             count_bonus = 1.0 + math.log(1.0 + min(max(1, edge.mentions), 3))
+            # Frequency surprise (edge-quality item 3): an entity appearing in
+            # more notes than DF_SOFT_CAP co-occurs with any one passage's
+            # other entities roughly at chance, so its contribution decays
+            # logarithmically past the cap. Chosen over a true per-pair NPMI
+            # because pairwise co-occurrence counts are sparse/noisy at this
+            # corpus size and note-cluster NPMI would be circular (clusters
+            # are computed downstream of this graph); df beyond a soft cap is
+            # a deterministic, monotone proxy for "no more than chance".
+            surprise = 1.0 / (1.0 + math.log1p(max(0, edge.df - config.DF_SOFT_CAP)))
             # H2: divide by the calibrated scale before clipping so idf rarity
             # actually discriminates — without it every production edge
             # saturates at exactly 1.0 and column normalization erases rarity.
-            weight = _clip(idf * edge.confidence * count_bonus / self.contains_scale)
-            metadata = {"idf": idf, "mentions": edge.mentions}
+            weight = _clip(
+                idf * edge.confidence * count_bonus * surprise / self.contains_scale
+            )
+            metadata = {"idf": idf, "mentions": edge.mentions, "surprise": surprise}
             edges.extend(
                 (
                     BaseEdge(edge.passage_id, edge.entity_id, "contains", weight, metadata=metadata),
@@ -143,6 +157,9 @@ class BaseGraphBuilder:
                 source_note_id=fact.source_note_id,
                 confidence=fact.confidence,
                 status=fact.status,
+                adjudication_multiplier=adjudication_multiplier(
+                    fact.adjudicated, fact.adjudication_score
+                ),
             )
             for fact in facts
             if fact.subject_entity_id in row_by_id
@@ -159,7 +176,7 @@ class BaseGraphBuilder:
                 row.fact_ids,
             )
         )
-        matrix = _matrix(node_ids, row_by_id, edges)
+        matrix = _matrix(node_ids, node_kinds, row_by_id, edges)
         strengths = np.asarray(matrix.sum(axis=0)).ravel()
         dangling = tuple(int(index) for index in np.flatnonzero(strengths == 0.0))
         return BaseGraph(
@@ -186,7 +203,10 @@ class BaseGraphBuilder:
             raise ValueError("base graph passage vectors must be nonzero")
         matrix = matrix / norms
         similarities = matrix @ matrix.T
-        selected: set[tuple[int, int]] = set()
+        # Mutual top-k (edge-quality item 5a): a pair becomes an edge only when
+        # BOTH endpoints select each other — one-sided selections (register-
+        # similar hubs dragging in everything above the floor) are dropped.
+        directed: set[tuple[int, int]] = set()
         for left, passage in enumerate(passages):
             candidates: list[tuple[float, int]] = []
             for right, other in enumerate(passages):
@@ -199,7 +219,12 @@ class BaseGraphBuilder:
                     candidates.append((score, right))
             candidates.sort(key=lambda row: (-row[0], passages[row[1]].passage_id))
             for _, right in candidates[: self.semantic_k]:
-                selected.add((min(left, right), max(left, right)))
+                directed.add((left, right))
+        selected = {
+            (left, right)
+            for left, right in directed
+            if left < right and (right, left) in directed
+        }
         edges: list[BaseEdge] = []
         for left, right in sorted(selected):
             score = float(similarities[left, right])
@@ -229,7 +254,9 @@ def grouped_fact_edges(facts: Sequence[FactGraphInput]) -> tuple[BaseEdge, ...]:
         for fact in support:
             confidence_by_source[fact.source_note_id] = max(
                 confidence_by_source.get(fact.source_note_id, 0.0),
-                _clip(fact.confidence),
+                # edge-quality item 1: a mid-band adjudication score multiplies
+                # the fact's contribution to its edge weight
+                _clip(fact.confidence) * _clip(fact.adjudication_multiplier),
             )
         unsupported = math.prod(
             1.0 - confidence_by_source[source_id]
@@ -270,6 +297,7 @@ def grouped_fact_edges(facts: Sequence[FactGraphInput]) -> tuple[BaseEdge, ...]:
 
 def _matrix(
     node_ids: tuple[str, ...],
+    node_kinds: tuple[str, ...],
     row_by_id: Mapping[str, int],
     edges: list[BaseEdge],
 ) -> csr_matrix:
@@ -284,6 +312,7 @@ def _matrix(
         weights[(dst, src)] = weights.get((dst, src), 0.0) + float(edge.weight)
     if not weights:
         return csr_matrix((len(node_ids), len(node_ids)), dtype=np.float64)
+    _dampen_entity_hubs(weights, node_kinds)
     rows, columns, data = zip(
         *((row, column, weight) for (row, column), weight in sorted(weights.items())),
         strict=True,
@@ -298,6 +327,45 @@ def _matrix(
     nonzero = strengths > 0
     inverse[nonzero] = 1.0 / strengths[nonzero]
     return (matrix @ diags(inverse)).tocsr()
+
+
+def _dampen_entity_hubs(
+    weights: dict[tuple[int, int], float],
+    node_kinds: tuple[str, ...],
+) -> None:
+    """Cap random-walk mass through entity mega-hubs (edge-quality item 3).
+
+    An entity column with more than HUB_DEGREE_CAP out-neighbors has its
+    outgoing weights scaled by HUB_DEGREE_CAP/degree BEFORE column
+    normalization, with the removed mass parked on a self-loop sized so the
+    column still normalizes to exactly 1 (column-stochastic invariant).
+    After normalization the hub forwards only cap/degree of arriving mass and
+    retains the rest on itself, where PPR damping decays it — instead of
+    spraying it across (e.g.) the owner entity's 80+ passages. Uniform
+    scaling preserves the relative ordering of the hub's neighbors. This is
+    the ONE dampening site: every matrix (build-time and the per-query
+    overlay in retrieval/evidence.py) is materialized from raw edge rows
+    through this function, so mass is never dampened twice.
+    """
+
+    cap = int(config.HUB_DEGREE_CAP)
+    if cap <= 0:
+        return
+    by_column: dict[int, list[tuple[int, int]]] = {}
+    for key in weights:
+        row, column = key
+        if row != column and node_kinds[column] == "entity":
+            by_column.setdefault(column, []).append(key)
+    for column, keys in sorted(by_column.items()):
+        if len(keys) <= cap:
+            continue
+        factor = cap / len(keys)
+        outgoing = sum(weights[key] for key in keys)
+        for key in keys:
+            weights[key] *= factor
+        weights[(column, column)] = (
+            weights.get((column, column), 0.0) + (1.0 - factor) * outgoing
+        )
 
 
 def materialize_base_graph(
@@ -332,7 +400,7 @@ def materialize_base_graph(
             ),
         )
     )
-    matrix = _matrix(ordered_ids, row_by_id, list(ordered_edges))
+    matrix = _matrix(ordered_ids, ordered_kinds, row_by_id, list(ordered_edges))
     strengths = np.asarray(matrix.sum(axis=0)).ravel()
     dangling = tuple(int(index) for index in np.flatnonzero(strengths == 0.0))
     return BaseGraph(

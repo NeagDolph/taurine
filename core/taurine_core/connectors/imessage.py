@@ -91,6 +91,46 @@ def _db_path(config: dict) -> Path:
     return Path(str(config.get("db") or taurine_config.IMESSAGE_DB)).expanduser()
 
 
+def self_identity_names(config: dict | None = None) -> tuple[str, ...]:
+    """Best-effort owner display names for owner-hub detection (item 3).
+
+    The ``account`` column on sent messages holds the owner's own handles
+    ("E:me@icloud.com" / "P:+1617…"); resolving them through Contacts yields
+    the owner's display name when they keep their own card. Cheap: one small
+    query against the copied db. Returns () on any failure — never raises.
+    """
+
+    try:
+        cfg = dict(config or {})
+        db_path = _db_path(cfg)
+        if not db_path.is_file():
+            return ()
+        contacts = _contact_names(cfg)
+        if not contacts:
+            return ()
+        with _copied_db(db_path) as copied:
+            with _open_readonly(copied) as conn:
+                columns = {
+                    str(info["name"])
+                    for info in conn.execute("PRAGMA table_info(message)")
+                }
+                if "account" not in columns:
+                    return ()
+                rows = conn.execute(
+                    "SELECT DISTINCT account FROM message"
+                    " WHERE is_from_me = 1 AND account IS NOT NULL LIMIT 32"
+                ).fetchall()
+        names: set[str] = set()
+        for row in rows:
+            handle = re.sub(r"^[EPep]:", "", str(row["account"] or "")).strip()
+            name = _resolve_handle(handle, contacts)
+            if name:
+                names.add(name)
+        return tuple(sorted(names))
+    except Exception:
+        return ()
+
+
 @contextmanager
 def _copied_db(source: Path) -> Iterator[Path]:
     with tempfile.TemporaryDirectory(prefix="taurine-imessage-") as tempdir:

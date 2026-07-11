@@ -38,6 +38,8 @@ from taurine_core.indexer.build import (
     sweep_stale_build_files,
 )
 from taurine_core.indexer.cluster_labels import cluster_labeler_for
+from taurine_core.indexer.context_enrich import context_enricher_for
+from taurine_core.indexer.edge_adjudication import edge_adjudicator_for
 from taurine_core.profile_context import owner_aliases as profile_owner_aliases
 from taurine_core.indexer.build_cache import BuildCache
 from taurine_core.indexer.embed import embed_texts
@@ -893,6 +895,10 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
             extractor=build_cache.caching_extractor(extract_notes),
             relation_completer=complete_relations,
             cluster_labeler=cluster_labeler_for(llm),
+            context_enricher=context_enricher_for(llm),
+            context_cache=build_cache,
+            edge_adjudicator=edge_adjudicator_for(llm),
+            adjudication_cache=build_cache,
         )
     )
     knowledge_database = Path("taurine-knowledge.db")

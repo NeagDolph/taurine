@@ -24,18 +24,46 @@ _NAME_STOPWORDS = frozenset(
 _NAME_RE = re.compile(r"^([A-Z][\w'’.-]*(?: [A-Z][\w'’.-]*){0,3})(?=$|[\s,:—–(-])")
 
 
-def owner_aliases(index: Any) -> tuple[str, ...]:
+_imessage_identity_cache: tuple[str, ...] | None = None
+
+
+def _imessage_self_identity() -> tuple[str, ...]:
+    """Owner names from the iMessage connector, cached per process (the
+    lookup copies chat.db, so it must run at most once per server run)."""
+
+    global _imessage_identity_cache
+    if _imessage_identity_cache is None:
+        try:
+            from taurine_core.connectors.imessage import self_identity_names
+
+            _imessage_identity_cache = tuple(self_identity_names())
+        except Exception:
+            _imessage_identity_cache = ()
+    return _imessage_identity_cache
+
+
+def owner_aliases(
+    index: Any,
+    *,
+    connector_identity: Any = None,
+) -> tuple[str, ...]:
     """Casefolded owner aliases for the entity resolver's hub guard (L18).
 
-    Configured aliases (``config.OWNER_ALIASES``) plus a name parsed from the
-    persisted user card's opening heading, with individual name tokens so
-    first-name-only mentions are covered. Deterministic; empty when unknown.
+    Configured aliases (``config.OWNER_ALIASES``), a name parsed from the
+    persisted user card's opening heading, and the iMessage connector's
+    self-identity (item 3a) — each expanded with individual name tokens so
+    first-name-only mentions are covered. ``connector_identity`` overrides
+    the iMessage lookup (tests inject ``lambda: ()``). Empty when unknown.
     """
 
     aliases = {str(value) for value in config.OWNER_ALIASES}
     card = getattr(index, "user_card", lambda: None)()
-    name = _card_owner_name(card) if isinstance(card, str) else None
-    if name:
+    names = [_card_owner_name(card)] if isinstance(card, str) else []
+    identity = connector_identity if connector_identity is not None else _imessage_self_identity
+    names.extend(identity())
+    for name in names:
+        if not name:
+            continue
         aliases.add(name)
         aliases.update(token for token in name.split() if len(token) >= 3)
     return tuple(sorted(alias.casefold() for alias in aliases))

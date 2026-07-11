@@ -11,7 +11,9 @@ from taurine_core.retrieval.types import TemporalIntent
 from taurine_core.schemas import ExtractedRelation
 
 
-FactStatus = Literal["active", "historical", "superseded", "conflicted", "candidate"]
+FactStatus = Literal[
+    "active", "historical", "superseded", "conflicted", "candidate", "rejected"
+]
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,11 @@ class FactRecord:
     superseded_by: str | None
     status: FactStatus
     build_id: str
+    # grounded adjudication verdict (edge-quality item 1); adjudicated stays
+    # False when the judge lane was unavailable or the row was skipped
+    adjudication_score: float | None = None
+    adjudication_quote: str = ""
+    adjudicated: bool = False
 
 
 def _predicate(
@@ -80,7 +87,7 @@ def _predicate(
 
 PREDICATES: dict[str, PredicateSpec] = {
     "works_with": _predicate("works_with", "works with", inverse="works_with"),
-    "works_at": _predicate("works_at", "works at", inverse="employs"),
+    "works_at": _predicate("works_at", "works at", inverse="employs", exclusive=True),
     "member_of": _predicate("member_of", "is a member of", inverse="has_member"),
     "part_of": _predicate("part_of", "is part of", inverse="contains"),
     "located_at": _predicate("located_at", "is located at", inverse="location_of", exclusive=True),
@@ -120,17 +127,14 @@ def promote_fact(
         raise ValueError(f"unregistered predicate: {relation.predicate}")
     if subject_entity_id == object_entity_id:
         raise ValueError("fact endpoints resolve to the same entity")
-    identity = "\x1f".join(
-        (
-            subject_entity_id,
-            relation.predicate,
-            object_entity_id,
-            source_passage_id,
-            str(relation.assertion_start),
-            str(relation.assertion_end),
-        )
+    fact_id = derive_fact_id(
+        subject_entity_id,
+        relation.predicate,
+        object_entity_id,
+        source_passage_id,
+        relation.assertion_start,
+        relation.assertion_end,
     )
-    fact_id = "fact-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:28]
     return FactRecord(
         fact_id=fact_id,
         subject_entity_id=subject_entity_id,
@@ -159,12 +163,106 @@ def promote_fact(
     )
 
 
+def derive_fact_id(
+    subject_entity_id: str,
+    predicate: str,
+    object_entity_id: str,
+    source_passage_id: str,
+    assertion_start: int,
+    assertion_end: int,
+) -> str:
+    """The one fact-identity derivation, shared by promotion and relabeling."""
+    identity = "\x1f".join(
+        (
+            subject_entity_id,
+            predicate,
+            object_entity_id,
+            source_passage_id,
+            str(assertion_start),
+            str(assertion_end),
+        )
+    )
+    return "fact-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:28]
+
+
+def relabel_fact(fact: FactRecord, predicate: str) -> FactRecord:
+    """Re-derive a fact under an adjudicator-chosen registry predicate.
+
+    Endpoint validation re-runs the same invariants promotion enforces; the
+    caller re-runs temporal reconciliation over the adjusted set.
+    """
+    if predicate not in PREDICATES:
+        raise ValueError(f"unregistered predicate: {predicate}")
+    if fact.subject_entity_id == fact.object_entity_id:
+        raise ValueError("fact endpoints resolve to the same entity")
+    return replace(
+        fact,
+        predicate=predicate,
+        fact_id=derive_fact_id(
+            fact.subject_entity_id,
+            predicate,
+            fact.object_entity_id,
+            fact.source_passage_id,
+            fact.assertion_start,
+            fact.assertion_end,
+        ),
+        # supersession links were derived under the old predicate grouping
+        superseded_by=None,
+    )
+
+
+def adjudication_multiplier(adjudicated: bool | int, score: float | None) -> float:
+    """Edge-weight multiplier for a judged fact (edge-quality item 1).
+
+    Unadjudicated rows and scores at/above the downweight band pass through
+    at 1.0; mid-band scores multiply the fact's graph edge weight directly.
+    """
+    if not adjudicated or score is None:
+        return 1.0
+    value = min(1.0, max(0.0, float(score)))
+    if value >= config.ADJUDICATION_DOWNWEIGHT_BELOW:
+        return 1.0
+    return value
+
+
 def canonical_fact_text(fact: FactRecord) -> str:
     predicate = PREDICATES[fact.predicate]
     return f"{fact.subject} — {fact.predicate} ({predicate.description}) — {fact.object}"
 
 
+def dedupe_note_facts(facts: Sequence[FactRecord]) -> tuple[FactRecord, ...]:
+    """Collapse identical logical triples repeated by the SAME source note.
+
+    The earliest assertion span survives and carries the group's max
+    confidence. Cross-note duplicates stay separate provenance rows (§4.5);
+    statuses never mix (an active and a candidate row of the same triple
+    make different temporal claims).
+    """
+    groups: dict[tuple[str, str, str, str, str], list[FactRecord]] = {}
+    for fact in facts:
+        key = (
+            fact.source_note_id,
+            fact.subject_entity_id,
+            fact.predicate,
+            fact.object_entity_id,
+            fact.status,
+        )
+        groups.setdefault(key, []).append(fact)
+    collapsed: list[FactRecord] = []
+    for group in groups.values():
+        winner = min(
+            group,
+            key=lambda fact: (fact.assertion_start, fact.assertion_end, fact.fact_id),
+        )
+        confidence = max(fact.confidence for fact in group)
+        if confidence != winner.confidence:
+            winner = replace(winner, confidence=confidence)
+        collapsed.append(winner)
+    return tuple(sorted(collapsed, key=lambda fact: fact.fact_id))
+
+
 def reconcile_temporal_facts(facts: Sequence[FactRecord]) -> tuple[FactRecord, ...]:
+    facts = dedupe_note_facts(facts)
     rows = {fact.fact_id: fact for fact in facts}
     groups: dict[tuple[str, str], list[FactRecord]] = {}
     for fact in facts:
@@ -180,13 +278,18 @@ def reconcile_temporal_facts(facts: Sequence[FactRecord]) -> tuple[FactRecord, .
             continue
         latest_time = max(fact.observed_at for fact in active)
         latest = [fact for fact in active if fact.observed_at == latest_time]
-        if len(latest) != 1:
+        if len({fact.object_entity_id for fact in latest}) != 1:
+            # a true observed_at tie between different objects is ambiguous
             for fact in active:
                 rows[fact.fact_id] = replace(fact, status="conflicted")
             continue
-        winner = latest[0]
+        winner = min(latest, key=lambda fact: fact.fact_id)
         winner_start = winner.valid_from if winner.valid_from is not None else winner.observed_at
-        prior = [fact for fact in active if fact.fact_id != winner.fact_id]
+        # rows asserting the winning object from other sources are a support
+        # group (§8.2), never superseded by their own object
+        prior = [
+            fact for fact in active if fact.object_entity_id != winner.object_entity_id
+        ]
         if any(
             (fact.valid_from if fact.valid_from is not None else fact.observed_at)
             >= winner_start
@@ -195,9 +298,7 @@ def reconcile_temporal_facts(facts: Sequence[FactRecord]) -> tuple[FactRecord, .
             for fact in active:
                 rows[fact.fact_id] = replace(fact, status="conflicted")
             continue
-        for fact in active:
-            if fact.fact_id == winner.fact_id:
-                continue
+        for fact in prior:
             rows[fact.fact_id] = replace(
                 fact,
                 status="superseded",
@@ -222,7 +323,8 @@ def facts_for_intent(
     at = intent.at if intent is not None and intent.at is not None else now
     selected: list[FactRecord] = []
     for fact in facts:
-        if fact.status == "candidate":
+        # candidates never surface; rejected rows exist for audit only
+        if fact.status in {"candidate", "rejected"}:
             continue
         if kind == "historical":
             if fact.status in {"historical", "superseded"}:

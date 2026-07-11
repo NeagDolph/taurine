@@ -26,6 +26,7 @@ def test_embed_texts_and_queries_normalize_rows_and_load_model_once(monkeypatch)
             convert_to_numpy: bool,
             show_progress_bar: bool,
             prompt: str | None = None,
+            batch_size: int | None = None,
         ) -> np.ndarray:
             assert convert_to_numpy is True
             assert show_progress_bar is False

@@ -17,6 +17,7 @@ from taurine_core.indexer.base_graph import (
     grouped_fact_edges,
     materialize_base_graph,
 )
+from taurine_core.indexer.facts import adjudication_multiplier
 from taurine_core.indexer.knowledge_store import BM25PassageHit
 from taurine_core.retrieval.calibration import AbstentionPolicy, HeadCalibrator
 from taurine_core.retrieval.heads import (
@@ -240,6 +241,9 @@ class SharedRetrievalEngine:
         self.fallback_on_abstain = bool(fallback_on_abstain)
         self.calibration_status = str(calibration_status)
         self._hub_ids: frozenset[str] | None = None
+        # item 5b: grounded per-edge reasons ride semantic-edge metadata from
+        # the store; surfaced as rerank hints and in evidence path rendering
+        self._semantic_reasons = _semantic_reason_index(snapshot.base_graph)
         # L29: materialized temporal graphs keyed by (snapshot, intent, time,
         # activated hubs). The engine is bound to one immutable snapshot, so a
         # snapshot swap always means a fresh engine and a fresh cache.
@@ -544,6 +548,7 @@ class SharedRetrievalEngine:
             path_support,
             paths_by_target,
             cap=candidate_cap,
+            semantic_reasons=self._semantic_reasons,
         )
         rerank_started = monotonic()
         reranked = self.reranker.rerank(
@@ -704,7 +709,9 @@ class SharedRetrievalEngine:
             for path in paths_by_target[target_id]:
                 if path not in selected_paths:
                     continue
-                rendered = _render_evidence_path(path, passage_by_id, fact_by_id)
+                rendered = _render_evidence_path(
+                    path, passage_by_id, fact_by_id, self._semantic_reasons
+                )
                 ref = self.registry.register(
                     "path",
                     path.path_key,
@@ -1169,6 +1176,7 @@ def _order_rerank_candidates(
     paths_by_target: Mapping[str, tuple[PathCandidate, ...]],
     *,
     cap: int,
+    semantic_reasons: Mapping[tuple[str, str], str] = {},
 ) -> tuple[PassageRerankCandidate, ...]:
     """H6: fill the bounded rerank pool by tier so incomparable score families
     never evict each other: (1) direct head hits by calibrated score desc,
@@ -1234,7 +1242,11 @@ def _order_rerank_candidates(
                 text=row.text,
                 recall_score=float(tier_score),
                 hint=_candidate_hint(
-                    passage_id, triple_support, path_support, paths_by_target
+                    passage_id,
+                    triple_support,
+                    path_support,
+                    paths_by_target,
+                    semantic_reasons,
                 ),
                 fused_score=float(fused_hit.score) if fused_hit is not None else 0.0,
                 ppr_mass=float(ppr.ranks.get(passage_id, 0.0)),
@@ -1252,13 +1264,50 @@ def _candidate_hint(
     triple_support: Mapping[str, float],
     path_support: Mapping[str, float],
     paths_by_target: Mapping[str, tuple[PathCandidate, ...]],
+    semantic_reasons: Mapping[tuple[str, str], str] = {},
 ) -> str:
     hints: list[str] = []
     if passage_id in triple_support or passage_id in path_support:
         hints.append("supports a recognized fact")
     if passage_id in paths_by_target:
         hints.append("reached by an explanatory graph path")
+        reason = _path_semantic_reason(
+            paths_by_target.get(passage_id, ()), semantic_reasons
+        )
+        if reason:
+            hints.append(f"linked because: {reason}")
     return "; ".join(hints)
+
+
+def _semantic_reason_index(graph: Any) -> dict[tuple[str, str], str]:
+    """Nonempty grounded reasons per semantic edge, keyed by sorted pair."""
+
+    reasons: dict[tuple[str, str], str] = {}
+    for edge in graph.edges:
+        if edge.kind != "semantic" or not edge.metadata:
+            continue
+        reason = str(edge.metadata.get("reason", ""))
+        if reason:
+            left, right = sorted((edge.src_id, edge.dst_id))
+            reasons[(left, right)] = reason
+    return reasons
+
+
+def _path_semantic_reason(
+    paths: Sequence[PathCandidate],
+    semantic_reasons: Mapping[tuple[str, str], str],
+) -> str:
+    """First grounded reason along a target's explanatory paths, if any."""
+
+    for path in paths:
+        for index, kind in enumerate(path.edge_kinds):
+            if not kind.startswith("semantic"):
+                continue
+            pair = tuple(sorted((path.node_ids[index], path.node_ids[index + 1])))
+            reason = semantic_reasons.get(pair, "")
+            if reason:
+                return reason
+    return ""
 
 
 def _direct_fallback(
@@ -1587,6 +1636,12 @@ def _temporal_retrieval_graph(
             source_note_id=str(fact.source_note_id),
             confidence=float(getattr(fact, "confidence", 1.0)) * weight,
             status="active",
+            # the query-time overlay rebuilds fact edges from rows, so the
+            # build-time adjudication downweight must be re-threaded here
+            adjudication_multiplier=adjudication_multiplier(
+                getattr(fact, "adjudicated", False),
+                getattr(fact, "adjudication_score", None),
+            ),
         )
         for fact, weight in selected
     )
@@ -1618,6 +1673,7 @@ def _render_evidence_path(
     path: PathCandidate,
     passages: Mapping[str, PassageContext],
     facts: Mapping[str, Any],
+    semantic_reasons: Mapping[tuple[str, str], str] = {},
 ) -> str:
     entity_labels: dict[str, str] = {}
     for fact in facts.values():
@@ -1651,6 +1707,10 @@ def _render_evidence_path(
             relation = "mentions"
         elif kind.startswith("semantic:"):
             relation = "semantically_related"
+            # item 5b: the grounded judge's concrete connection, when present
+            reason = semantic_reasons.get(tuple(sorted((left, right))), "")
+            if reason:
+                relation = f"semantically_related ({reason})"
         rendered += f" --{relation}--> {label(right)}"
     return rendered
 

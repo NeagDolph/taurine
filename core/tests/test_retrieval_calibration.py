@@ -218,3 +218,12 @@ def test_pre_ppr_strict_floor_is_capped_at_one() -> None:
 
     assert decision.accepted
     assert decision.reason == "accepted_high_precision_head"
+
+
+def test_checked_in_semantic_floor_is_tightened_and_hash_verifies() -> None:
+    """Edge-quality item 5a: the artifact floor moved 0.55 → 0.62 and the
+    content hash was regenerated (load_calibration verifies it)."""
+
+    artifact = load_calibration(_ARTIFACT)
+
+    assert artifact.graph.semantic_floor == pytest.approx(0.62)

@@ -42,6 +42,7 @@ class OpenRouterClient:
         user: str,
         timeout_s: float | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": model,
@@ -56,6 +57,11 @@ class OpenRouterClient:
         }
         if temperature is not None:
             payload["temperature"] = float(temperature)
+        if max_tokens is not None:
+            # Cap runaway generations (some open judges emit tens of thousands
+            # of tokens of malformed JSON); a truncated response fails parse and
+            # the caller fails open on that batch rather than burning the budget.
+            payload["max_tokens"] = int(max_tokens)
         headers = {"Authorization": f"Bearer {self._api_key}"}
 
         try:

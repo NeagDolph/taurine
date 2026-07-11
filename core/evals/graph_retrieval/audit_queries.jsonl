@@ -1,0 +1,12 @@
+{"id": "entity-employer", "shape": "entity", "text": "Where do I work right now?"}
+{"id": "entity-person", "shape": "entity", "text": "Who do I talk to the most about work?"}
+{"id": "entity-org", "shape": "entity", "text": "Which companies have I interviewed with?"}
+{"id": "topical-projects", "shape": "topical", "text": "What projects am I currently working on?"}
+{"id": "topical-money", "shape": "topical", "text": "What are my notes about rent and bills?"}
+{"id": "topical-travel", "shape": "topical", "text": "What travel plans have I written down?"}
+{"id": "temporal-graduation", "shape": "temporal", "text": "When is my graduation?"}
+{"id": "temporal-deadlines", "shape": "temporal", "text": "What deadlines are coming up soon?"}
+{"id": "temporal-recent", "shape": "temporal", "text": "What did I work on most recently?"}
+{"id": "conversational-plans", "shape": "conversational", "text": "What did we last discuss about weekend plans?"}
+{"id": "multihop-team", "shape": "multihop", "text": "Which projects involve the people I message most often?"}
+{"id": "multihop-places", "shape": "multihop", "text": "What events are connected to the places I have visited?"}

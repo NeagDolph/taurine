@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+from taurine_core import config
 from taurine_core.indexer.entities import EntityResolver, MentionInput
 from taurine_core.schemas import ExtractedMention
 
@@ -280,3 +281,295 @@ def _mention(
             schema_id="schema-1",
         ),
     )
+
+
+# ── owner auto-detection (edge-quality item 3) ─────────────────────────────
+
+_SOURCES = ("imessage", "apple_notes", "gmail", "obsidian")
+
+
+def _owner_corpus() -> tuple[tuple[MentionInput, ...], dict[str, str]]:
+    """Modeled on the real corpus: 'Neil' df=82 across 4 sources,
+    'Neil Agrawal' df=28, runner-up 'Ernie' df=23, 100 notes total."""
+    mentions: list[MentionInput] = []
+    for index in range(82):
+        mentions.append(_mention(f"neil-{index:03d}", f"n{index:03d}", "Neil", "person", 0))
+    for index in range(28):
+        mentions.append(
+            _mention(f"agrawal-{index:03d}", f"n{index:03d}", "Neil Agrawal", "person", 10)
+        )
+    for index in range(23):
+        mentions.append(_mention(f"ernie-{index:03d}", f"n{index:03d}", "Ernie", "person", 30))
+    note_sources = {
+        f"n{index:03d}": _SOURCES[index % len(_SOURCES)] for index in range(100)
+    }
+    return tuple(mentions), note_sources
+
+
+def test_owner_is_autodetected_from_frequency_dominance_and_source_spread() -> None:
+    mentions, note_sources = _owner_corpus()
+    resolver = EntityResolver(total_notes=100, note_sources=note_sources)
+
+    result = resolver.resolve_mentions(mentions)
+
+    by_canonical = {row.canonical: row for row in result.entities}
+    neil = by_canonical["Neil"]
+    agrawal = by_canonical["Neil Agrawal"]
+    ernie = by_canonical["Ernie"]
+    assert neil.df == 82 and agrawal.df == 28 and ernie.df == 23
+    assert neil.traversal_eligible is False
+    assert neil.traversal_reason == "owner_alias_hub"
+    # token-superset of the detected owner alias is flagged with the same reason
+    assert agrawal.traversal_eligible is False
+    assert agrawal.traversal_reason == "owner_alias_hub"
+    assert ernie.traversal_eligible is True
+    assert ernie.traversal_reason == "eligible"
+
+
+def test_owner_autodetection_requires_three_sources() -> None:
+    mentions, note_sources = _owner_corpus()
+    single_source = {note_id: "imessage" for note_id in note_sources}
+    resolver = EntityResolver(total_notes=100, note_sources=single_source)
+
+    result = resolver.resolve_mentions(mentions)
+
+    by_canonical = {row.canonical: row for row in result.entities}
+    assert by_canonical["Neil"].traversal_reason == "document_frequency_hub"
+    assert by_canonical["Neil Agrawal"].traversal_eligible is True
+
+
+def test_owner_autodetection_requires_double_the_runner_up() -> None:
+    mentions: list[MentionInput] = []
+    for index in range(30):
+        mentions.append(_mention(f"neil-{index:03d}", f"n{index:03d}", "Neil", "person", 0))
+    for index in range(20):
+        mentions.append(_mention(f"ernie-{index:03d}", f"n{index:03d}", "Ernie", "person", 10))
+    note_sources = {f"n{index:03d}": _SOURCES[index % 4] for index in range(100)}
+    resolver = EntityResolver(total_notes=100, note_sources=note_sources)
+
+    result = resolver.resolve_mentions(tuple(mentions))
+
+    by_canonical = {row.canonical: row for row in result.entities}
+    # 30 < 2 × 20: no detection, both stay eligible (df below the hub cap)
+    assert by_canonical["Neil"].traversal_eligible is True
+    assert by_canonical["Ernie"].traversal_eligible is True
+
+
+def test_owner_name_variants_cannot_block_autodetection() -> None:
+    """The runner-up must be a genuinely different person: 'Neil Agrawal'
+    (token superset of the leader) is skipped when computing dominance."""
+    mentions: list[MentionInput] = []
+    for index in range(30):
+        mentions.append(_mention(f"neil-{index:03d}", f"n{index:03d}", "Neil", "person", 0))
+    for index in range(20):
+        mentions.append(
+            _mention(f"agrawal-{index:03d}", f"n{index:03d}", "Neil Agrawal", "person", 10)
+        )
+    for index in range(10):
+        mentions.append(_mention(f"ernie-{index:03d}", f"n{index:03d}", "Ernie", "person", 30))
+    note_sources = {f"n{index:03d}": _SOURCES[index % 4] for index in range(100)}
+    resolver = EntityResolver(total_notes=100, note_sources=note_sources)
+
+    result = resolver.resolve_mentions(tuple(mentions))
+
+    by_canonical = {row.canonical: row for row in result.entities}
+    # 30 < 2 × 28 would fail, but the variant is excluded → runner-up is Ernie
+    assert by_canonical["Neil"].traversal_reason == "owner_alias_hub"
+    assert by_canonical["Neil Agrawal"].traversal_reason == "owner_alias_hub"
+    assert by_canonical["Ernie"].traversal_eligible is True
+
+
+def test_owner_autodetection_disabled_without_note_sources() -> None:
+    mentions, _ = _owner_corpus()
+    resolver = EntityResolver(total_notes=100)
+
+    result = resolver.resolve_mentions(mentions)
+
+    by_canonical = {row.canonical: row for row in result.entities}
+    assert by_canonical["Neil"].traversal_reason == "document_frequency_hub"
+    assert by_canonical["Neil Agrawal"].traversal_eligible is True
+
+
+def test_explicit_owner_aliases_always_win_over_autodetection() -> None:
+    mentions, note_sources = _owner_corpus()
+    extra = tuple(
+        _mention(f"maya-{index}", f"n{index:03d}", "Maya Chen", "person", 50)
+        for index in range(2)
+    )
+    resolver = EntityResolver(
+        total_notes=100,
+        owner_aliases={"maya chen"},
+        note_sources=note_sources,
+    )
+
+    result = resolver.resolve_mentions(mentions + extra)
+
+    by_canonical = {row.canonical: row for row in result.entities}
+    # the configured owner is flagged even at low df, and its token-subset too
+    assert by_canonical["Maya Chen"].traversal_reason == "owner_alias_hub"
+    # auto-detection is skipped entirely: 'Neil' keeps the frequency reason
+    assert by_canonical["Neil"].traversal_reason == "document_frequency_hub"
+    assert by_canonical["Neil Agrawal"].traversal_eligible is True
+
+
+def test_configured_owner_alias_flags_token_subset_and_superset_surfaces() -> None:
+    resolver = EntityResolver(total_notes=10, owner_aliases={"neil"})
+
+    result = resolver.resolve_mentions(
+        (
+            _mention("m1", "n1", "Neil", "person", 0),
+            _mention("m2", "n2", "Neil Agrawal", "person", 0),
+            _mention("m3", "n3", "Ernie", "person", 0),
+        )
+    )
+
+    by_canonical = {row.canonical: row for row in result.entities}
+    assert by_canonical["Neil"].traversal_reason == "owner_alias_hub"
+    assert by_canonical["Neil Agrawal"].traversal_reason == "owner_alias_hub"
+    assert by_canonical["Ernie"].traversal_eligible is True
+
+
+# ── gray-zone emission + forced merges (edge-quality item 6) ────────────────
+
+
+def test_embedding_gray_zone_pairs_are_emitted_not_merged() -> None:
+    """Similarity just under the merge floor is surfaced for the judge."""
+    resolver = EntityResolver(
+        total_notes=4,
+        similarity=lambda left, right: 0.94,
+        similarity_threshold=0.95,
+    )
+
+    result = resolver.resolve_mentions(
+        (
+            _mention("m1", "n1", "Launch Plan", "project", 0),
+            _mention("m2", "n2", "Launch Planning", "project", 0),
+        )
+    )
+
+    assert len(result.entities) == 2
+    (pair,) = [
+        row for row in result.gray_zone_pairs if row.reason == "embedding_gray_zone"
+    ]
+    assert {pair.left_surface, pair.right_surface} == {"Launch Plan", "Launch Planning"}
+    assert pair.etype == "project"
+
+
+def test_person_guard_blocked_merge_lands_in_the_gray_zone() -> None:
+    """'Neil'/'Neil Agrawal' with embeddings above the floor: the person guard
+    blocks the deterministic merge, so the pair goes to the judge instead."""
+    resolver = EntityResolver(
+        total_notes=4,
+        similarity=lambda left, right: 0.97,
+        similarity_threshold=0.95,
+    )
+
+    result = resolver.resolve_mentions(
+        (
+            _mention("m1", "n1", "Neil", "person", 0),
+            _mention("m2", "n2", "Neil Agrawal", "person", 0),
+        )
+    )
+
+    assert len(result.entities) == 2
+    assert any(
+        {row.left_surface, row.right_surface} == {"Neil", "Neil Agrawal"}
+        for row in result.gray_zone_pairs
+    )
+
+
+def test_token_subset_pairs_are_emitted_without_embeddings() -> None:
+    result = EntityResolver(total_notes=4).resolve_mentions(
+        (
+            _mention("m1", "n1", "Neil", "person", 0),
+            _mention("m2", "n2", "Neil Agrawal", "person", 0),
+            _mention("m3", "n3", "Ernie", "person", 0),
+        )
+    )
+
+    (pair,) = [row for row in result.gray_zone_pairs if row.reason == "token_overlap"]
+    assert {pair.left_surface, pair.right_surface} == {"Neil", "Neil Agrawal"}
+    # same token counts never emit ("Neil" vs "Ernie" share nothing anyway)
+    assert len(result.gray_zone_pairs) == 1
+
+
+def test_ambiguous_acronym_pairs_are_emitted_for_the_judge() -> None:
+    result = EntityResolver(total_notes=3).resolve_mentions(
+        (
+            _mention("m1", "n1", "John Smith", "person", 0),
+            _mention("m2", "n2", "Jane Stevens", "person", 0),
+            _mention("m3", "n3", "JS", "person", 0),
+        )
+    )
+
+    ambiguous = [row for row in result.gray_zone_pairs if row.reason == "acronym_ambiguous"]
+    surfaces = {
+        frozenset({row.left_surface, row.right_surface}) for row in ambiguous
+    }
+    assert surfaces == {
+        frozenset({"JS", "John Smith"}),
+        frozenset({"JS", "Jane Stevens"}),
+    }
+
+
+def test_gray_zone_pairs_are_capped_by_combined_df(monkeypatch) -> None:
+    monkeypatch.setattr(config, "MERGE_GRAY_ZONE_CAP", 1)
+    result = EntityResolver(total_notes=8).resolve_mentions(
+        (
+            _mention("m1", "n1", "Neil", "person", 0),
+            _mention("m2", "n2", "Neil", "person", 0),
+            _mention("m3", "n3", "Neil Agrawal", "person", 0),
+            _mention("m4", "n4", "Maya", "person", 0),
+            _mention("m5", "n5", "Maya Chen", "person", 0),
+        )
+    )
+
+    (pair,) = result.gray_zone_pairs
+    # Neil (df=2) + Neil Agrawal (df=1) outranks Maya (1) + Maya Chen (1)
+    assert {pair.left_surface, pair.right_surface} == {"Neil", "Neil Agrawal"}
+    assert pair.combined_df == 3
+
+
+def test_forced_merges_union_the_pair_before_insertion() -> None:
+    resolver = EntityResolver(total_notes=4)
+    mentions = (
+        _mention("m1", "n1", "Neil", "person", 0),
+        _mention("m2", "n2", "Neil Agrawal", "person", 0),
+    )
+
+    baseline = resolver.resolve_mentions(mentions)
+    merged = EntityResolver(total_notes=4).resolve_mentions(
+        mentions, forced_merges=(("person", "neil", "neil agrawal"),)
+    )
+
+    assert len(baseline.entities) == 2
+    assert len(merged.entities) == 1
+    assert merged.mention_to_entity["m1"] == merged.mention_to_entity["m2"]
+    entity = merged.entities[0]
+    assert {"Neil", "Neil Agrawal"} <= set(entity.aliases)
+
+
+def test_forced_merges_never_cross_the_digit_guard() -> None:
+    result = EntityResolver(total_notes=4).resolve_mentions(
+        (
+            _mention("m1", "n1", "Launch 2", "project", 0),
+            _mention("m2", "n2", "Launch", "project", 0),
+        ),
+        forced_merges=(("project", "launch 2", "launch"),),
+    )
+
+    assert len(result.entities) == 2
+
+
+def test_gray_zone_emission_is_deterministic_across_input_order() -> None:
+    mentions = (
+        _mention("m1", "n1", "Neil", "person", 0),
+        _mention("m2", "n2", "Neil Agrawal", "person", 0),
+        _mention("m3", "n3", "Maya", "person", 0),
+        _mention("m4", "n4", "Maya Chen", "person", 0),
+    )
+
+    forward = EntityResolver(total_notes=4).resolve_mentions(mentions)
+    backward = EntityResolver(total_notes=4).resolve_mentions(tuple(reversed(mentions)))
+
+    assert forward.gray_zone_pairs == backward.gray_zone_pairs

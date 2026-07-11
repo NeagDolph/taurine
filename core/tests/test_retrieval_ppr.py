@@ -88,3 +88,39 @@ def _passage(passage_id: str, note_id: str, vector: list[float]) -> PassageGraph
         ordinal=0,
         vector=np.asarray(vector, dtype=np.float32),
     )
+
+
+def test_hub_dampening_caps_mass_through_a_synthetic_hub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 3: with the hub column dampened, less random-walk mass leaks from
+    the seed through the hub to unrelated passages, and total probability and
+    (sub-)column stochasticity are preserved."""
+    from taurine_core import config
+
+    def build_graph() -> object:
+        passages = tuple(
+            _passage(f"p{index}", f"n{index}", [1.0, float(index) * 0.01])
+            for index in range(8)
+        )
+        entities = (EntityGraphInput("hub", "Neil", "person", 8, True),)
+        contains = tuple(
+            PassageEntityInput(f"p{index}", "hub", 0.9, 1, 8) for index in range(8)
+        )
+        return BaseGraphBuilder(
+            build_id="build-1", semantic_k=0, semantic_floor=1.0
+        ).build(passages, entities, contains, ())
+
+    baseline = TypedPPR(build_graph(), damping=0.5).run(passage_reset={"p0": 1.0})
+    monkeypatch.setattr(config, "HUB_DEGREE_CAP", 4)
+    dampened_graph = build_graph()
+    dampened = TypedPPR(dampened_graph, damping=0.5).run(passage_reset={"p0": 1.0})
+
+    assert dampened.accepted is True
+    assert sum(dampened.ranks.values()) == pytest.approx(1.0, abs=1e-8)
+    strengths = np.asarray(dampened_graph.matrix.sum(axis=0)).ravel()
+    assert all(value == pytest.approx(1.0) for value in strengths if value > 0)
+    # unrelated leaves receive strictly less mass through the dampened hub
+    assert dampened.ranks["p7"] < baseline.ranks["p7"]
+    # the withheld mass parks on the hub's self-loop instead of spraying out
+    assert dampened.ranks["hub"] > baseline.ranks["hub"]

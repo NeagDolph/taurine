@@ -22,7 +22,7 @@ from taurine_core.indexer.base_graph import (
 )
 from taurine_core.indexer.communities import ClusterRecord
 from taurine_core.indexer.embed import FactEmbedding, PassageEmbedding
-from taurine_core.indexer.facts import PREDICATES, FactRecord
+from taurine_core.indexer.facts import PREDICATES, FactRecord, adjudication_multiplier
 from taurine_core.indexer.passages import PassageDraft
 from taurine_core.indexer.projection import ProjectionEdge
 from taurine_core.schemas import NoteRecord
@@ -63,6 +63,7 @@ class StoredNote:
     build_id: str
     ingest_salience: float = 1.0
     salience: float = 1.0
+    snapshot_document: bool = False
 
 
 @dataclass(frozen=True)
@@ -148,6 +149,9 @@ class FactContext:
     superseded_by: str | None
     status: str
     build_id: str
+    adjudication_score: float | None = None
+    adjudication_quote: str = ""
+    adjudicated: bool = False
 
     @property
     def assertion_text(self) -> str:
@@ -381,9 +385,22 @@ class KnowledgeStore:
                 build_id=row["build_id"],
                 ingest_salience=float(row["ingest_salience"]),
                 salience=float(row["salience"]),
+                snapshot_document=bool(row["snapshot_document"]),
             )
             for row in rows
         )
+
+    def set_note_snapshot_flags(self, flags: dict[str, bool]) -> None:
+        """Persist the snapshot-document classification (audit surface)."""
+        self._writable()
+        with self._conn:
+            self._conn.executemany(
+                "UPDATE notes SET snapshot_document = ? WHERE note_id = ?",
+                [
+                    (1 if value else 0, note_id)
+                    for note_id, value in sorted(flags.items())
+                ],
+            )
 
     def write_passages(
         self,
@@ -408,8 +425,9 @@ class KnowledgeStore:
                     """
                     INSERT INTO passages(
                         passage_id, note_id, ordinal, char_start, char_end,
-                        token_count, text, content_hash, created, modified, build_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        token_count, text, content_hash, context, created,
+                        modified, build_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
                     """,
                     (
                         passage.passage_id,
@@ -426,8 +444,28 @@ class KnowledgeStore:
                     ),
                 )
                 self._conn.execute(
-                    "INSERT INTO passages_fts(passage_id, note_id, title, body) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO passages_fts(passage_id, note_id, title, body, context)"
+                    " VALUES (?, ?, ?, ?, '')",
                     (passage.passage_id, note_id, note["title"], passage.text),
+                )
+
+    def set_passage_contexts(self, contexts: Mapping[str, str]) -> None:
+        """Attach situating prefixes to stored passages (retrieval input only).
+
+        Context reaches the FTS index and the embedding frame; the stored
+        passage text, offsets, and evidence rendering never change.
+        """
+        self._writable()
+        with self._conn:
+            for passage_id in sorted(contexts):
+                context = str(contexts[passage_id])
+                self._conn.execute(
+                    "UPDATE passages SET context = ? WHERE passage_id = ?",
+                    (context, passage_id),
+                )
+                self._conn.execute(
+                    "UPDATE passages_fts SET context = ? WHERE passage_id = ?",
+                    (context, passage_id),
                 )
 
     def write_passage_embeddings(
@@ -647,21 +685,23 @@ class KnowledgeStore:
 
     def write_semantic_edges(
         self,
-        rows: Sequence[tuple[str, str, float, float]],
+        rows: Sequence[tuple[str, str, float, float] | tuple[str, str, float, float, str]],
         *,
         build_id: str,
     ) -> None:
         self._writable()
         with self._conn:
-            for src, dst, cosine, weight in rows:
+            for row in rows:
+                src, dst, cosine, weight = row[0], row[1], row[2], row[3]
+                reason = str(row[4]) if len(row) > 4 else ""
                 left, right = sorted((src, dst))
                 self._conn.execute(
                     """
                     INSERT OR REPLACE INTO passage_semantic_edges(
-                        src_passage_id, dst_passage_id, cosine, weight, build_id
-                    ) VALUES (?, ?, ?, ?, ?)
+                        src_passage_id, dst_passage_id, cosine, weight, reason, build_id
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (left, right, float(cosine), float(weight), build_id),
+                    (left, right, float(cosine), float(weight), reason, build_id),
                 )
 
     def write_passage_entity_edges(
@@ -865,7 +905,7 @@ class KnowledgeStore:
             rows = self._conn.execute(
                 """
                 SELECT f.passage_id, -bm25(passages_fts) AS score,
-                       p.text, n.title
+                       p.text, p.context, n.title
                 FROM passages_fts f
                 JOIN passages p ON p.passage_id = f.passage_id
                 JOIN notes n ON n.note_id = p.note_id
@@ -877,11 +917,15 @@ class KnowledgeStore:
             ).fetchall()
         except sqlite3.OperationalError:
             return ()
+        # context is a retrieval input, so it counts toward coverage — a
+        # situating-prefix-only match must not look like a stray term hit
         return tuple(
             BM25PassageHit(
                 passage_id=row["passage_id"],
                 raw_score=float(row["score"]),
-                token_coverage=_token_coverage(terms, f"{row['title']} {row['text']}"),
+                token_coverage=_token_coverage(
+                    terms, f"{row['title']} {row['text']} {row['context']}"
+                ),
             )
             for row in rows
         )
@@ -1120,14 +1164,15 @@ class KnowledgeStore:
 
     def _insert_fact_row(self, fact: FactRecord, *, superseded_by: str | None) -> None:
         self._conn.execute(
-            """INSERT INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 fact.fact_id, fact.subject_entity_id, fact.predicate, fact.object_entity_id,
                 fact.source_passage_id, fact.source_note_id, fact.assertion_start,
                 fact.assertion_end, fact.subject_start, fact.subject_end, fact.object_start,
                 fact.object_end, fact.confidence, fact.extraction_method, fact.schema_id,
                 fact.observed_at, fact.valid_from, fact.valid_to, fact.invalidated_at,
-                superseded_by, fact.status, fact.build_id,
+                superseded_by, fact.status, fact.build_id, fact.adjudication_score,
+                fact.adjudication_quote, int(fact.adjudicated),
             ),
         )
 
@@ -1169,6 +1214,9 @@ class KnowledgeStore:
             return ()
         clauses: list[str] = []
         parameters: list[Any] = []
+        # rejected facts are audit rows: excluded from recall, embeddings,
+        # traversal, and serving no matter what the caller asks for
+        clauses.append("f.status <> 'rejected'")
         if not include_candidates:
             clauses.append("f.status <> 'candidate'")
         if build_id is not None:
@@ -1247,6 +1295,9 @@ class KnowledgeStore:
                     superseded_by=row["superseded_by"],
                     status=row["status"],
                     build_id=row["build_id"],
+                    adjudication_score=_optional_float(row["adjudication_score"]),
+                    adjudication_quote=str(row["adjudication_quote"]),
+                    adjudicated=bool(row["adjudicated"]),
                 )
             )
         return tuple(contexts)
@@ -1265,13 +1316,13 @@ class KnowledgeStore:
         edges: list[BaseEdge] = []
         for row in self._conn.execute(
             """
-            SELECT src_passage_id, dst_passage_id, cosine, weight
+            SELECT src_passage_id, dst_passage_id, cosine, weight, reason
             FROM passage_semantic_edges WHERE build_id = ?
             ORDER BY src_passage_id, dst_passage_id
             """,
             (build_id,),
         ).fetchall():
-            metadata = {"cosine": float(row["cosine"])}
+            metadata = {"cosine": float(row["cosine"]), "reason": str(row["reason"])}
             edges.extend(
                 (
                     BaseEdge(row["src_passage_id"], row["dst_passage_id"], "semantic", float(row["weight"]), metadata=metadata),
@@ -1296,7 +1347,8 @@ class KnowledgeStore:
         fact_rows = self._conn.execute(
             """
             SELECT fact_id, subject_entity_id, predicate, object_entity_id,
-                   source_note_id, confidence, status
+                   source_note_id, confidence, status, adjudication_score,
+                   adjudicated
             FROM facts
             WHERE build_id = ?
             ORDER BY fact_id
@@ -1314,6 +1366,10 @@ class KnowledgeStore:
                         source_note_id=str(row["source_note_id"]),
                         confidence=float(row["confidence"]),
                         status=str(row["status"]),
+                        adjudication_multiplier=adjudication_multiplier(
+                            bool(row["adjudicated"]),
+                            _optional_float(row["adjudication_score"]),
+                        ),
                     )
                     for row in fact_rows
                 )
@@ -1434,7 +1490,7 @@ class KnowledgeStore:
                 """
                 SELECT count(*) FROM facts f
                 LEFT JOIN fact_embeddings fe ON fe.fact_id = f.fact_id
-                WHERE f.status <> 'candidate' AND fe.fact_id IS NULL
+                WHERE f.status NOT IN ('candidate', 'rejected') AND fe.fact_id IS NULL
                 """
             ).fetchone()[0]
         )
@@ -1470,6 +1526,7 @@ class KnowledgeStore:
             "salience",
             "quality_rank",
             "value_score",
+            "snapshot_document",
             "extraction_status",
             "extraction_error",
             "build_id",
@@ -1479,6 +1536,31 @@ class KnowledgeStore:
             for row in self._conn.execute("PRAGMA table_info(notes)").fetchall()
         }
         if not required <= columns:
+            raise KnowledgeSchemaError(
+                "incompatible derived knowledge schema; delete and regenerate the knowledge index"
+            )
+        passage_columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(passages)").fetchall()
+        }
+        if "context" not in passage_columns:
+            raise KnowledgeSchemaError(
+                "incompatible derived knowledge schema; delete and regenerate the knowledge index"
+            )
+        fact_columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()
+        }
+        semantic_columns = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "PRAGMA table_info(passage_semantic_edges)"
+            ).fetchall()
+        }
+        if (
+            not {"adjudication_score", "adjudication_quote", "adjudicated"} <= fact_columns
+            or "reason" not in semantic_columns
+        ):
             raise KnowledgeSchemaError(
                 "incompatible derived knowledge schema; delete and regenerate the knowledge index"
             )
@@ -1527,6 +1609,7 @@ CREATE TABLE notes (
     salience REAL NOT NULL DEFAULT 1.0,
     quality_rank REAL NOT NULL DEFAULT 0.0,
     value_score REAL NOT NULL DEFAULT 0.0,
+    snapshot_document INTEGER NOT NULL DEFAULT 0,
     extraction_status TEXT NOT NULL CHECK (extraction_status IN ('pending', 'complete', 'failed', 'skipped_low_salience')),
     extraction_error TEXT NOT NULL DEFAULT '',
     build_id TEXT NOT NULL
@@ -1541,6 +1624,7 @@ CREATE TABLE passages (
     token_count INTEGER NOT NULL,
     text TEXT NOT NULL,
     content_hash TEXT NOT NULL,
+    context TEXT NOT NULL DEFAULT '',
     created REAL NOT NULL,
     modified REAL NOT NULL,
     build_id TEXT NOT NULL,
@@ -1549,11 +1633,15 @@ CREATE TABLE passages (
     CHECK(length(text) > 0)
 );
 CREATE INDEX passages_note_idx ON passages(note_id, ordinal);
+-- context is a separate indexed column (not appended to body) so the stored
+-- FTS body stays byte-identical to the passage text while BM25 still matches
+-- situating-prefix terms.
 CREATE VIRTUAL TABLE passages_fts USING fts5(
     passage_id UNINDEXED,
     note_id UNINDEXED,
     title,
     body,
+    context,
     tokenize='unicode61'
 );
 
@@ -1628,8 +1716,13 @@ CREATE TABLE facts (
     valid_to REAL,
     invalidated_at REAL,
     superseded_by TEXT REFERENCES facts(fact_id),
-    status TEXT NOT NULL CHECK (status IN ('active', 'historical', 'superseded', 'conflicted', 'candidate')),
+    status TEXT NOT NULL CHECK (status IN ('active', 'historical', 'superseded', 'conflicted', 'candidate', 'rejected')),
     build_id TEXT NOT NULL,
+    -- grounded adjudication verdict (edge-quality item 1); rejected rows are
+    -- retained for audit with their score and quote, never served
+    adjudication_score REAL,
+    adjudication_quote TEXT NOT NULL DEFAULT '',
+    adjudicated INTEGER NOT NULL DEFAULT 0,
     CHECK(subject_entity_id <> object_entity_id),
     CHECK(assertion_start >= 0 AND assertion_end > assertion_start)
 );
@@ -1666,6 +1759,9 @@ CREATE TABLE passage_semantic_edges (
     dst_passage_id TEXT NOT NULL REFERENCES passages(passage_id) ON DELETE CASCADE,
     cosine REAL NOT NULL,
     weight REAL NOT NULL,
+    -- grounded judge's ≤14-word connection (edge-quality item 5b); empty when
+    -- the lane was unavailable, the batch failed, or the edge is same-note
+    reason TEXT NOT NULL DEFAULT '',
     build_id TEXT NOT NULL,
     PRIMARY KEY(src_passage_id, dst_passage_id),
     CHECK(src_passage_id < dst_passage_id)

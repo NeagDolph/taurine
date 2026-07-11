@@ -11,6 +11,7 @@ import logging
 import os
 import statistics
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,7 +22,13 @@ from scipy.sparse.csgraph import connected_components
 
 from taurine_core import config
 from taurine_core.evaluation.graph_retrieval import load_calibration
-from taurine_core.indexer.base_graph import BaseGraphBuilder, EntityGraphInput, PassageEntityInput, PassageGraphInput
+from taurine_core.indexer.base_graph import (
+    BaseGraphBuilder,
+    EntityGraphInput,
+    PassageEntityInput,
+    PassageGraphInput,
+    materialize_base_graph,
+)
 from taurine_core.indexer.cluster_labels import (
     ClusterSummary,
     build_cluster_summaries,
@@ -30,9 +37,25 @@ from taurine_core.indexer.cluster_labels import (
     label_clusters,
 )
 from taurine_core.indexer.communities import ClusterRecord, cluster_projection
+from taurine_core.indexer.context_enrich import (
+    EnrichmentBatch,
+    EnrichmentResult,
+    context_enricher_for,
+    enrich_passages,
+)
+from taurine_core.indexer.edge_adjudication import (
+    MergeOutcome,
+    SemanticPair,
+    adjudicate_facts,
+    adjudicate_merges,
+    adjudicate_semantic_edges,
+    edge_adjudicator_for,
+    merge_mention_contexts,
+)
 from taurine_core.indexer.embed import embed_facts, embed_passages, embed_texts
 from taurine_core.indexer.entities import EntityResolver, MentionInput
 from taurine_core.indexer.extract import extract_notes
+from taurine_core.indexer.doc_kind import snapshot_document
 from taurine_core.indexer.facts import PREDICATES, promote_fact, reconcile_temporal_facts
 from taurine_core.indexer.knowledge_store import KnowledgeStore, compute_graph_hash
 from taurine_core.indexer.passages import TokenizerPort, build_passages
@@ -73,6 +96,16 @@ class BuildDependencies:
     # optional like the relation-completion lane: server syncs wire an LLM,
     # CLI builds may not — absence means fallback cluster names, never failure
     cluster_labeler: Callable[[Sequence[ClusterSummary]], object] | None = None
+    # optional situating-prefix lane (contextual retrieval): absence or any
+    # batch failure means empty contexts, never a failed build. context_cache
+    # is a BuildCache in production so unchanged passages re-enrich for free.
+    context_enricher: Callable[[EnrichmentBatch], object] | None = None
+    context_cache: Any | None = None
+    # optional grounded edge-adjudication judge (edge-quality items 1/5b/6):
+    # absence means facts stay unadjudicated, semantic edges keep empty
+    # reasons, and no gray-zone merges happen — never a failed build.
+    edge_adjudicator: Callable[[str, dict], Any] | None = None
+    adjudication_cache: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +150,123 @@ class BuildReport:
     cluster_size_histogram: dict[str, int] | None = None
     cluster_labeled_count: int = 0
     cluster_label_failed_batches: int = 0
+    context_enriched_count: int = 0
+    context_enrich_failed_batches: int = 0
+    # grounded edge adjudication (audit contract, edge-quality items 1/5b/6):
+    # per-outcome counts keyed by predicate, plus lane health counters
+    adjudicated_fact_count: int = 0
+    unadjudicated_fact_count: int = 0
+    adjudication_failed_batches: int = 0
+    adjudication_malformed_rows: int = 0
+    adjudicated_by_predicate: dict[str, int] | None = None
+    adjudication_kept_by_predicate: dict[str, int] | None = None
+    adjudication_downweighted_by_predicate: dict[str, int] | None = None
+    adjudication_rejected_by_predicate: dict[str, int] | None = None
+    adjudication_relabeled_by_predicate: dict[str, int] | None = None
+    semantic_reasoned_edge_count: int = 0
+    semantic_reason_dropped_count: int = 0
+    semantic_reason_failed_batches: int = 0
+    merge_gray_zone_pair_count: int = 0
+    merge_adjudicated_count: int = 0
+    merge_approved_count: int = 0
+    merge_failed_batches: int = 0
+    peak_memory_gb: float = 0.0
+    peak_memory_stage: str = ""
+
+
+class BuildMemoryExceeded(Exception):
+    """Raised when a build's resident set crosses the configured ceiling."""
+
+
+class _BuildMemoryWatchdog:
+    """Samples process RSS during a build.
+
+    Records the peak (for observability — the build report surfaces it) and
+    trips a cooperative abort flag when RSS crosses ``ceiling_gb``. The flag is
+    checked at every stage boundary so a runaway build fails with a clean
+    ``BuildError`` (temp DB discarded, prior snapshot untouched) instead of the
+    OS OOM-killing the sidecar. Device (MPS/CUDA) runaway is caught separately
+    by the allocator watermark cap set in ``taurine_core.__init__`` which turns
+    an over-allocation into a catchable RuntimeError.
+    """
+
+    def __init__(self, ceiling_gb: float) -> None:
+        self.ceiling_gb = float(ceiling_gb)
+        self.peak_gb = 0.0
+        self.peak_stage = ""
+        self._current_stage = "startup"
+        self._tripped = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._proc = None
+        try:
+            import psutil
+
+            self._proc = psutil.Process()
+        except Exception:  # noqa: BLE001 — psutil optional; fall back below
+            self._proc = None
+
+    def _rss_gb(self) -> float:
+        if self._proc is not None:
+            try:
+                return self._proc.memory_info().rss / 1e9
+            except Exception:  # noqa: BLE001
+                return 0.0
+        try:
+            import resource
+
+            usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # macOS reports bytes, Linux kilobytes.
+            return usage / (1e9 if sys.platform == "darwin" else 1e6)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def set_stage(self, stage: str) -> None:
+        self._current_stage = stage
+
+    def check(self) -> None:
+        # Sample synchronously so a stage boundary evaluates the ceiling
+        # deterministically, independent of the poll thread's timing.
+        self._sample()
+        if self._tripped:
+            raise BuildMemoryExceeded(
+                f"build resident set exceeded {self.ceiling_gb:.4g} GB "
+                f"(peak {self.peak_gb:.3g} GB at stage '{self.peak_stage}')"
+            )
+
+    def _sample(self) -> None:
+        rss = self._rss_gb()
+        if rss > self.peak_gb:
+            self.peak_gb = rss
+            self.peak_stage = self._current_stage
+        if self.ceiling_gb > 0 and rss > self.ceiling_gb:
+            self._tripped = True
+            _LOG.error(
+                "build memory watchdog: RSS %.1f GB > ceiling %.1f GB at stage %s — "
+                "requesting abort",
+                rss,
+                self.ceiling_gb,
+                self._current_stage,
+            )
+
+    def _run(self) -> None:
+        # Sample immediately so a fast build still records a peak and a breached
+        # ceiling trips before the first poll interval elapses.
+        self._sample()
+        while not self._stop.wait(0.5):
+            self._sample()
+            if self._tripped:
+                return
+
+    def __enter__(self) -> "_BuildMemoryWatchdog":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
 
 
 class BuildCoordinator:
@@ -136,7 +286,13 @@ class BuildCoordinator:
     ) -> BuildReport:
         if not replace_derived:
             raise BuildError("--replace-derived is required for a clean knowledge build")
-        announce = on_stage or (lambda stage: None)
+        watchdog = _BuildMemoryWatchdog(config.BUILD_MEMORY_CEILING_GB)
+
+        def announce(stage: str) -> None:
+            watchdog.set_stage(stage)
+            watchdog.check()
+            if on_stage is not None:
+                on_stage(stage)
         target_path = Path(target)
         health_reasons = sorted(dict.fromkeys(degraded_reasons))
         calibration = load_calibration(
@@ -196,10 +352,12 @@ class BuildCoordinator:
             stages.append(name)
             stage_timings_ms[name] = (now - stage_started) * 1000.0
             stage_started = now
+            watchdog.check()
             _LOG.info(
                 "build %s: stage %s done in %.0f ms", build_id, name, stage_timings_ms[name]
             )
 
+        watchdog.__enter__()
         try:
             announce("source")
             store = KnowledgeStore(temporary)
@@ -249,6 +407,32 @@ class BuildCoordinator:
                 )
                 passage_rows.extend((note, draft) for draft in drafts)
             stage_done("passages")
+            announce("context_enrichment")
+            # Item 4 (contextual retrieval): episodic passages get a cached,
+            # fail-open situating prefix that reaches ONLY the FTS context
+            # column and the embedding frame below — passage text, offsets,
+            # and evidence rendering are untouched.
+            drafts_by_note: dict[str, list[Any]] = {}
+            for note, draft in passage_rows:
+                drafts_by_note.setdefault(note.note_id, []).append(draft)
+            enrichment: EnrichmentResult = enrich_passages(
+                tuple(
+                    (note, tuple(drafts_by_note.get(note.note_id, ())))
+                    for note in ordered
+                ),
+                self.dependencies.context_enricher,
+                cache=self.dependencies.context_cache,
+            )
+            if enrichment.contexts:
+                store.set_passage_contexts(enrichment.contexts)
+            if enrichment.enriched_count or enrichment.failed_batches:
+                _LOG.info(
+                    "build %s: %d passages context-enriched, %d enrichment batches failed",
+                    build_id,
+                    enrichment.enriched_count,
+                    enrichment.failed_batches,
+                )
+            stage_done("context_enrichment")
 
             embedded_by_id = {}
             for position, note in enumerate(ordered):
@@ -258,6 +442,7 @@ class BuildCoordinator:
                     drafts,
                     title=note.title,
                     source=note.source,
+                    contexts=enrichment.contexts,
                     embedder=self.dependencies.embedder,
                     model_id=self.dependencies.embedding_model_id,
                     build_id=build_id,
@@ -353,12 +538,40 @@ class BuildCoordinator:
                         return 0.0
                     return float(surface_matrix[left_row] @ surface_matrix[right_row])
 
-            resolution = EntityResolver(
-                total_notes=max(1, len(ordered)),
-                owner_aliases={value.casefold() for value in owner_aliases},
-                similarity=similarity,
-                similarity_threshold=config.ENTITY_EMBED_SIM,
-            ).resolve_mentions(mention_inputs)
+            def resolve_entities(
+                forced_merges: Sequence[tuple[str, str, str]] = (),
+            ) -> Any:
+                return EntityResolver(
+                    total_notes=max(1, len(ordered)),
+                    owner_aliases={value.casefold() for value in owner_aliases},
+                    similarity=similarity,
+                    similarity_threshold=config.ENTITY_EMBED_SIM,
+                    note_sources={note.note_id: note.source for note in ordered},
+                ).resolve_mentions(mention_inputs, forced_merges=forced_merges)
+
+            resolution = resolve_entities()
+            # item 6: gray-zone pairs the deterministic resolver declined go
+            # to the grounded merge judge; approved pairs force a second
+            # union pass BEFORE entities/mentions/facts are inserted.
+            merge_outcome = MergeOutcome((), 0, 0, 0)
+            gray_zone_pair_count = len(resolution.gray_zone_pairs)
+            if self.dependencies.edge_adjudicator is not None and resolution.gray_zone_pairs:
+                merge_outcome = adjudicate_merges(
+                    resolution.gray_zone_pairs,
+                    contexts=merge_mention_contexts(
+                        resolution, {note.note_id: note.text for note in ordered}
+                    ),
+                    judge=self.dependencies.edge_adjudicator,
+                    cache=self.dependencies.adjudication_cache,
+                )
+                if merge_outcome.approved:
+                    _LOG.info(
+                        "build %s: merge judge approved %d of %d gray-zone pairs",
+                        build_id,
+                        merge_outcome.approved_count,
+                        gray_zone_pair_count,
+                    )
+                    resolution = resolve_entities(merge_outcome.approved)
             for entity in resolution.entities:
                 store.insert_entity(entity_id=entity.entity_id, canonical=entity.canonical, normalized=entity.normalized, etype=entity.etype, df=entity.df, traversal_eligible=entity.traversal_eligible, traversal_reason=entity.traversal_reason, ambiguity_key=entity.ambiguity_key, build_id=build_id)
                 for alias in entity.aliases:
@@ -376,6 +589,24 @@ class BuildCoordinator:
                     (row.note_id, row.mention.char_start, row.mention.char_end, row.mention.surface.casefold()),
                     [],
                 ).append(row)
+            # snapshot documents (resumes, offer letters, transcripts) describe
+            # the world as of their own date: their facts anchor observed_at to
+            # the date parsed from the title, else note.created — never
+            # note.modified — so an old resume synced yesterday cannot outrank
+            # a recent first-person note (edge-quality spec item 2)
+            snapshot_notes = {note.note_id: snapshot_document(note) for note in ordered}
+            fact_observed_default: dict[str, float] = {}
+            for note in ordered:
+                is_snapshot, doc_date = snapshot_notes[note.note_id]
+                if is_snapshot:
+                    fact_observed_default[note.note_id] = float(
+                        doc_date if doc_date is not None else note.created
+                    )
+                else:
+                    fact_observed_default[note.note_id] = float(note.modified)
+            store.set_note_snapshot_flags(
+                {note_id: flag for note_id, (flag, _) in snapshot_notes.items()}
+            )
             fact_rows = []
             degenerate_facts: list[tuple[str, str]] = []
             invalid_candidates = 0
@@ -411,7 +642,7 @@ class BuildCoordinator:
                                 (note.note_id, f"{candidate.head} {candidate.predicate} {candidate.tail}")
                             )
                             continue
-                        fact_rows.append(promote_fact(candidate, subject_entity_id=subject.entity_id, object_entity_id=object_.entity_id, source_passage_id=passage.passage_id, source_note_id=note.note_id, observed_at=(candidate.observed_at if candidate.observed_at is not None else note.modified), valid_from=candidate.valid_from, valid_to=candidate.valid_to, build_id=build_id))
+                        fact_rows.append(promote_fact(candidate, subject_entity_id=subject.entity_id, object_entity_id=object_.entity_id, source_passage_id=passage.passage_id, source_note_id=note.note_id, observed_at=(candidate.observed_at if candidate.observed_at is not None else fact_observed_default[note.note_id]), valid_from=candidate.valid_from, valid_to=candidate.valid_to, build_id=build_id))
             if invalid_candidates:
                 _LOG.warning(
                     "build %s: skipped %d fact candidates with unregistered predicates or invalid spans",
@@ -455,7 +686,9 @@ class BuildCoordinator:
                     CompletionNote(
                         note_id=note.note_id,
                         value_score=provisional_values.get(note.note_id, 0.0),
-                        observed_at=note.modified,
+                        # snapshot-aware: completed facts anchor to the same
+                        # corrected observation time as extracted facts
+                        observed_at=fact_observed_default[note.note_id],
                         # one CompletionEntity per mention: every span stays
                         # available for endpoint grounding (H8)
                         entities=tuple(
@@ -509,8 +742,33 @@ class BuildCoordinator:
                     len(fact_rows) - len(unique_facts),
                 )
             fact_rows = list(reconcile_temporal_facts(tuple(unique_facts.values())))
-            store.insert_facts(fact_rows)
             stage_done("facts")
+            announce("adjudication")
+            # item 1: every candidate/active fact is judged against its own
+            # source passage text (quote-verified in code). Rejected rows stay
+            # for audit but are excluded from edges, embeddings, recall, and
+            # serving; mid-band scores multiply the fact's edge weight.
+            fact_adjudication = adjudicate_facts(
+                fact_rows,
+                passages_by_note=passage_by_note,
+                note_titles={note.note_id: note.title for note in ordered},
+                judge=self.dependencies.edge_adjudicator,
+                cache=self.dependencies.adjudication_cache,
+                note_sources={note.note_id: note.source for note in ordered},
+            )
+            fact_rows = list(fact_adjudication.facts)
+            if fact_adjudication.adjudicated or fact_adjudication.failed_batches:
+                _LOG.info(
+                    "build %s: %d facts adjudicated (%d rejected, %d relabeled), "
+                    "%d batches failed",
+                    build_id,
+                    fact_adjudication.adjudicated,
+                    sum(fact_adjudication.rejected_by_predicate.values()),
+                    sum(fact_adjudication.relabeled_by_predicate.values()),
+                    fact_adjudication.failed_batches,
+                )
+            store.insert_facts(fact_rows)
+            stage_done("adjudication")
 
             announce("base_graph")
             graph_passages = tuple(
@@ -545,8 +803,80 @@ class BuildCoordinator:
                 # L19: the semantic floor lives in the calibration artifact
                 semantic_floor=calibration.graph.semantic_floor,
             ).build(graph_passages, entity_graph, contains_graph, fact_rows)
+            # item 5b: cross-note semantic edges must carry a concrete
+            # grounded reason or be dropped; same-note edges and fail-open
+            # batches keep an empty reason. Dropped edges are filtered from
+            # the in-memory graph BEFORE persistence so the stored rows keep
+            # reproducing the graph hash.
+            note_of_passage = {
+                draft.passage_id: note.note_id for note, draft in passage_rows
+            }
+            draft_of_passage = {
+                draft.passage_id: draft for _note, draft in passage_rows
+            }
+            title_of_note = {note.note_id: note.title for note in ordered}
+            cross_note_semantic = [
+                edge
+                for edge in base_graph.edges
+                if edge.kind == "semantic"
+                and edge.src_id < edge.dst_id
+                and note_of_passage[edge.src_id] != note_of_passage[edge.dst_id]
+            ]
+            # Only judge the strongest cross-note links (deterministic: weight
+            # desc, then passage ids). The long tail keeps an empty reason and
+            # is never dropped — this caps judge calls without losing edges.
+            reason_cap = int(config.SEMANTIC_REASON_MAX_EDGES)
+            if reason_cap > 0 and len(cross_note_semantic) > reason_cap:
+                cross_note_semantic.sort(
+                    key=lambda edge: (-edge.weight, edge.src_id, edge.dst_id)
+                )
+                cross_note_semantic = cross_note_semantic[:reason_cap]
+            semantic_pairs = tuple(
+                SemanticPair(
+                    src_passage_id=edge.src_id,
+                    dst_passage_id=edge.dst_id,
+                    src_title=title_of_note[note_of_passage[edge.src_id]],
+                    dst_title=title_of_note[note_of_passage[edge.dst_id]],
+                    src_text=draft_of_passage[edge.src_id].text,
+                    dst_text=draft_of_passage[edge.dst_id].text,
+                    src_content_hash=draft_of_passage[edge.src_id].content_hash,
+                    dst_content_hash=draft_of_passage[edge.dst_id].content_hash,
+                )
+                for edge in cross_note_semantic
+            )
+            semantic_reasons = adjudicate_semantic_edges(
+                semantic_pairs,
+                judge=self.dependencies.edge_adjudicator,
+                cache=self.dependencies.adjudication_cache,
+            )
+            if semantic_reasons.dropped:
+                _LOG.info(
+                    "build %s: %d cross-note semantic edges dropped (no concrete "
+                    "reason), %d reasoned",
+                    build_id,
+                    semantic_reasons.dropped_count,
+                    semantic_reasons.reasoned_count,
+                )
+                base_graph = materialize_base_graph(
+                    build_id=build_id,
+                    node_ids=base_graph.node_ids,
+                    node_kinds=base_graph.node_kinds,
+                    edges=tuple(
+                        edge
+                        for edge in base_graph.edges
+                        if edge.kind != "semantic"
+                        or tuple(sorted((edge.src_id, edge.dst_id)))
+                        not in semantic_reasons.dropped
+                    ),
+                )
             semantic_edge_rows = tuple(
-                (edge.src_id, edge.dst_id, edge.weight, edge.weight)
+                (
+                    edge.src_id,
+                    edge.dst_id,
+                    edge.weight,
+                    edge.weight,
+                    semantic_reasons.reasons.get((edge.src_id, edge.dst_id), ""),
+                )
                 for edge in base_graph.edges
                 if edge.kind == "semantic" and edge.src_id < edge.dst_id
             )
@@ -817,6 +1147,32 @@ class BuildCoordinator:
                 ),
                 cluster_labeled_count=cluster_labeled,
                 cluster_label_failed_batches=cluster_label_failures,
+                context_enriched_count=enrichment.enriched_count,
+                context_enrich_failed_batches=enrichment.failed_batches,
+                adjudicated_fact_count=fact_adjudication.adjudicated,
+                unadjudicated_fact_count=fact_adjudication.unadjudicated,
+                adjudication_failed_batches=fact_adjudication.failed_batches,
+                adjudication_malformed_rows=fact_adjudication.malformed_rows,
+                adjudicated_by_predicate=fact_adjudication.adjudicated_by_predicate,
+                adjudication_kept_by_predicate=fact_adjudication.kept_by_predicate,
+                adjudication_downweighted_by_predicate=(
+                    fact_adjudication.downweighted_by_predicate
+                ),
+                adjudication_rejected_by_predicate=(
+                    fact_adjudication.rejected_by_predicate
+                ),
+                adjudication_relabeled_by_predicate=(
+                    fact_adjudication.relabeled_by_predicate
+                ),
+                semantic_reasoned_edge_count=semantic_reasons.reasoned_count,
+                semantic_reason_dropped_count=semantic_reasons.dropped_count,
+                semantic_reason_failed_batches=semantic_reasons.failed_batches,
+                merge_gray_zone_pair_count=gray_zone_pair_count,
+                merge_adjudicated_count=merge_outcome.judged_count,
+                merge_approved_count=merge_outcome.approved_count,
+                merge_failed_batches=merge_outcome.failed_batches,
+                peak_memory_gb=round(watchdog.peak_gb, 3),
+                peak_memory_stage=watchdog.peak_stage,
             )
         except Exception as exc:
             if store is not None:
@@ -839,6 +1195,8 @@ class BuildCoordinator:
             if isinstance(exc, BuildError):
                 raise
             raise BuildError(str(exc)) from exc
+        finally:
+            watchdog.__exit__(None, None, None)
 
 
 def main(
@@ -893,6 +1251,8 @@ def main(
             else relation_completer_for(cli_llm)
         ),
         cluster_labeler=None if cli_llm is None else cluster_labeler_for(cli_llm),
+        context_enricher=None if cli_llm is None else context_enricher_for(cli_llm),
+        edge_adjudicator=None if cli_llm is None else edge_adjudicator_for(cli_llm),
     )
     sweep_stale_build_files(args.db)
     if args.no_relation_completion:

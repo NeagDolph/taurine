@@ -1,6 +1,6 @@
 {
   "artifact_version": "1",
-  "hash": "sha256:e78d3d83e0969f15a4b57cd955086f684465c004caff1c854db982f6d619764f",
+  "hash": "sha256:6d1f8d7d26cd4130cda1d7988f852bb0ca971c8e60e150b2e65e3ba2886fb388",
   "model_manifest": {
     "embedding": "Qwen/Qwen3-Embedding-0.6B",
     "reranker": "Qwen/Qwen3-Reranker-0.6B",
@@ -502,6 +502,6 @@
     "entailment_floor": 0.8
   },
   "graph": {
-    "semantic_floor": 0.55
+    "semantic_floor": 0.62
   }
 }

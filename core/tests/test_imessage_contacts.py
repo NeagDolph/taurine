@@ -147,3 +147,93 @@ def test_contact_names_tolerates_broken_db(tmp_path: Path) -> None:
     broken = tmp_path / "AddressBook-v22.abcddb"
     broken.write_text("not a sqlite database")
     assert _contact_names({"contacts_glob": str(broken)}) == {}
+
+
+# ── owner self-identity (edge-quality item 3a) ─────────────────────────────
+
+
+def _make_chat_db_with_accounts(
+    path: Path, accounts: list[tuple[str, bool]]
+) -> None:
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT, display_name TEXT);
+        CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+        CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT,
+            attributedBody BLOB, date INTEGER, is_from_me INTEGER,
+            handle_id INTEGER, account TEXT);
+        CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+        """
+    )
+    for rowid, (account, from_me) in enumerate(accounts, start=1):
+        conn.execute(
+            "INSERT INTO message (ROWID, text, date, is_from_me, account)"
+            " VALUES (?, 'hi', 1, ?, ?)",
+            (rowid, int(from_me), account),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_self_identity_resolves_sent_account_handles_through_contacts(
+    tmp_path: Path,
+) -> None:
+    from taurine_core.connectors.imessage import self_identity_names
+
+    contacts_db = tmp_path / "AddressBook-v22.abcddb"
+    _make_contacts_db(
+        contacts_db,
+        [
+            ("Neil", "Pathangay", "", "", "neil@icloud.com"),
+            ("Ernie", "Zhang", "", "+15128509385", ""),
+        ],
+    )
+    chat_db = tmp_path / "chat.db"
+    _make_chat_db_with_accounts(
+        chat_db,
+        [
+            ("E:neil@icloud.com", True),
+            ("E:neil@icloud.com", True),
+            ("E:someone-else@example.com", False),  # received: never self
+        ],
+    )
+
+    names = self_identity_names({"db": str(chat_db), "contacts_glob": str(contacts_db)})
+
+    assert names == ("Neil Pathangay",)
+
+
+def test_self_identity_is_empty_without_account_column_or_contacts(
+    tmp_path: Path,
+) -> None:
+    from taurine_core.connectors.imessage import self_identity_names
+
+    contacts_db = tmp_path / "AddressBook-v22.abcddb"
+    _make_contacts_db(contacts_db, [("Neil", "Pathangay", "", "", "neil@icloud.com")])
+    legacy_chat_db = tmp_path / "chat.db"
+    _make_chat_db(legacy_chat_db, "+15128509385", [("hey", False)])
+
+    # legacy schema without the account column → ()
+    assert (
+        self_identity_names(
+            {"db": str(legacy_chat_db), "contacts_glob": str(contacts_db)}
+        )
+        == ()
+    )
+    # no contacts resolve → ()
+    with_accounts = tmp_path / "chat2.db"
+    _make_chat_db_with_accounts(with_accounts, [("E:neil@icloud.com", True)])
+    assert (
+        self_identity_names(
+            {"db": str(with_accounts), "contacts_glob": str(tmp_path / "missing-*.abcddb")}
+        )
+        == ()
+    )
+    # missing db → ()
+    assert (
+        self_identity_names(
+            {"db": str(tmp_path / "absent.db"), "contacts_glob": str(contacts_db)}
+        )
+        == ()
+    )

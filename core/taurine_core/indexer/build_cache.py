@@ -41,6 +41,18 @@ CREATE TABLE IF NOT EXISTS extraction_cache (
     payload TEXT NOT NULL,
     created REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS context_cache (
+    key TEXT PRIMARY KEY,
+    passage_id TEXT NOT NULL,
+    context TEXT NOT NULL,
+    created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS adjudication_cache (
+    key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created REAL NOT NULL
+);
 """
 
 
@@ -124,7 +136,7 @@ class BuildCache:
     def _drop_corrupt(self, table: str, keys: Sequence[str]) -> None:
         if not keys:
             return
-        assert table in {"embedding_cache", "extraction_cache"}
+        assert table in {"embedding_cache", "extraction_cache", "adjudication_cache"}
         with self._lock, self._conn:
             self._conn.executemany(
                 f"DELETE FROM {table} WHERE key = ?", [(key,) for key in keys]
@@ -239,6 +251,85 @@ class BuildCache:
                 [
                     (key, note_id, extraction.model_dump_json(), now)
                     for key, note_id, extraction in rows
+                ],
+            )
+
+
+    # -- passage contexts ----------------------------------------------------
+
+    def cached_contexts(self, keys: Sequence[str]) -> dict[str, str]:
+        """Situating-prefix cache rows keyed by the context_enrich key family
+        (prompt version, model, passage content hash, window hash)."""
+
+        rows: dict[str, str] = {}
+        with self._lock:
+            for start in range(0, len(keys), 500):
+                chunk = list(dict.fromkeys(keys[start : start + 500]))
+                placeholders = ",".join("?" for _ in chunk)
+                for key, context in self._conn.execute(
+                    f"SELECT key, context FROM context_cache WHERE key IN ({placeholders})",
+                    chunk,
+                ):
+                    rows[key] = str(context)
+        return rows
+
+    def store_contexts(self, rows: Sequence[tuple[str, str, str]]) -> None:
+        """Store (key, passage_id, context) rows; empty contexts are cached
+        too — a model that declined to situate a passage stays declined."""
+
+        if not rows:
+            return
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO context_cache (key, passage_id, context, created)"
+                " VALUES (?, ?, ?, ?)",
+                [(key, passage_id, context, now) for key, passage_id, context in rows],
+            )
+
+
+    # -- edge adjudication verdicts -------------------------------------------
+
+    def cached_judgments(self, keys: Sequence[str]) -> dict[str, dict]:
+        """Grounded-judge verdict rows keyed by the edge_adjudication key
+        families (prompt version, model, edge identity, content hashes)."""
+
+        rows: dict[str, dict] = {}
+        corrupt: list[str] = []
+        with self._lock:
+            for start in range(0, len(keys), 500):
+                chunk = list(dict.fromkeys(keys[start : start + 500]))
+                placeholders = ",".join("?" for _ in chunk)
+                for key, payload in self._conn.execute(
+                    f"SELECT key, payload FROM adjudication_cache WHERE key IN ({placeholders})",
+                    chunk,
+                ):
+                    try:
+                        parsed = json.loads(payload)
+                    except Exception:
+                        parsed = None
+                    # a corrupt row is a cache miss, never a build failure (L8)
+                    if not isinstance(parsed, dict):
+                        corrupt.append(key)
+                        continue
+                    rows[key] = parsed
+        self._drop_corrupt("adjudication_cache", corrupt)
+        return rows
+
+    def store_judgments(self, rows: Sequence[tuple[str, str, dict]]) -> None:
+        """Store (key, kind, verdict) rows; only code-verified verdicts should
+        reach the cache so replays never resurrect malformed judgments."""
+
+        if not rows:
+            return
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO adjudication_cache (key, kind, payload, created)"
+                " VALUES (?, ?, ?, ?)",
+                [
+                    (key, kind, json.dumps(payload, sort_keys=True), now)
+                    for key, kind, payload in rows
                 ],
             )
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -93,19 +93,30 @@ def embed_passages(
     *,
     title: str,
     source: str,
+    contexts: Mapping[str, str] | None = None,
     embedder: Callable[[list[str]], np.ndarray] | None = None,
     model_id: str,
     build_id: str,
     dim: int = config.EMBED_DIM,
 ) -> tuple[PassageEmbedding, ...]:
-    """Embed exact passages with deterministic document metadata."""
+    """Embed exact passages with deterministic document metadata.
+
+    ``contexts`` carries optional situating prefixes (contextual retrieval);
+    a non-empty context joins the frame — and therefore the content-keyed
+    embedding cache key — while the stored passage text stays untouched.
+    """
     ordered = sorted(passages, key=lambda row: row.passage_id)
     if not ordered:
         return ()
     if len({row.passage_id for row in ordered}) != len(ordered):
         raise ValueError("duplicate passage_id in embedding batch")
+    by_passage = contexts or {}
     texts = [
-        f"Title: {title}\nSource: {source}\nPassage:\n{row.text}"
+        (
+            f"Title: {title}\nSource: {source}\nContext: {context}\nPassage:\n{row.text}"
+            if (context := by_passage.get(row.passage_id, ""))
+            else f"Title: {title}\nSource: {source}\nPassage:\n{row.text}"
+        )
         for row in ordered
     ]
     matrix = np.asarray((embedder or embed_texts)(texts), dtype=np.float32)
@@ -144,11 +155,20 @@ def _embed(texts: list[str], *, prompt: str | None = None) -> np.ndarray:
     kwargs: dict[str, Any] = {
         "convert_to_numpy": True,
         "show_progress_bar": False,
+        # Bound the per-forward-pass working set. A large caller batch (e.g. the
+        # ~7k unique entity surfaces resolved in one build call) otherwise hands
+        # sentence-transformers one huge list; an explicit batch caps peak
+        # device memory regardless of caller batch size.
+        "batch_size": max(1, int(config.EMBED_BATCH_SIZE)),
     }
     if prompt is not None:
         kwargs["prompt"] = prompt
     encoded = model.encode(texts, **kwargs)
     matrix = np.asarray(encoded, dtype=np.float32)
+    # Release cached Metal blocks after a large job so the allocator does not
+    # carry a build's worth of intermediate tensors forward.
+    if len(texts) >= max(1, int(config.EMBED_BATCH_SIZE)):
+        _release_device_cache()
     if matrix.ndim == 1:
         matrix = matrix.reshape(1, -1)
     if matrix.shape != (len(texts), config.EMBED_DIM):
@@ -196,6 +216,19 @@ def _get_model() -> Any:
         # a bundled path must load with zero hub traffic (no update pings)
         _MODEL = SentenceTransformer(ref, local_files_only=ref != config.EMBED_MODEL)
     return _MODEL
+
+
+def _release_device_cache() -> None:
+    """Best-effort release of the MPS/CUDA caching allocator between big jobs."""
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _sentences(text: str) -> list[str]:

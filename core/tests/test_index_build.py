@@ -3,17 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from tests.conftest import make_note
+from taurine_core import config
 from taurine_core.evaluation.graph_retrieval import load_calibration
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies, BuildError, main
 from taurine_core.indexer.knowledge_store import KnowledgeStore
 from taurine_core.retrieval.snapshot import load_index_snapshot
-from taurine_core.schemas import ExtractedMention, ExtractedRelation, Extraction
+from taurine_core.schemas import ExtractedMention, ExtractedRelation, Extraction, NoteRecord
 
 
 class Tokenizer:
@@ -69,11 +71,13 @@ def test_clean_build_is_atomic_deterministic_and_order_independent(tmp_path: Pat
     assert first.stages == (
         "source",
         "passages",
+        "context_enrichment",
         "embeddings",
         "extraction",
         "entities",
         "relation_completion",
         "facts",
+        "adjudication",
         "base_graph",
         "projection",
         "ranks",
@@ -1100,11 +1104,192 @@ def test_profile_owner_aliases_parse_the_user_card_heading() -> None:
             return self._card
 
     card = "# Neil Pathangay\n\nNeil is a software engineer working on Taurine."
-    aliases = owner_aliases(FakeIndex(card))
+    aliases = owner_aliases(FakeIndex(card), connector_identity=lambda: ())
     assert "neil pathangay" in aliases
     assert "neil" in aliases
     assert "pathangay" in aliases
 
     # generic headings never become owner aliases
-    assert owner_aliases(FakeIndex("# User Profile\n\nSome background.")) == ()
-    assert owner_aliases(FakeIndex(None)) == ()
+    assert (
+        owner_aliases(
+            FakeIndex("# User Profile\n\nSome background."),
+            connector_identity=lambda: (),
+        )
+        == ()
+    )
+    assert owner_aliases(FakeIndex(None), connector_identity=lambda: ()) == ()
+
+
+def test_profile_owner_aliases_merge_imessage_self_identity() -> None:
+    from taurine_core.profile_context import owner_aliases
+
+    class FakeIndex:
+        def user_card(self) -> str | None:
+            return None
+
+    aliases = owner_aliases(
+        FakeIndex(), connector_identity=lambda: ("Neil Pathangay",)
+    )
+    assert "neil pathangay" in aliases
+    assert "neil" in aliases
+    assert "pathangay" in aliases
+
+
+def _works_at_extractor(org_by_note):
+    def extractor(notes, *, tokenizer):
+        del tokenizer
+        results = {}
+        for note in notes:
+            org = org_by_note[note.note_id]
+            results[note.note_id] = Extraction(
+                mentions=[
+                    ExtractedMention(surface="Neil", etype="person", confidence=0.95, char_start=0, char_end=4, extractor="fake", schema_id="s1"),
+                    ExtractedMention(surface=org, etype="org", confidence=0.9, char_start=14, char_end=14 + len(org), extractor="fake", schema_id="s1"),
+                ],
+                fact_candidates=[
+                    ExtractedRelation(head="Neil", predicate="works_at", tail=org, confidence=0.9, subject_start=0, subject_end=4, object_start=14, object_end=14 + len(org), assertion_start=0, assertion_end=14 + len(org), extraction_method="fake", schema_id="s1", status="active")
+                ],
+                schema_id="s1",
+            )
+        return results
+
+    return extractor
+
+
+def _snapshot_note(note_id: str, title: str, text: str, *, created: float, modified: float) -> NoteRecord:
+    return NoteRecord(
+        note_id=note_id,
+        title=title,
+        folder="Fixture",
+        created=created,
+        modified=modified,
+        content_hash=hashlib.sha256((title + text).encode("utf-8")).hexdigest(),
+        text=text,
+    )
+
+
+def test_snapshot_document_anchors_observed_at_so_old_resume_loses(tmp_path: Path) -> None:
+    """A 2024 resume synced AFTER a 2026 intro note must not outrank it."""
+    resume_date = datetime(2024, 1, 18, tzinfo=timezone.utc).timestamp()
+    intro_time = datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp()
+    resume = _snapshot_note(
+        "n1", "neil_agrawal_resume_1_18_24", "Neil works-at Wolters.",
+        created=100.0, modified=intro_time + 5000.0,
+    )
+    intro = _snapshot_note(
+        "n2", "Intro", "Neil works-at Klaviyo.",
+        created=intro_time, modified=intro_time,
+    )
+
+    target = tmp_path / "knowledge.db"
+    report = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16,
+            extractor=_works_at_extractor({"n1": "Wolters", "n2": "Klaviyo"}),
+        )
+    ).build([resume, intro], target, replace_derived=True)
+
+    assert report.fact_count == 2
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        rows = list(
+            store._conn.execute(
+                "SELECT source_note_id, observed_at, status FROM facts ORDER BY source_note_id"
+            )
+        )
+        assert rows[0][1] == pytest.approx(resume_date)  # doc date, not modified
+        assert rows[0][2] == "superseded"
+        assert rows[1][1] == pytest.approx(intro_time)
+        assert rows[1][2] == "active"
+        flags = dict(
+            store._conn.execute("SELECT note_id, snapshot_document FROM notes")
+        )
+        assert flags == {"n1": 1, "n2": 0}
+        assert store.source_notes()[0].snapshot_document is True
+        assert store.validate_invariants().ok
+    finally:
+        store.close()
+
+
+def test_snapshot_without_parseable_date_uses_created_never_modified(tmp_path: Path) -> None:
+    resume = _snapshot_note(
+        "n1", "Neil Agrawal Resume", "Neil works-at Klaviyo.",
+        created=500.0, modified=999999.0,
+    )
+
+    target = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16,
+            extractor=_works_at_extractor({"n1": "Klaviyo"}),
+        )
+    ).build([resume], target, replace_derived=True)
+
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        observed = store._conn.execute("SELECT observed_at FROM facts").fetchone()[0]
+        assert observed == pytest.approx(500.0)
+    finally:
+        store.close()
+
+
+def test_same_note_duplicate_triples_collapse_in_the_real_build(tmp_path: Path) -> None:
+    text = "Neil works-at Klaviyo. Neil works-at Klaviyo."
+    note = _snapshot_note("n1", "Intro", text, created=50.0, modified=50.0)
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        mentions = []
+        candidates = []
+        for offset in (0, 23):
+            mentions.append(ExtractedMention(surface="Neil", etype="person", confidence=0.95, char_start=offset, char_end=offset + 4, extractor="fake", schema_id="s1"))
+            mentions.append(ExtractedMention(surface="Klaviyo", etype="org", confidence=0.9, char_start=offset + 14, char_end=offset + 21, extractor="fake", schema_id="s1"))
+            candidates.append(ExtractedRelation(head="Neil", predicate="works_at", tail="Klaviyo", confidence=0.6 if offset == 0 else 0.9, subject_start=offset, subject_end=offset + 4, object_start=offset + 14, object_end=offset + 21, assertion_start=offset, assertion_end=offset + 21, extraction_method="fake", schema_id="s1", status="active"))
+        return {"n1": Extraction(mentions=mentions, fact_candidates=candidates, schema_id="s1")}
+
+    target = tmp_path / "knowledge.db"
+    report = BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16, extractor=extractor
+        )
+    ).build([note], target, replace_derived=True)
+
+    assert report.fact_count == 1
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        row = store._conn.execute(
+            "SELECT assertion_start, confidence, status FROM facts"
+        ).fetchone()
+        assert row[0] == 0  # earliest assertion span kept
+        assert row[1] == pytest.approx(0.9)  # max confidence kept
+        assert row[2] == "active"
+    finally:
+        store.close()
+
+
+def test_build_memory_watchdog_aborts_cleanly_over_ceiling(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A near-zero ceiling trips the watchdog on the first stage boundary; the
+    # build must fail with BuildError and never install the target.
+    monkeypatch.setattr(config, "BUILD_MEMORY_CEILING_GB", 0.0001)
+    target = tmp_path / "guarded.db"
+    deps = BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+    with pytest.raises(BuildError, match="resident set exceeded"):
+        BuildCoordinator(deps).build(
+            [make_note("a", "Alpha", "Launch is scheduled for July 18.")],
+            target,
+            replace_derived=True,
+        )
+    assert not target.exists()  # nothing installed
+
+
+def test_build_records_peak_memory(tmp_path: Path) -> None:
+    deps = BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+    report = BuildCoordinator(deps).build(
+        [make_note("a", "Alpha", "Launch is scheduled for July 18.")],
+        tmp_path / "peak.db",
+        replace_derived=True,
+    )
+    assert report.peak_memory_gb > 0.0
+    assert report.peak_memory_stage != ""
