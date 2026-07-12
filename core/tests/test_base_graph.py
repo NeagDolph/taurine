@@ -101,10 +101,12 @@ def test_contains_weights_discriminate_rare_from_common_entities() -> None:
 
 
 def test_contains_weight_scale_saturates_only_at_the_realistic_maximum() -> None:
-    """A maximal edge (idf≈3.4, conf 1.0, bonus≈2.4) still reaches ~1.0."""
+    """The formula's true maximum (corpus-rare entity, idf≈7, conf 1.0,
+    bonus≈2.4) still reaches ~1.0 after sqrt compression; a rare entity in a
+    small fixture corpus lands high but below saturation."""
     passages = tuple(
         _passage(f"p{index}", f"n{index}", 0, [1.0, float(index) * 0.01])
-        for index in range(30)
+        for index in range(500)
     )
     entities = (EntityGraphInput("unique", "Nadir", "person", 1, True),)
     contains = (PassageEntityInput("p0", "unique", 1.0, 3, 0),)

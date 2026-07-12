@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from scipy.sparse import csr_matrix
 
+from taurine_core import config
+
 
 def _matrix(
     note_ids: list[str], edges: list[tuple[str, str]]
@@ -125,14 +127,14 @@ def _clique(names: list[str], mechanisms: dict[str, float]) -> list:
 def test_cluster_weight_desaturates_entity_mechanism() -> None:
     from taurine_core.indexer.communities import cluster_weight
 
-    # saturated entity noisy-or contributes at most 0.3
-    assert cluster_weight({"entity": 1.0}) == 0.3
-    assert cluster_weight({"entity": 5.0}) == 0.3  # defensive cap
+    # a maximal entity mechanism contributes at most CLUSTER_W_ENTITY
+    assert cluster_weight({"entity": 1.0}) == config.CLUSTER_W_ENTITY
+    assert cluster_weight({"entity": 5.0}) == config.CLUSTER_W_ENTITY  # defensive cap
     semantic = cluster_weight({"semantic": 0.71})
     entity = cluster_weight({"entity": 0.99})
     assert semantic > entity
     combined = cluster_weight({"semantic": 0.5, "fact": 0.4, "entity": 1.0})
-    assert abs(combined - (0.5 + 0.7 * 0.4 + 0.3)) < 1e-9
+    assert abs(combined - (0.5 + 0.7 * 0.4 + config.CLUSTER_W_ENTITY)) < 1e-9
 
 
 def test_cluster_projection_splits_semantic_cliques_and_is_order_independent() -> None:
@@ -184,10 +186,10 @@ def test_cluster_projection_drops_below_min_weight_edges() -> None:
     trio = ["a-0", "a-1", "a-2"]
     edges = [
         *_clique(trio, {"semantic": 0.9}),
-        # entity 0.4 → 0.12 combined < CLUSTER_MIN_WEIGHT: ignored, so the
+        # entity 0.25 → 0.125 combined < CLUSTER_MIN_WEIGHT: ignored, so the
         # pendant pair has no clustering edges at all → unclustered
-        _weighted_edge("a-0", "b-0", {"entity": 0.4}),
-        _weighted_edge("b-0", "b-1", {"entity": 0.4}),
+        _weighted_edge("a-0", "b-0", {"entity": 0.25}),
+        _weighted_edge("b-0", "b-1", {"entity": 0.25}),
     ]
 
     labels = cluster_projection(edges)

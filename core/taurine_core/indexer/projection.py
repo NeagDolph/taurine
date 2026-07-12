@@ -111,10 +111,16 @@ def _candidate(
 
 
 def _render(pair: tuple[str, str], candidate: _Candidate) -> ProjectionEdge:
+    # Within a mechanism: strongest signal + a bounded support bonus (§10.7's
+    # "maximum plus bounded supporting-edge bonus"). Noisy-or here saturated —
+    # six shared friend-names or overlapping passage pairs pinned the pair at
+    # ~1.0 regardless of how weak each link was, flattening the whole map.
     mechanisms = {
-        mechanism: _noisy_or(scores)
+        mechanism: _strongest_plus_support(scores)
         for mechanism, scores in sorted(candidate.scores.items())
     }
+    # Across mechanisms (≤3 terms) noisy-or stays: independent evidence kinds
+    # legitimately reinforce.
     weight = _noisy_or(list(mechanisms.values()))
     if set(mechanisms) == {"semantic"}:
         edge_type = "semantic"
@@ -156,9 +162,11 @@ def _select_edges(edges: list[ProjectionEdge], max_degree: int) -> list[Projecti
         degree[edge.src_note_id] += 1
         degree[edge.dst_note_id] += 1
 
-    # L2: the spanning-forest phase is pure — no degree cap — so a hub note
-    # bridging more components than max_degree still connects them all. The
-    # cap applies only to the fill phase below.
+    # L2: the spanning-forest phase is pure — no degree cap and no weight
+    # floor — so every note keeps its single best route into the graph even
+    # when that route is weak, and a hub note bridging more components than
+    # max_degree still connects them all. The cap and the low-value floor
+    # apply only to the fill phase below.
     for edge in edges:
         left_root, right_root = find(edge.src_note_id), find(edge.dst_note_id)
         if left_root == right_root:
@@ -166,8 +174,13 @@ def _select_edges(edges: list[ProjectionEdge], max_degree: int) -> list[Projecti
         add(edge)
         parent[max(left_root, right_root)] = min(left_root, right_root)
 
+    from taurine_core import config
+
+    fill_floor = float(config.PROJECTION_FILL_MIN_WEIGHT)
     for edge in edges:
         if (edge.src_note_id, edge.dst_note_id) in selected_pairs:
+            continue
+        if edge.weight < fill_floor:
             continue
         if degree[edge.src_note_id] >= max_degree or degree[edge.dst_note_id] >= max_degree:
             continue
@@ -180,3 +193,21 @@ def _noisy_or(scores: list[float]) -> float:
     for score in scores:
         remaining *= 1.0 - min(1.0, max(0.0, score))
     return 1.0 - remaining
+
+
+def _strongest_plus_support(scores: list[float]) -> float:
+    """Max score plus a small bounded bonus per additional supporting link.
+
+    Mirrors the retrieval engine's note aggregation: one strong, specific
+    connection outranks any pile of weak ones, and extra shared entities or
+    passage pairs add at most SUPPORT_BONUS_CAP on top.
+    """
+    if not scores:
+        return 0.0
+    strongest = max(scores)
+    bonus = min(_SUPPORT_BONUS_CAP, _SUPPORT_BONUS * (len(scores) - 1))
+    return min(1.0, strongest + bonus)
+
+
+_SUPPORT_BONUS = 0.05
+_SUPPORT_BONUS_CAP = 0.15

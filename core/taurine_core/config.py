@@ -126,6 +126,10 @@ EMAIL_RECENCY_SCORE_HALF_LIFE_DAYS = 30.0
 # ── note graph / map communities ───────────────────────────────────────
 COMMUNITY_LP_ITERS = 20                  # label-propagation passes (legacy-DB fallback communities)
 PROJECTION_MAX_DEGREE = 12               # product map only; never retrieval
+# Map cleanliness: fill-phase edges below this weight are pruned. The spanning
+# forest ignores the floor, so every note keeps its best route (no new
+# isolated nodes) — only the mesh of weak incidental links disappears.
+PROJECTION_FILL_MIN_WEIGHT = 0.35
 
 # ── build-time note clusters (map lens; persisted per build) ──────────
 # Clustering edge weight re-weights projection mechanisms: the entity
@@ -133,7 +137,7 @@ PROJECTION_MAX_DEGREE = 12               # product map only; never retrieval
 # capped and down-weighted; semantic and fact stay discriminative.
 CLUSTER_W_SEMANTIC = 1.0
 CLUSTER_W_FACT = 0.7
-CLUSTER_W_ENTITY = 0.3
+CLUSTER_W_ENTITY = 0.5                   # entity mechanism now discriminates (was saturated at 1.0)
 CLUSTER_MIN_WEIGHT = 0.15                # combined weight below this: edge ignored for clustering
 CLUSTER_RESOLUTION = 1.0                 # modularity resolution (higher → smaller clusters)
 CLUSTER_MAX_SIZE = 35                    # clusters larger than this are recursively re-clustered
@@ -150,7 +154,7 @@ FACT_REVERSE_WEIGHT_DEFAULT = 0.35
 # contains weight = clip01(idf × confidence × count_bonus × surprise / SCALE):
 # realistic max ≈ 3.2 × 1.0 × 2.1 ≈ 6.7 → ~1.0, typical mid values land 0.3-0.7
 # (H2 — without the rescale every production edge clipped to exactly 1.0)
-CONTAINS_WEIGHT_SCALE = 6.0
+CONTAINS_WEIGHT_SCALE = 14.0             # ≈ formula max (idf 6.7 × conf 1.0 × bonus 2.1); sqrt-compressed
 # frequency-surprise soft cap (edge-quality item 3): entities seen in more
 # notes than this co-occur with any one passage roughly at chance, so their
 # contains weights carry surprise = 1/(1+log1p(df − cap)) beyond it

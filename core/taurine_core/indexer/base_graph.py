@@ -133,12 +133,15 @@ class BaseGraphBuilder:
             # are computed downstream of this graph); df beyond a soft cap is
             # a deterministic, monotone proxy for "no more than chance".
             surprise = 1.0 / (1.0 + math.log1p(max(0, edge.df - config.DF_SOFT_CAP)))
-            # H2: divide by the calibrated scale before clipping so idf rarity
-            # actually discriminates — without it every production edge
-            # saturates at exactly 1.0 and column normalization erases rarity.
-            weight = _clip(
-                idf * edge.confidence * count_bonus * surprise / self.contains_scale
-            )
+            # H2 + saturation fix: scale to the formula's true maximum and
+            # sqrt-compress. A plain /scale clip left every rare entity (idf≈6+,
+            # the majority) pinned at exactly 1.0 — one shared rare name became
+            # a max-strength projection edge and the map lost all hierarchy.
+            # sqrt preserves ordering while spreading df=1..50 across ~1.0..0.28
+            # instead of a cliff; only multi-mention full-confidence rare
+            # entities reach 1.0.
+            raw = max(0.0, idf * edge.confidence * count_bonus * surprise)
+            weight = _clip(math.sqrt(raw / self.contains_scale))
             metadata = {"idf": idf, "mentions": edge.mentions, "surprise": surprise}
             edges.extend(
                 (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from scipy.sparse import csr_matrix
 
 from taurine_core.indexer.base_graph import BaseEdge, BaseGraph
@@ -205,3 +206,49 @@ def _graph(edges: tuple[BaseEdge, ...]) -> BaseGraph:
         dangling_rows=(0, 1, 2, 3),
         edges=edges,
     )
+
+
+def test_mechanism_aggregation_is_strongest_plus_bounded_support() -> None:
+    """Six weak shared-entity links must not noisy-or to ~1.0: the pair scores
+    strongest + a small capped bonus, so one strong specific link outranks a
+    pile of weak incidental ones."""
+    edges = tuple(
+        BaseEdge(f"p1", "e" + str(i), "contains", 0.4)
+        for i in range(6)
+    ) + tuple(
+        BaseEdge(f"p2", "e" + str(i), "contains", 0.4)
+        for i in range(6)
+    )
+    rows = build_projection(
+        _graph(edges),
+        passages=(ProjectionPassage("p1", "n1"), ProjectionPassage("p2", "n2")),
+        entity_labels={f"e{i}": f"E{i}" for i in range(6)},
+        max_degree=12,
+    )
+    assert len(rows) == 1
+    entity_weight = rows[0].mechanisms["entity"]
+    # noisy-or of six 0.16s would be ~0.65; strongest+support = 0.16 + 5*0.05 capped
+    assert entity_weight == pytest.approx(0.4 * 0.4 + 0.15, abs=1e-6)
+    assert rows[0].weight < 0.5
+
+
+def test_fill_phase_prunes_low_value_edges_but_forest_keeps_connectivity(monkeypatch) -> None:
+    from taurine_core import config
+
+    monkeypatch.setattr(config, "PROJECTION_FILL_MIN_WEIGHT", 0.5)
+    # chain n1-n2-n3 with weak links (forest must keep them attached), plus a
+    # weak extra mesh edge n1-n3 that the fill floor must prune
+    edges = tuple(
+        BaseEdge(src, dst, "semantic", weight)
+        for src, dst, weight in (
+            ("p1", "p2", 0.45), ("p2", "p1", 0.45),
+            ("p2", "p3", 0.44), ("p3", "p2", 0.44),
+            ("p1", "p3", 0.40), ("p3", "p1", 0.40),
+        )
+    )
+    passages = tuple(ProjectionPassage(f"p{i}", f"n{i}") for i in (1, 2, 3))
+    rows = build_projection(_graph(edges), passages, {}, max_degree=12)
+    pairs = {(row.src_note_id, row.dst_note_id) for row in rows}
+    # forest edges survive below the floor (connectivity), mesh edge pruned
+    assert ("n1", "n2") in pairs and ("n2", "n3") in pairs
+    assert ("n1", "n3") not in pairs

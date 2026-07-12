@@ -461,7 +461,9 @@ def test_fallback_embedding_floor_is_separate_and_stricter_than_recognition_floo
     snapshot = replace(
         _snapshot(tmp_path),
         fact_ids=("f1",),
-        fact_matrix=np.array([[0.75, np.sqrt(1.0 - 0.75**2)]], dtype=np.float32),
+        # cosine 0.5 calibrates into the accept band under the 2026-07-12
+        # empirical curve but stays below the stricter fallback floor
+        fact_matrix=np.array([[0.5, np.sqrt(1.0 - 0.5**2)]], dtype=np.float32),
     )
     store = ContextStore((_context("f1", passage_id="p1"),))
     result = TripleRecognizer(

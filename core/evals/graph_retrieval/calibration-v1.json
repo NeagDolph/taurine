@@ -1,507 +1,531 @@
 {
-  "artifact_version": "1",
-  "hash": "sha256:6d1f8d7d26cd4130cda1d7988f852bb0ca971c8e60e150b2e65e3ba2886fb388",
-  "model_manifest": {
-    "embedding": "Qwen/Qwen3-Embedding-0.6B",
-    "reranker": "Qwen/Qwen3-Reranker-0.6B",
-    "nli": "cross-encoder/nli-deberta-v3-base",
-    "extractor": "fastino/gliner2-large-v1"
+ "artifact_version": "1",
+ "hash": "sha256:0292814edf9dbbd70169da468d26bc2454b271f1ac8cfc034236ed39f40b3150",
+ "model_manifest": {
+  "embedding": "Qwen/Qwen3-Embedding-0.6B",
+  "reranker": "Qwen/Qwen3-Reranker-0.6B",
+  "nli": "cross-encoder/nli-deberta-v3-base",
+  "extractor": "fastino/gliner2-large-v1"
+ },
+ "config_hash": "sha256:knowledge-graph-overhaul-v1",
+ "extraction": {
+  "entity_thresholds": {
+   "person": 0.5,
+   "organization": 0.5,
+   "project": 0.5,
+   "product": 0.5,
+   "place": 0.5,
+   "event": 0.5,
+   "date_or_deadline": 0.5,
+   "concept": 0.5
   },
-  "config_hash": "sha256:knowledge-graph-overhaul-v1",
-  "extraction": {
-    "entity_thresholds": {
-      "person": 0.5,
-      "organization": 0.5,
-      "project": 0.5,
-      "product": 0.5,
-      "place": 0.5,
-      "event": 0.5,
-      "date_or_deadline": 0.5,
-      "concept": 0.5
-    },
-    "relation_thresholds": {
-      "works_with": 0.45,
-      "works_at": 0.45,
-      "member_of": 0.45,
-      "part_of": 0.45,
-      "located_at": 0.45,
-      "scheduled_for": 0.45,
-      "paid_or_owes": 0.45,
-      "owns_or_has": 0.45,
-      "uses": 0.45,
-      "about": 0.45,
-      "met_with": 0.45,
-      "related_to": 0.45,
-      "decided": 0.45,
-      "prefers": 0.45,
-      "blocked_by": 0.45,
-      "responsible_for": 0.45,
-      "completed": 0.45,
-      "supersedes": 0.45
-    },
-    "promotion_thresholds": {
-      "works_with": 0.7,
-      "works_at": 0.7,
-      "member_of": 0.7,
-      "part_of": 0.7,
-      "located_at": 0.7,
-      "scheduled_for": 0.7,
-      "paid_or_owes": 0.7,
-      "owns_or_has": 0.7,
-      "uses": 0.7,
-      "about": 0.7,
-      "met_with": 0.7,
-      "related_to": 0.7,
-      "decided": 0.7,
-      "prefers": 0.7,
-      "blocked_by": 0.7,
-      "responsible_for": 0.7,
-      "completed": 0.7,
-      "supersedes": 0.7
-    }
+  "relation_thresholds": {
+   "works_with": 0.45,
+   "works_at": 0.45,
+   "member_of": 0.45,
+   "part_of": 0.45,
+   "located_at": 0.45,
+   "scheduled_for": 0.45,
+   "paid_or_owes": 0.45,
+   "owns_or_has": 0.45,
+   "uses": 0.45,
+   "about": 0.45,
+   "met_with": 0.45,
+   "related_to": 0.45,
+   "decided": 0.45,
+   "prefers": 0.45,
+   "blocked_by": 0.45,
+   "responsible_for": 0.45,
+   "completed": 0.45,
+   "supersedes": 0.45
   },
-  "modes": {
-    "live": {
-      "heads": {
-        "dense": {
-          "knots": [
-            [
-              -1.0,
-              0.0
-            ],
-            [
-              0.45,
-              0.05
-            ],
-            [
-              0.62,
-              0.55
-            ],
-            [
-              0.78,
-              0.95
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.7,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "bm25": {
-          "knots": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              2.0,
-              0.1
-            ],
-            [
-              6.0,
-              0.7
-            ],
-            [
-              20.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.75,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "exact": {
-          "knots": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              0.5,
-              0.8
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.9,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "entity": {
-          "knots": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              0.6,
-              0.4
-            ],
-            [
-              0.85,
-              0.9
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.85,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "triple": {
-          "knots": [
-            [
-              -1.0,
-              0.0
-            ],
-            [
-              0.55,
-              0.1
-            ],
-            [
-              0.72,
-              0.75
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.8,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        }
-      },
-      "head_weights": {
-        "dense": 1.0,
-        "bm25": 1.0,
-        "exact": 1.0,
-        "entity": 1.0,
-        "triple": 1.0
-      },
-      "rrf_k": 60,
-      "mmr_lambda": 0.2,
-      "source_diversity_penalty": 0.05,
-      "note_support_bonus": 0.05,
-      "note_support_bonus_cap": 0.1,
-      "evidence_floor": 0.75,
-      "single_head_override": 0.92,
-      "minimum_independent_heads": 2,
-      "bm25_min_token_coverage": 0.5
-    },
-    "chat": {
-      "heads": {
-        "dense": {
-          "knots": [
-            [
-              -1.0,
-              0.0
-            ],
-            [
-              0.4,
-              0.05
-            ],
-            [
-              0.58,
-              0.55
-            ],
-            [
-              0.76,
-              0.95
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.62,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "bm25": {
-          "knots": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              1.5,
-              0.1
-            ],
-            [
-              5.0,
-              0.7
-            ],
-            [
-              20.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.65,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "exact": {
-          "knots": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              0.5,
-              0.8
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.9,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "entity": {
-          "knots": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              0.55,
-              0.4
-            ],
-            [
-              0.8,
-              0.9
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.78,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "triple": {
-          "knots": [
-            [
-              -1.0,
-              0.0
-            ],
-            [
-              0.5,
-              0.1
-            ],
-            [
-              0.68,
-              0.75
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.72,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        }
-      },
-      "head_weights": {
-        "dense": 1.0,
-        "bm25": 1.0,
-        "exact": 1.0,
-        "entity": 1.0,
-        "triple": 1.0
-      },
-      "rrf_k": 60,
-      "mmr_lambda": 0.2,
-      "source_diversity_penalty": 0.05,
-      "note_support_bonus": 0.05,
-      "note_support_bonus_cap": 0.1,
-      "evidence_floor": 0.65,
-      "single_head_override": 0.9,
-      "minimum_independent_heads": 2,
-      "bm25_min_token_coverage": 0.5
-    },
-    "tool": {
-      "heads": {
-        "dense": {
-          "knots": [
-            [
-              -1.0,
-              0.0
-            ],
-            [
-              0.38,
-              0.05
-            ],
-            [
-              0.55,
-              0.55
-            ],
-            [
-              0.74,
-              0.95
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.58,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "bm25": {
-          "knots": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              1.0,
-              0.1
-            ],
-            [
-              4.0,
-              0.7
-            ],
-            [
-              20.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.6,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "exact": {
-          "knots": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              0.5,
-              0.8
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.9,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "entity": {
-          "knots": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              0.5,
-              0.4
-            ],
-            [
-              0.78,
-              0.9
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.75,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        },
-        "triple": {
-          "knots": [
-            [
-              -1.0,
-              0.0
-            ],
-            [
-              0.48,
-              0.1
-            ],
-            [
-              0.65,
-              0.75
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "acceptance_floor": 0.7,
-          "sample_count": 0,
-          "trained_at": "2026-07-09",
-          "held_out": {}
-        }
-      },
-      "head_weights": {
-        "dense": 1.0,
-        "bm25": 1.0,
-        "exact": 1.0,
-        "entity": 1.0,
-        "triple": 1.0
-      },
-      "rrf_k": 60,
-      "mmr_lambda": 0.2,
-      "source_diversity_penalty": 0.05,
-      "note_support_bonus": 0.05,
-      "note_support_bonus_cap": 0.1,
-      "evidence_floor": 0.6,
-      "single_head_override": 0.88,
-      "minimum_independent_heads": 2,
-      "bm25_min_token_coverage": 0.34
-    }
-  },
-  "triple_recognition": {
-    "live_floor": 0.82,
-    "chat_floor": 0.74,
-    "tool_floor": 0.72,
-    "live_fallback_embedding_floor": 0.9,
-    "chat_fallback_embedding_floor": 0.86,
-    "tool_fallback_embedding_floor": 0.84,
-    "chat_ambiguity_low": 0.6,
-    "chat_ambiguity_high": 0.84,
-    "tool_ambiguity_low": 0.58,
-    "tool_ambiguity_high": 0.82
-  },
-  "rerank": {
-    "live_floor": 0.76,
-    "chat_floor": 0.66
-  },
-  "nli": {
-    "entailment_floor": 0.8
-  },
-  "graph": {
-    "semantic_floor": 0.62
+  "promotion_thresholds": {
+   "works_with": 0.7,
+   "works_at": 0.7,
+   "member_of": 0.7,
+   "part_of": 0.7,
+   "located_at": 0.7,
+   "scheduled_for": 0.7,
+   "paid_or_owes": 0.7,
+   "owns_or_has": 0.7,
+   "uses": 0.7,
+   "about": 0.7,
+   "met_with": 0.7,
+   "related_to": 0.7,
+   "decided": 0.7,
+   "prefers": 0.7,
+   "blocked_by": 0.7,
+   "responsible_for": 0.7,
+   "completed": 0.7,
+   "supersedes": 0.7
   }
+ },
+ "modes": {
+  "live": {
+   "heads": {
+    "dense": {
+     "knots": [
+      [
+       -1.0,
+       0.0
+      ],
+      [
+       0.45,
+       0.05
+      ],
+      [
+       0.62,
+       0.55
+      ],
+      [
+       0.78,
+       0.95
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.7,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "bm25": {
+     "knots": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       2.0,
+       0.1
+      ],
+      [
+       6.0,
+       0.7
+      ],
+      [
+       20.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.75,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "exact": {
+     "knots": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.5,
+       0.8
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.9,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "entity": {
+     "knots": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.6,
+       0.4
+      ],
+      [
+       0.85,
+       0.9
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.85,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "triple": {
+     "knots": [
+      [
+       -1.0,
+       0.0
+      ],
+      [
+       0.4,
+       0.02
+      ],
+      [
+       0.48,
+       0.35
+      ],
+      [
+       0.56,
+       0.78
+      ],
+      [
+       0.72,
+       0.95
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.5,
+     "sample_count": 8,
+     "trained_at": "2026-07-12-empirical-corpus-cosines",
+     "held_out": {}
+    }
+   },
+   "head_weights": {
+    "dense": 1.0,
+    "bm25": 1.0,
+    "exact": 1.0,
+    "entity": 1.0,
+    "triple": 1.0
+   },
+   "rrf_k": 60,
+   "mmr_lambda": 0.2,
+   "source_diversity_penalty": 0.05,
+   "note_support_bonus": 0.05,
+   "note_support_bonus_cap": 0.1,
+   "evidence_floor": 0.75,
+   "single_head_override": 0.92,
+   "minimum_independent_heads": 2,
+   "bm25_min_token_coverage": 0.5
+  },
+  "chat": {
+   "heads": {
+    "dense": {
+     "knots": [
+      [
+       -1.0,
+       0.0
+      ],
+      [
+       0.4,
+       0.05
+      ],
+      [
+       0.58,
+       0.55
+      ],
+      [
+       0.76,
+       0.95
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.62,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "bm25": {
+     "knots": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       1.5,
+       0.1
+      ],
+      [
+       5.0,
+       0.7
+      ],
+      [
+       20.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.65,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "exact": {
+     "knots": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.5,
+       0.8
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.9,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "entity": {
+     "knots": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.55,
+       0.4
+      ],
+      [
+       0.8,
+       0.9
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.78,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "triple": {
+     "knots": [
+      [
+       -1.0,
+       0.0
+      ],
+      [
+       0.38,
+       0.02
+      ],
+      [
+       0.46,
+       0.35
+      ],
+      [
+       0.54,
+       0.78
+      ],
+      [
+       0.7,
+       0.95
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.35,
+     "sample_count": 8,
+     "trained_at": "2026-07-12-empirical-corpus-cosines",
+     "held_out": {}
+    }
+   },
+   "head_weights": {
+    "dense": 1.0,
+    "bm25": 1.0,
+    "exact": 1.0,
+    "entity": 1.0,
+    "triple": 1.0
+   },
+   "rrf_k": 60,
+   "mmr_lambda": 0.2,
+   "source_diversity_penalty": 0.05,
+   "note_support_bonus": 0.05,
+   "note_support_bonus_cap": 0.1,
+   "evidence_floor": 0.65,
+   "single_head_override": 0.9,
+   "minimum_independent_heads": 2,
+   "bm25_min_token_coverage": 0.5
+  },
+  "tool": {
+   "heads": {
+    "dense": {
+     "knots": [
+      [
+       -1.0,
+       0.0
+      ],
+      [
+       0.38,
+       0.05
+      ],
+      [
+       0.55,
+       0.55
+      ],
+      [
+       0.74,
+       0.95
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.58,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "bm25": {
+     "knots": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       1.0,
+       0.1
+      ],
+      [
+       4.0,
+       0.7
+      ],
+      [
+       20.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.6,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "exact": {
+     "knots": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.5,
+       0.8
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.9,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "entity": {
+     "knots": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       0.5,
+       0.4
+      ],
+      [
+       0.78,
+       0.9
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.75,
+     "sample_count": 0,
+     "trained_at": "2026-07-09",
+     "held_out": {}
+    },
+    "triple": {
+     "knots": [
+      [
+       -1.0,
+       0.0
+      ],
+      [
+       0.38,
+       0.02
+      ],
+      [
+       0.45,
+       0.35
+      ],
+      [
+       0.53,
+       0.78
+      ],
+      [
+       0.7,
+       0.95
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "acceptance_floor": 0.35,
+     "sample_count": 8,
+     "trained_at": "2026-07-12-empirical-corpus-cosines",
+     "held_out": {}
+    }
+   },
+   "head_weights": {
+    "dense": 1.0,
+    "bm25": 1.0,
+    "exact": 1.0,
+    "entity": 1.0,
+    "triple": 1.0
+   },
+   "rrf_k": 60,
+   "mmr_lambda": 0.2,
+   "source_diversity_penalty": 0.05,
+   "note_support_bonus": 0.05,
+   "note_support_bonus_cap": 0.1,
+   "evidence_floor": 0.6,
+   "single_head_override": 0.88,
+   "minimum_independent_heads": 2,
+   "bm25_min_token_coverage": 0.34
+  }
+ },
+ "triple_recognition": {
+  "live_floor": 0.82,
+  "chat_floor": 0.74,
+  "tool_floor": 0.72,
+  "live_fallback_embedding_floor": 0.88,
+  "chat_fallback_embedding_floor": 0.8,
+  "tool_fallback_embedding_floor": 0.78,
+  "chat_ambiguity_low": 0.6,
+  "chat_ambiguity_high": 0.84,
+  "tool_ambiguity_low": 0.58,
+  "tool_ambiguity_high": 0.82
+ },
+ "rerank": {
+  "live_floor": 0.76,
+  "chat_floor": 0.66
+ },
+ "nli": {
+  "entailment_floor": 0.8
+ },
+ "graph": {
+  "semantic_floor": 0.62
+ }
 }
