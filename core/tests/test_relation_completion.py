@@ -293,3 +293,37 @@ def test_completion_parser_rejects_offsets_outside_source_passage() -> None:
     assert result.facts == ()
     assert result.proposals == ()
     assert result.rejected == 1
+
+
+def test_tool_hop_notes_join_selection_capped(monkeypatch) -> None:
+    from taurine_core import config
+    from taurine_core.indexer.relation_completion import (
+        CompletionNote,
+        select_completion_notes,
+    )
+
+    monkeypatch.setattr(config, "COMPLETION_TOOL_HOP_CAP", 2)
+
+    def note(note_id: str, value: float, *, tool_hop: bool, relations: int = 1):
+        return CompletionNote(
+            note_id=note_id,
+            value_score=value,
+            observed_at=0.0,
+            entities=(),
+            passages=(),
+            active_relation_count=relations,
+            schema_gap=False,
+            tool_hop=tool_hop,
+        )
+
+    filler = [note(f"filler-{i:02d}", 0.9 - i * 0.001, tool_hop=False) for i in range(40)]
+    notes = filler + [
+        note("hop-a", 0.5, tool_hop=True),
+        note("hop-b", 0.4, tool_hop=True),
+        note("hop-c", 0.3, tool_hop=True),  # over the cap
+    ]
+    selected = {row.note_id for row in select_completion_notes(notes)}
+    # value gate takes the top 15% of 43 (~7 filler notes); the hop lane adds
+    # exactly COMPLETION_TOOL_HOP_CAP=2 more by value order
+    assert {"hop-a", "hop-b"} <= selected
+    assert "hop-c" not in selected

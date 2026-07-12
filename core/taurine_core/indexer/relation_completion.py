@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from taurine_core import config
 from taurine_core.indexer.facts import FactRecord, PREDICATES, promote_fact
 from taurine_core.schemas import ExtractedRelation
 
@@ -62,6 +63,12 @@ class CompletionNote:
     passages: tuple[CompletionPassage, ...]
     active_relation_count: int
     schema_gap: bool
+    # tool-hop gate: the note mentions an eligible tool/product plus a
+    # project/organization anchor but asserts no active `uses` fact — the
+    # exact shape "which projects use X?" queries need and GLiNER misses in
+    # technical prose. These notes join the completion lane (capped) with a
+    # usage-relation focus nudge.
+    tool_hop: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +110,15 @@ def select_completion_notes(notes: Sequence[CompletionNote]) -> tuple[Completion
     for note in ordered:
         if (len(note.entities) >= 2 and note.active_relation_count == 0) or note.schema_gap:
             selected[note.note_id] = note
+    # tool-hop lane: strongest unselected tool/anchor notes join, capped, so
+    # "which projects use X" facts get a chance without unbounding the call
+    tool_hop_budget = max(0, int(config.COMPLETION_TOOL_HOP_CAP))
+    for note in ordered:
+        if tool_hop_budget <= 0:
+            break
+        if note.tool_hop and note.note_id not in selected:
+            selected[note.note_id] = note
+            tool_hop_budget -= 1
     return tuple(sorted(selected.values(), key=lambda row: (-row.value_score, row.note_id)))
 
 
@@ -115,12 +131,15 @@ def parse_completion_response(
     if not isinstance(payload, dict):
         return CompletionResult((), ())
     note_index = {note.note_id: note for note in notes}
+    note_by_passage = {
+        passage.passage_id: note for note in notes for passage in note.passages
+    }
     facts: list[FactRecord] = []
     proposals: list[PredicateProposal] = []
     rejected = 0
     rows = payload.get("facts")
     for raw in rows if isinstance(rows, list) else ():
-        parsed = _parse_row(raw, note_index, build_id)
+        parsed = _parse_row(raw, note_index, build_id, note_by_passage)
         if parsed is None:
             rejected += 1
         elif isinstance(parsed, FactRecord):
@@ -147,10 +166,16 @@ def _parse_row(
     raw: object,
     notes: dict[str, CompletionNote],
     build_id: str,
+    note_by_passage: dict[str, CompletionNote] | None = None,
 ) -> FactRecord | PredicateProposal | None:
     if not isinstance(raw, dict):
         return None
     note = notes.get(str(raw.get("note_id", "")))
+    if note is None and note_by_passage is not None:
+        # models frequently omit note_id even when instructed; passage ids are
+        # globally unique, so the passage resolves the note unambiguously —
+        # without this fallback the lane silently rejected every proposal
+        note = note_by_passage.get(str(raw.get("passage_id", "")))
     if note is None:
         return None
     passages = {row.passage_id: row for row in note.passages}

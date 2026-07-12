@@ -1455,3 +1455,54 @@ def test_payload_helpers_match_engine_registered_shapes(tmp_path: Path) -> None:
     core = fact_group_payload(context.logical_key, "active", None, None, (context,))
     for key, value in core.items():
         assert fact_record.payload[key] == value
+
+
+def test_neighborhood_fact_ids_pick_top_anchored_facts_and_skip_unactivated_hubs() -> None:
+    from types import SimpleNamespace
+
+    from taurine_core.retrieval.evidence import _neighborhood_fact_ids
+
+    def fact(fact_id, subject, object_, confidence):
+        return SimpleNamespace(
+            fact_id=fact_id,
+            subject_entity_id=subject,
+            object_entity_id=object_,
+            confidence=confidence,
+        )
+
+    rows = [
+        fact("f-uses-1", "e-project", "e-docker", 0.9),
+        fact("f-uses-2", "e-other", "e-docker", 0.8),
+        fact("f-low", "e-docker", "e-thing", 0.4),
+        fact("f-owner", "e-owner", "e-org", 0.99),  # hub, not activated
+        fact("f-inactive", "e-docker", "e-old", 0.95),  # not traversable
+    ]
+    picked = _neighborhood_fact_ids(
+        rows,
+        resolved_entity_ids={"e-docker", "e-owner"},
+        traversable_fact_ids={"f-uses-1", "f-uses-2", "f-low", "f-owner"},
+        hub_ids=frozenset({"e-owner"}),
+        activated_hubs=frozenset(),
+        cap=2,
+    )
+    assert picked == {"f-uses-1", "f-uses-2"}
+    # activating the hub admits its facts
+    picked_hub = _neighborhood_fact_ids(
+        rows,
+        resolved_entity_ids={"e-owner"},
+        traversable_fact_ids={"f-owner"},
+        hub_ids=frozenset({"e-owner"}),
+        activated_hubs=frozenset({"e-owner"}),
+        cap=3,
+    )
+    assert picked_hub == {"f-owner"}
+
+
+def test_candidate_hint_names_the_anchoring_query_entity() -> None:
+    from taurine_core.retrieval.evidence import _candidate_hint
+
+    hint = _candidate_hint(
+        "p1", {}, {}, {}, {}, entity_anchor={"p1": ("Docker", "Git")}
+    )
+    assert "mentions the query entity: Docker, Git" in hint
+    assert _candidate_hint("p2", {}, {}, {}, {}, entity_anchor={"p1": ("Docker",)}) == ""

@@ -428,14 +428,33 @@ class SharedRetrievalEngine:
             for entity_id in resolved_entity_ids
         }
         entity_passages = getattr(self.store, "passage_ids_for_entities", None)
-        entity_passage_ids = set(
-            entity_passages(
-                tuple(sorted(resolved_entity_ids)),
-                build_id=self.snapshot.build_id,
-            )
-            if callable(entity_passages)
-            else ()
-        )
+        entity_passage_ids: set[str] = set()
+        # neighborhood assembly: remember WHICH resolved entity anchors each
+        # passage so the reranker sees "mentions <entity> (query entity)"
+        # instead of an unexplained expansion candidate
+        entity_anchor: dict[str, list[str]] = {}
+        if callable(entity_passages) and resolved_entity_ids:
+            contexts_fn = getattr(self.store, "entity_contexts", None)
+            canonical_by_id = {
+                row.entity_id: row.canonical
+                for row in (
+                    contexts_fn(
+                        tuple(sorted(resolved_entity_ids)),
+                        build_id=self.snapshot.build_id,
+                    )
+                    if callable(contexts_fn)
+                    else ()
+                )
+            }
+            for entity_id in sorted(resolved_entity_ids):
+                ids = set(
+                    entity_passages((entity_id,), build_id=self.snapshot.build_id)
+                )
+                entity_passage_ids.update(ids)
+                name = canonical_by_id.get(entity_id, "")
+                if name:
+                    for passage_id in ids:
+                        entity_anchor.setdefault(passage_id, []).append(name)
         # M7: resolved-entity mass enters the teleport only through
         # query_entity_reset; mirroring it into passage_reset double-counted
         # entity evidence and let weak entities inherit the strongest weight.
@@ -464,6 +483,19 @@ class SharedRetrievalEngine:
             )
             for row in fact_rows
         }
+        # neighborhood facts: a resolved query entity surfaces its strongest
+        # asserted facts even when triple recognition (query↔triple cosine)
+        # missed them — "which projects use Docker?" gets Docker's `uses`
+        # facts as first-class evidence. Hub entities only when explicitly
+        # activated (they are the user's stated target).
+        neighborhood_fact_ids = _neighborhood_fact_ids(
+            fact_rows,
+            resolved_entity_ids=resolved_entity_ids,
+            traversable_fact_ids=traversable_fact_ids,
+            hub_ids=hub_ids,
+            activated_hubs=frozenset(activated_hubs),
+            cap=int(config.ENTITY_NEIGHBORHOOD_FACTS),
+        )
         note_by_passage = {
             row.passage_id: row.note_id for row in passage_rows
         }
@@ -538,6 +570,13 @@ class SharedRetrievalEngine:
                         )
         latency["paths"] = _elapsed_ms(path_started)
 
+        # neighborhood facts' source passages join the pool so the facts stay
+        # citable (M6 requires a supplied/selected support passage)
+        fact_by_id_all = {str(row.fact_id): row for row in fact_rows}
+        for fact_id in neighborhood_fact_ids:
+            context = fact_by_id_all.get(fact_id)
+            if context is not None and str(context.source_passage_id) in passage_by_id:
+                candidate_ids.add(str(context.source_passage_id))
         rerank_candidates = _order_rerank_candidates(
             candidate_ids,
             passage_by_id,
@@ -549,6 +588,10 @@ class SharedRetrievalEngine:
             paths_by_target,
             cap=candidate_cap,
             semantic_reasons=self._semantic_reasons,
+            entity_anchor={
+                passage_id: tuple(sorted(set(names)))
+                for passage_id, names in entity_anchor.items()
+            },
         )
         rerank_started = monotonic()
         reranked = self.reranker.rerank(
@@ -668,8 +711,10 @@ class SharedRetrievalEngine:
                 "rerank_degraded": reranked.degraded,
                 "rerank_fallback": fallback,
                 "pre_abstention": pre_decision.reason,
+                "neighborhood_fact_ids": sorted(neighborhood_fact_ids),
+                "entity_anchor_passages": len(entity_anchor),
             },
-            extra_fact_ids=presentable_conflicted,
+            extra_fact_ids=set(presentable_conflicted) | neighborhood_fact_ids,
         )
         latency["pack"] = _elapsed_ms(pack_started)
         return replace(pack, trace=replace(pack.trace, latency_ms=dict(latency)))
@@ -1165,6 +1210,42 @@ def _triple_head_hits(result: TripleRecognitionResult) -> HeadResult:
     return HeadResult(tuple(accepted), tuple(rejected))
 
 
+def _neighborhood_fact_ids(
+    fact_rows: Sequence[Any],
+    *,
+    resolved_entity_ids: set[str],
+    traversable_fact_ids: set[str] | frozenset[str],
+    hub_ids: frozenset[str] | set[str],
+    activated_hubs: frozenset[str],
+    cap: int,
+) -> set[str]:
+    """Top asserted facts touching resolved query entities (confidence desc).
+
+    Hub entities contribute only when explicitly activated by the query —
+    otherwise every query naming the owner would drag in their whole fact
+    neighborhood.
+    """
+    anchors = {
+        entity_id
+        for entity_id in resolved_entity_ids
+        if entity_id not in hub_ids or entity_id in activated_hubs
+    }
+    if not anchors or cap <= 0:
+        return set()
+    scored = sorted(
+        (
+            (-float(getattr(row, "confidence", 0.5)), str(row.fact_id))
+            for row in fact_rows
+            if str(row.fact_id) in traversable_fact_ids
+            and (
+                str(getattr(row, "subject_entity_id", "")) in anchors
+                or str(getattr(row, "object_entity_id", "")) in anchors
+            )
+        ),
+    )
+    return {fact_id for _, fact_id in scored[:cap]}
+
+
 def _order_rerank_candidates(
     candidate_ids: set[str],
     passage_by_id: Mapping[str, PassageContext],
@@ -1177,6 +1258,7 @@ def _order_rerank_candidates(
     *,
     cap: int,
     semantic_reasons: Mapping[tuple[str, str], str] = {},
+    entity_anchor: Mapping[str, tuple[str, ...]] = {},
 ) -> tuple[PassageRerankCandidate, ...]:
     """H6: fill the bounded rerank pool by tier so incomparable score families
     never evict each other: (1) direct head hits by calibrated score desc,
@@ -1247,6 +1329,7 @@ def _order_rerank_candidates(
                     path_support,
                     paths_by_target,
                     semantic_reasons,
+                    entity_anchor,
                 ),
                 fused_score=float(fused_hit.score) if fused_hit is not None else 0.0,
                 ppr_mass=float(ppr.ranks.get(passage_id, 0.0)),
@@ -1265,10 +1348,14 @@ def _candidate_hint(
     path_support: Mapping[str, float],
     paths_by_target: Mapping[str, tuple[PathCandidate, ...]],
     semantic_reasons: Mapping[tuple[str, str], str] = {},
+    entity_anchor: Mapping[str, tuple[str, ...]] = {},
 ) -> str:
     hints: list[str] = []
     if passage_id in triple_support or passage_id in path_support:
         hints.append("supports a recognized fact")
+    anchors = entity_anchor.get(passage_id, ())
+    if anchors:
+        hints.append(f"mentions the query entity: {', '.join(anchors[:3])}")
     if passage_id in paths_by_target:
         hints.append("reached by an explanatory graph path")
         reason = _path_semantic_reason(

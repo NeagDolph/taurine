@@ -676,12 +676,34 @@ class BuildCoordinator:
                     salience=note_salience,
                 )
                 facts_by_note: dict[str, int] = {}
+                uses_by_note: set[str] = set()
                 for fact in fact_rows:
                     if fact.status == "active":
                         facts_by_note[fact.source_note_id] = facts_by_note.get(fact.source_note_id, 0) + 1
+                        if fact.predicate == "uses":
+                            uses_by_note.add(fact.source_note_id)
                 mentions_by_note: dict[str, list[Any]] = {}
                 for row in resolution.mentions:
                     mentions_by_note.setdefault(row.note_id, []).append(row)
+                entity_kind = {
+                    entity.entity_id: (entity.etype, bool(entity.traversal_eligible))
+                    for entity in resolution.entities
+                }
+
+                def _tool_hop(note_id: str) -> bool:
+                    # eligible tool/product mention + a project/org anchor, no
+                    # active `uses` fact from this note yet
+                    if note_id in uses_by_note:
+                        return False
+                    kinds = {
+                        entity_kind[row.entity_id][0]
+                        for row in mentions_by_note.get(note_id, ())
+                        if entity_kind.get(row.entity_id, ("", False))[1]
+                    }
+                    return "product" in kinds and bool(
+                        kinds & {"project", "organization"}
+                    )
+
                 completion_notes = tuple(
                     CompletionNote(
                         note_id=note.note_id,
@@ -706,6 +728,7 @@ class BuildCoordinator:
                         ),
                         active_relation_count=facts_by_note.get(note.note_id, 0),
                         schema_gap=False,
+                        tool_hop=_tool_hop(note.note_id),
                     )
                     for note in ordered
                     if note.note_id not in gated_note_ids
@@ -1652,35 +1675,85 @@ def carry_forward_records(
 def relation_completer_for(llm: Any) -> Callable[[Sequence[CompletionNote]], object]:
     """Bounded LLM relation-completion callable shared by the server and CLI."""
 
-    def complete_relations(notes: Sequence[CompletionNote]) -> object:
-        payload = {
-            "predicates": {
-                name: spec.description for name, spec in sorted(PREDICATES.items())
-            },
-            "notes": [
-                {
-                    "note_id": note.note_id,
-                    "observed_at": note.observed_at,
-                    "entities": [asdict(entity) for entity in note.entities],
-                    "passages": [asdict(passage) for passage in note.passages],
-                }
-                for note in notes
-            ],
+    system_prompt = (
+        "Return JSON {facts:[...]}. Each fact row MUST contain exactly these "
+        "fields: note_id, passage_id, subject_entity_id, object_entity_id, "
+        "predicate, assertion_start, assertion_end, confidence (0-1). Offsets "
+        "are note-global character positions inside the cited passage, and the "
+        "assertion span must contain a listed mention of both entities. Find "
+        "only relations directly supported by the supplied passage text; reuse "
+        "entity_id and passage_id values exactly; select a registered predicate "
+        "when possible. For an unregistered predicate, also provide "
+        "predicate_description. Do not infer unsupported relations. Notes "
+        "carrying a `focus` field likely assert that a project or organization "
+        "uses a tool/technology — extract those `uses` relations when the text "
+        "supports them (subject = the project/system, object = the tool)."
+    )
+
+    def _note_payload(note: CompletionNote) -> dict[str, Any]:
+        return {
+            "note_id": note.note_id,
+            "observed_at": note.observed_at,
+            "entities": [asdict(entity) for entity in note.entities],
+            "passages": [asdict(passage) for passage in note.passages],
+            **(
+                {"focus": "tool/technology usage — check for `uses` relations"}
+                if note.tool_hop
+                else {}
+            ),
         }
-        return asyncio.run(
-            llm.complete_json(
-                config.CHAT_MODEL,
-                (
-                    "Return JSON {facts:[...]}. Find only relations directly supported by the "
-                    "supplied passage text. Reuse entity_id and passage_id exactly, select a "
-                    "registered predicate when possible, and provide source-exact assertion_start "
-                    "and assertion_end offsets plus confidence. For an unregistered predicate, "
-                    "also provide predicate_description. Do not infer unsupported relations."
-                ),
-                json.dumps(payload, ensure_ascii=False),
-                timeout_s=config.SUMMARY_TIMEOUT_S,
-            )
-        )
+
+    def complete_relations(notes: Sequence[CompletionNote]) -> object:
+        # One call per bounded batch: the previous single-call design sent the
+        # whole selection (100+ notes, ~0.5 MB) and overflowed the model's
+        # context, so the lane silently produced nothing on real corpora.
+        predicates = {
+            name: spec.description for name, spec in sorted(PREDICATES.items())
+        }
+        batch_size = max(1, int(config.COMPLETION_NOTES_PER_CALL))
+        batches = [
+            notes[start : start + batch_size]
+            for start in range(0, len(notes), batch_size)
+        ]
+
+        async def run_batches() -> dict[str, Any]:
+            semaphore = asyncio.Semaphore(max(1, int(config.COMPLETION_CONCURRENCY)))
+
+            async def one(batch: Sequence[CompletionNote]) -> dict[str, Any]:
+                async with semaphore:
+                    try:
+                        return await llm.complete_json(
+                            config.CHAT_MODEL,
+                            system_prompt,
+                            json.dumps(
+                                {
+                                    "predicates": predicates,
+                                    "notes": [_note_payload(note) for note in batch],
+                                },
+                                ensure_ascii=False,
+                            ),
+                            timeout_s=config.SUMMARY_TIMEOUT_S,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — per-batch fail-open
+                        _LOG.warning(
+                            "relation completion batch failed (%s): %s",
+                            type(exc).__name__,
+                            exc,
+                        )
+                        return {}
+
+            results = await asyncio.gather(*(one(batch) for batch in batches))
+            merged: dict[str, Any] = {"facts": [], "aliases": []}
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                for key in ("facts", "aliases"):
+                    rows = result.get(key)
+                    if isinstance(rows, list):
+                        merged[key].extend(rows)
+            return merged
+
+        return asyncio.run(run_batches())
 
     return complete_relations
 

@@ -1,0 +1,16 @@
+{"id": "docker-projects", "query": "Which projects use Docker?", "expect_any": ["nemotron", "telephony-asr", "modal-asr", "whisper"], "note": "entity-hop: deployment projects, not resume skill lists"}
+{"id": "whisper-deploy", "query": "What did I deploy WhisperLive on?", "expect_any": ["whisper", "a6000"]}
+{"id": "dssm-projects", "query": "Which projects use DSSM?", "expect_any": ["shoplc", "recommendation-engine", "reranker", "ivr", "retrieval-bench"]}
+{"id": "employer-now", "query": "Where does Neil work right now?", "expect_any": ["Klaviyo", "my name is Neil"], "expect_fact_predicate": "works_at"}
+{"id": "graduation", "query": "When is my graduation?", "expect_any": ["graduation form", "Fill out graduation"]}
+{"id": "tokyo", "query": "What are my Tokyo trip activity ideas?", "expect_any": ["Tokyo"]}
+{"id": "ernest", "query": "Who is Ernest Chae and what do we work on together?", "expect_any": ["Ernest", "NLP Project"]}
+{"id": "vishwa-dinner", "query": "What did Vishwa say about the dinner plans?", "expect_any": ["Vishwa"]}
+{"id": "shoplc-results", "query": "What were the ShopLC reranker benchmark results?", "expect_any": ["reranker", "bench", "shoplc"]}
+{"id": "dad-tab", "query": "How much does my dad owe me?", "expect_any": ["dad", "Owed"]}
+{"id": "workout", "query": "What is my workout routine?", "expect_any": ["Workout"]}
+{"id": "lectures", "query": "What did the lectures say about recursive contracts?", "expect_any": ["Recursive Contracts"]}
+{"id": "failover-decision", "query": "What did I decide about the transcription failover?", "expect_any": ["failover"]}
+{"id": "voice-v4", "query": "What is the plan for voice agent v4?", "expect_any": ["voice-agent-v4", "voice agent"]}
+{"id": "filler", "query": "the the um okay yeah right", "expect_abstain": true}
+{"id": "gibberish", "query": "completely unrelated zephyr quasar nonsense token", "expect_abstain": true}
