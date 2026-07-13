@@ -3,14 +3,32 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Sequence
 
 from taurine_core import config
 from taurine_core.indexer.facts import FactRecord, PREDICATES, promote_fact
 from taurine_core.schemas import ExtractedRelation
+
+_COMPLETION_PROMPT_VERSION = "relation-completion-v1"
+
+COMPLETION_SYSTEM_PROMPT = (
+    "Return JSON {facts:[...]}. Each fact row MUST contain exactly these "
+    "fields: note_id, passage_id, subject_entity_id, object_entity_id, "
+    "predicate, assertion_start, assertion_end, confidence (0-1). Offsets "
+    "are note-global character positions inside the cited passage, and the "
+    "assertion span must contain a listed mention of both entities. Find "
+    "only relations directly supported by the supplied passage text; reuse "
+    "entity_id and passage_id values exactly; select a registered predicate "
+    "when possible. For an unregistered predicate, also provide "
+    "predicate_description. Do not infer unsupported relations. Notes "
+    "carrying a `focus` field likely assert that a project or organization "
+    "uses a tool/technology — extract those `uses` relations when the text "
+    "supports them (subject = the project/system, object = the tool)."
+)
 
 # open predicates that are plain synonyms of registered ones become normal
 # facts instead of quarantined proposals (L21c); keys are casefolded and
@@ -69,6 +87,42 @@ class CompletionNote:
     # technical prose. These notes join the completion lane (capped) with a
     # usage-relation focus nudge.
     tool_hop: bool = False
+
+
+def completion_note_payload(note: CompletionNote) -> dict:
+    # shared by the LLM call and the cache key so they can never drift apart
+    return {
+        "note_id": note.note_id,
+        "observed_at": note.observed_at,
+        "entities": [asdict(entity) for entity in note.entities],
+        "passages": [asdict(passage) for passage in note.passages],
+        **(
+            {"focus": "tool/technology usage — check for `uses` relations"}
+            if note.tool_hop
+            else {}
+        ),
+    }
+
+
+def completion_note_key(model_id: str, note: CompletionNote) -> str:
+    """Content key: any change to the note's payload, the prompt, the model,
+    or the predicate registry busts the cache naturally."""
+    identity = json.dumps(
+        {
+            "version": _COMPLETION_PROMPT_VERSION,
+            "model": model_id,
+            "prompt": hashlib.sha256(
+                COMPLETION_SYSTEM_PROMPT.encode("utf-8")
+            ).hexdigest(),
+            "predicates": [
+                [name, spec.description] for name, spec in sorted(PREDICATES.items())
+            ],
+            "note": completion_note_payload(note),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return "completion:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -131,6 +185,47 @@ def select_completion_notes(notes: Sequence[CompletionNote]) -> tuple[Completion
             selected[note.note_id] = note
             tool_hop_budget -= 1
     return tuple(sorted(selected.values(), key=lambda row: (-row.value_score, row.note_id)))
+
+
+def group_completion_rows(
+    payload: object, notes: Sequence[CompletionNote]
+) -> dict[str, dict]:
+    """Raw model rows grouped by resolved note, for per-note cache storage.
+
+    Fact rows resolve via note_id with the same passage_id fallback the parser
+    uses; alias rows attribute to the first supplied note listing the entity.
+    Every supplied note gets an entry (empty results are cached too)."""
+
+    grouped: dict[str, dict] = {
+        note.note_id: {"facts": [], "aliases": []} for note in notes
+    }
+    if not isinstance(payload, dict):
+        return grouped
+    note_ids = set(grouped)
+    passage_to_note = {
+        passage.passage_id: note.note_id
+        for note in notes
+        for passage in note.passages
+    }
+    rows = payload.get("facts")
+    for raw in rows if isinstance(rows, list) else ():
+        if not isinstance(raw, dict):
+            continue
+        note_id = str(raw.get("note_id", ""))
+        if note_id not in note_ids:
+            note_id = passage_to_note.get(str(raw.get("passage_id", "")), "")
+        if note_id in note_ids:
+            grouped[note_id]["facts"].append(raw)
+    alias_rows = payload.get("aliases")
+    for raw in alias_rows if isinstance(alias_rows, list) else ():
+        if not isinstance(raw, dict):
+            continue
+        entity_id = str(raw.get("entity_id", ""))
+        for note in notes:
+            if any(row.entity_id == entity_id for row in note.entities):
+                grouped[note.note_id]["aliases"].append(raw)
+                break
+    return grouped
 
 
 def parse_completion_response(

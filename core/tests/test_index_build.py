@@ -13,6 +13,7 @@ from tests.conftest import make_note
 from taurine_core import config
 from taurine_core.evaluation.graph_retrieval import load_calibration
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies, BuildError, main
+from taurine_core.indexer.build_cache import BuildCache
 from taurine_core.indexer.knowledge_store import KnowledgeStore
 from taurine_core.retrieval.snapshot import load_index_snapshot
 from taurine_core.schemas import ExtractedMention, ExtractedRelation, Extraction, NoteRecord
@@ -33,6 +34,108 @@ def embedder(texts: list[str]) -> np.ndarray:
         row /= np.linalg.norm(row)
         rows.append(row)
     return np.vstack(rows)
+
+
+def _completion_extractor(notes, *, tokenizer):
+    del tokenizer
+    results = {}
+    for note in notes:
+        maya = note.text.index("Maya")
+        launch = note.text.index("Launch")
+        results[note.note_id] = Extraction(
+            mentions=[
+                ExtractedMention(
+                    surface="Maya",
+                    etype="person",
+                    confidence=0.95,
+                    char_start=maya,
+                    char_end=maya + 4,
+                    extractor="fake",
+                    schema_id="s1",
+                ),
+                ExtractedMention(
+                    surface="Launch",
+                    etype="project",
+                    confidence=0.95,
+                    char_start=launch,
+                    char_end=launch + 6,
+                    extractor="fake",
+                    schema_id="s1",
+                ),
+            ],
+            fact_candidates=[],
+            schema_id="s1",
+        )
+    return results
+
+
+def test_completion_cache_skips_repeat_calls_and_caches_empty(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    def completer(notes):
+        calls.append(len(notes))
+        return {
+            "facts": [],
+            "aliases": [],
+            "completed_note_ids": [note.note_id for note in notes],
+        }
+
+    note = make_note(
+        "note-a",
+        "Launch planning",
+        "Maya coordinates the Launch project and reviews its detailed weekly roadmap.",
+    )
+    cache = BuildCache(tmp_path / "cache.db")
+    try:
+        coordinator = BuildCoordinator(
+            BuildDependencies(
+                tokenizer=Tokenizer(),
+                embedder=embedder,
+                embedding_dim=16,
+                extractor=_completion_extractor,
+                relation_completer=completer,
+                completion_cache=cache,
+            )
+        )
+        coordinator.build([note], tmp_path / "first.db", replace_derived=True)
+        assert calls == [1]
+        assert calls[0] > 0
+
+        coordinator.build([note], tmp_path / "second.db", replace_derived=True)
+        assert calls == [1]
+    finally:
+        cache.close()
+
+
+def test_completion_failed_batch_notes_retry_next_build(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    def completer(notes):
+        calls.append(len(notes))
+        return {"facts": [], "aliases": [], "completed_note_ids": []}
+
+    note = make_note(
+        "note-a",
+        "Launch planning",
+        "Maya coordinates the Launch project and reviews its detailed weekly roadmap.",
+    )
+    cache = BuildCache(tmp_path / "cache.db")
+    try:
+        coordinator = BuildCoordinator(
+            BuildDependencies(
+                tokenizer=Tokenizer(),
+                embedder=embedder,
+                embedding_dim=16,
+                extractor=_completion_extractor,
+                relation_completer=completer,
+                completion_cache=cache,
+            )
+        )
+        coordinator.build([note], tmp_path / "first.db", replace_derived=True)
+        coordinator.build([note], tmp_path / "second.db", replace_derived=True)
+        assert calls == [1, 1]
+    finally:
+        cache.close()
 
 
 def test_clean_build_is_atomic_deterministic_and_order_independent(tmp_path: Path) -> None:

@@ -13,7 +13,7 @@ import statistics
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -61,9 +61,13 @@ from taurine_core.indexer.knowledge_store import KnowledgeStore, compute_graph_h
 from taurine_core.indexer.passages import TokenizerPort, build_passages
 from taurine_core.indexer.projection import ProjectionPassage, build_projection
 from taurine_core.indexer.relation_completion import (
+    COMPLETION_SYSTEM_PROMPT,
     CompletionEntity,
     CompletionNote,
     CompletionPassage,
+    completion_note_key,
+    completion_note_payload,
+    group_completion_rows,
     parse_completion_response,
     select_completion_notes,
 )
@@ -106,6 +110,9 @@ class BuildDependencies:
     # reasons, and no gray-zone merges happen — never a failed build.
     edge_adjudicator: Callable[[str, dict], Any] | None = None
     adjudication_cache: Any | None = None
+    # per-note completion cache (BuildCache in production): unchanged notes —
+    # including notes that yielded nothing — are never re-asked
+    completion_cache: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -735,9 +742,58 @@ class BuildCoordinator:
                 )
                 selected_completion = select_completion_notes(completion_notes)
                 if selected_completion:
+                    cache = self.dependencies.completion_cache
+                    keys = {
+                        note.note_id: completion_note_key(
+                            config.COMPLETION_MODEL, note
+                        )
+                        for note in selected_completion
+                    }
+                    cached_rows: dict[str, dict] = {}
+                    if cache is not None:
+                        by_key = cache.cached_judgments(sorted(set(keys.values())))
+                        cached_rows = {
+                            note_id: by_key[key]
+                            for note_id, key in keys.items()
+                            if key in by_key
+                        }
+                    pending = tuple(
+                        note
+                        for note in selected_completion
+                        if note.note_id not in cached_rows
+                    )
+                    fresh: dict[str, Any] = {
+                        "facts": [],
+                        "aliases": [],
+                        "completed_note_ids": [],
+                    }
                     try:
+                        if pending:
+                            raw = self.dependencies.relation_completer(pending)
+                            if isinstance(raw, dict):
+                                fresh = {
+                                    "facts": list(raw.get("facts") or []),
+                                    "aliases": list(raw.get("aliases") or []),
+                                    "completed_note_ids": list(
+                                        raw.get("completed_note_ids") or []
+                                    ),
+                                }
+                        merged_payload = {
+                            "facts": [
+                                row
+                                for rows in cached_rows.values()
+                                for row in rows.get("facts", [])
+                            ]
+                            + fresh["facts"],
+                            "aliases": [
+                                row
+                                for rows in cached_rows.values()
+                                for row in rows.get("aliases", [])
+                            ]
+                            + fresh["aliases"],
+                        }
                         completed = parse_completion_response(
-                            self.dependencies.relation_completer(selected_completion),
+                            merged_payload,
                             selected_completion,
                             build_id=build_id,
                         )
@@ -748,6 +804,20 @@ class BuildCoordinator:
                         proposals = completed.proposals
                         completion_rejected = completed.rejected
                         completion_aliases = completed.aliases
+                        # only notes vouched for by a successful call may store;
+                        # failed-batch notes retry next build
+                        if cache is not None and fresh["completed_note_ids"]:
+                            grouped = group_completion_rows(fresh, pending)
+                            completed_ids = {
+                                str(note_id)
+                                for note_id in fresh["completed_note_ids"]
+                            } & set(grouped)
+                            cache.store_judgments(
+                                [
+                                    (keys[note_id], "completion", grouped[note_id])
+                                    for note_id in sorted(completed_ids)
+                                ]
+                            )
             for proposal in {row.proposal_id: row for row in proposals}.values():
                 store.insert_predicate_proposal(proposal)
             for alias in completion_aliases:
@@ -1675,34 +1745,6 @@ def carry_forward_records(
 def relation_completer_for(llm: Any) -> Callable[[Sequence[CompletionNote]], object]:
     """Bounded LLM relation-completion callable shared by the server and CLI."""
 
-    system_prompt = (
-        "Return JSON {facts:[...]}. Each fact row MUST contain exactly these "
-        "fields: note_id, passage_id, subject_entity_id, object_entity_id, "
-        "predicate, assertion_start, assertion_end, confidence (0-1). Offsets "
-        "are note-global character positions inside the cited passage, and the "
-        "assertion span must contain a listed mention of both entities. Find "
-        "only relations directly supported by the supplied passage text; reuse "
-        "entity_id and passage_id values exactly; select a registered predicate "
-        "when possible. For an unregistered predicate, also provide "
-        "predicate_description. Do not infer unsupported relations. Notes "
-        "carrying a `focus` field likely assert that a project or organization "
-        "uses a tool/technology — extract those `uses` relations when the text "
-        "supports them (subject = the project/system, object = the tool)."
-    )
-
-    def _note_payload(note: CompletionNote) -> dict[str, Any]:
-        return {
-            "note_id": note.note_id,
-            "observed_at": note.observed_at,
-            "entities": [asdict(entity) for entity in note.entities],
-            "passages": [asdict(passage) for passage in note.passages],
-            **(
-                {"focus": "tool/technology usage — check for `uses` relations"}
-                if note.tool_hop
-                else {}
-            ),
-        }
-
     def complete_relations(notes: Sequence[CompletionNote]) -> object:
         # One call per bounded batch: the previous single-call design sent the
         # whole selection (100+ notes, ~0.5 MB) and overflowed the model's
@@ -1719,16 +1761,18 @@ def relation_completer_for(llm: Any) -> Callable[[Sequence[CompletionNote]], obj
         async def run_batches() -> dict[str, Any]:
             semaphore = asyncio.Semaphore(max(1, int(config.COMPLETION_CONCURRENCY)))
 
-            async def one(batch: Sequence[CompletionNote]) -> dict[str, Any]:
+            async def one(batch: Sequence[CompletionNote]) -> dict[str, Any] | None:
                 async with semaphore:
                     try:
                         return await llm.complete_json(
                             config.COMPLETION_MODEL,
-                            system_prompt,
+                            COMPLETION_SYSTEM_PROMPT,
                             json.dumps(
                                 {
                                     "predicates": predicates,
-                                    "notes": [_note_payload(note) for note in batch],
+                                    "notes": [
+                                        completion_note_payload(note) for note in batch
+                                    ],
                                 },
                                 ensure_ascii=False,
                             ),
@@ -1743,13 +1787,20 @@ def relation_completer_for(llm: Any) -> Callable[[Sequence[CompletionNote]], obj
                             type(exc).__name__,
                             exc,
                         )
-                        return {}
+                        return None
 
             results = await asyncio.gather(*(one(batch) for batch in batches))
-            merged: dict[str, Any] = {"facts": [], "aliases": []}
-            for result in results:
+            merged: dict[str, Any] = {
+                "facts": [],
+                "aliases": [],
+                "completed_note_ids": [],
+            }
+            for batch, result in zip(batches, results):
                 if not isinstance(result, dict):
                     continue
+                # a successful call vouches for every note in its batch — including
+                # notes the model returned nothing for (cached as empty, asked once)
+                merged["completed_note_ids"].extend(note.note_id for note in batch)
                 for key in ("facts", "aliases"):
                     rows = result.get(key)
                     if isinstance(rows, list):

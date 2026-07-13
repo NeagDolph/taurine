@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from taurine_core.indexer.relation_completion import (
     CompletionAlias,
     CompletionEntity,
     CompletionNote,
     CompletionPassage,
+    completion_note_key,
+    group_completion_rows,
     parse_completion_response,
     select_completion_notes,
 )
@@ -57,6 +61,50 @@ def test_schema_gap_ignores_value_threshold() -> None:
     selected = {note.note_id for note in select_completion_notes(notes)}
 
     assert "note-gap" in selected
+
+
+def test_completion_note_key_stable_and_content_sensitive() -> None:
+    note = _note("note-a", value=1.0, entities=2, relations=0)
+    assert completion_note_key("m", note) == completion_note_key("m", note)
+    assert completion_note_key("m", note) != completion_note_key("m2", note)
+    changed = replace(note, tool_hop=True)
+    assert completion_note_key("m", note) != completion_note_key("m", changed)
+
+
+def test_group_completion_rows_resolves_note_id_passage_fallback_and_alias() -> None:
+    note_a = CompletionNote(
+        note_id="note-a",
+        value_score=1.0,
+        observed_at=0.0,
+        entities=(CompletionEntity("e-a", "A", 0, 1),),
+        passages=(CompletionPassage("p-a", "A", 0),),
+        active_relation_count=0,
+        schema_gap=False,
+    )
+    note_b = CompletionNote(
+        note_id="note-b",
+        value_score=1.0,
+        observed_at=0.0,
+        entities=(CompletionEntity("e-b", "B", 0, 1),),
+        passages=(CompletionPassage("p-b", "B", 0),),
+        active_relation_count=0,
+        schema_gap=False,
+    )
+    payload = {
+        "facts": [
+            {"note_id": "note-a", "passage_id": "p-a"},
+            {"note_id": "", "passage_id": "p-b"},
+            {"note_id": "ghost", "passage_id": "ghost"},
+        ],
+        "aliases": [{"entity_id": "e-b", "alias": "B"}],
+    }
+
+    grouped = group_completion_rows(payload, [note_a, note_b])
+
+    assert len(grouped["note-a"]["facts"]) == 1
+    assert len(grouped["note-b"]["facts"]) == 1
+    assert grouped["note-b"]["aliases"] == [{"entity_id": "e-b", "alias": "B"}]
+    assert grouped["note-a"]["aliases"] == []
 
 
 def test_completion_selector_includes_value_top_floor_sparse_and_schema_gap() -> None:

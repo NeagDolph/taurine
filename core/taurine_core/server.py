@@ -899,6 +899,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
             context_cache=build_cache,
             edge_adjudicator=edge_adjudicator_for(llm),
             adjudication_cache=build_cache,
+            completion_cache=build_cache,
         )
     )
     knowledge_database = Path("taurine-knowledge.db")
