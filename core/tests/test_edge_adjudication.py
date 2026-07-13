@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,6 +26,7 @@ from taurine_core.indexer.edge_adjudication import (
     adjudicate_semantic_edges,
     merge_mention_contexts,
     _fact_batches,
+    _parse_fact_response,
 )
 from taurine_core.indexer.entities import GrayZonePair
 from taurine_core.indexer.facts import promote_fact
@@ -106,6 +108,14 @@ def _verdict(fact_id: str, *, score: float, quote: str, relabel=None) -> dict:
     }
 
 
+def _payload_facts(payload: dict) -> list[dict]:
+    return [
+        fact
+        for note in payload.get("notes", ())
+        for fact in note.get("facts", ())
+    ]
+
+
 class ScriptedFactJudge:
     """Returns per-fact verdicts from a fact_id → verdict map; counts calls."""
 
@@ -119,7 +129,7 @@ class ScriptedFactJudge:
         return {
             "facts": [
                 self.verdicts[row["fact_key"]]
-                for row in payload["facts"]
+                for row in _payload_facts(payload)
                 if row["fact_key"] in self.verdicts
             ]
         }
@@ -311,11 +321,109 @@ def test_batches_group_by_note_cap_facts_and_bound_text(monkeypatch) -> None:
 
     batches = _fact_batches(facts, draft_by_passage, {"n1": "One", "n2": "Two"})
 
-    assert [batch.note_id for batch in batches] == ["n1", "n1", "n2"]
-    assert [len(batch.facts) for batch in batches] == [2, 1, 1]
-    assert all(len(batch.text) <= 200 for batch in batches)
+    assert [len(batch.facts) for batch in batches] == [2, 2]
+    assert [
+        [section.note_id for section in batch.sections] for batch in batches
+    ] == [["n1"], ["n1", "n2"]]
+    assert all(
+        len(section.text) <= 200
+        for batch in batches
+        for section in batch.sections
+    )
     # the shared text is supplied once per call and contains the facts' passages
-    assert _TEXT in batches[0].text
+    assert _TEXT in batches[0].sections[0].text
+
+
+def _packed_fact_fixture():
+    drafts = {
+        note_id: _draft(f"p-{suffix}")
+        for note_id, suffix in (
+            ("note-a", "a"),
+            ("note-b", "b"),
+            ("note-c", "c"),
+        )
+    }
+    facts = []
+    for note_id, draft in drafts.items():
+        facts.extend(
+            (
+                _fact(
+                    "Maya Chen",
+                    "works_at",
+                    "Klaviyo",
+                    note_id=note_id,
+                    passage_id=draft.passage_id,
+                ),
+                _fact(
+                    "Rex",
+                    "owns_or_has",
+                    "Launch",
+                    note_id=note_id,
+                    passage_id=draft.passage_id,
+                    span=(32, 70),
+                ),
+            )
+        )
+    return facts, {draft.passage_id: draft for draft in drafts.values()}
+
+
+def test_fact_batches_pack_small_notes_into_one_call() -> None:
+    facts, draft_by_passage = _packed_fact_fixture()
+
+    batches = _fact_batches(
+        facts,
+        draft_by_passage,
+        {"note-a": "A", "note-b": "B", "note-c": "C"},
+    )
+
+    assert len(batches) == 1
+    assert len(batches[0].facts) == 6
+    assert [section.note_id for section in batches[0].sections] == [
+        "note-a",
+        "note-b",
+        "note-c",
+    ]
+
+
+def test_fact_batches_still_split_at_fact_cap(monkeypatch) -> None:
+    monkeypatch.setattr(config, "ADJUDICATION_FACTS_PER_CALL", 4)
+    facts, draft_by_passage = _packed_fact_fixture()
+
+    batches = _fact_batches(facts, draft_by_passage, {})
+
+    assert [len(batch.facts) for batch in batches] == [4, 2]
+
+
+def test_quote_must_ground_in_the_facts_own_note() -> None:
+    fact_a = _fact(note_id="note-a", passage_id="p-a")
+    fact_b = _fact(
+        "Rex",
+        "owns_or_has",
+        "Launch",
+        note_id="note-b",
+        passage_id="p-b",
+        span=(0, 28),
+    )
+    text_a = "Maya Chen works at Klaviyo."
+    text_b = "Rex owns the Launch project."
+    batch = SimpleNamespace(
+        facts=(fact_a, fact_b),
+        text=f"{text_a}\n\n{text_b}",
+        sections=(
+            SimpleNamespace(note_id="note-a", text=text_a),
+            SimpleNamespace(note_id="note-b", text=text_b),
+        ),
+    )
+    response = {
+        "facts": [
+            _verdict(fact_a.fact_id, score=0.9, quote="Rex owns the Launch project")
+        ]
+    }
+
+    parsed, malformed = _parse_fact_response(response, batch)
+
+    assert parsed == {}
+    assert malformed == 1
 
 
 def test_cached_judgments_skip_the_llm(tmp_path: Path) -> None:
@@ -654,7 +762,7 @@ def test_build_persists_rejections_for_audit_and_excludes_them_everywhere(
                     "relabel": None,
                     "score": 0.05,
                 }
-                for row in payload.get("facts", ())
+                for row in _payload_facts(payload)
             ],
             "pairs": {},
         }
@@ -708,7 +816,7 @@ def test_build_downweight_multiplies_the_fact_edge_weight(tmp_path: Path) -> Non
                         "relabel": None,
                         "score": score,
                     }
-                    for row in payload.get("facts", ())
+                    for row in _payload_facts(payload)
                 ],
                 "pairs": {},
             }
@@ -860,7 +968,7 @@ def test_builds_with_a_cached_judge_are_deterministic(tmp_path: Path) -> None:
                     "relabel": None,
                     "score": 0.5,
                 }
-                for row in payload.get("facts", ())
+                for row in _payload_facts(payload)
             ],
             "pairs": {},
         }
@@ -960,7 +1068,7 @@ def test_fact_contexts_expose_adjudication_fields(tmp_path: Path) -> None:
                     "relabel": None,
                     "score": 0.55,
                 }
-                for row in payload.get("facts", ())
+                for row in _payload_facts(payload)
             ],
             "pairs": {},
         }

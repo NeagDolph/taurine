@@ -47,9 +47,10 @@ _MERGE_PROMPT_VERSION = "merge-adjudication-v1"
 
 _FACT_SYSTEM_PROMPT = (
     "You are a strict adjudicator of facts extracted into a personal knowledge "
-    "graph. You receive one source text and candidate facts (subject — "
-    "predicate — object) extracted from it. Judge each fact ONLY against the "
-    "supplied text, never against world knowledge. For each fact return an "
+    "graph. You receive one or more source notes, each with its own text and the "
+    "candidate facts (subject — predicate — object) extracted from it. Judge each "
+    "fact ONLY against its own note's supplied text, never against another note "
+    "or world knowledge. For each fact return an "
     "object with exactly these fields:\n"
     '- "fact_key": copied verbatim from the input fact.\n'
     '- "support": "supported" if the text plainly asserts the relation, '
@@ -150,12 +151,17 @@ class FactJudgment:
 
 
 @dataclass(frozen=True)
-class _FactBatch:
-    """One judge call: a note's relevant passage text plus ≤25 of its facts."""
-
+class _NoteSection:
     note_id: str
     title: str
     text: str
+
+
+@dataclass(frozen=True)
+class _FactBatch:
+    """One judge call: one or more notes' relevant passage text plus their facts."""
+
+    sections: tuple[_NoteSection, ...]
     facts: tuple[FactRecord, ...]
     assertions: Mapping[str, str]
 
@@ -253,7 +259,7 @@ def adjudicate_facts(
             if parsed is None:
                 _LOG.warning(
                     "fact adjudication batch for note %s returned a malformed response",
-                    batch.note_id,
+                    ", ".join(section.note_id for section in batch.sections),
                 )
                 failed += 1
                 continue
@@ -336,10 +342,11 @@ def _fact_batches(
     draft_by_passage: Mapping[str, Any],
     note_titles: Mapping[str, str],
 ) -> tuple[_FactBatch, ...]:
-    """Deterministic per-note batches sharing the relevant passage text once.
+    """Deterministic batches packing multiple notes per call (measured builds
+    averaged ~3 facts/call against a 25-fact cap when batches were per-note).
 
-    A note with more facts than the per-call cap splits into multiple calls;
-    the supplied text stays bounded at ADJUDICATION_TEXT_MAX_CHARS."""
+    A note's facts stay contiguous and ordered; the supplied text stays
+    bounded at ADJUDICATION_TEXT_MAX_CHARS per call."""
 
     by_note: dict[str, list[FactRecord]] = {}
     for fact in facts:
@@ -347,6 +354,37 @@ def _fact_batches(
     max_chars = int(config.ADJUDICATION_TEXT_MAX_CHARS)
     max_facts = max(1, int(config.ADJUDICATION_FACTS_PER_CALL))
     batches: list[_FactBatch] = []
+
+    current_facts: list[FactRecord] = []
+    # note_id → {passage_id: text}, insertion-ordered
+    current_notes: dict[str, dict[str, str]] = {}
+    current_chars = 0
+
+    def flush() -> None:
+        nonlocal current_facts, current_notes, current_chars
+        if current_facts:
+            sections = tuple(
+                _NoteSection(
+                    note_id=note_id,
+                    title=note_titles.get(note_id, ""),
+                    text="\n\n".join(passages.values()),
+                )
+                for note_id, passages in current_notes.items()
+            )
+            batches.append(
+                _FactBatch(
+                    sections=sections,
+                    facts=tuple(current_facts),
+                    assertions={
+                        fact.fact_id: _assertion_text(
+                            fact, draft_by_passage[fact.source_passage_id]
+                        )
+                        for fact in current_facts
+                    },
+                )
+            )
+        current_facts, current_notes, current_chars = [], {}, 0
+
     for note_id in sorted(by_note):
         rows = sorted(
             by_note[note_id],
@@ -356,68 +394,53 @@ def _fact_batches(
                 fact.fact_id,
             ),
         )
-        current: list[FactRecord] = []
-        current_passages: dict[str, str] = {}
-        current_chars = 0
-
-        def flush() -> None:
-            nonlocal current, current_passages, current_chars
-            if current:
-                text = "\n\n".join(current_passages.values())
-                batches.append(
-                    _FactBatch(
-                        note_id=note_id,
-                        title=note_titles.get(note_id, ""),
-                        text=text,
-                        facts=tuple(current),
-                        assertions={
-                            fact.fact_id: _assertion_text(
-                                fact, draft_by_passage[fact.source_passage_id]
-                            )
-                            for fact in current
-                        },
-                    )
-                )
-            current, current_passages, current_chars = [], {}, 0
-
         for fact in rows:
             draft = draft_by_passage[fact.source_passage_id]
             passage_text = draft.text[:max_chars]
-            added = (
-                0
-                if draft.passage_id in current_passages
-                else len(passage_text) + 2
-            )
-            if current and (
-                len(current) >= max_facts or current_chars + added > max_chars
+            seen = draft.passage_id in current_notes.get(note_id, {})
+            added = 0 if seen else len(passage_text) + 2
+            if current_facts and (
+                len(current_facts) >= max_facts
+                or current_chars + added > max_chars
             ):
                 flush()
                 added = len(passage_text) + 2
-            if draft.passage_id not in current_passages:
-                current_passages[draft.passage_id] = passage_text
+            current_notes.setdefault(note_id, {})
+            if draft.passage_id not in current_notes[note_id]:
+                current_notes[note_id][draft.passage_id] = passage_text
                 current_chars += added
-            current.append(fact)
-        flush()
+            current_facts.append(fact)
+    flush()
     return tuple(batches)
 
 
 def _fact_payload(batch: _FactBatch) -> dict:
+    facts_by_note: dict[str, list[FactRecord]] = {}
+    for fact in batch.facts:
+        facts_by_note.setdefault(fact.source_note_id, []).append(fact)
     return {
-        "note_title": batch.title,
-        "text": batch.text,
         "predicates": {
             name: spec.description for name, spec in sorted(PREDICATES.items())
         },
-        "facts": [
+        "notes": [
             {
-                "fact_key": fact.fact_id,
-                "subject": fact.subject,
-                "predicate": fact.predicate,
-                "predicate_description": PREDICATES[fact.predicate].description,
-                "object": fact.object,
-                "assertion": batch.assertions.get(fact.fact_id, ""),
+                "note_title": section.title,
+                "text": section.text,
+                "facts": [
+                    {
+                        "fact_key": fact.fact_id,
+                        "subject": fact.subject,
+                        "predicate": fact.predicate,
+                        "predicate_description": PREDICATES[
+                            fact.predicate
+                        ].description,
+                        "object": fact.object,
+                        "assertion": batch.assertions.get(fact.fact_id, ""),
+                    }
+                    for fact in facts_by_note.get(section.note_id, ())
+                ],
             }
-            for fact in batch.facts
+            for section in batch.sections
         ],
     }
 
@@ -434,8 +457,10 @@ def _parse_fact_response(
     rows = response.get("facts") if isinstance(response, Mapping) else None
     if not isinstance(rows, list):
         return None, 0
-    known = {fact.fact_id for fact in batch.facts}
-    normalized_text = _normalize_ws(batch.text)
+    known = {fact.fact_id: fact.source_note_id for fact in batch.facts}
+    normalized_by_note = {
+        section.note_id: _normalize_ws(section.text) for section in batch.sections
+    }
     parsed: dict[str, FactJudgment] = {}
     malformed = 0
     for raw in rows:
@@ -447,7 +472,8 @@ def _parse_fact_response(
             or judgment.fact_id not in known
             or judgment.fact_id in parsed
             or not judgment.quote
-            or _normalize_ws(judgment.quote) not in normalized_text
+            or _normalize_ws(judgment.quote)
+            not in normalized_by_note.get(known[judgment.fact_id], "")
         ):
             malformed += 1
             continue
