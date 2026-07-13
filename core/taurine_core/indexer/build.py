@@ -1723,7 +1723,7 @@ def relation_completer_for(llm: Any) -> Callable[[Sequence[CompletionNote]], obj
                 async with semaphore:
                     try:
                         return await llm.complete_json(
-                            config.CHAT_MODEL,
+                            config.COMPLETION_MODEL,
                             system_prompt,
                             json.dumps(
                                 {

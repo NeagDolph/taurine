@@ -28,7 +28,6 @@ CHUNK_MAX_TOKENS = 300                   # sentence-boundary chunking
 
 # ── LLM (ALL calls via OpenRouter) ─────────────────────────────────────
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-ENRICH_MODEL = "z-ai/glm-5.2"            # enrichment is offline: quality over latency
 ENRICH_TIMEOUT_S = 60.0
 LLM_TIMEOUT_S = 15.0
 # chain-of-thought off everywhere: enrichment is bulk offline work (GLM-5.2
@@ -61,9 +60,6 @@ REENRICH_CONCURRENCY = 4
 # vocabulary, which is what builds graph edges; batching also amortizes the
 # user card prefix. Any note missing/invalid in a batch response falls back
 # to a per-note call.
-ENRICH_BATCH_SIZE = 10                   # max notes per LLM call
-ENRICH_BATCH_CHAR_BUDGET = 24_000        # max summed note-text chars per call
-ENRICH_BATCH_MIN_NOTES = 3               # below this, per-note calls (batch overhead loses)
 
 # ── notes sync / connectors ────────────────────────────────────────────
 SYNC_INTERVAL_S = 300.0
@@ -240,6 +236,8 @@ ADJUDICATION_MODEL = "openai/gpt-oss-120b"
 ADJUDICATION_CONCURRENCY = 6             # bounded parallel judge calls (all lanes)
 ADJUDICATION_FACTS_PER_CALL = 25         # facts per judge call (grouped by note)
 ADJUDICATION_MAX_TOKENS = 4096           # cap runaway judge generations (fail-open)
+COMPLETION_MODEL = ADJUDICATION_MODEL    # structured extraction; the judge validates its output
+COMPLETION_NO_RELATION_MIN_PERCENTILE = 0.5  # no-relation gate needs median-or-better value
 COMPLETION_TOOL_HOP_CAP = 40             # extra tool/anchor notes per build in the completion lane
 COMPLETION_NOTES_PER_CALL = 12           # completion batch size (single giant call overflowed context)
 COMPLETION_CONCURRENCY = 4               # parallel completion batches
