@@ -312,9 +312,30 @@ def test_chat_fallback_pack_on_a_real_build(tmp_path: Path) -> None:
     snapshot = load_index_snapshot(database)
     store = snapshot.open_knowledge_store()
     try:
-        # Equidistant from every passage: cosine 1/sqrt(3) ≈ 0.577 calibrates
-        # below the chat dense floor but above the 0.75 × floor fallback floor.
-        blended = snapshot.passage_matrix.sum(axis=0)
+        # Engineer the top cosine into the fallback band of the LOADED artifact
+        # (curves are data-fitted and change across self-calibration runs):
+        # calibrated target = midpoint of (0.75 x floor, floor), inverted
+        # through the chat dense knots to a raw cosine, realized exactly
+        # against passage 0 with the remainder on an axis orthogonal to every
+        # one-hot passage vector.
+        from taurine_core.evaluation.graph_retrieval import load_calibration
+        from taurine_core.retrieval.runtime import CALIBRATION_PATH
+
+        chat_dense = load_calibration(CALIBRATION_PATH).modes["chat"].heads["dense"]
+        floor = chat_dense.acceptance_floor
+        target_probability = (0.75 * floor + floor) / 2
+
+        def invert(knots, probability):
+            for (x0, y0), (x1, y1) in zip(knots, knots[1:]):
+                if y0 <= probability <= y1:
+                    if y1 == y0:
+                        return x1
+                    return x0 + (x1 - x0) * (probability - y0) / (y1 - y0)
+            return knots[-1][0]
+
+        raw = float(invert(list(chat_dense.knots), target_probability))
+        blended = raw * snapshot.passage_matrix[0].astype(np.float32)
+        blended[-1] = float(np.sqrt(max(0.0, 1.0 - raw * raw)))
         blended = blended / np.linalg.norm(blended)
 
         registry = EvidenceRegistry()

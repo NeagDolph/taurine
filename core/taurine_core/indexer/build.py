@@ -1733,6 +1733,9 @@ def relation_completer_for(llm: Any) -> Callable[[Sequence[CompletionNote]], obj
                                 ensure_ascii=False,
                             ),
                             timeout_s=config.SUMMARY_TIMEOUT_S,
+                            # deterministic completions keep fact identities
+                            # stable across rebuilds so adjudication cache hits
+                            temperature=0.0,
                         )
                     except Exception as exc:  # noqa: BLE001 — per-batch fail-open
                         _LOG.warning(

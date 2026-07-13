@@ -67,7 +67,10 @@ def test_clean_build_is_atomic_deterministic_and_order_independent(tmp_path: Pat
     )
     assert first.calibration_hash == artifact.hash
     assert first.release_ready is False
-    assert "uncalibrated_retrieval_head:live:dense" in first.release_blockers
+    # dense is self-calibrated (sample_count > 0) and must NOT be a blocker;
+    # heads without fitted curves still block release
+    assert "uncalibrated_retrieval_head:live:dense" not in first.release_blockers
+    assert "uncalibrated_retrieval_head:live:bm25" in first.release_blockers
     assert first.stages == (
         "source",
         "passages",

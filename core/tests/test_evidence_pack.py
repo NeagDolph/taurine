@@ -177,8 +177,37 @@ class FakeTripleRecognizer:
         return self.result
 
 
-def _calibrator(mode: str) -> tuple[HeadCalibrator, AbstentionPolicy]:
+def _pinned_artifact():
+    """Real artifact with FIXED floors/curves for floor-semantics tests.
+
+    The shipping artifact is data-fitted per corpus (self-calibration), so
+    tests that assert acceptance/abstention boundaries pin the values their
+    fixtures were designed around instead of tracking the fitted data.
+    """
     artifact = load_calibration(_ARTIFACT_PATH)
+    data = artifact.model_dump(mode="json")
+    for mode_name in ("live", "chat", "tool"):
+        mode_cfg = data["modes"][mode_name]
+        mode_cfg["heads"]["dense"] = {
+            **mode_cfg["heads"]["dense"],
+            "knots": [[-1.0, 0.0], [0.45, 0.05], [0.62, 0.55], [0.78, 0.95], [1.0, 1.0]],
+            "acceptance_floor": 0.7 if mode_name == "live" else 0.62,
+        }
+        mode_cfg["evidence_floor"] = 0.75 if mode_name == "live" else 0.65
+    data["rerank"]["live_floor"] = 0.76
+    data["rerank"]["chat_floor"] = 0.66
+    from taurine_core.evaluation.graph_retrieval import (
+        CalibrationArtifact,
+        compute_artifact_hash,
+    )
+
+    pinned = CalibrationArtifact.model_validate(data)
+    data["hash"] = compute_artifact_hash(pinned)
+    return CalibrationArtifact.model_validate(data)
+
+
+def _calibrator(mode: str) -> tuple[HeadCalibrator, AbstentionPolicy]:
+    artifact = _pinned_artifact()
     calibrator = HeadCalibrator(
         artifact,
         mode=mode,  # type: ignore[arg-type]
@@ -1204,13 +1233,13 @@ def _fallback_rows() -> tuple[PassageRow, ...]:
 
 
 def _fallback_engine(
-    tmp_path: Path, mode: str, *, fallback_on_abstain: bool, cosine: float = 0.56
+    tmp_path: Path, mode: str, *, fallback_on_abstain: bool, cosine: float = 0.60
 ) -> tuple[SharedRetrievalEngine, EvidenceRegistry]:
     rows = _fallback_rows()
     passage_ids = tuple(row.passage_id for row in rows)
     # Every passage shares the query direction with the requested cosine, so
-    # each calibrates below the acceptance floor but (for 0.56) above the
-    # 0.75 × floor fallback floor.
+    # under the PINNED chat curve each calibrates below the 0.62 acceptance
+    # floor but (for 0.60 -> ~0.49) above the 0.75 × floor fallback floor.
     matrix = np.zeros((len(rows), 8), dtype=np.float32)
     for index in range(len(rows)):
         matrix[index, 0] = cosine

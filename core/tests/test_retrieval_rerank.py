@@ -54,7 +54,8 @@ def _candidate(index: int, *, text: str | None = None) -> PassageRerankCandidate
 
 
 def test_passage_reranker_scores_exact_passages_and_applies_mode_floor() -> None:
-    artifact = load_calibration(_ARTIFACT)
+    # floor semantics use a pinned literal: the shipping artifact's rerank
+    # floors are data-fitted per corpus and no longer suit boundary fixtures
     scorer = FakeScorer((0.9, 0.4))
     candidates = (
         _candidate(0, text="The exact first source text."),
@@ -64,7 +65,7 @@ def test_passage_reranker_scores_exact_passages_and_applies_mode_floor() -> None
     result = LocalPassageReranker(
         scorer,
         mode="live",
-        acceptance_floor=artifact.rerank.live_floor,
+        acceptance_floor=0.76,
     ).rerank("What was decided?", candidates)
 
     assert [row.candidate.passage_id for row in result.accepted] == ["p00"]

@@ -31,9 +31,16 @@ def test_curve_interpolates_clamps_and_applies_acceptance_floor() -> None:
 
     assert calibrator.probability("dense", -9.0) == pytest.approx(0.0)
     assert calibrator.probability("dense", 9.0) == pytest.approx(1.0)
-    assert calibrator.probability("dense", 0.67) == pytest.approx(0.75)
-    assert calibrator.accepts("dense", 0.67)
-    assert not calibrator.accepts("dense", 0.58)
+    # curve values are data-fitted (self-calibration); assert curve SHAPE and
+    # floor semantics relative to the loaded artifact, not literal knots
+    knots = artifact.modes["chat"].heads["dense"].knots
+    mid = knots[len(knots) // 2]
+    assert calibrator.probability("dense", mid[0]) == pytest.approx(mid[1], abs=1e-6)
+    floor = artifact.modes["chat"].heads["dense"].acceptance_floor
+    accepted_raw = next(x for x, y in reversed(knots) if y >= min(0.999, floor + 1e-6))
+    rejected_raw = knots[0][0]
+    assert calibrator.accepts("dense", accepted_raw)
+    assert not calibrator.accepts("dense", rejected_raw)
     assert calibrator.rrf_k == 60
     assert calibrator.head_weights["dense"] == pytest.approx(1.0)
     assert calibrator.mmr_lambda == pytest.approx(0.2)
@@ -132,13 +139,16 @@ def test_post_abstention_requires_evidence_floor_and_allows_exact_override() -> 
     artifact = load_calibration(_ARTIFACT)
     policy = AbstentionPolicy(artifact, mode="live")
 
-    low = policy.post_rerank((_hit("exact", "e1", 1.0, 1, "entity"),), (0.70,))
+    floor = artifact.modes["live"].evidence_floor
+    low = policy.post_rerank(
+        (_hit("exact", "e1", 1.0, 1, "entity"),), (max(0.0, floor - 0.05),)
+    )
     assert not low.accepted
     assert low.reason == "no_evidence_above_floor"
 
     high_precision = policy.post_rerank(
         (_hit("exact", "e1", 1.0, 1, "entity"),),
-        (0.80,),
+        (min(1.0, floor + 0.05),),
     )
     assert high_precision.accepted
     assert high_precision.reason == "accepted_high_precision_head"
@@ -191,9 +201,11 @@ def test_pre_ppr_requires_strict_floor_when_a_head_is_unavailable() -> None:
     artifact = load_calibration(_ARTIFACT)
     policy = AbstentionPolicy(artifact, mode="chat")
 
-    # Chat dense floor is 0.62 → degraded strict floor is 0.682.
-    marginal = (_hit("dense", "p1", 0.65, 1),)
-    strong = (_hit("dense", "p1", 0.70, 1),)
+    # degraded strict floor is 1.1 × the (data-fitted) chat dense floor
+    floor = artifact.modes["chat"].heads["dense"].acceptance_floor
+    strict = min(1.0, floor * 1.1)
+    marginal = (_hit("dense", "p1", (floor + strict) / 2, 1),)
+    strong = (_hit("dense", "p1", min(1.0, strict + 0.02), 1),)
 
     healthy = policy.pre_ppr(marginal)
     degraded = policy.pre_ppr(marginal, unavailable_heads=("bm25",))
