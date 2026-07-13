@@ -138,8 +138,7 @@ CLUSTER_MIN_WEIGHT = 0.15                # combined weight below this: edge igno
 CLUSTER_RESOLUTION = 1.0                 # modularity resolution (higher → smaller clusters)
 CLUSTER_MAX_SIZE = 35                    # clusters larger than this are recursively re-clustered
 CLUSTER_MIN_SIZE = 3                     # clusters smaller than this merge into their best neighbor
-CLUSTER_LABEL_BATCH = 12                 # clusters per naming call
-# CLUSTER_LABEL_MODEL / IDEA_SEARCH_MODEL live below SUMMARY_MODEL.
+# IDEA_SEARCH_MODEL lives below SUMMARY_MODEL.
 
 # ── evidence-first passage/base graph ─────────────────────────────────
 PASSAGE_TARGET_TOKENS = 220
@@ -196,7 +195,6 @@ FUZZY_SNAP_LABELS = ("person", "organization", "project")  # spans eligible for 
 # ── summarizer (spec 2026-07-08: one pass, change-triggered) ───────────
 SUMMARY_MODEL = "deepseek/deepseek-v4-flash"
 SUMMARY_FALLBACK_MODEL = "deepseek/deepseek-chat"
-CLUSTER_LABEL_MODEL = SUMMARY_MODEL      # LLM cluster naming during sync (fallback names otherwise)
 IDEA_SEARCH_MODEL = SUMMARY_MODEL        # idea-lens per-note alignment adjudication
 CONTEXT_ENRICH_MODEL = SUMMARY_MODEL     # situating prefixes for episodic passages (empty on failure)
 CONTEXT_ENRICH_BATCH = 10                # passages per enrichment call, grouped by note

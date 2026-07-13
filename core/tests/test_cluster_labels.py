@@ -11,13 +11,11 @@ from pathlib import Path
 import numpy as np
 
 from tests.conftest import make_note
-from taurine_core import config
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies
 from taurine_core.indexer.cluster_labels import (
     ClusterSummary,
     build_cluster_summaries,
     fallback_label,
-    label_clusters,
 )
 from taurine_core.indexer.knowledge_store import KnowledgeStore
 from taurine_core.retrieval.snapshot import load_index_snapshot
@@ -124,84 +122,29 @@ def test_fallback_label_prefers_entities_then_source() -> None:
     assert fallback_label(unnamed)[0] == "Group Chats"
 
 
-def test_label_clusters_batches_parses_and_fails_open(monkeypatch) -> None:
-    monkeypatch.setattr(config, "CLUSTER_LABEL_BATCH", 2)
-    summaries = tuple(
-        ClusterSummary(
-            cluster_id=index,
-            size=3,
-            top_entities=(f"Entity {index}",),
-            note_lines=(f"Note {index}",),
-            source_mix="mostly obsidian",
-            dominant_source="obsidian",
-        )
-        for index in range(4)
-    )
-    calls: list[tuple[int, ...]] = []
-
-    def labeler(batch):
-        calls.append(tuple(summary.cluster_id for summary in batch))
-        if len(calls) == 2:
-            raise RuntimeError("provider down")
-        return {
-            "clusters": [
-                {"cluster_id": 0, "name": "ShopLC Reranker Work", "description": "Reranker."},
-                {"cluster_id": 1, "name": "  ", "description": "blank name is invalid"},
-                {"cluster_id": 99, "name": "Unknown", "description": "not in batch"},
-                "garbage-row",
-            ]
-        }
-
-    labels, errors = label_clusters(summaries, labeler)
-
-    assert calls == [(0, 1), (2, 3)]  # batch size honored
-    assert labels == {0: ("ShopLC Reranker Work", "Reranker.")}
-    assert errors == 1  # second batch failed open, first batch survived
-
-
 # ── build persistence + snapshot serving ───────────────────────────────
 
 
-def _build(tmp_path: Path, labeler=None):
+def _build(tmp_path: Path):
     database = tmp_path / "knowledge.db"
     report = BuildCoordinator(
         BuildDependencies(
             tokenizer=Tokenizer(),
             embedder=_grouped_embed,
             embedding_dim=16,
-            cluster_labeler=labeler,
         )
     ).build(_cluster_notes(), database, replace_derived=True)
     return database, report
 
 
-def test_build_persists_llm_labeled_clusters_and_membership(tmp_path: Path) -> None:
-    seen_payloads: list[tuple[int, ...]] = []
-
-    def labeler(batch):
-        seen_payloads.append(tuple(summary.cluster_id for summary in batch))
-        # payload carries only bounded metadata, never note bodies
-        for summary in batch:
-            assert all(len(line) <= 90 for line in summary.note_lines)
-        return {
-            "clusters": [
-                {
-                    "cluster_id": summary.cluster_id,
-                    "name": f"Named {summary.cluster_id}",
-                    "description": f"What unites cluster {summary.cluster_id}.",
-                }
-                for summary in batch
-            ]
-        }
-
-    database, report = _build(tmp_path, labeler)
+def test_build_persists_fallback_labeled_clusters_and_membership(
+    tmp_path: Path,
+) -> None:
+    database, report = _build(tmp_path)
 
     assert report.cluster_count == 2
-    assert report.cluster_labeled_count == 2
-    assert report.cluster_label_failed_batches == 0
     assert sum(report.cluster_size_histogram.values()) == 2
     assert "clusters" in report.stages
-    assert seen_payloads  # LLM lane actually ran
 
     store = KnowledgeStore(database, read_only=True)
     try:
@@ -212,39 +155,21 @@ def test_build_persists_llm_labeled_clusters_and_membership(tmp_path: Path) -> N
         store.close()
     assert [record.cluster_id for record in records] == [0, 1]
     assert records[0].size == 4  # size-ordered: billing (4) before travel (3)
-    assert records[0].name == "Named 0"
-    assert records[0].label_source == "llm"
+    assert all(record.name for record in records)
+    assert all(record.label_source == "fallback" for record in records)
     assert set(membership) == {note.note_id for note in _cluster_notes()}
     assert {membership[f"bill-{i}"] for i in range(4)} == {0}
     assert {membership[f"trip-{i}"] for i in range(3)} == {1}
 
     snapshot = load_index_snapshot(database)
     assert dict(snapshot.note_clusters) == membership
-    assert [row.name for row in snapshot.clusters] == ["Named 0", "Named 1"]
-
-
-def test_build_survives_labeler_failure_with_fallback_names(tmp_path: Path) -> None:
-    def labeler(batch):
-        raise RuntimeError("openrouter unavailable")
-
-    database, report = _build(tmp_path, labeler)
-
-    assert report.cluster_count == 2
-    assert report.cluster_labeled_count == 0
-    assert report.cluster_label_failed_batches == 1
-    store = KnowledgeStore(database, read_only=True)
-    try:
-        records = store.clusters(report.build_id)
-    finally:
-        store.close()
-    assert all(record.label_source == "fallback" for record in records)
-    assert all(record.name for record in records)
+    assert all(row.name for row in snapshot.clusters)
+    assert all(row.label_source == "fallback" for row in snapshot.clusters)
 
 
 def test_build_without_labeler_uses_fallback_names(tmp_path: Path) -> None:
-    database, report = _build(tmp_path, labeler=None)
+    database, report = _build(tmp_path)
     assert report.cluster_count == 2
-    assert report.cluster_labeled_count == 0
     snapshot = load_index_snapshot(database)
     assert all(row.label_source == "fallback" for row in snapshot.clusters)
 
@@ -254,7 +179,7 @@ def test_snapshot_falls_back_when_cluster_tables_missing(tmp_path: Path) -> None
     dropping them and assert the snapshot (and runtime boot) still serve the
     cluster contract via remapped label propagation."""
 
-    database, report = _build(tmp_path, labeler=None)
+    database, report = _build(tmp_path)
     with sqlite3.connect(database) as conn:
         conn.execute("DROP TABLE note_clusters")
         conn.execute("DROP TABLE clusters")
@@ -279,7 +204,7 @@ def test_runtime_boots_against_pre_cluster_database(tmp_path: Path, monkeypatch)
     from taurine_core.models_local import LocalModelUnavailable
     from taurine_core.retrieval.runtime import RetrievalRuntime
 
-    database, _report = _build(tmp_path, labeler=None)
+    database, _report = _build(tmp_path)
     with sqlite3.connect(database) as conn:
         conn.execute("DROP TABLE note_clusters")
         conn.execute("DROP TABLE clusters")
@@ -307,19 +232,7 @@ def test_graph_endpoint_serves_persisted_clusters(tmp_path: Path) -> None:
     from taurine_core.schemas import SyncReport
     from taurine_core.server import Runtime, create_app
 
-    def labeler(batch):
-        return {
-            "clusters": [
-                {
-                    "cluster_id": summary.cluster_id,
-                    "name": f"Named {summary.cluster_id}",
-                    "description": f"Cluster {summary.cluster_id} description.",
-                }
-                for summary in batch
-            ]
-        }
-
-    database, _report = _build(tmp_path, labeler)
+    database, _report = _build(tmp_path)
     snapshot = load_index_snapshot(database)
     runtime = Runtime(
         index=None,
@@ -334,8 +247,8 @@ def test_graph_endpoint_serves_persisted_clusters(tmp_path: Path) -> None:
         payload = client.get("/graph").json()
 
     clusters = {cluster["id"]: cluster for cluster in payload["clusters"]}
-    assert clusters[0]["name"] == "Named 0"
-    assert clusters[0]["description"] == "Cluster 0 description."
+    assert clusters[0]["name"] == snapshot.clusters[0].name
+    assert clusters[0]["description"] == snapshot.clusters[0].description
     assert clusters[0]["size"] == 4
     nodes = {node["note_id"]: node for node in payload["nodes"]}
     assert {nodes[f"bill-{index}"]["community"] for index in range(4)} == {0}

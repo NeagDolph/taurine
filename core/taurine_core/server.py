@@ -37,7 +37,6 @@ from taurine_core.indexer.build import (
     relation_completer_for,
     sweep_stale_build_files,
 )
-from taurine_core.indexer.cluster_labels import cluster_labeler_for
 from taurine_core.indexer.context_enrich import context_enricher_for
 from taurine_core.indexer.edge_adjudication import edge_adjudicator_for
 from taurine_core.profile_context import owner_aliases as profile_owner_aliases
@@ -894,7 +893,6 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
             embedder=build_cache.caching_embedder(config.EMBED_MODEL, embed_texts),
             extractor=build_cache.caching_extractor(extract_notes),
             relation_completer=complete_relations,
-            cluster_labeler=cluster_labeler_for(llm),
             context_enricher=context_enricher_for(llm),
             context_cache=build_cache,
             edge_adjudicator=edge_adjudicator_for(llm),

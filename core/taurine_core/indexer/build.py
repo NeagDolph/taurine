@@ -32,9 +32,7 @@ from taurine_core.indexer.base_graph import (
 from taurine_core.indexer.cluster_labels import (
     ClusterSummary,
     build_cluster_summaries,
-    cluster_labeler_for,
     fallback_label,
-    label_clusters,
 )
 from taurine_core.indexer.communities import ClusterRecord, cluster_projection
 from taurine_core.indexer.context_enrich import (
@@ -97,9 +95,6 @@ class BuildDependencies:
     now: Callable[[], float] = time.time
     extractor: Callable[..., dict[str, Any]] | None = None
     relation_completer: Callable[[Sequence[CompletionNote]], object] | None = None
-    # optional like the relation-completion lane: server syncs wire an LLM,
-    # CLI builds may not — absence means fallback cluster names, never failure
-    cluster_labeler: Callable[[Sequence[ClusterSummary]], object] | None = None
     # optional situating-prefix lane (contextual retrieval): absence or any
     # batch failure means empty contexts, never a failed build. context_cache
     # is a BuildCache in production so unchanged passages re-enrich for free.
@@ -155,8 +150,6 @@ class BuildReport:
     near_duplicate_note_pairs: tuple[tuple[str, str], ...] = ()
     cluster_count: int = 0
     cluster_size_histogram: dict[str, int] | None = None
-    cluster_labeled_count: int = 0
-    cluster_label_failed_batches: int = 0
     context_enriched_count: int = 0
     context_enrich_failed_batches: int = 0
     # grounded edge adjudication (audit contract, edge-quality items 1/5b/6):
@@ -1023,10 +1016,8 @@ class BuildCoordinator:
             )
             stage_done("ranks")
             announce("clusters")
-            # Membership is a pure function of the (already hashed) projection
-            # and names come from a non-deterministic LLM, so the cluster
-            # tables stay OUT of the graph hash — hashing them would break
-            # the L24 reproducibility verification. Graph-hash inputs are
+            # Membership and names are deterministic presentation metadata;
+            # cluster tables stay OUT of the graph hash. Graph-hash inputs are
             # unchanged by this stage.
             cluster_assignments = cluster_projection(projection)
             cluster_membership = {
@@ -1054,43 +1045,20 @@ class BuildCoordinator:
                 value_scores=value_scores,
                 note_entities=note_entity_labels,
             )
-            cluster_names: dict[int, tuple[str, str]] = {}
-            cluster_label_failures = 0
-            if self.dependencies.cluster_labeler is not None and cluster_summaries:
-                cluster_names, cluster_label_failures = label_clusters(
-                    cluster_summaries, self.dependencies.cluster_labeler
-                )
             cluster_records = []
             for summary in cluster_summaries:
-                named = cluster_names.get(summary.cluster_id)
-                if named is None:
-                    name, description = fallback_label(summary)
-                    label_source = "fallback"
-                else:
-                    name, description = named
-                    label_source = "llm"
+                name, description = fallback_label(summary)
                 cluster_records.append(
                     ClusterRecord(
                         cluster_id=summary.cluster_id,
                         size=summary.size,
                         name=name,
                         description=description,
-                        label_source=label_source,
+                        label_source="fallback",
                         top_entities=summary.top_entities,
                     )
                 )
             store.write_clusters(cluster_records, cluster_membership, build_id=build_id)
-            cluster_labeled = sum(
-                1 for record in cluster_records if record.label_source == "llm"
-            )
-            if cluster_records:
-                _LOG.info(
-                    "build %s: %d clusters (%d LLM-labeled, %d label batches failed)",
-                    build_id,
-                    len(cluster_records),
-                    cluster_labeled,
-                    cluster_label_failures,
-                )
             stage_done("clusters")
             announce("fact_embeddings")
             fact_embeddings = embed_facts(
@@ -1238,8 +1206,6 @@ class BuildCoordinator:
                 cluster_size_histogram=_cluster_size_histogram(
                     [record.size for record in cluster_records]
                 ),
-                cluster_labeled_count=cluster_labeled,
-                cluster_label_failed_batches=cluster_label_failures,
                 context_enriched_count=enrichment.enriched_count,
                 context_enrich_failed_batches=enrichment.failed_batches,
                 adjudicated_fact_count=fact_adjudication.adjudicated,
@@ -1343,7 +1309,6 @@ def main(
             if args.no_relation_completion or cli_llm is None
             else relation_completer_for(cli_llm)
         ),
-        cluster_labeler=None if cli_llm is None else cluster_labeler_for(cli_llm),
         context_enricher=None if cli_llm is None else context_enricher_for(cli_llm),
         edge_adjudicator=None if cli_llm is None else edge_adjudicator_for(cli_llm),
     )
