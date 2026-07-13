@@ -10,11 +10,60 @@ from taurine_core.indexer.relation_completion import (
 )
 
 
+def _note(
+    note_id: str,
+    *,
+    value: float,
+    entities: int,
+    relations: int,
+    schema_gap: bool = False,
+) -> CompletionNote:
+    return CompletionNote(
+        note_id=note_id,
+        value_score=value,
+        observed_at=0.0,
+        entities=tuple(
+            CompletionEntity(f"entity-{index}", f"Entity {index}", index, index + 1)
+            for index in range(entities)
+        ),
+        passages=(),
+        active_relation_count=relations,
+        schema_gap=schema_gap,
+    )
+
+
+def test_no_relation_gate_requires_median_value() -> None:
+    notes = [
+        _note(f"note-{i:02d}", value=1.0 - i * 0.1, entities=2, relations=0)
+        for i in range(10)
+    ]
+
+    selected = {note.note_id for note in select_completion_notes(notes)}
+
+    assert "note-09" not in selected
+    assert "note-08" not in selected
+    assert "note-03" in selected
+
+
+def test_schema_gap_ignores_value_threshold() -> None:
+    notes = [
+        _note(f"note-{i:02d}", value=1.0 - i * 0.1, entities=2, relations=0)
+        for i in range(10)
+    ]
+    notes.append(
+        _note("note-gap", value=0.0, entities=0, relations=5, schema_gap=True)
+    )
+
+    selected = {note.note_id for note in select_completion_notes(notes)}
+
+    assert "note-gap" in selected
+
+
 def test_completion_selector_includes_value_top_floor_sparse_and_schema_gap() -> None:
     notes = tuple(
         CompletionNote(
             note_id=f"n{i}",
-            value_score=float(10 - i),
+            value_score=5.5 if i == 9 else float(10 - i),
             observed_at=float(i),
             entities=(
                 (

@@ -107,8 +107,19 @@ def select_completion_notes(notes: Sequence[CompletionNote]) -> tuple[Completion
     ordered = sorted(notes, key=lambda row: (-row.value_score, row.note_id))
     value_count = min(len(ordered), max(5, math.ceil(len(ordered) * 0.15)))
     selected = {row.note_id: row for row in ordered[:value_count]}
+    # the no-relation arm self-scales: barren bottom-half chatter (≥2 entities,
+    # 0 facts) stays out of the LLM call instead of being re-asked every build
+    values = sorted(row.value_score for row in ordered)
+    pct = min(1.0, max(0.0, float(config.COMPLETION_NO_RELATION_MIN_PERCENTILE)))
+    threshold = values[
+        min(len(values) - 1, int(math.floor(pct * (len(values) - 1))))
+    ]
     for note in ordered:
-        if (len(note.entities) >= 2 and note.active_relation_count == 0) or note.schema_gap:
+        if note.schema_gap or (
+            len(note.entities) >= 2
+            and note.active_relation_count == 0
+            and note.value_score >= threshold
+        ):
             selected[note.note_id] = note
     # tool-hop lane: strongest unselected tool/anchor notes join, capped, so
     # "which projects use X" facts get a chance without unbounding the call
