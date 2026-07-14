@@ -45,16 +45,8 @@ def extract_notes(
     results: dict[str, Extraction] = {}
     for note in notes:
         try:
-            text = _bounded_text(note.text, tokenizer)
-            entities, relations = model.predict_relations(
-                text,
-                labels=list(config.INGEST_ENTITY_TYPES),
-                relations=list(PREDICATES),
-                flat_ner=True,
-                threshold=float(config.RELEX_ENTITY_THRESHOLD),
-                adjacency_threshold=float(config.RELEX_ADJACENCY_THRESHOLD),
-                relation_threshold=float(config.RELEX_RELATION_THRESHOLD),
-                multi_label=False,
+            text, entities, relations = _predict_with_oom_fallback(
+                model, note.text, tokenizer
             )
             results[note.note_id] = _normalize_result(text, entities, relations)
         except Exception as exc:  # one bad note/model response never fails the build
@@ -62,6 +54,8 @@ def extract_notes(
             results[note.note_id] = Extraction(
                 failed=True, error="relex inference failed"
             )
+        finally:
+            _release_device_cache()
         if progress is not None:
             progress(len(results), len(notes))
     return {note.note_id: results[note.note_id] for note in notes}
@@ -89,8 +83,74 @@ def _load_model() -> Any:
     return _to_inference_device(model)
 
 
-def _bounded_text(text: str, tokenizer: Any) -> str:
-    maximum = max(1, int(config.RELEX_MAX_TOKENS))
+def _release_device_cache() -> None:
+    """Bound per-note MPS intermediates while retaining the cached model."""
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
+def _predict_with_oom_fallback(
+    model: Any,
+    note_text: str,
+    tokenizer: Any,
+) -> tuple[str, object, object]:
+    limits = [max(1, int(config.RELEX_MAX_TOKENS))]
+    while limits[-1] // 2 >= 512:
+        limits.append(limits[-1] // 2)
+    for index, limit in enumerate(limits):
+        text = _bounded_text(note_text, tokenizer, maximum=limit)
+        try:
+            entities, relations = _predict(model, text)
+            return text, entities, relations
+        except Exception as exc:
+            is_mps_oom = "mps backend out of memory" in str(exc).casefold()
+            if not is_mps_oom:
+                raise
+            if index + 1 == len(limits):
+                _LOG.warning(
+                    "Relex MPS OOM after bounded retries; moving model to CPU"
+                )
+                model.to("cpu")
+                _release_device_cache()
+                text = _bounded_text(
+                    note_text,
+                    tokenizer,
+                    maximum=int(config.RELEX_MAX_TOKENS),
+                )
+                entities, relations = _predict(model, text)
+                return text, entities, relations
+            _LOG.warning(
+                "Relex MPS OOM at %d tokens; retrying at %d",
+                limit,
+                limits[index + 1],
+            )
+            _release_device_cache()
+    raise RuntimeError("unreachable Relex context fallback")
+
+
+def _predict(model: Any, text: str) -> tuple[object, object]:
+    return model.predict_relations(
+        text,
+        labels=list(config.INGEST_ENTITY_TYPES),
+        relations=list(PREDICATES),
+        flat_ner=True,
+        threshold=float(config.RELEX_ENTITY_THRESHOLD),
+        adjacency_threshold=float(config.RELEX_ADJACENCY_THRESHOLD),
+        relation_threshold=float(config.RELEX_RELATION_THRESHOLD),
+        multi_label=False,
+    )
+
+
+def _bounded_text(text: str, tokenizer: Any, *, maximum: int | None = None) -> str:
+    maximum = max(
+        1,
+        int(config.RELEX_MAX_TOKENS) if maximum is None else int(maximum),
+    )
     if tokenizer is not None:
         encoded = tokenizer(
             text,

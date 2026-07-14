@@ -224,6 +224,79 @@ def test_relex_respects_max_token_window(monkeypatch: pytest.MonkeyPatch) -> Non
     assert model.calls[0]["text"] == "zero one"
 
 
+def test_relex_releases_device_cache_after_each_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = FakeRelexModel({})
+    _install_model(monkeypatch, model)
+    releases: list[None] = []
+    monkeypatch.setattr(
+        extract_relex,
+        "_release_device_cache",
+        lambda: releases.append(None),
+    )
+
+    extract_relex.extract_notes(
+        [make_note("n1", "One", "one"), make_note("n2", "Two", "two")]
+    )
+
+    assert len(releases) == 2
+
+
+def test_relex_retries_mps_oom_with_a_smaller_context_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OOMModel(FakeRelexModel):
+        def predict_relations(self, text: str, **kwargs):
+            self.calls.append({"text": text, **kwargs})
+            if len(text.split()) > 1024:
+                raise RuntimeError("MPS backend out of memory")
+            return [], []
+
+    model = OOMModel({})
+    _install_model(monkeypatch, model)
+    text = " ".join(f"word-{index}" for index in range(1200))
+
+    result = extract_relex.extract_notes(
+        [make_note("n1", "Long", text)], tokenizer=OffsetTokenizer()
+    )["n1"]
+
+    assert result.failed is False
+    assert [len(call["text"].split()) for call in model.calls] == [1200, 1024]
+
+
+def test_relex_falls_back_to_cpu_after_mps_retries_are_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DeviceModel(FakeRelexModel):
+        def __init__(self):
+            super().__init__({})
+            self.device = "mps"
+
+        def to(self, device: str):
+            self.device = device
+            return self
+
+        def predict_relations(self, text: str, **kwargs):
+            self.calls.append({"text": text, "device": self.device, **kwargs})
+            if self.device == "mps":
+                raise RuntimeError("MPS backend out of memory")
+            return [], []
+
+    model = DeviceModel()
+    _install_model(monkeypatch, model)
+    monkeypatch.setattr(config, "RELEX_MAX_TOKENS", 512)
+
+    result = extract_relex.extract_notes(
+        [make_note("n1", "Fallback", " ".join(["word"] * 600))],
+        tokenizer=OffsetTokenizer(),
+    )["n1"]
+
+    assert result.failed is False
+    assert [call["device"] for call in model.calls] == ["mps", "cpu"]
+    assert [len(call["text"].split()) for call in model.calls] == [512, 512]
+
+
 def test_relex_model_load_failure_fails_open_for_every_note(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
