@@ -256,6 +256,9 @@ def _record_for_chat(
             speaker = _resolve_handle(message.handle_id, contacts) or "them"
         lines_desc.append(f"[{speaker}] {message.text}")
 
+    # Intentionally no character cap: CONNECTOR_DOC_MAX_CHARS belongs to file
+    # connectors (and email applies its own transcript policy). iMessage is
+    # bounded only by its per-chat time window and runaway-safety message cap.
     transcript = "\n".join(reversed(lines_desc))
     content_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
     participant_names = [

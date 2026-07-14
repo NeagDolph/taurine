@@ -88,11 +88,14 @@ REENRICH_CONCURRENCY = 4
 # ── notes sync / connectors ────────────────────────────────────────────
 SYNC_INTERVAL_S = 300.0
 CONNECTOR_DOC_MAX_CHARS = 12000          # per-document body cap at extraction
-# each conversation contributes the smaller of its last IMESSAGE_WINDOW_DAYS
-# of messages or its last IMESSAGE_MAX_MESSAGES; conversations whose most
-# recent message predates the window are skipped entirely
-IMESSAGE_WINDOW_DAYS = 183               # ~6 months
-IMESSAGE_MAX_MESSAGES = 150              # most-recent-N cap per conversation
+# Each conversation contributes the smaller of its last IMESSAGE_WINDOW_DAYS
+# of messages or its last IMESSAGE_MAX_MESSAGES. A year of context keeps quiet
+# conversations useful; chats whose newest message predates it still drop
+# entirely.
+IMESSAGE_WINDOW_DAYS = 365
+# A year of an active group chat. Neil's call 2026-07-14: if a year of one chat
+# is huge, that chat is important. This is runaway safety, not curation.
+IMESSAGE_MAX_MESSAGES = 2000
 CLAUDE_MEMORY_GLOB = "~/.claude/projects/*/memory/*.md"
 CODEX_MEMORY_GLOBS = ("~/.codex/AGENTS.md", "~/.codex/memory/**/*.md", "~/.codex/memories/**/*.md")
 OBSIDIAN_APP_JSON = "~/Library/Application Support/obsidian/obsidian.json"

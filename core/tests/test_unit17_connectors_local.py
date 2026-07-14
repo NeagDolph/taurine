@@ -197,6 +197,48 @@ def test_imessage_extracts_bounded_chat_transcripts_with_attribution_and_hashes(
     assert first[0].content_hash == second[0].content_hash
 
 
+def test_imessage_defaults_keep_a_year_with_a_runaway_only_message_cap() -> None:
+    assert config.IMESSAGE_WINDOW_DAYS == 365
+    assert config.IMESSAGE_MAX_MESSAGES == 2000
+
+
+def test_imessage_keeps_messages_older_than_six_months_within_the_year(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    db_path = home / "Library" / "Messages" / "chat.db"
+    _create_imessage_db(db_path)
+    now = datetime.now(tz=UTC)
+    _insert_handle(db_path, 1, "+15550000000")
+    _insert_chat(db_path, 1, "year-window-guid", "Year Window")
+    _insert_message(
+        db_path,
+        1,
+        1,
+        1,
+        "eight months ago",
+        now - timedelta(days=240),
+        from_me=False,
+    )
+    _insert_message(
+        db_path,
+        1,
+        2,
+        1,
+        "recent",
+        now - timedelta(days=1),
+        from_me=True,
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    record = IMessageConnector().extract({"require_contact": False})[0]
+
+    assert record.text.splitlines() == [
+        "[them] eight months ago",
+        "[me] recent",
+    ]
+
+
 def test_imessage_caps_at_max_messages_keeping_the_newest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
