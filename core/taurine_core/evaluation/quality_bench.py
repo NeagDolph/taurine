@@ -237,7 +237,7 @@ def _run_extraction(args: argparse.Namespace) -> int:
             value.strip() for value in args.backends.split(",") if value.strip()
         )
     )
-    invalid = set(backends) - {"gliner2", "relex", "hybrid"}
+    invalid = set(backends) - {"gliner2", "relex", "hybrid", "union"}
     if not backends or invalid:
         raise ValueError(f"unsupported extraction backends: {sorted(invalid)}")
 
