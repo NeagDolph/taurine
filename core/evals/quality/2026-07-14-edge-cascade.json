@@ -1,0 +1,545 @@
+{
+  "cost": {
+    "flash_batch_calls": 28,
+    "flash_judged_pairs": 557,
+    "reranker_direction_calls": 1114,
+    "runtime_changes": 0
+  },
+  "metrics": {
+    "best_configuration": "gpt_oss_base",
+    "cascade": {
+      "against_other_model_labels": {
+        "auto_drop_count": 2,
+        "auto_drop_precision": 0.5,
+        "auto_keep_count": 555,
+        "auto_keep_precision": 0.745946,
+        "auto_resolved_count": 557,
+        "auto_resolved_rate": 1.0,
+        "cascade_agreement": 0.745063,
+        "examples": 557,
+        "hi": 0.09,
+        "llm_calls_eliminated_rate": 1.0,
+        "lo": 0.08,
+        "middle_band_size": 0,
+        "overall_false_drop_rate": 0.00241
+      },
+      "against_selected_labels": {
+        "auto_drop_count": 2,
+        "auto_drop_precision": 1.0,
+        "auto_keep_count": 555,
+        "auto_keep_precision": 0.854054,
+        "auto_resolved_count": 557,
+        "auto_resolved_rate": 1.0,
+        "cascade_agreement": 0.854578,
+        "examples": 557,
+        "hi": 0.09,
+        "llm_calls_eliminated_rate": 1.0,
+        "lo": 0.08,
+        "middle_band_size": 0,
+        "overall_false_drop_rate": 0.0
+      },
+      "constraints": {
+        "auto_drop_precision_min": 0.95,
+        "overall_false_drop_rate_max": 0.05,
+        "requires_nonempty_auto_keep_and_auto_drop": true
+      },
+      "heldout": {
+        "auto_drop_count": 1,
+        "auto_drop_precision": 1.0,
+        "auto_keep_count": 118,
+        "auto_keep_precision": 0.79661,
+        "auto_resolved_count": 119,
+        "auto_resolved_rate": 1.0,
+        "cascade_agreement": 0.798319,
+        "examples": 119,
+        "hi": 0.09,
+        "llm_calls_eliminated_rate": 1.0,
+        "lo": 0.08,
+        "middle_band_size": 0,
+        "overall_false_drop_rate": 0.0
+      },
+      "robustness_label_set": "flash",
+      "selection_scope": "all_reconstructed_pairs",
+      "train": {
+        "auto_drop_count": 1,
+        "auto_drop_precision": 1.0,
+        "auto_keep_count": 437,
+        "auto_keep_precision": 0.869565,
+        "auto_resolved_count": 438,
+        "auto_resolved_rate": 1.0,
+        "cascade_agreement": 0.869863,
+        "examples": 438,
+        "hi": 0.09,
+        "llm_calls_eliminated_rate": 1.0,
+        "lo": 0.08,
+        "middle_band_size": 0,
+        "overall_false_drop_rate": 0.0
+      }
+    },
+    "coverage": {
+      "cached_semantic_rows": 557,
+      "experiment_examples": 557,
+      "gpt_reasons": 557,
+      "knowledge_passages": 2091,
+      "matched_cache_keys": 557
+    },
+    "disagreement_sample": [
+      {
+        "flash": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "gpt_oss": {
+          "reason": "Both describe WhisperLive transcription service code changes",
+          "verdict": "keep"
+        },
+        "key": "005bfaadfb70bac2294efa59d93eadfb33aa317fe9af2f2297e83f21d7659cd4",
+        "pair": [
+          "passage-2ba8637c45d40985204c368000ea4fec",
+          "passage-fd1461c63a5c08c3e90042014df9fbb1"
+        ],
+        "passage_a": {
+          "text": "` bucket `{session_id}/{channel}.opus`\n\u2192 delete WAV. No DB migration (located by naming convention). Verified e2e ~92% word match\nvs the large-v3 reference.\n\n**Code (all committed/PR'd):**\n- transcription-service `main`: `whisperlive/wink_recorder.py`, `wink_batch.py`,\n  `whisperlive_patch_recorder.",
+          "title": "call-recording-feature"
+        },
+        "passage_b": {
+          "text": "7b9fc1` (parent of first WhisperLive commit `6f848b2`). Per-file restore was clean because no non-transcription commit touched any transcription file in either window.\n\n**How to apply:**\n- **Lockstep deploy is mandatory**: old client 404s on the removed `/transcription/token` + `/transcription/deepg",
+          "title": "transcription-revert-deepgram-proxy"
+        }
+      },
+      {
+        "flash": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "gpt_oss": {
+          "reason": "Both are parts of the same Klaviyo job offer document.",
+          "verdict": "keep"
+        },
+        "key": "01694140e2b0142ffac0c403f41c315a82ba8572c6effcd3b109487678909d5b",
+        "pair": [
+          "passage-749685b4e3426777e436179049f08501",
+          "passage-eefcd0d6b4619e87fbc9361f9af2d4dc"
+        ],
+        "passage_a": {
+          "text": "4, 2025. If you have any questions about this offer, please contact your recruiter. \nWe can\u2019t wait for you to become a Klaviyo!  \nSincerely,  \n \nCarmel Galvin CPO \n \nI have read, understood, and accept this conditional job offer: \n \nName:  \tNeil Agrawal \n \n \nSignature:  \t{{CANDIDATE_SIGNATURE}} \t \n ",
+          "title": "klaviyo_offer"
+        },
+        "passage_b": {
+          "text": ", 2025. If you have any \nquestions about this offer, please contact your recruiter. \nWe can\u2019t wait for you to become a Klaviyo!  \nSincerely,  \n \nCarmel Galvin \nCPO \n \nI have read, understood, and accept this conditional job offer: \n \nName:  Neil Agrawal \n \n \nSignature:  {{CANDIDATE_SIGNATURE}}  \n \n ",
+          "title": "klaviyo_offer"
+        }
+      },
+      {
+        "flash": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "gpt_oss": {
+          "reason": "Both entries are identical duplicate expense logs.",
+          "verdict": "keep"
+        },
+        "key": "076f258f008289b689a13ae8a091ff1b823bdd557b20f88e961fdc3137f2cab1",
+        "pair": [
+          "passage-5594b91468ecf99ba4fb6529c668700f",
+          "passage-a038ad3c5ea0760ebd05e05d1dbe6577"
+        ],
+        "passage_a": {
+          "text": "2/17 Uber eats papa John's: $36\n2/14 Instacart Costco: $58\n1/4 Uber eats star market: $11.23\n2/11 Uber Eats papa John's: $40\n2/2 Uber Eats Love Art Sushi: $20.51\n2/29 DoorDash Chick-fil-a: $22.65\n3/3 DoorDash Taco Bell: $24.06\n3/1 DoorDash Taco Bell: $27.18\n1/15 Uber Eats Dunkin': $28.53\n1/20 Uber E",
+          "title": "2/17 Uber eats papa John's: $36"
+        },
+        "passage_b": {
+          "text": "2/17 Uber eats papa John's: $36\n2/14 Instacart Costco: $58\n1/4 Uber eats star market: $11.23\n2/11 Uber Eats papa John's: $40\n2/2 Uber Eats Love Art Sushi: $20.51\n2/29 DoorDash Chick-fil-a: $22.65\n3/3 DoorDash Taco Bell: $24.06\n3/1 DoorDash Taco Bell: $27.18\n1/15 Uber Eats Dunkin': $28.53\n1/20 Uber E",
+          "title": "2/17 Uber eats papa John's: $36"
+        }
+      },
+      {
+        "flash": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "gpt_oss": {
+          "reason": "Both excerpts are from the same Presentation Storyboard note.",
+          "verdict": "keep"
+        },
+        "key": "08ab1f05111fafd0391f0b6b2f57aa6fa8e11473fda7122c9d6a640bf51f7e43",
+        "pair": [
+          "passage-10de65ba6292059cf9f29bfcbdce7a39",
+          "passage-45ceb7ee6dff75e255f7a6a6d580d303"
+        ],
+        "passage_a": {
+          "text": " The impact you had\n\t- What you learned  \n- Share projects & key takeaways with your peers, managers, and leadership\n- Celebrate your accomplishments from this fall!\n    \n  \n\n## Topics\n\n### Introduction (1 Slide)\n- ? could just say my name and team, could use some notes on what exactly to say here\n\n",
+          "title": "Presentation Storyboard"
+        },
+        "passage_b": {
+          "text": "\nI am Neil Agrawal, a security engineering co-op for Klaviyo (On the Secure Product Operations team) and I'm creating a final presentation going over my projects, successes, learning moments, and other topics. I have been writing a storyboard for the presentation but I want you to look at the contex",
+          "title": "Presentation Storyboard"
+        }
+      },
+      {
+        "flash": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "gpt_oss": {
+          "reason": "Duplicate of same Casey Meeting notes, identical content.",
+          "verdict": "keep"
+        },
+        "key": "08b7bf2ad6e38fa57769b52c8d78e98039a6fd86189049f15a3a27d407a638d6",
+        "pair": [
+          "passage-00d0b8d505618978271a0cbce2a31f41",
+          "passage-9dfc65a66b1c663452e477073f0352d0"
+        ],
+        "passage_a": {
+          "text": "* I want to develop skills to develop time expectation to let people know in advance if the date to get to something is way beyond what they expect.\n* A big thing about employees is that they're constantly learning. People that are willing to chase newness and uncertainty are \n* When finding employe",
+          "title": "Casey Meeting - Sep 11"
+        },
+        "passage_b": {
+          "text": "* I want to develop skills to develop time expectation to let people know in advance if the date to get to something is way beyond what they expect.\n* A big thing about employees is that they're constantly learning. People that are willing to chase newness and uncertainty are \n* When finding employe",
+          "title": "Casey Meeting - Sep 11"
+        }
+      },
+      {
+        "flash": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "gpt_oss": {
+          "reason": "Identical presentation storyboard for Neil Agrawal.",
+          "verdict": "keep"
+        },
+        "key": "0a4994e78622f7b505dd1a895738bf68044dc52fb5999307f319c2ddd8e0ee56",
+        "pair": [
+          "passage-45ceb7ee6dff75e255f7a6a6d580d303",
+          "passage-a92d9d152fd921622319ae79c4b3b958"
+        ],
+        "passage_a": {
+          "text": "\nI am Neil Agrawal, a security engineering co-op for Klaviyo (On the Secure Product Operations team) and I'm creating a final presentation going over my projects, successes, learning moments, and other topics. I have been writing a storyboard for the presentation but I want you to look at the contex",
+          "title": "Presentation Storyboard"
+        },
+        "passage_b": {
+          "text": "\nI am Neil Agrawal, a security engineering co-op for Klaviyo (On the Secure Product Operations team) and I'm creating a final presentation going over my projects, successes, learning moments, and other topics. I have been writing a storyboard for the presentation but I want you to look at the contex",
+          "title": "Presentation Storyboard"
+        }
+      },
+      {
+        "flash": {
+          "reason": "Both are from the same presentation storyboard document.",
+          "verdict": "keep"
+        },
+        "gpt_oss": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "key": "01a0fdc1790b93f6086d7b7c8f014ec6ed4cd445671166d6694722128a0e2b0e",
+        "pair": [
+          "passage-18dd4d4bfe68e46942b937f77540227d",
+          "passage-56f39fb18421dd67f398a2ba419483a1"
+        ],
+        "passage_a": {
+          "text": "ides)\nWhat challenges or roadblocks did you experience? How did you overcome these and what learning came from these moments?\n- Login Event Database migration fiasco\n- Database overload Incident due to feature flag\n    \n\n### Team & Culture (1 Slide)\nThe majority of the presentation will focus on you",
+          "title": "Presentation Storyboard"
+        },
+        "passage_b": {
+          "text": " and future career goals?\n  \n\n### How has AI impacted your co-op? (1 slide)\nIn 1 slide, please share your AI goal and some of your findings with any of the prompts below\n\n- What new AI concepts or tools did you learn during your co-op, and how did you leverage them? \n- Did AI help you overcome a spe",
+          "title": "Presentation Storyboard"
+        }
+      },
+      {
+        "flash": {
+          "reason": "Both discuss contract violation examples in LSL lecture.",
+          "verdict": "keep"
+        },
+        "gpt_oss": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "key": "09bcf45f9b8cf755c50dd1917c27f6cacf02225331d6b28cfa5fd1b36e7c5d52",
+        "pair": [
+          "passage-5372e8b517935525387ac01fc3196b7d",
+          "passage-be1e9a842734c9c735552aef59f93d5b"
+        ],
+        "passage_a": {
+          "text": " blame looks when the function, individually, is violating its own contract. It says that the function f\nhad a contract violation, and that the contract expected an Integer but received the value #f. Contracts are ways of\nclassifying sets of values (like all Integers), and each time a value is check",
+          "title": "Lecture 5_ Using LSL II"
+        },
+        "passage_b": {
+          "text": " in highlighting the contract that was violated (this doesn\u2019t happen with test suites, since a single test suitemay result in many errors, so highlighting would be confusing).\nThat\u2019s a really simple case.\nBut sometimes the situation is a bit more complex. For example, consider this (quite artificial",
+          "title": "combined_lectures"
+        }
+      },
+      {
+        "flash": {
+          "reason": "Both are resumes but for different people.",
+          "verdict": "keep"
+        },
+        "gpt_oss": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "key": "154d7fed8dcb6f1a1917c9185c86e2abeb96725406b7d7cb8abbe0bec216e75c",
+        "pair": [
+          "passage-d1d03a193609648fc0b578258e511ac3",
+          "passage-e83c9fbd146a3ce1b464fb89e7e0c974"
+        ],
+        "passage_a": {
+          "text": " Spearheaded the transition of email systems to a new provider, achieving better delivery rates and customer \nengagement. \n\u2022 Reconstructed multiple pages on the company website to enhance user experience and conversion rates. \n\u2022 Cultivated technical and teamwork skills in collaboration with remote d",
+          "title": "neil_agrawal_resume"
+        },
+        "passage_b": {
+          "text": "\tRecreated Doodle Jump in 3D to explore WebRTC and mobile gyroscope technology.\n\t\u2022\tRefined expertise in WebRTC, mobile web development, THREE.js, and Svelte.\nGamifier | GPT-4, FFmpeg, Coqui-TTS, Docker | Github Repo\tApril 2023\n\t\u2022\tVentured into the potential of LLMs by creating Gamifier, a GPT-4 powe",
+          "title": "CS1210 Resume"
+        }
+      },
+      {
+        "flash": {
+          "reason": "Both are resumes of Neil Agrawal.",
+          "verdict": "keep"
+        },
+        "gpt_oss": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "key": "15a18704c171b08dcf532474440ad3a900e02fb1dcf0b459e978678894e7ccf6",
+        "pair": [
+          "passage-2492f1d65f1fe30476f3524025dc08c3",
+          "passage-f8abb6a60e7c5df26dbb8077edaeee3a"
+        ],
+        "passage_a": {
+          "text": " \u2013 Austin, TX Aug 2017 \u2013 Jun 2021 \nGPA: 4.0/4.0 \nComputer Knowledge \nLanguages: Proficient in JavaScript, TypeScript, HTML, CSS, Python, Java; Familiar with Kotlin, SQL, C \nFrameworks: ReactJS, NodeJS, React Native, Svelte, Express.js, Vue.js \nCloud & DevOps: GCP , AWS, Docker, CI/CD pipelines, \nSki",
+          "title": "neil_agrawal_resume_1_18_24"
+        },
+        "passage_b": {
+          "text": " August 2023 \nWeb Development Intern \n\u25cf Enhanced user experience and functionality within Salesforce storefront through Agile Scrum methodology. \n\u25cf Revamped the Rising Auctions page to elevate user engagement. \n\u25cf Identified and fixed software bugs to improve system reliability. \nShopLC, D\u00fcsseldorf, ",
+          "title": "neil_agrawal_resume_old"
+        }
+      },
+      {
+        "flash": {
+          "reason": "Both discuss opponents' arguments against psychedelics.",
+          "verdict": "keep"
+        },
+        "gpt_oss": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "key": "2fb3c91d8b2085fd9b65280eafb536724b73ad3c0e2b8a6651228e1eb5255006",
+        "pair": [
+          "passage-083015f4a7dbf699f6f352c50baa3c5e",
+          "passage-2e4e4142bdca15406f39417d5fdd531d"
+        ],
+        "passage_a": {
+          "text": " I know there \nare countless stories of people suffering from PTSD or who are dying of cancer whose \nlives have been positively impacted by psychedelics. Add to your pathos argument \nhere.  \n \nRefutation \n- What is your opponent likely to argue \n- Opponents may argue that psychedelics are dangerous,",
+          "title": "NAgrawal_STCA_DCcomments"
+        },
+        "passage_b": {
+          "text": " from the time when that idea originated?) Some opponents may rely on past stigmatization and classification of psychedelics as Schedule I drugs, implying a high potential for abuse and no accepted medical use. Others might point to isolated cases of individuals experiencing adverse effects or \"bad ",
+          "title": "NAgrawal_STCA_DCcomments"
+        }
+      },
+      {
+        "flash": {
+          "reason": "Both explain the rationale for writing a new calculus textbook.",
+          "verdict": "keep"
+        },
+        "gpt_oss": {
+          "reason": "NONE",
+          "verdict": "drop"
+        },
+        "key": "30877f77ca490f71548876ada8869ae09bdb300b8fd2a496d7127ece46e250ee",
+        "pair": [
+          "passage-06badcb2c2302ac5f2689368fcaea125",
+          "passage-80941789cee7a795964c33bb35038383"
+        ],
+        "passage_a": {
+          "text": " of integration. But why publish a new textbook for this purpose\nwhen so many already exist? There are several reasons why we believe that our textbook is a\nvast improvement over those already in existence.\n\u2022 Even if this textbook is used as a classic printed text, we believe that the exposition, ex",
+          "title": "Worldwide Integral Calculus"
+        },
+        "passage_b": {
+          "text": "us textbook. We have tried to\nwrite the text as we would speak the material in class; though, of course, the book contains far\nmore details than we would normally present in class. In the book, we emphasize intuitive ideas\nin conjunction with rigorous statements of theorems, and provide a large numb",
+          "title": "Worldwide Differential Calculus"
+        }
+      }
+    ],
+    "flash_judge": {
+      "batch_size": 20,
+      "batches": 28,
+      "cache_path": "evals/quality/2026-07-14-flash-edge-verdicts.json",
+      "failed_batches": 1,
+      "model": "deepseek/deepseek-v4-flash"
+    },
+    "flash_vs_gpt_oss": {
+      "agreement": 0.739677,
+      "both_drop": 40,
+      "both_keep": 372,
+      "cohens_kappa": 0.206264,
+      "examples": 557,
+      "gpt_oss_drop_flash_keep": 43,
+      "gpt_oss_keep_flash_drop": 102
+    },
+    "refits": {
+      "flash_base": {
+        "decision_threshold": 0.26,
+        "features": [
+          "cosine",
+          "shared_entity_count",
+          "min_shared_entity_idf",
+          "same_source",
+          "title_jaccard",
+          "length_ratio"
+        ],
+        "heldout": {
+          "drop_agreement": 0.739496,
+          "examples": 119,
+          "false_drop_rate": 0.012195,
+          "llm_drops": 37,
+          "llm_keeps": 82,
+          "predicted_drops": 8
+        },
+        "intercept": -4.354620751209,
+        "train": {
+          "drop_agreement": 0.792237,
+          "examples": 438,
+          "false_drop_rate": 0.048048,
+          "llm_drops": 105,
+          "llm_keeps": 333,
+          "predicted_drops": 46
+        },
+        "weights": {
+          "cosine": -1.315827646559,
+          "length_ratio": 0.460610969607,
+          "min_shared_entity_idf": 0.06389964826,
+          "same_source": 5.96529047464,
+          "shared_entity_count": -0.084270660975,
+          "title_jaccard": -1.571683980463
+        }
+      },
+      "flash_base_reranker": {
+        "decision_threshold": 0.25,
+        "features": [
+          "cosine",
+          "shared_entity_count",
+          "min_shared_entity_idf",
+          "same_source",
+          "title_jaccard",
+          "length_ratio",
+          "rerank_src_to_dst",
+          "rerank_dst_to_src"
+        ],
+        "heldout": {
+          "drop_agreement": 0.747899,
+          "examples": 119,
+          "false_drop_rate": 0.012195,
+          "llm_drops": 37,
+          "llm_keeps": 82,
+          "predicted_drops": 9
+        },
+        "intercept": -4.328204960794,
+        "train": {
+          "drop_agreement": 0.792237,
+          "examples": 438,
+          "false_drop_rate": 0.045045,
+          "llm_drops": 105,
+          "llm_keeps": 333,
+          "predicted_drops": 44
+        },
+        "weights": {
+          "cosine": -1.152250627178,
+          "length_ratio": 0.31752686483,
+          "min_shared_entity_idf": 0.030472004716,
+          "rerank_dst_to_src": 0.916537643369,
+          "rerank_src_to_dst": -0.40592383825,
+          "same_source": 5.619887683248,
+          "shared_entity_count": -0.087964685936,
+          "title_jaccard": -1.613609453038
+        }
+      },
+      "gpt_oss_base": {
+        "decision_threshold": 0.16,
+        "features": [
+          "cosine",
+          "shared_entity_count",
+          "min_shared_entity_idf",
+          "same_source",
+          "title_jaccard",
+          "length_ratio"
+        ],
+        "heldout": {
+          "drop_agreement": 0.806723,
+          "examples": 119,
+          "false_drop_rate": 0.031915,
+          "llm_drops": 25,
+          "llm_keeps": 94,
+          "predicted_drops": 8
+        },
+        "intercept": -17.80822951084,
+        "train": {
+          "drop_agreement": 0.869863,
+          "examples": 438,
+          "false_drop_rate": 0.002632,
+          "llm_drops": 58,
+          "llm_keeps": 380,
+          "predicted_drops": 3
+        },
+        "weights": {
+          "cosine": 13.689557337711,
+          "length_ratio": 1.821353473569,
+          "min_shared_entity_idf": 0.099872333155,
+          "same_source": 5.1862635243,
+          "shared_entity_count": -0.076275852288,
+          "title_jaccard": -1.011065597425
+        }
+      },
+      "gpt_oss_base_reranker": {
+        "decision_threshold": 0.09,
+        "features": [
+          "cosine",
+          "shared_entity_count",
+          "min_shared_entity_idf",
+          "same_source",
+          "title_jaccard",
+          "length_ratio",
+          "rerank_src_to_dst",
+          "rerank_dst_to_src"
+        ],
+        "heldout": {
+          "drop_agreement": 0.781513,
+          "examples": 119,
+          "false_drop_rate": 0.010638,
+          "llm_drops": 25,
+          "llm_keeps": 94,
+          "predicted_drops": 1
+        },
+        "intercept": -18.557619579842,
+        "train": {
+          "drop_agreement": 0.869863,
+          "examples": 438,
+          "false_drop_rate": 0.0,
+          "llm_drops": 58,
+          "llm_keeps": 380,
+          "predicted_drops": 1
+        },
+        "weights": {
+          "cosine": 14.796606653937,
+          "length_ratio": 1.517991653077,
+          "min_shared_entity_idf": 0.000408729657,
+          "rerank_dst_to_src": 2.412410486773,
+          "rerank_src_to_dst": -1.110404713347,
+          "same_source": 4.656833242941,
+          "shared_entity_count": -0.093942556607,
+          "title_jaccard": -1.269522695242
+        }
+      }
+    },
+    "reranker": {
+      "available": true,
+      "failed_directions": 0,
+      "load_error": "",
+      "max_chars_per_passage": 1000,
+      "model": "Qwen/Qwen3-Reranker-0.6B",
+      "scored_directions": 1114
+    }
+  },
+  "timestamp_source": "orchestrator-cascade-experiment-2026-07-14",
+  "variant": "semantic_edge_flash_reranker_cascade"
+}
