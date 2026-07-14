@@ -433,3 +433,36 @@ def merge_hybrid(gliner: Extraction, relex: Extraction) -> Extraction:
         for row in relex.fact_candidates
     ]
     return _extraction_from_rows(mentions, facts, schema_id)
+
+
+def merge_union(gliner: Extraction, relex: Extraction) -> Extraction:
+    """Both extractors' relations, GLiNER2-first mentions (judge filters later).
+
+    Judge-sampled precision measured the two novel-fact pools at equal quality
+    (2026-07-14), so the union dominates either alone: recall is at least
+    GLiNER2's, yield is both pools, and adjudication stays the quality gate.
+    Duplicate logical triples keep the higher-confidence row."""
+    if relex.failed:
+        return gliner
+    if gliner.failed:
+        return relex
+    hybrid = merge_hybrid(gliner, relex)
+    by_triple: dict[tuple[str, str, str], ExtractedRelation] = {}
+    for row in (*gliner.fact_candidates, *hybrid.fact_candidates):
+        key = (row.head.casefold(), row.predicate.casefold(), row.tail.casefold())
+        current = by_triple.get(key)
+        if current is None or row.confidence > current.confidence:
+            by_triple[key] = row
+    schema_id = (
+        "union-"
+        + hashlib.sha256(
+            f"{gliner.schema_id}\x1f{relex.schema_id}".encode()
+        ).hexdigest()[:24]
+    )
+    facts = [
+        row.model_copy(update={"schema_id": schema_id})
+        for _, row in sorted(
+            by_triple.items(), key=lambda item: (item[1].assertion_start, item[0])
+        )
+    ]
+    return _extraction_from_rows(list(hybrid.mentions), facts, schema_id)

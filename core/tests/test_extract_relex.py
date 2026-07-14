@@ -368,6 +368,82 @@ def _fixture_relation():
     )
 
 
+def test_union_keeps_both_relation_sets_deduped_by_logical_triple() -> None:
+    from taurine_core.schemas import ExtractedRelation
+
+    gliner_fact = _fixture_relation().model_copy(
+        update={
+            "extraction_method": "gliner2_batch",
+            "schema_id": "gliner-schema",
+            "confidence": 0.95,
+        }
+    )
+    gliner_only = gliner_fact.model_copy(
+        update={"predicate": "works_with", "confidence": 0.6}
+    )
+    base = Extraction(
+        mentions=[
+            ExtractedMention(
+                surface="Alice",
+                etype="person",
+                confidence=0.97,
+                char_start=0,
+                char_end=5,
+                extractor="fastino/gliner2-large-v1",
+                schema_id="gliner-schema",
+            )
+        ],
+        fact_candidates=[gliner_fact, gliner_only],
+        schema_id="gliner-schema",
+    )
+    relex = Extraction(
+        mentions=[
+            ExtractedMention(
+                surface="Project X",
+                etype="project",
+                confidence=0.88,
+                char_start=25,
+                char_end=34,
+                extractor=config.RELEX_MODEL,
+                schema_id="relex-schema",
+            )
+        ],
+        # same logical triple at lower confidence + one relex-only triple
+        fact_candidates=[
+            _fixture_relation().model_copy(update={"confidence": 0.7}),
+            _fixture_relation().model_copy(
+                update={"predicate": "uses", "confidence": 0.8}
+            ),
+        ],
+        schema_id="relex-schema",
+    )
+
+    merged = extract_relex.merge_union(base, relex)
+
+    triples = {
+        (row.head, row.predicate, row.tail): row for row in merged.fact_candidates
+    }
+    assert set(triples) == {
+        ("Alice", "responsible_for", "Project X"),
+        ("Alice", "works_with", "Project X"),
+        ("Alice", "uses", "Project X"),
+    }
+    # duplicate resolved to the higher-confidence GLiNER2 row, provenance kept
+    winner = triples[("Alice", "responsible_for", "Project X")]
+    assert winner.confidence == 0.95
+    assert winner.extraction_method == "gliner2_batch"
+    assert triples[("Alice", "uses", "Project X")].extraction_method == "relex_hybrid"
+    assert merged.schema_id.startswith("union-")
+    assert all(row.schema_id == merged.schema_id for row in merged.fact_candidates)
+
+
+def test_union_degrades_to_surviving_side_on_failure() -> None:
+    ok = Extraction(schema_id="ok")
+    failed = Extraction(failed=True, error="boom")
+    assert extract_relex.merge_union(ok, failed) is ok
+    assert extract_relex.merge_union(failed, ok) is ok
+
+
 def test_dispatch_honors_default_and_explicit_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
