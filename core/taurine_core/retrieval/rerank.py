@@ -94,12 +94,14 @@ class LocalPassageReranker:
         *,
         deadline_at: float | None = None,
     ) -> PassageRerankResult:
-        bounded = tuple(
+        ordered_candidates = tuple(
             sorted(
                 candidates,
                 key=lambda row: (-_safe_recall(row.recall_score), row.passage_id),
-            )[: self._candidate_cap]
+            )
         )
+        bounded = ordered_candidates[: self._candidate_cap]
+        unscored = ordered_candidates[self._candidate_cap :]
         if not bounded:
             return PassageRerankResult((), (), False, "no_passage_candidates")
         documents = tuple(candidate.rerank_document for candidate in bounded)
@@ -114,16 +116,24 @@ class LocalPassageReranker:
                 )
             )
         except ModelDeadlineExceeded:
-            return _degraded(bounded, "local_reranker_deadline")
+            return _with_unscored_tail(
+                _degraded(bounded, "local_reranker_deadline"), unscored
+            )
         except LocalModelUnavailable:
-            return _degraded(bounded, "local_reranker_unavailable")
+            return _with_unscored_tail(
+                _degraded(bounded, "local_reranker_unavailable"), unscored
+            )
         except Exception:
             # Fail-closed to the degraded state, but keep a debug trail so a
             # programming error cannot masquerade as "reranker unavailable".
             logger.debug("passage reranker raised", exc_info=True)
-            return _degraded(bounded, "local_reranker_unavailable")
+            return _with_unscored_tail(
+                _degraded(bounded, "local_reranker_unavailable"), unscored
+            )
         if len(scores) != len(bounded) or any(not math.isfinite(score) for score in scores):
-            return _degraded(bounded, "local_reranker_invalid_output")
+            return _with_unscored_tail(
+                _degraded(bounded, "local_reranker_invalid_output"), unscored
+            )
 
         ordered = sorted(
             zip(bounded, scores, strict=True),
@@ -143,8 +153,9 @@ class LocalPassageReranker:
             )
             for rank, (candidate, score) in enumerate(ordered, 1)
         )
+        complete_decisions = (*decisions, *_unscored_decisions(unscored, len(decisions)))
         return PassageRerankResult(
-            decisions=decisions,
+            decisions=complete_decisions,
             accepted=tuple(row for row in decisions if row.accepted),
             degraded=False,
             reason="reranked" if decisions else "no_passage_candidates",
@@ -152,11 +163,7 @@ class LocalPassageReranker:
 
     @property
     def _candidate_cap(self) -> int:
-        return (
-            config.LIVE_RERANK_CANDIDATES
-            if self.mode == "live"
-            else config.CHAT_RERANK_CANDIDATES
-        )
+        return max(0, int(config.RERANK_MAX_CANDIDATES))
 
 
 def _degraded(
@@ -178,6 +185,37 @@ def _degraded(
         for rank, candidate in enumerate(candidates, 1)
     )
     return PassageRerankResult(decisions, (), True, reason)
+
+
+def _with_unscored_tail(
+    result: PassageRerankResult,
+    candidates: Sequence[PassageRerankCandidate],
+) -> PassageRerankResult:
+    return PassageRerankResult(
+        decisions=(
+            *result.decisions,
+            *_unscored_decisions(candidates, len(result.decisions)),
+        ),
+        accepted=result.accepted,
+        degraded=result.degraded,
+        reason=result.reason,
+    )
+
+
+def _unscored_decisions(
+    candidates: Sequence[PassageRerankCandidate],
+    rank_offset: int,
+) -> tuple[PassageRerankDecision, ...]:
+    return tuple(
+        PassageRerankDecision(
+            candidate=candidate,
+            score=0.0,
+            accepted=False,
+            rank=rank,
+            reason="outside_rerank_candidate_cap",
+        )
+        for rank, candidate in enumerate(candidates, rank_offset + 1)
+    )
 
 
 def _safe_recall(score: float) -> float:

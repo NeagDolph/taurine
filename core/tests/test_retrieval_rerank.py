@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -79,11 +80,19 @@ def test_passage_reranker_scores_exact_passages_and_applies_mode_floor() -> None
     assert "canonical fact triple" not in scorer.calls[0][2]
 
 
-@pytest.mark.parametrize(("mode", "cap"), [("live", 30), ("chat", 60), ("tool", 60)])
-def test_passage_reranker_enforces_mode_candidate_cap(mode: str, cap: int) -> None:
+@pytest.mark.parametrize("mode", ["live", "chat", "tool"])
+def test_passage_reranker_caps_scoring_at_24_and_preserves_unscored_tail(
+    mode: str,
+) -> None:
     artifact = load_calibration(_ARTIFACT)
-    scorer = FakeScorer(tuple(0.9 for _ in range(cap)))
-    candidates = tuple(_candidate(index) for index in range(75))
+    scorer = FakeScorer(tuple(0.9 for _ in range(24)))
+    candidates = tuple(
+        replace(
+            _candidate(index),
+            recall_score=(1.0 if index in {0, 1} else 1.0 - index / 100.0),
+        )
+        for index in reversed(range(25))
+    )
     floor = (
         artifact.rerank.live_floor if mode == "live" else artifact.rerank.chat_floor
     )
@@ -92,11 +101,21 @@ def test_passage_reranker_enforces_mode_candidate_cap(mode: str, cap: int) -> No
         scorer, mode=mode, acceptance_floor=floor  # type: ignore[arg-type]
     ).rerank("query", candidates)
 
-    assert len(scorer.calls[0][1]) == cap
-    assert len(result.decisions) == cap
-    assert [row.candidate.passage_id for row in result.decisions] == [
-        f"p{index:02d}" for index in range(cap)
+    assert len(scorer.calls[0][1]) == 24
+    assert [
+        document.split("Passage:\n", 1)[1].splitlines()[0]
+        for document in scorer.calls[0][1]
+    ] == [
+        f"Exact source passage {index}" for index in range(24)
     ]
+    assert len(result.decisions) == 25
+    assert [row.candidate.passage_id for row in result.decisions] == [
+        f"p{index:02d}" for index in range(25)
+    ]
+    assert len(result.accepted) == 24
+    assert result.decisions[-1].score == 0.0
+    assert result.decisions[-1].accepted is False
+    assert result.decisions[-1].reason == "outside_rerank_candidate_cap"
 
 
 @pytest.mark.parametrize(
