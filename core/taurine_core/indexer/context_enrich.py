@@ -99,7 +99,11 @@ def template_context(
         head = "iMessage thread"
         participants = _title_value(title, "iMessage:")
         if participants:
-            head += f" between {participants}"
+            participant_count = len(
+                [value for value in participants.split(",") if value.strip()]
+            )
+            preposition = "between" if participant_count > 1 else "with"
+            head += f" {preposition} {participants}"
     elif source in {"gmail", "outlook"}:
         head = "Email"
         subject = _title_value(title, "Email:")

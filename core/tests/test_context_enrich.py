@@ -123,7 +123,7 @@ def test_template_context_handles_single_or_unprefixed_imessage_title(title: str
 
     context = context_enrich_module.template_context(note, passage, "end of")
 
-    expected_participants = " between Rowan" if title.startswith("iMessage:") else ""
+    expected_participants = " with Rowan" if title.startswith("iMessage:") else ""
     assert context == f"iMessage thread{expected_participants}; end of the thread."
     assert "unknown" not in context.casefold()
 
@@ -330,7 +330,7 @@ def test_hybrid_small_note_keeps_templates_without_llm_or_cache(
 
     assert calls == []
     assert set(result.contexts) == {"p0", "p1"}
-    assert all(value.startswith("iMessage thread between Rowan") for value in result.contexts.values())
+    assert all(value.startswith("iMessage thread with Rowan") for value in result.contexts.values())
     assert result.failed_batches == 0
 
 
@@ -377,7 +377,7 @@ def test_hybrid_llm_failure_leaves_template_contexts(
     )
 
     assert set(result.contexts) == {"p0", "p1"}
-    assert all(value.startswith("iMessage thread between Rowan") for value in result.contexts.values())
+    assert all(value.startswith("iMessage thread with Rowan") for value in result.contexts.values())
     assert result.enriched_count == 2
     assert result.failed_batches == 1
 
