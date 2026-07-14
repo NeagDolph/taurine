@@ -30,6 +30,11 @@ from taurine_core.indexer.passages import PassageDraft
 from taurine_core.schemas import NoteRecord
 
 
+@pytest.fixture
+def _llm_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "llm")
+
+
 def _note(
     note_id: str = "note-1",
     *,
@@ -144,8 +149,8 @@ def test_template_context_omits_missing_email_metadata_and_clamps_length() -> No
     assert "from" not in context
 
 
-def test_context_enrich_config_defaults_preserve_llm_behavior() -> None:
-    assert config.CONTEXT_ENRICH_MODE == "llm"
+def test_context_enrich_config_defaults_to_hybrid_behavior() -> None:
+    assert config.CONTEXT_ENRICH_MODE == "hybrid"
     assert config.CONTEXT_LLM_MIN_CHARS == 2000
     assert config.CONTEXT_LLM_MIN_PASSAGES == 3
 
@@ -193,7 +198,7 @@ def test_overlong_window_keeps_head_and_tail() -> None:
 # -- enrichment + parsing ----------------------------------------------------
 
 
-def test_enrich_parses_contexts_scoped_to_episodic_sources() -> None:
+def test_enrich_parses_contexts_scoped_to_episodic_sources(_llm_mode) -> None:
     calls: list[EnrichmentBatch] = []
 
     def enricher(batch: EnrichmentBatch) -> dict:
@@ -214,7 +219,7 @@ def test_enrich_parses_contexts_scoped_to_episodic_sources() -> None:
     assert result.failed_batches == 0
 
 
-def test_contexts_are_whitespace_normalized_and_clamped_to_240_chars() -> None:
+def test_contexts_are_whitespace_normalized_and_clamped_to_240_chars(_llm_mode) -> None:
     def enricher(batch: EnrichmentBatch) -> dict:
         return {"contexts": {"0": "  a\nlong   context " + "x" * 400}}
 
@@ -225,7 +230,7 @@ def test_contexts_are_whitespace_normalized_and_clamped_to_240_chars() -> None:
     assert len(context) == 240
 
 
-def test_failed_and_malformed_batches_fail_open_and_are_counted() -> None:
+def test_failed_and_malformed_batches_fail_open_and_are_counted(_llm_mode) -> None:
     note = _note()
     drafts = _drafts(12)  # two batches
 
@@ -241,7 +246,7 @@ def test_failed_and_malformed_batches_fail_open_and_are_counted() -> None:
     assert result.failed_batches == 2
 
 
-def test_absent_enricher_yields_empty_contexts() -> None:
+def test_absent_enricher_yields_empty_contexts(_llm_mode) -> None:
     result = enrich_passages(((_note(), _drafts(3)),), None)
 
     assert result.contexts == {}
@@ -249,7 +254,7 @@ def test_absent_enricher_yields_empty_contexts() -> None:
     assert result.failed_batches == 0
 
 
-def test_unknown_ordinals_and_non_string_contexts_are_ignored() -> None:
+def test_unknown_ordinals_and_non_string_contexts_are_ignored(_llm_mode) -> None:
     def enricher(batch: EnrichmentBatch) -> dict:
         return {"contexts": {"0": "good context", "9": "phantom", "1": 42, "x": "bad"}}
 
@@ -423,7 +428,7 @@ def test_cache_skips_llm_for_unchanged_passages(tmp_path: Path) -> None:
     assert second.enriched_count == 3
 
 
-def test_cache_key_covers_model_content_and_window(tmp_path: Path) -> None:
+def test_cache_key_covers_model_content_and_window(tmp_path: Path, _llm_mode) -> None:
     cache = BuildCache(tmp_path / "cache.db")
     note = _note()
     drafts = _drafts(2)
@@ -452,7 +457,7 @@ def test_cache_key_covers_model_content_and_window(tmp_path: Path) -> None:
     assert [row.passage_id for row in calls[3].passages] == ["p1-new"]
 
 
-def test_failed_batches_are_never_cached(tmp_path: Path) -> None:
+def test_failed_batches_are_never_cached(tmp_path: Path, _llm_mode) -> None:
     cache = BuildCache(tmp_path / "cache.db")
     note = _note()
     drafts = _drafts(1)
@@ -660,7 +665,9 @@ class _FakeContextLLM:
         }
 
 
-def test_build_enriches_episodic_notes_and_bm25_finds_context_terms(tmp_path: Path) -> None:
+def test_build_enriches_episodic_notes_and_bm25_finds_context_terms(
+    tmp_path: Path, _llm_mode
+) -> None:
     notes = [
         NoteRecord(
             note_id="chat-1",
@@ -718,7 +725,9 @@ def test_build_enriches_episodic_notes_and_bm25_finds_context_terms(tmp_path: Pa
         store.close()
 
 
-def test_build_without_enricher_matches_todays_behavior(tmp_path: Path) -> None:
+def test_build_without_enricher_matches_todays_behavior(
+    tmp_path: Path, _llm_mode
+) -> None:
     notes = [
         NoteRecord(
             note_id="chat-1",
@@ -743,7 +752,9 @@ def test_build_without_enricher_matches_todays_behavior(tmp_path: Path) -> None:
         store.close()
 
 
-def test_failing_enricher_degrades_to_empty_context_and_counts(tmp_path: Path) -> None:
+def test_failing_enricher_degrades_to_empty_context_and_counts(
+    tmp_path: Path, _llm_mode
+) -> None:
     notes = [
         NoteRecord(
             note_id="chat-1",
@@ -773,7 +784,7 @@ def test_failing_enricher_degrades_to_empty_context_and_counts(tmp_path: Path) -
     assert report.build_id  # build completed normally
 
 
-def test_context_changes_embeddings_via_cache_key(tmp_path: Path) -> None:
+def test_context_changes_embeddings_via_cache_key(tmp_path: Path, _llm_mode) -> None:
     """Same passage, enriched vs not: the framed text differs, so the vector
     differs — proof the embedding input (and cache key) carries the context."""
 

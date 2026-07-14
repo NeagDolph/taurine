@@ -33,7 +33,7 @@ class LiveSpanExtractorPort(Protocol):
 
 
 def default_query_embedder(text: str) -> np.ndarray | None:
-    """Embed one live query window with the shared local query embedder."""
+    """Embed one live query window with the selected shared query backend."""
 
     try:
         from taurine_core.indexer.embed import embed_queries
