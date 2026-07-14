@@ -38,14 +38,18 @@ from taurine_core.indexer.build import (
     sweep_stale_build_files,
 )
 from taurine_core.indexer.context_enrich import context_enricher_for
-from taurine_core.indexer.edge_adjudication import edge_adjudicator_for
+from taurine_core.indexer.edge_adjudication import (
+    SemanticPair,
+    adjudicate_semantic_edges,
+    edge_adjudicator_for,
+)
 from taurine_core.profile_context import owner_aliases as profile_owner_aliases
 from taurine_core.indexer.build_cache import BuildCache
 from taurine_core.indexer.embed import embed_texts
 from taurine_core import idea_search
 from taurine_core.indexer.communities import fallback_clusters
 from taurine_core.indexer.extract import extract_notes_dispatch as extract_notes
-from taurine_core.indexer.knowledge_store import KnowledgeSchemaError
+from taurine_core.indexer.knowledge_store import KnowledgeSchemaError, KnowledgeStore
 from taurine_core.models_local import passage_tokenizer
 from taurine_core.indexer.profile import ProfileGenerator, ProfileProgress
 from taurine_core.indexer.store import Index
@@ -201,6 +205,16 @@ class Runtime:
     profile_generation_task: asyncio.Task[Any] | None = None
     knowledge_runtime: Any = None
     regenerate_knowledge: Callable[..., Any] | None = None
+
+
+class EdgeReasonRequest(BaseModel):
+    src_passage_id: str
+    dst_passage_id: str
+
+
+class EdgeReasonResponse(BaseModel):
+    reason: str
+    generated: bool
 
 
 class _MonotonicClock:
@@ -387,6 +401,64 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             llm=active_runtime.connector_llm,
             limit=payload.limit,
         )
+
+    @app.post("/graph/edge-reason")
+    async def graph_edge_reason(payload: EdgeReasonRequest) -> EdgeReasonResponse:
+        from taurine_core.indexer.edge_prune import is_template_reason
+
+        active_runtime = _ready_runtime(app)
+        if active_runtime.knowledge_runtime is None:
+            raise HTTPException(status_code=503, detail="knowledge index unavailable")
+        snapshot = active_runtime.knowledge_runtime.snapshot
+        database_path = getattr(snapshot, "database_path", None)
+        if database_path is None:
+            raise HTTPException(status_code=503, detail="knowledge index unavailable")
+        store = KnowledgeStore(database_path, read_only=True)
+        try:
+            context = store.semantic_edge_context(
+                payload.src_passage_id, payload.dst_passage_id
+            )
+        finally:
+            store.close()
+        if context is None:
+            raise HTTPException(status_code=404, detail="semantic edge not found")
+        if not is_template_reason(context.reason):
+            return EdgeReasonResponse(reason=context.reason, generated=False)
+        if active_runtime.connector_llm is None:
+            return EdgeReasonResponse(reason=context.reason, generated=False)
+
+        pair = SemanticPair(
+            src_passage_id=context.src_passage_id,
+            dst_passage_id=context.dst_passage_id,
+            src_title=context.src_title,
+            dst_title=context.dst_title,
+            src_text=context.src_text,
+            dst_text=context.dst_text,
+            src_content_hash=context.src_content_hash,
+            dst_content_hash=context.dst_content_hash,
+        )
+        outcome = await asyncio.to_thread(
+            adjudicate_semantic_edges,
+            [pair],
+            judge=edge_adjudicator_for(active_runtime.connector_llm),
+        )
+        reason = outcome.reasons.get(pair.pair)
+        if not reason:
+            return EdgeReasonResponse(reason=context.reason, generated=False)
+        try:
+            writable = KnowledgeStore(database_path)
+            try:
+                persisted = writable.update_semantic_edge_reason(
+                    pair.src_passage_id, pair.dst_passage_id, reason
+                )
+            finally:
+                writable.close()
+        except Exception as exc:
+            logging.getLogger("taurine.server").warning(
+                "could not persist lazy semantic-edge reason: %s", exc
+            )
+            persisted = False
+        return EdgeReasonResponse(reason=reason, generated=persisted)
 
     @app.get("/facts")
     async def facts(ids: str = "") -> FactsResponse:

@@ -109,6 +109,19 @@ class PassageContext:
 
 
 @dataclass(frozen=True)
+class SemanticEdgeContext:
+    src_passage_id: str
+    dst_passage_id: str
+    src_title: str
+    dst_title: str
+    src_text: str
+    dst_text: str
+    src_content_hash: str
+    dst_content_hash: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class NoteContext:
     note_id: str
     title: str
@@ -703,6 +716,55 @@ class KnowledgeStore:
                     """,
                     (left, right, float(cosine), float(weight), reason, build_id),
                 )
+
+    def semantic_edge_context(
+        self, src_passage_id: str, dst_passage_id: str
+    ) -> SemanticEdgeContext | None:
+        left, right = sorted((str(src_passage_id), str(dst_passage_id)))
+        row = self._conn.execute(
+            """
+            SELECT edge.src_passage_id, edge.dst_passage_id, edge.reason,
+                   src_note.title AS src_title, dst_note.title AS dst_title,
+                   src.text AS src_text, dst.text AS dst_text,
+                   src.content_hash AS src_content_hash,
+                   dst.content_hash AS dst_content_hash
+            FROM passage_semantic_edges AS edge
+            JOIN passages AS src ON src.passage_id = edge.src_passage_id
+            JOIN passages AS dst ON dst.passage_id = edge.dst_passage_id
+            JOIN notes AS src_note ON src_note.note_id = src.note_id
+            JOIN notes AS dst_note ON dst_note.note_id = dst.note_id
+            WHERE edge.src_passage_id = ? AND edge.dst_passage_id = ?
+            """,
+            (left, right),
+        ).fetchone()
+        if row is None:
+            return None
+        return SemanticEdgeContext(
+            src_passage_id=str(row["src_passage_id"]),
+            dst_passage_id=str(row["dst_passage_id"]),
+            src_title=str(row["src_title"]),
+            dst_title=str(row["dst_title"]),
+            src_text=str(row["src_text"]),
+            dst_text=str(row["dst_text"]),
+            src_content_hash=str(row["src_content_hash"]),
+            dst_content_hash=str(row["dst_content_hash"]),
+            reason=str(row["reason"]),
+        )
+
+    def update_semantic_edge_reason(
+        self, src_passage_id: str, dst_passage_id: str, reason: str
+    ) -> bool:
+        self._writable()
+        left, right = sorted((str(src_passage_id), str(dst_passage_id)))
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE passage_semantic_edges SET reason = ?
+                WHERE src_passage_id = ? AND dst_passage_id = ?
+                """,
+                (str(reason), left, right),
+            )
+        return cursor.rowcount > 0
 
     def write_passage_entity_edges(
         self,

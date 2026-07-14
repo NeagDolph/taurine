@@ -338,6 +338,84 @@ def test_facts_endpoint_resolves_labels_and_drops_unknown_ids(tmp_path: Path) ->
         assert client.get("/facts", params={"ids": over_cap}).json() == {"facts": []}
 
 
+class EdgeReasonLLM:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls = 0
+
+    async def complete_json(self, model: str, system: str, prompt: str, **kwargs: Any):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("judge unavailable")
+        return {"pairs": {"0": "both plan the same Saturday potluck"}}
+
+
+def _edge_reason_runtime(tmp_path: Path, llm: Any) -> Runtime:
+    runtime, _ = _runtime(tmp_path)
+    runtime.connector_llm = llm
+    store = KnowledgeStore(runtime.knowledge_runtime.snapshot.database_path)
+    try:
+        store.write_semantic_edges(
+            [
+                (
+                    "passage-alpha",
+                    "passage-gamma",
+                    0.8,
+                    0.8,
+                    "Semantically similar passages from obsidian and obsidian",
+                )
+            ],
+            build_id=BUILD_ID,
+        )
+    finally:
+        store.close()
+    return runtime
+
+
+def test_edge_reason_endpoint_generates_and_persists_rich_reason(tmp_path: Path) -> None:
+    llm = EdgeReasonLLM()
+    runtime = _edge_reason_runtime(tmp_path, llm)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/graph/edge-reason",
+            json={"src_passage_id": "passage-alpha", "dst_passage_id": "passage-gamma"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "reason": "both plan the same Saturday potluck",
+        "generated": True,
+    }
+    assert llm.calls == 1
+    store = KnowledgeStore(runtime.knowledge_runtime.snapshot.database_path, read_only=True)
+    try:
+        reason = store._conn.execute(
+            "SELECT reason FROM passage_semantic_edges WHERE src_passage_id = ? AND dst_passage_id = ?",
+            ("passage-alpha", "passage-gamma"),
+        ).fetchone()["reason"]
+        assert reason == "both plan the same Saturday potluck"
+    finally:
+        store.close()
+
+
+def test_edge_reason_endpoint_fails_open_to_template(tmp_path: Path) -> None:
+    llm = EdgeReasonLLM(fail=True)
+    runtime = _edge_reason_runtime(tmp_path, llm)
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post(
+            "/graph/edge-reason",
+            json={"src_passage_id": "passage-alpha", "dst_passage_id": "passage-gamma"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "reason": "Semantically similar passages from obsidian and obsidian",
+        "generated": False,
+    }
+
+
 def test_retrieval_runtime_serves_snapshot_clusters_with_legacy_fallback(
     tmp_path: Path,
 ) -> None:

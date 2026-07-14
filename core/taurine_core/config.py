@@ -269,6 +269,7 @@ SEMANTIC_REASON_SNIPPET_CHARS = 300      # per-passage snippet supplied to the j
 # lever against adjudication call volume — ~8k cross-note edges would otherwise
 # be hundreds of judge calls per build for the lowest-value signal.
 SEMANTIC_REASON_MAX_EDGES = 600          # 0 = judge every cross-note edge
+SEMANTIC_PRUNE_MODE = "llm"              # "local" only after offline fit verification
 # Intelligent fact gating: a fact is only worth an LLM grounding check when it
 # is genuinely risky. Facts that are high-confidence, from evergreen written
 # sources, and on a non-exclusive predicate are trusted (GLiNER already gated

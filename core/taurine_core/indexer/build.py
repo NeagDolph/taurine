@@ -930,11 +930,59 @@ class BuildCoordinator:
                 )
                 for edge in cross_note_semantic
             )
-            semantic_reasons = adjudicate_semantic_edges(
-                semantic_pairs,
-                judge=self.dependencies.edge_adjudicator,
-                cache=self.dependencies.adjudication_cache,
-            )
+            if config.SEMANTIC_PRUNE_MODE == "local":
+                from taurine_core.indexer import edge_prune
+
+                entity_labels = {
+                    entity.entity_id: entity.canonical for entity in resolution.entities
+                }
+                passage_entities: dict[str, dict[str, float]] = {}
+                for edge in base_graph.edges:
+                    if edge.kind == "contains" and edge.src_id in draft_of_passage:
+                        passage_entities.setdefault(edge.src_id, {})[edge.dst_id] = float(
+                            edge.metadata.get("idf", 0.0)
+                        )
+                edge_by_pair = {
+                    (edge.src_id, edge.dst_id): edge for edge in cross_note_semantic
+                }
+                source_of_note = {note.note_id: note.source for note in ordered}
+                features_by_pair = {}
+                for pair in semantic_pairs:
+                    left_entities = passage_entities.get(pair.src_passage_id, {})
+                    right_entities = passage_entities.get(pair.dst_passage_id, {})
+                    shared = [
+                        (
+                            entity_labels.get(entity_id, entity_id),
+                            min(left_entities[entity_id], right_entities[entity_id]),
+                        )
+                        for entity_id in sorted(left_entities.keys() & right_entities.keys())
+                    ]
+                    features_by_pair[pair.pair] = edge_prune.make_features(
+                        pair,
+                        cosine=edge_by_pair[pair.pair].weight,
+                        shared_entities=shared,
+                        src_source=source_of_note[note_of_passage[pair.src_passage_id]],
+                        dst_source=source_of_note[note_of_passage[pair.dst_passage_id]],
+                    )
+                try:
+                    semantic_reasons = edge_prune.decide(
+                        semantic_pairs, features_by_pair
+                    )
+                except Exception as exc:
+                    _LOG.warning(
+                        "local semantic-edge pruning failed; using LLM lane: %s", exc
+                    )
+                    semantic_reasons = adjudicate_semantic_edges(
+                        semantic_pairs,
+                        judge=self.dependencies.edge_adjudicator,
+                        cache=self.dependencies.adjudication_cache,
+                    )
+            else:
+                semantic_reasons = adjudicate_semantic_edges(
+                    semantic_pairs,
+                    judge=self.dependencies.edge_adjudicator,
+                    cache=self.dependencies.adjudication_cache,
+                )
             if semantic_reasons.dropped:
                 _LOG.info(
                     "build %s: %d cross-note semantic edges dropped (no concrete "
