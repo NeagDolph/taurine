@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol
 
 import numpy as np
 
+from taurine_core import config
 from taurine_core.indexer.base_graph import BaseGraph
 
 if TYPE_CHECKING:
@@ -137,6 +138,10 @@ def load_index_snapshot(
             fact_matrix = np.empty((0, passage_matrix.shape[1]), dtype=np.float32)
         elif fact_matrix.shape[1]:
             passage_matrix = np.empty((0, fact_matrix.shape[1]), dtype=np.float32)
+        else:
+            dimension = config.embed_dim()
+            passage_matrix = np.empty((0, dimension), dtype=np.float32)
+            fact_matrix = np.empty((0, dimension), dtype=np.float32)
         projection = store.projection(build.build_id)
         if store.has_cluster_tables():
             clusters = store.clusters(build.build_id)

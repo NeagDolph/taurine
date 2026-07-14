@@ -4,12 +4,20 @@ import hashlib
 import re
 
 import numpy as np
+import pytest
 
 from tests.conftest import make_note
+from taurine_core import config
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies
 from taurine_core.models_local import LocalModelUnavailable
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.retrieval.runtime import RetrievalRuntime
+
+
+@pytest.fixture(autouse=True)
+def _fixture_embedding_space(monkeypatch):
+    monkeypatch.setattr(config, "EMBED_BACKEND", "openrouter")
+    monkeypatch.setattr(config, "EMBED_API_DIM", 16)
 
 
 class Tokenizer:
@@ -26,6 +34,39 @@ def _embed(texts: list[str]) -> np.ndarray:
         row = raw.astype(np.float32) + 1.0
         rows.append(row / np.linalg.norm(row))
     return np.vstack(rows)
+
+
+def test_runtime_rejects_snapshot_from_inactive_embedding_model(tmp_path) -> None:
+    database = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(),
+            embedder=_embed,
+            embedding_dim=16,
+            embedding_model_id=config.EMBED_MODEL,
+        )
+    ).build([make_note("n1", "One", "first source passage")], database, replace_derived=True)
+
+    with pytest.raises(ValueError, match="active embedding model"):
+        RetrievalRuntime(database)
+
+
+def test_runtime_rejects_snapshot_with_wrong_active_embedding_dimension(
+    tmp_path, monkeypatch
+) -> None:
+    database = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(),
+            embedder=_embed,
+            embedding_dim=16,
+            embedding_model_id=config.EMBED_API_MODEL,
+        )
+    ).build([make_note("n1", "One", "first source passage")], database, replace_derived=True)
+    monkeypatch.setattr(config, "EMBED_API_DIM", 4096)
+
+    with pytest.raises(ValueError, match="embedding dimension"):
+        RetrievalRuntime(database)
 
 
 def test_runtime_checks_manifests_and_publishes_new_complete_build(

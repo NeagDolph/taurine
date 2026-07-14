@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import OrderedDict
 from dataclasses import dataclass, replace
@@ -262,12 +263,24 @@ class SharedRetrievalEngine:
     ) -> EvidencePack:
         started = monotonic()
         latency: dict[str, float] = {}
+        head_errors: dict[str, str] = {}
 
-        query_vector = np.asarray(self.query_embedder(query.text), dtype=np.float32)
+        try:
+            query_vector: np.ndarray | None = np.asarray(
+                self.query_embedder(query.text), dtype=np.float32
+            )
+        except Exception:  # noqa: BLE001 - remote embedding is fail-open at query time
+            query_vector = None
+            unavailable_reason = "query_embedding_unavailable"
+            head_errors["dense"] = unavailable_reason
+            if self.triple_recognizer is not None:
+                head_errors["triple"] = unavailable_reason
+            logging.getLogger("taurine.retrieval").warning(
+                "query embedding unavailable; dense and triple heads unavailable"
+            )
         latency["query_embedding"] = _elapsed_ms(started)
 
         head_started = monotonic()
-        head_errors: dict[str, str] = {}
 
         def isolated(head: str, search: Callable[[], HeadResult]) -> HeadResult:
             # §17.3: one broken head degrades retrieval instead of killing it.
@@ -277,11 +290,17 @@ class SharedRetrievalEngine:
                 head_errors[head] = _sanitized_error(exc)
                 return HeadResult((), (), status="unavailable", reason=head_errors[head])
 
-        dense = isolated(
-            "dense",
-            lambda: DensePassageHead(self.snapshot, self.calibrator).search(
-                query_vector, k=len(self.snapshot.passage_ids)
-            ),
+        dense = (
+            isolated(
+                "dense",
+                lambda: DensePassageHead(self.snapshot, self.calibrator).search(
+                    query_vector, k=len(self.snapshot.passage_ids)
+                ),
+            )
+            if query_vector is not None
+            else HeadResult(
+                (), (), status="unavailable", reason="query_embedding_unavailable"
+            )
         )
         candidate_cap = (
             config.LIVE_RERANK_CANDIDATES
@@ -317,7 +336,7 @@ class SharedRetrievalEngine:
         required_entity_ids = {
             hit.target_id for hit in entity.accepted if hit.target_kind == "entity"
         }
-        if self.triple_recognizer is not None:
+        if self.triple_recognizer is not None and query_vector is not None:
             try:
                 triple = self.triple_recognizer.recognize(
                     query,
@@ -331,6 +350,10 @@ class SharedRetrievalEngine:
                 triple = TripleRecognitionResult(
                     (), (), {}, True, "triple_recognizer_unavailable"
                 )
+        elif self.triple_recognizer is not None:
+            triple = TripleRecognitionResult(
+                (), (), {}, True, "query_embedding_unavailable"
+            )
         else:
             triple = TripleRecognitionResult(
                 (), (), {}, False, "triple_recognizer_disabled"

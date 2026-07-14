@@ -32,7 +32,8 @@ def make_note(
     )
 
 
-def unit_vec(seed: int, *, dim: int = config.EMBED_DIM) -> np.ndarray:
+def unit_vec(seed: int, *, dim: int | None = None) -> np.ndarray:
+    dim = config.embed_dim() if dim is None else int(dim)
     rng = np.random.default_rng(seed)
     values = rng.normal(size=dim).astype(np.float32)
     values /= np.linalg.norm(values)

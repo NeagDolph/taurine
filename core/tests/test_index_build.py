@@ -14,6 +14,7 @@ from taurine_core import config
 from taurine_core.evaluation.graph_retrieval import load_calibration
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies, BuildError, main
 from taurine_core.indexer.build_cache import BuildCache
+from taurine_core.indexer.embed import EmbeddingError
 from taurine_core.indexer.knowledge_store import KnowledgeStore
 from taurine_core.retrieval.snapshot import load_index_snapshot
 from taurine_core.schemas import ExtractedMention, ExtractedRelation, Extraction, NoteRecord
@@ -34,6 +35,18 @@ def embedder(texts: list[str]) -> np.ndarray:
         row /= np.linalg.norm(row)
         rows.append(row)
     return np.vstack(rows)
+
+
+def test_build_dependencies_resolve_embedding_backend_at_construction(monkeypatch) -> None:
+    monkeypatch.setattr(config, "EMBED_BACKEND", "local")
+    local = BuildDependencies(tokenizer=Tokenizer(), embedder=embedder)
+    assert local.embedding_model_id == config.EMBED_MODEL
+    assert local.embedding_dim == 1024
+
+    monkeypatch.setattr(config, "EMBED_BACKEND", "openrouter")
+    remote = BuildDependencies(tokenizer=Tokenizer(), embedder=embedder)
+    assert remote.embedding_model_id == config.EMBED_API_MODEL
+    assert remote.embedding_dim == 4096
 
 
 def _completion_extractor(notes, *, tokenizer):
@@ -217,8 +230,8 @@ def test_empty_build_bootstraps_a_loadable_snapshot(tmp_path: Path) -> None:
     assert report.extraction_failure_count == 0
     assert target.exists()
     snapshot = load_index_snapshot(target)
-    assert snapshot.passage_matrix.shape[0] == 0
-    assert snapshot.fact_matrix.shape[0] == 0
+    assert snapshot.passage_matrix.shape == (0, config.embed_dim())
+    assert snapshot.fact_matrix.shape == (0, config.embed_dim())
     assert len(snapshot.projection) == 0
 
 
@@ -227,11 +240,13 @@ def test_failed_build_never_replaces_active_target(tmp_path: Path) -> None:
     target.write_bytes(b"known-active-snapshot")
     deps = BuildDependencies(
         tokenizer=Tokenizer(),
-        embedder=lambda _texts: (_ for _ in ()).throw(RuntimeError("embedding failed")),
+        embedder=lambda _texts: (_ for _ in ()).throw(
+            EmbeddingError("OpenRouter embeddings returned HTTP 503 after 3 attempts")
+        ),
         embedding_dim=16,
     )
 
-    with pytest.raises(BuildError, match="embedding failed"):
+    with pytest.raises(BuildError, match="OpenRouter embeddings returned HTTP 503"):
         BuildCoordinator(deps).build(
             [make_note("a", "Alpha", "body")], target, replace_derived=True
         )
@@ -1063,12 +1078,15 @@ def test_model_fingerprints_ride_config_manifest_not_model_manifest(
 
     fingerprints = json.loads(report.config_manifest["model_fingerprints"])
     assert set(fingerprints) == {"embedding", "gliner"}
+    assert fingerprints["embedding"] == f"api:{config.EMBED_API_MODEL}"
     # the model_manifest keeps ONLY the artifact identity strings the runtime
     # compares for equality — fingerprints must never leak into it
     artifact = load_calibration(
         Path(__file__).parents[1] / "evals" / "graph_retrieval" / "calibration-v1.json"
     )
-    assert report.model_manifest == artifact.model_manifest
+    expected_manifest = dict(artifact.model_manifest)
+    expected_manifest["embedding"] = config.embed_model_id()
+    assert report.model_manifest == expected_manifest
 
 
 def test_model_fingerprint_tracks_local_artifact_changes(tmp_path: Path, monkeypatch) -> None:

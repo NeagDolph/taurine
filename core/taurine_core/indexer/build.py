@@ -13,7 +13,7 @@ import statistics
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -90,8 +90,8 @@ class BuildCancelled(BuildError):
 class BuildDependencies:
     tokenizer: TokenizerPort
     embedder: Callable[[list[str]], np.ndarray]
-    embedding_dim: int = config.EMBED_DIM
-    embedding_model_id: str = config.EMBED_MODEL
+    embedding_dim: int = field(default_factory=config.embed_dim)
+    embedding_model_id: str = field(default_factory=config.embed_model_id)
     now: Callable[[], float] = time.time
     extractor: Callable[..., dict[str, Any]] | None = None
     relation_completer: Callable[[Sequence[CompletionNote]], object] | None = None
@@ -302,18 +302,18 @@ class BuildCoordinator:
             / "graph_retrieval"
             / "calibration-v1.json"
         )
-        if self.dependencies.embedding_model_id != calibration.model_manifest["embedding"]:
-            raise BuildError("embedding model does not match the calibration artifact")
         model_manifest = dict(calibration.model_manifest)
-        # L26: fingerprints live in config_manifest, NOT model_manifest — the
-        # runtime compares model_manifest for equality against the artifact's
-        # identity strings, so fingerprints ride a separate key it tolerates.
+        model_manifest["embedding"] = self.dependencies.embedding_model_id
+        # L26: fingerprints live in config_manifest, NOT model_manifest. The
+        # runtime compares model identities while tolerating these fingerprints.
         config_manifest = {
             "builder": "knowledge-build-v1",
             "config_hash": calibration.config_hash,
             "model_fingerprints": json.dumps(
                 {
-                    "embedding": _model_fingerprint(self.dependencies.embedding_model_id),
+                    "embedding": _embedding_fingerprint(
+                        self.dependencies.embedding_model_id
+                    ),
                     "gliner": _model_fingerprint(config.GLINER2_MODEL),
                 },
                 sort_keys=True,
@@ -1712,6 +1712,14 @@ def _model_fingerprint(repo_id: str) -> str:
         json.dumps(entries, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return f"sha256:{digest}"
+
+
+def _embedding_fingerprint(model_id: str) -> str:
+    """Record remote model identity or fingerprint the selected local artifact."""
+
+    if model_id == config.EMBED_API_MODEL:
+        return f"api:{model_id}"
+    return _model_fingerprint(model_id)
 
 
 def sweep_stale_build_files(

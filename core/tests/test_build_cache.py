@@ -72,8 +72,8 @@ def test_caching_embedder_is_model_scoped(tmp_path: Path) -> None:
 
     cache = BuildCache(tmp_path / "cache.db")
     try:
-        cache.caching_embedder("model-a", inner)(["alpha"])
-        cache.caching_embedder("model-b", inner)(["alpha"])
+        cache.caching_embedder(config.EMBED_MODEL, inner)(["alpha"])
+        cache.caching_embedder(config.EMBED_API_MODEL, inner)(["alpha"])
         assert calls == [["alpha"], ["alpha"]]
     finally:
         cache.close()

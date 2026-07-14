@@ -962,7 +962,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
     knowledge_builder = BuildCoordinator(
         BuildDependencies(
             tokenizer=passage_tokenizer(),
-            embedder=build_cache.caching_embedder(config.EMBED_MODEL, embed_texts),
+            embedder=build_cache.caching_embedder(config.embed_model_id(), embed_texts),
             extractor=build_cache.caching_extractor(extract_notes),
             relation_completer=complete_relations,
             context_enricher=context_enricher_for(llm),

@@ -851,6 +851,35 @@ def test_failing_bm25_head_degrades_to_dense_only_and_names_the_dead_head(
     assert any(row.passage_id == "p1" for row in pack.passages)
 
 
+def test_query_embedding_failure_disables_dense_and_triple_but_keeps_other_heads(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    engine, _registry, _store = _engine(tmp_path)
+    recognizer = engine.triple_recognizer
+    assert isinstance(recognizer, FakeTripleRecognizer)
+
+    def unavailable(_text: str) -> np.ndarray:
+        raise RuntimeError("provider secret detail")
+
+    engine.query_embedder = unavailable
+    with caplog.at_level("WARNING", logger="taurine.retrieval"):
+        pack = engine.retrieve(
+            RetrievalQuery("What does Maya own?", "chat", now=10.0),
+            entity_spans=(("Launch", "project"),),
+        )
+
+    assert pack.decision.accepted
+    unavailable_heads = pack.trace.debug["unavailable_heads"]
+    assert set(unavailable_heads) == {"dense", "triple"}
+    assert recognizer.calls == []
+    surviving_heads = {hit.head for hit in pack.trace.head_hits}
+    assert {"bm25", "exact", "entity"} <= surviving_heads
+    assert "dense" not in surviving_heads
+    assert "triple" not in surviving_heads
+    assert any("dense and triple heads unavailable" in row.message for row in caplog.records)
+    assert all("provider secret detail" not in row.message for row in caplog.records)
+
+
 def test_degraded_head_set_requires_strict_floor_for_acceptance(
     tmp_path: Path,
 ) -> None:

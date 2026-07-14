@@ -118,7 +118,7 @@ def _stub_embeddings(monkeypatch):
 
     def fake_embed(texts: list[str]) -> np.ndarray:
         rng = np.random.default_rng(42)
-        return rng.normal(size=(len(texts), config.EMBED_DIM)).astype(np.float32)
+        return rng.normal(size=(len(texts), config.embed_dim())).astype(np.float32)
 
     monkeypatch.setattr(store_mod, "embed_texts", fake_embed, raising=False)
     monkeypatch.setattr(extract_mod, "_extractor_model", lambda: FakeExtractorModel())

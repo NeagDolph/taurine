@@ -201,9 +201,11 @@ def test_snapshot_falls_back_when_cluster_tables_missing(tmp_path: Path) -> None
 
 
 def test_runtime_boots_against_pre_cluster_database(tmp_path: Path, monkeypatch) -> None:
+    from taurine_core import config
     from taurine_core.models_local import LocalModelUnavailable
     from taurine_core.retrieval.runtime import RetrievalRuntime
 
+    monkeypatch.setattr(config, "EMBED_API_DIM", 16)
     database, _report = _build(tmp_path)
     with sqlite3.connect(database) as conn:
         conn.execute("DROP TABLE note_clusters")

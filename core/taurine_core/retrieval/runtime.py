@@ -10,6 +10,7 @@ from typing import Any, Sequence
 
 from rapidfuzz.distance import Levenshtein
 
+from taurine_core import config
 from taurine_core.evaluation.graph_retrieval import (
     CalibrationArtifact,
     CalibrationCurve,
@@ -332,8 +333,27 @@ class RetrievalRuntime:
             raise ValueError(
                 "active knowledge snapshot calibration does not match the runtime artifact"
             )
-        if dict(snapshot.model_manifest) != self.artifact.model_manifest:
+        snapshot_manifest = dict(snapshot.model_manifest)
+        snapshot_embedding = snapshot_manifest.pop("embedding", None)
+        if snapshot_embedding != config.embed_model_id():
+            raise ValueError(
+                "active knowledge snapshot embedding model does not match "
+                "the active embedding model"
+            )
+        artifact_manifest = dict(self.artifact.model_manifest)
+        artifact_manifest.pop("embedding", None)
+        if snapshot_manifest != artifact_manifest:
             raise ValueError("active knowledge snapshot model manifest is incompatible")
+        expected_dim = config.embed_dim()
+        for kind, matrix in (
+            ("passage", snapshot.passage_matrix),
+            ("fact", snapshot.fact_matrix),
+        ):
+            if matrix.shape[0] and matrix.shape[1] != expected_dim:
+                raise ValueError(
+                    f"active knowledge snapshot {kind} embedding dimension "
+                    f"{matrix.shape[1]} does not match active dimension {expected_dim}"
+                )
         if snapshot.config_manifest.get("config_hash") != self.artifact.config_hash:
             raise ValueError("active knowledge snapshot config manifest is incompatible")
 

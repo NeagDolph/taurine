@@ -14,17 +14,41 @@ ASR_RECONNECT_MIN_S = 1.0
 ASR_RECONNECT_MAX_S = 30.0
 
 # ── embedding / chunking ───────────────────────────────────────────────
-# Qwen3-Embedding-0.6B (2025): 1024-dim, instruction-aware, runs on MPS.
-# Documents embed bare; queries get the instruction prefix (asymmetric
-# retrieval). Replaced bge-small-en-v1.5 (384-dim) — see 2026-07-07 upgrade.
+# Both Qwen3 backends share asymmetric retrieval: documents embed bare and
+# queries receive EMBED_QUERY_PROMPT. The local toggle preserves the existing
+# 0.6B MPS path; the pilot defaults to OpenRouter's 8B model.
+EMBED_BACKEND = "openrouter"             # "openrouter" (pilot) | "local"
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
-EMBED_DIM = 1024
+EMBED_LOCAL_DIM = 1024
+EMBED_API_MODEL = "qwen/qwen3-embedding-8b"
+EMBED_API_DIM = 4096
 EMBED_BATCH_SIZE = 64                     # per-forward-pass cap; bounds MPS peak
+EMBED_API_MAX_TEXTS = 64
+EMBED_API_MAX_CHARS = 100_000
+EMBED_API_ATTEMPTS = 3
+EMBED_API_BACKOFF_S = 0.5
+EMBED_API_TIMEOUT_S = 30.0
 EMBED_QUERY_PROMPT = (
     "Instruct: Given a snippet of spoken conversation, retrieve personal "
     "notes relevant to what is being discussed\nQuery: "
 )
 CHUNK_MAX_TOKENS = 300                   # sentence-boundary chunking
+
+
+def embed_model_id() -> str:
+    if EMBED_BACKEND == "openrouter":
+        return EMBED_API_MODEL
+    if EMBED_BACKEND == "local":
+        return EMBED_MODEL
+    raise ValueError(f"unsupported embedding backend: {EMBED_BACKEND!r}")
+
+
+def embed_dim() -> int:
+    if EMBED_BACKEND == "openrouter":
+        return EMBED_API_DIM
+    if EMBED_BACKEND == "local":
+        return EMBED_LOCAL_DIM
+    raise ValueError(f"unsupported embedding backend: {EMBED_BACKEND!r}")
 
 # ── LLM (ALL calls via OpenRouter) ─────────────────────────────────────
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
