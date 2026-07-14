@@ -243,29 +243,7 @@ def test_relex_releases_device_cache_after_each_note(
     assert len(releases) == 2
 
 
-def test_relex_retries_mps_oom_with_a_smaller_context_window(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class OOMModel(FakeRelexModel):
-        def predict_relations(self, text: str, **kwargs):
-            self.calls.append({"text": text, **kwargs})
-            if len(text.split()) > 1024:
-                raise RuntimeError("MPS backend out of memory")
-            return [], []
-
-    model = OOMModel({})
-    _install_model(monkeypatch, model)
-    text = " ".join(f"word-{index}" for index in range(1200))
-
-    result = extract_relex.extract_notes(
-        [make_note("n1", "Long", text)], tokenizer=OffsetTokenizer()
-    )["n1"]
-
-    assert result.failed is False
-    assert [len(call["text"].split()) for call in model.calls] == [1200, 1024]
-
-
-def test_relex_falls_back_to_cpu_after_mps_retries_are_exhausted(
+def test_relex_retries_mps_oom_on_cpu_with_the_same_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class DeviceModel(FakeRelexModel):
@@ -285,16 +263,15 @@ def test_relex_falls_back_to_cpu_after_mps_retries_are_exhausted(
 
     model = DeviceModel()
     _install_model(monkeypatch, model)
-    monkeypatch.setattr(config, "RELEX_MAX_TOKENS", 512)
+    text = " ".join(f"word-{index}" for index in range(1200))
 
     result = extract_relex.extract_notes(
-        [make_note("n1", "Fallback", " ".join(["word"] * 600))],
-        tokenizer=OffsetTokenizer(),
+        [make_note("n1", "Fallback", text)], tokenizer=OffsetTokenizer()
     )["n1"]
 
     assert result.failed is False
     assert [call["device"] for call in model.calls] == ["mps", "cpu"]
-    assert [len(call["text"].split()) for call in model.calls] == [512, 512]
+    assert [len(call["text"].split()) for call in model.calls] == [1200, 1200]
 
 
 def test_relex_model_load_failure_fails_open_for_every_note(

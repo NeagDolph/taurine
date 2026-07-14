@@ -99,38 +99,17 @@ def _predict_with_oom_fallback(
     note_text: str,
     tokenizer: Any,
 ) -> tuple[str, object, object]:
-    limits = [max(1, int(config.RELEX_MAX_TOKENS))]
-    while limits[-1] // 2 >= 512:
-        limits.append(limits[-1] // 2)
-    for index, limit in enumerate(limits):
-        text = _bounded_text(note_text, tokenizer, maximum=limit)
-        try:
-            entities, relations = _predict(model, text)
-            return text, entities, relations
-        except Exception as exc:
-            is_mps_oom = "mps backend out of memory" in str(exc).casefold()
-            if not is_mps_oom:
-                raise
-            if index + 1 == len(limits):
-                _LOG.warning(
-                    "Relex MPS OOM after bounded retries; moving model to CPU"
-                )
-                model.to("cpu")
-                _release_device_cache()
-                text = _bounded_text(
-                    note_text,
-                    tokenizer,
-                    maximum=int(config.RELEX_MAX_TOKENS),
-                )
-                entities, relations = _predict(model, text)
-                return text, entities, relations
-            _LOG.warning(
-                "Relex MPS OOM at %d tokens; retrying at %d",
-                limit,
-                limits[index + 1],
-            )
-            _release_device_cache()
-    raise RuntimeError("unreachable Relex context fallback")
+    text = _bounded_text(note_text, tokenizer)
+    try:
+        entities, relations = _predict(model, text)
+    except Exception as exc:
+        if "mps backend out of memory" not in str(exc).casefold():
+            raise
+        _LOG.warning("Relex MPS OOM; moving model to CPU and retrying full context")
+        model.to("cpu")
+        _release_device_cache()
+        entities, relations = _predict(model, text)
+    return text, entities, relations
 
 
 def _predict(model: Any, text: str) -> tuple[object, object]:
