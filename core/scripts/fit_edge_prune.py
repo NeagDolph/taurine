@@ -19,7 +19,19 @@ if __package__ in {None, ""}:
 from taurine_core import config
 from taurine_core.evaluation.quality_bench import write_report
 from taurine_core.indexer.edge_adjudication import SemanticPair, _reason_key
-from taurine_core.indexer.edge_prune import FEATURE_NAMES, EdgeFeatures, make_features
+from taurine_core.indexer.edge_prune import (
+    FEATURE_NAMES,
+    NLI_MAX_CHARS,
+    EdgeFeatures,
+    make_features,
+    nli_cross_entailment,
+)
+
+
+BASELINE_WITHOUT_NLI = {
+    "train": {"drop_agreement": 0.869863, "false_drop_rate": 0.002632},
+    "heldout": {"drop_agreement": 0.806723, "false_drop_rate": 0.031915},
+}
 
 
 @dataclass(frozen=True)
@@ -45,6 +57,15 @@ def _read_only(path: str | Path) -> sqlite3.Connection:
     )
     connection.row_factory = sqlite3.Row
     return connection
+
+
+def load_nli_scorer_fail_open() -> tuple[Any | None, str]:
+    from taurine_core import models_local
+
+    try:
+        return models_local.local_nli_scorer(config.EVIDENCE_NLI_MODEL), ""
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def classification_metrics(
@@ -96,9 +117,20 @@ def select_threshold(
     )
 
 
+def refit_adoption_gate(fitted: Mapping[str, Any]) -> bool:
+    heldout = fitted.get("heldout", {})
+    return (
+        float(heldout.get("drop_agreement", 0.0)) >= 0.88
+        and float(heldout.get("false_drop_rate", 1.0)) <= 0.05
+    )
+
+
 def _load_examples(
-    cache_path: str | Path, knowledge_path: str | Path
-) -> tuple[list[FitExample], dict[str, int]]:
+    cache_path: str | Path,
+    knowledge_path: str | Path,
+    *,
+    nli_scorer: Any | None,
+) -> tuple[list[FitExample], dict[str, int], dict[str, int | bool | str]]:
     cache = _read_only(cache_path)
     knowledge = _read_only(knowledge_path)
     try:
@@ -164,6 +196,7 @@ def _load_examples(
             by_hash.setdefault(passage.content_hash, []).append(passage)
         examples: list[FitExample] = []
         matched: set[str] = set()
+        failed_directions = 0
         hashes = sorted(by_hash)
         for left_hash, right_hash in itertools.combinations_with_replacement(hashes, 2):
             if left_hash == right_hash:
@@ -197,21 +230,35 @@ def _load_examples(
                 )
                 for entity_id in sorted(left_entities.keys() & right_entities.keys())
             ]
+            nli = nli_cross_entailment(pair, nli_scorer)
+            failed_directions += nli.failed_directions
             features = make_features(
                 pair,
                 cosine=float(np.dot(left.vector, right.vector)),
                 shared_entities=shared,
                 src_source=left.source,
                 dst_source=right.source,
+                nli_src_to_dst=nli.src_to_dst,
+                nli_dst_to_src=nli.dst_to_src,
             )
             examples.append(FitExample(key=key, features=features, llm_keep=labels[key]))
             if len(matched) == len(labels):
                 break
-        return examples, {
-            "cached_semantic_rows": len(labels),
-            "knowledge_passages": len(passages),
-            "matched_cache_keys": len(matched),
-        }
+        return (
+            examples,
+            {
+                "cached_semantic_rows": len(labels),
+                "knowledge_passages": len(passages),
+                "matched_cache_keys": len(matched),
+            },
+            {
+                "available": nli_scorer is not None,
+                "model": config.EVIDENCE_NLI_MODEL,
+                "max_chars_per_passage": NLI_MAX_CHARS,
+                "failed_directions": failed_directions,
+                "scored_directions": len(examples) * 2 - failed_directions,
+            },
+        )
     finally:
         cache.close()
         knowledge.close()
@@ -271,20 +318,38 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache", required=True)
     parser.add_argument("--knowledge", required=True)
     parser.add_argument(
-        "--out", default="evals/quality/2026-07-13-edge-prune.json"
+        "--out", default="evals/quality/2026-07-14-edge-prune-nli.json"
     )
-    parser.add_argument("--timestamp-source", default="approved-plan-2026-07-13")
+    parser.add_argument(
+        "--timestamp-source", default="orchestrator-iterate-2026-07-14"
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    examples, coverage = _load_examples(args.cache, args.knowledge)
+    nli_scorer, load_error = load_nli_scorer_fail_open()
+    examples, coverage, nli_diagnostics = _load_examples(
+        args.cache, args.knowledge, nli_scorer=nli_scorer
+    )
+    nli_diagnostics["load_error"] = load_error
     fitted = fit(examples)
+    gate_met = refit_adoption_gate(fitted)
     report = write_report(
         args.out,
-        variant="local_semantic_edge_prune",
-        metrics={**fitted, "label_coverage": coverage},
+        variant="local_semantic_edge_prune_nli",
+        metrics={
+            **fitted,
+            "baseline_without_nli": BASELINE_WITHOUT_NLI,
+            "adoption_gate": {
+                "heldout_drop_agreement_min": 0.88,
+                "heldout_false_drop_rate_max": 0.05,
+                "met": gate_met,
+                "eligible_for_embedding": gate_met,
+            },
+            "label_coverage": coverage,
+            "nli_cross_entailment": nli_diagnostics,
+        },
         cost={"runtime_llm_calls": 0, "features": list(FEATURE_NAMES)},
         timestamp_source=args.timestamp_source,
     )

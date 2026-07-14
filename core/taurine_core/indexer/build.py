@@ -946,7 +946,19 @@ class BuildCoordinator:
                     (edge.src_id, edge.dst_id): edge for edge in cross_note_semantic
                 }
                 source_of_note = {note.note_id: note.source for note in ordered}
+                try:
+                    from taurine_core import models_local
+
+                    nli_scorer = models_local.local_nli_scorer(
+                        config.EVIDENCE_NLI_MODEL
+                    )
+                except Exception as exc:
+                    _LOG.warning(
+                        "semantic-edge NLI unavailable; using zero features: %s", exc
+                    )
+                    nli_scorer = None
                 features_by_pair = {}
+                nli_failed_directions = 0
                 for pair in semantic_pairs:
                     left_entities = passage_entities.get(pair.src_passage_id, {})
                     right_entities = passage_entities.get(pair.dst_passage_id, {})
@@ -957,12 +969,21 @@ class BuildCoordinator:
                         )
                         for entity_id in sorted(left_entities.keys() & right_entities.keys())
                     ]
+                    nli = edge_prune.nli_cross_entailment(pair, nli_scorer)
+                    nli_failed_directions += nli.failed_directions
                     features_by_pair[pair.pair] = edge_prune.make_features(
                         pair,
                         cosine=edge_by_pair[pair.pair].weight,
                         shared_entities=shared,
                         src_source=source_of_note[note_of_passage[pair.src_passage_id]],
                         dst_source=source_of_note[note_of_passage[pair.dst_passage_id]],
+                        nli_src_to_dst=nli.src_to_dst,
+                        nli_dst_to_src=nli.dst_to_src,
+                    )
+                if nli_scorer is not None and nli_failed_directions:
+                    _LOG.warning(
+                        "semantic-edge NLI failed open for %d directions",
+                        nli_failed_directions,
                     )
                 try:
                     semantic_reasons = edge_prune.decide(

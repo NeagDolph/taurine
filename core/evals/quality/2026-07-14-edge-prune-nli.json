@@ -1,0 +1,76 @@
+{
+  "cost": {
+    "features": [
+      "cosine",
+      "shared_entity_count",
+      "min_shared_entity_idf",
+      "same_source",
+      "title_jaccard",
+      "length_ratio",
+      "nli_src_to_dst",
+      "nli_dst_to_src"
+    ],
+    "runtime_llm_calls": 0
+  },
+  "metrics": {
+    "adoption_gate": {
+      "eligible_for_embedding": false,
+      "heldout_drop_agreement_min": 0.88,
+      "heldout_false_drop_rate_max": 0.05,
+      "met": false
+    },
+    "baseline_without_nli": {
+      "heldout": {
+        "drop_agreement": 0.806723,
+        "false_drop_rate": 0.031915
+      },
+      "train": {
+        "drop_agreement": 0.869863,
+        "false_drop_rate": 0.002632
+      }
+    },
+    "decision_threshold": 0.16,
+    "heldout": {
+      "drop_agreement": 0.815126,
+      "examples": 119,
+      "false_drop_rate": 0.031915,
+      "llm_drops": 25,
+      "llm_keeps": 94,
+      "predicted_drops": 9
+    },
+    "intercept": -18.563382624098,
+    "label_coverage": {
+      "cached_semantic_rows": 557,
+      "knowledge_passages": 2091,
+      "matched_cache_keys": 557
+    },
+    "nli_cross_entailment": {
+      "available": true,
+      "failed_directions": 0,
+      "load_error": "",
+      "max_chars_per_passage": 1000,
+      "model": "cross-encoder/nli-deberta-v3-base",
+      "scored_directions": 1114
+    },
+    "train": {
+      "drop_agreement": 0.872146,
+      "examples": 438,
+      "false_drop_rate": 0.002632,
+      "llm_drops": 58,
+      "llm_keeps": 380,
+      "predicted_drops": 4
+    },
+    "weights": {
+      "cosine": 15.298061938724,
+      "length_ratio": 1.921593719831,
+      "min_shared_entity_idf": 0.09992669216,
+      "nli_dst_to_src": -0.35400638621,
+      "nli_src_to_dst": -0.219627750846,
+      "same_source": 4.706937178752,
+      "shared_entity_count": -0.070964843892,
+      "title_jaccard": -1.076305803941
+    }
+  },
+  "timestamp_source": "orchestrator-iterate-2026-07-14",
+  "variant": "local_semantic_edge_prune_nli"
+}

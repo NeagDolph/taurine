@@ -15,6 +15,8 @@ FEATURE_NAMES = (
     "same_source",
     "title_jaccard",
     "length_ratio",
+    "nli_src_to_dst",
+    "nli_dst_to_src",
 )
 
 # Offline fit 2026-07-13, 557/557 labels matched. Heldout: drop agreement
@@ -28,8 +30,11 @@ WEIGHTS = {
     "same_source": 5.1862635243,
     "title_jaccard": -1.011065597425,
     "length_ratio": 1.821353473569,
+    "nli_src_to_dst": 0.0,
+    "nli_dst_to_src": 0.0,
 }
 DECISION_THRESHOLD = 0.16
+NLI_MAX_CHARS = 1000
 
 _TOKEN_RE = re.compile(r"[\w']+")
 _TEMPLATE_PREFIXES = ("Both mention ", "Semantically similar passages from ")
@@ -43,6 +48,8 @@ class EdgeFeatures:
     same_source: float
     title_jaccard: float
     length_ratio: float
+    nli_src_to_dst: float = 0.0
+    nli_dst_to_src: float = 0.0
     shared_entities: tuple[str, ...] = ()
     src_source: str = ""
     dst_source: str = ""
@@ -55,7 +62,17 @@ class EdgeFeatures:
             "same_source": float(self.same_source),
             "title_jaccard": float(self.title_jaccard),
             "length_ratio": float(self.length_ratio),
+            "nli_src_to_dst": float(self.nli_src_to_dst),
+            "nli_dst_to_src": float(self.nli_dst_to_src),
         }
+
+
+@dataclass(frozen=True)
+class NLICrossEntailment:
+    src_to_dst: float
+    dst_to_src: float
+    scorer_available: bool
+    failed_directions: int
 
 
 @dataclass(frozen=True)
@@ -74,8 +91,10 @@ def make_features(
     shared_entities: Sequence[tuple[str, float]] = (),
     src_source: str = "",
     dst_source: str = "",
+    nli_src_to_dst: float = 0.0,
+    nli_dst_to_src: float = 0.0,
 ) -> EdgeFeatures:
-    """Build the six runtime features plus reason-template metadata."""
+    """Build the runtime features plus reason-template metadata."""
     ranked = sorted(
         ((str(label), float(idf)) for label, idf in shared_entities if str(label)),
         key=lambda row: (-row[1], row[0].casefold(), row[0]),
@@ -93,10 +112,35 @@ def make_features(
         same_source=float(bool(src_source) and src_source == dst_source),
         title_jaccard=title_jaccard,
         length_ratio=length_ratio,
+        nli_src_to_dst=float(nli_src_to_dst),
+        nli_dst_to_src=float(nli_dst_to_src),
         shared_entities=tuple(label for label, _ in ranked[:3]),
         src_source=str(src_source),
         dst_source=str(dst_source),
     )
+
+
+def nli_cross_entailment(
+    pair: Any, scorer: Any | None, *, max_chars: int = NLI_MAX_CHARS
+) -> NLICrossEntailment:
+    """Score both passage directions, failing each unavailable direction to 0."""
+    if scorer is None:
+        return NLICrossEntailment(0.0, 0.0, False, 2)
+    bound = max(1, int(max_chars))
+    src_text = str(pair.src_text)[:bound]
+    dst_text = str(pair.dst_text)[:bound]
+    scores: list[float] = []
+    failures = 0
+    for premise, hypothesis in ((src_text, dst_text), (dst_text, src_text)):
+        try:
+            score = float(scorer.score(premise, hypothesis))
+            if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+                raise ValueError("invalid NLI score")
+        except Exception:
+            score = 0.0
+            failures += 1
+        scores.append(score)
+    return NLICrossEntailment(scores[0], scores[1], True, failures)
 
 
 def keep_probability(features: EdgeFeatures) -> float:
