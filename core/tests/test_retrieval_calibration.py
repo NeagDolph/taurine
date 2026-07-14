@@ -154,6 +154,25 @@ def test_post_abstention_requires_evidence_floor_and_allows_exact_override() -> 
     assert high_precision.reason == "accepted_high_precision_head"
 
 
+def test_post_abstention_uses_explicit_cloud_evidence_floor_only_when_supplied() -> None:
+    artifact = load_calibration(_ARTIFACT)
+    policy = AbstentionPolicy(artifact, mode="live")
+    score = 0.2
+    hits = (_hit("exact", "e1", 1.0, 1, "entity"),)
+
+    artifact_result = policy.post_rerank(hits, (score,))
+    cloud_result = policy.post_rerank(
+        hits,
+        (score,),
+        evidence_floor_override=0.15,
+    )
+
+    assert artifact.modes["live"].evidence_floor > score
+    assert artifact_result.reason == "no_evidence_above_floor"
+    assert cloud_result.accepted is True
+    assert cloud_result.reason == "accepted_high_precision_head"
+
+
 def test_post_abstention_requires_independent_heads_to_agree_on_selected_evidence() -> None:
     artifact = load_calibration(_ARTIFACT)
     policy = AbstentionPolicy(artifact, mode="chat")

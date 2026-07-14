@@ -170,6 +170,13 @@ class PassageRerankResult:
     accepted: tuple[PassageRerankDecision, ...]
     degraded: bool
     reason: str
+    model_id: str = config.RERANK_MODEL
+    floor_source: Literal["artifact", "api_override", "none"] = "artifact"
+    evidence_floor_override: float | None = None
+
+
+class _InvalidRerankOutput(ValueError):
+    pass
 
 
 class LocalPassageReranker:
@@ -181,12 +188,40 @@ class LocalPassageReranker:
         *,
         mode: RetrievalMode,
         acceptance_floor: float,
+        model_id: str = config.RERANK_MODEL,
+        evidence_floor_override: float | None = None,
+        fallback_scorer: PairScorer | None = None,
+        fallback_acceptance_floor: float | None = None,
+        fallback_model_id: str = config.RERANK_MODEL,
     ) -> None:
         self.scorer = scorer
         self.mode = mode
         self.acceptance_floor = float(acceptance_floor)
+        self.model_id = str(model_id)
+        self.evidence_floor_override = (
+            None
+            if evidence_floor_override is None
+            else float(evidence_floor_override)
+        )
+        self.fallback_scorer = fallback_scorer
+        self.fallback_acceptance_floor = (
+            None
+            if fallback_acceptance_floor is None
+            else float(fallback_acceptance_floor)
+        )
+        self.fallback_model_id = str(fallback_model_id)
         if not 0.0 <= self.acceptance_floor <= 1.0:
             raise ValueError("passage rerank acceptance floor must be within [0, 1]")
+        if self.evidence_floor_override is not None and not (
+            0.0 <= self.evidence_floor_override <= 1.0
+        ):
+            raise ValueError("passage evidence floor override must be within [0, 1]")
+        if (self.fallback_scorer is None) != (self.fallback_acceptance_floor is None):
+            raise ValueError("fallback scorer and acceptance floor must be supplied together")
+        if self.fallback_acceptance_floor is not None and not (
+            0.0 <= self.fallback_acceptance_floor <= 1.0
+        ):
+            raise ValueError("fallback rerank acceptance floor must be within [0, 1]")
 
     def rerank(
         self,
@@ -204,62 +239,69 @@ class LocalPassageReranker:
         bounded = ordered_candidates[: self._candidate_cap]
         unscored = ordered_candidates[self._candidate_cap :]
         if not bounded:
-            return PassageRerankResult((), (), False, "no_passage_candidates")
+            return PassageRerankResult(
+                (), (), False, "no_passage_candidates", "", "none", None
+            )
         documents = tuple(candidate.rerank_document for candidate in bounded)
         try:
-            scores = tuple(
-                float(score)
-                for score in self.scorer.score_pairs(
+            scores = _score_documents(
+                self.scorer,
+                query,
+                documents,
+                deadline_at=deadline_at,
+            )
+        except Exception as primary_exc:  # noqa: BLE001 - fallback boundary
+            if self.fallback_scorer is None:
+                if not isinstance(primary_exc, (ModelDeadlineExceeded, LocalModelUnavailable)):
+                    # Keep a debug trail so programming errors cannot
+                    # masquerade as an unavailable local model.
+                    logger.debug("passage reranker raised", exc_info=True)
+                return _with_unscored_tail(
+                    _degraded(bounded, _failure_reason(primary_exc)), unscored
+                )
+            logger.warning(
+                "cloud passage reranker failed (%s); trying local Qwen fallback",
+                type(primary_exc).__name__,
+            )
+            try:
+                scores = _score_documents(
+                    self.fallback_scorer,
                     query,
                     documents,
-                    instruction=PASSAGE_RERANK_INSTRUCTION,
                     deadline_at=deadline_at,
                 )
-            )
-        except ModelDeadlineExceeded:
-            return _with_unscored_tail(
-                _degraded(bounded, "local_reranker_deadline"), unscored
-            )
-        except LocalModelUnavailable:
-            return _with_unscored_tail(
-                _degraded(bounded, "local_reranker_unavailable"), unscored
-            )
-        except Exception:
-            # Fail-closed to the degraded state, but keep a debug trail so a
-            # programming error cannot masquerade as "reranker unavailable".
-            logger.debug("passage reranker raised", exc_info=True)
-            return _with_unscored_tail(
-                _degraded(bounded, "local_reranker_unavailable"), unscored
-            )
-        if len(scores) != len(bounded) or any(not math.isfinite(score) for score in scores):
-            return _with_unscored_tail(
-                _degraded(bounded, "local_reranker_invalid_output"), unscored
+            except Exception as fallback_exc:  # noqa: BLE001 - final fail-open boundary
+                logger.warning(
+                    "no passage reranker succeeded; local fallback failed (%s)",
+                    type(fallback_exc).__name__,
+                )
+                return _with_unscored_tail(
+                    _degraded(bounded, _failure_reason(fallback_exc)), unscored
+                )
+            return _ranked_result(
+                bounded,
+                scores,
+                unscored,
+                acceptance_floor=float(self.fallback_acceptance_floor),
+                model_id=self.fallback_model_id,
+                floor_source="artifact",
+                evidence_floor_override=None,
+                reason="reranked_with_local_fallback",
             )
 
-        ordered = sorted(
-            zip(bounded, scores, strict=True),
-            key=lambda row: (-row[1], row[0].passage_id),
-        )
-        decisions = tuple(
-            PassageRerankDecision(
-                candidate=candidate,
-                score=min(1.0, max(0.0, score)),
-                accepted=score >= self.acceptance_floor,
-                rank=rank,
-                reason=(
-                    "accepted_passage_rerank"
-                    if score >= self.acceptance_floor
-                    else "below_passage_rerank_floor"
-                ),
-            )
-            for rank, (candidate, score) in enumerate(ordered, 1)
-        )
-        complete_decisions = (*decisions, *_unscored_decisions(unscored, len(decisions)))
-        return PassageRerankResult(
-            decisions=complete_decisions,
-            accepted=tuple(row for row in decisions if row.accepted),
-            degraded=False,
-            reason="reranked" if decisions else "no_passage_candidates",
+        return _ranked_result(
+            bounded,
+            scores,
+            unscored,
+            acceptance_floor=self.acceptance_floor,
+            model_id=self.model_id,
+            floor_source=(
+                "api_override"
+                if self.evidence_floor_override is not None
+                else "artifact"
+            ),
+            evidence_floor_override=self.evidence_floor_override,
+            reason="reranked",
         )
 
     @property
@@ -285,7 +327,84 @@ def _degraded(
         )
         for rank, candidate in enumerate(candidates, 1)
     )
-    return PassageRerankResult(decisions, (), True, reason)
+    return PassageRerankResult(decisions, (), True, reason, "", "none", None)
+
+
+def _failure_reason(
+    error: Exception,
+) -> Literal[
+    "local_reranker_deadline",
+    "local_reranker_unavailable",
+    "local_reranker_invalid_output",
+]:
+    if isinstance(error, ModelDeadlineExceeded):
+        return "local_reranker_deadline"
+    if isinstance(error, _InvalidRerankOutput):
+        return "local_reranker_invalid_output"
+    return "local_reranker_unavailable"
+
+
+def _score_documents(
+    scorer: PairScorer,
+    query: str,
+    documents: tuple[str, ...],
+    *,
+    deadline_at: float | None,
+) -> tuple[float, ...]:
+    scores = tuple(
+        float(score)
+        for score in scorer.score_pairs(
+            query,
+            documents,
+            instruction=PASSAGE_RERANK_INSTRUCTION,
+            deadline_at=deadline_at,
+        )
+    )
+    if len(scores) != len(documents) or any(
+        not math.isfinite(score) for score in scores
+    ):
+        raise _InvalidRerankOutput("passage reranker returned invalid scores")
+    return scores
+
+
+def _ranked_result(
+    candidates: tuple[PassageRerankCandidate, ...],
+    scores: tuple[float, ...],
+    unscored: tuple[PassageRerankCandidate, ...],
+    *,
+    acceptance_floor: float,
+    model_id: str,
+    floor_source: Literal["artifact", "api_override"],
+    evidence_floor_override: float | None,
+    reason: str,
+) -> PassageRerankResult:
+    ordered = sorted(
+        zip(candidates, scores, strict=True),
+        key=lambda row: (-row[1], row[0].passage_id),
+    )
+    decisions = tuple(
+        PassageRerankDecision(
+            candidate=candidate,
+            score=min(1.0, max(0.0, score)),
+            accepted=score >= acceptance_floor,
+            rank=rank,
+            reason=(
+                "accepted_passage_rerank"
+                if score >= acceptance_floor
+                else "below_passage_rerank_floor"
+            ),
+        )
+        for rank, (candidate, score) in enumerate(ordered, 1)
+    )
+    return PassageRerankResult(
+        decisions=(*decisions, *_unscored_decisions(unscored, len(decisions))),
+        accepted=tuple(row for row in decisions if row.accepted),
+        degraded=False,
+        reason=reason,
+        model_id=model_id,
+        floor_source=floor_source,
+        evidence_floor_override=evidence_floor_override,
+    )
 
 
 def _with_unscored_tail(
@@ -300,6 +419,9 @@ def _with_unscored_tail(
         accepted=result.accepted,
         degraded=result.degraded,
         reason=result.reason,
+        model_id=result.model_id,
+        floor_source=result.floor_source,
+        evidence_floor_override=result.evidence_floor_override,
     )
 
 

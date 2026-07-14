@@ -380,6 +380,28 @@ def test_shared_engine_assembles_registered_passage_fact_path_and_note_evidence(
     assert pack.trace.paths
 
 
+def test_cloud_rerank_result_threads_model_identity_and_override_floor_to_trace(
+    tmp_path: Path,
+) -> None:
+    engine, _registry, _store = _engine(tmp_path)
+    engine.reranker = LocalPassageReranker(
+        FakeScorer((0.6, 0.6, 0.6, 0.6)),
+        mode="chat",
+        acceptance_floor=0.5,
+        model_id="cohere/rerank-v3.5",
+        evidence_floor_override=0.15,
+    )
+
+    pack = engine.retrieve(
+        RetrievalQuery("What does Maya own?", "chat", now=10.0),
+        entity_spans=(("Launch", "project"),),
+    )
+
+    assert pack.decision.accepted is True
+    assert pack.trace.debug["reranker_model_id"] == "cohere/rerank-v3.5"
+    assert pack.trace.debug["rerank_floor_source"] == "api_override"
+
+
 def test_shared_engine_uses_whole_corpus_dense_reset_and_never_reads_projection(tmp_path: Path) -> None:
     engine, _registry, store = _engine(tmp_path)
 

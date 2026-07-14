@@ -275,6 +275,77 @@ def test_passage_reranker_scores_exact_passages_and_applies_mode_floor() -> None
     assert "canonical fact triple" not in scorer.calls[0][2]
 
 
+def test_cloud_reranker_success_uses_api_identity_and_override_floors() -> None:
+    remote = FakeScorer((0.6, 0.4))
+    local = FakeScorer((0.9, 0.9))
+    result = LocalPassageReranker(
+        remote,
+        mode="chat",
+        acceptance_floor=0.5,
+        model_id="cohere/rerank-v3.5",
+        evidence_floor_override=0.15,
+        fallback_scorer=local,
+        fallback_acceptance_floor=0.2,
+        fallback_model_id="Qwen/Qwen3-Reranker-0.6B",
+    ).rerank("query", (_candidate(0), _candidate(1)))
+
+    assert len(remote.calls) == 1
+    assert local.calls == []
+    assert result.model_id == "cohere/rerank-v3.5"
+    assert result.floor_source == "api_override"
+    assert result.evidence_floor_override == pytest.approx(0.15)
+    assert [row.candidate.passage_id for row in result.accepted] == ["p00"]
+
+
+def test_cloud_reranker_failure_uses_local_qwen_identity_and_artifact_floor(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    remote = FakeScorer(RerankError("cloud unavailable"))
+    local = FakeScorer((0.3, 0.1))
+    result = LocalPassageReranker(
+        remote,
+        mode="live",
+        acceptance_floor=0.5,
+        model_id="cohere/rerank-v3.5",
+        evidence_floor_override=0.15,
+        fallback_scorer=local,
+        fallback_acceptance_floor=0.26,
+        fallback_model_id="Qwen/Qwen3-Reranker-0.6B",
+    ).rerank("query", (_candidate(0), _candidate(1)))
+
+    assert len(remote.calls) == 1
+    assert len(local.calls) == 1
+    assert result.degraded is False
+    assert result.model_id == "Qwen/Qwen3-Reranker-0.6B"
+    assert result.floor_source == "artifact"
+    assert result.evidence_floor_override is None
+    assert [row.candidate.passage_id for row in result.accepted] == ["p00"]
+    assert "cloud passage reranker failed" in caplog.text
+
+
+def test_cloud_and_local_reranker_failures_degrade_with_logged_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    result = LocalPassageReranker(
+        FakeScorer(RerankError("cloud unavailable")),
+        mode="chat",
+        acceptance_floor=0.5,
+        model_id="cohere/rerank-v3.5",
+        evidence_floor_override=0.15,
+        fallback_scorer=FakeScorer(LocalModelUnavailable("local missing")),
+        fallback_acceptance_floor=0.2,
+        fallback_model_id="Qwen/Qwen3-Reranker-0.6B",
+    ).rerank("query", (_candidate(0),))
+
+    assert result.degraded is True
+    assert result.accepted == ()
+    assert result.model_id == ""
+    assert result.floor_source == "none"
+    assert result.evidence_floor_override is None
+    assert "cloud passage reranker failed" in caplog.text
+    assert "no passage reranker succeeded" in caplog.text
+
+
 @pytest.mark.parametrize("mode", ["live", "chat", "tool"])
 def test_passage_reranker_caps_scoring_at_24_and_preserves_unscored_tail(
     mode: str,

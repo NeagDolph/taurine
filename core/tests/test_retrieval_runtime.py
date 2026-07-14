@@ -36,6 +36,101 @@ def _embed(texts: list[str]) -> np.ndarray:
     return np.vstack(rows)
 
 
+class PairScorerStub:
+    def score_pairs(
+        self,
+        query: str,
+        documents,
+        *,
+        instruction: str,
+        deadline_at: float | None = None,
+    ):
+        del query, instruction, deadline_at
+        return tuple(0.9 for _ in documents)
+
+
+def test_local_mode_keeps_qwen_for_triples_and_passage_reranking(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "local")
+    monkeypatch.setattr(config, "EMBED_LOCAL_DIM", 16)
+    database = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=_embed, embedding_dim=16)
+    ).build(
+        [make_note("n1", "One", "first source passage")],
+        database,
+        replace_derived=True,
+    )
+    local = PairScorerStub()
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_pair_reranker", lambda: local
+    )
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime._openrouter_pair_reranker",
+        lambda: (_ for _ in ()).throw(AssertionError("remote client loaded in local mode")),
+    )
+
+    runtime = RetrievalRuntime(database)
+    try:
+        engine = runtime.make_engine("chat", EvidenceRegistry())
+        assert runtime.local_pair_scorer is local
+        assert runtime.pair_scorer is local
+        assert runtime.pair_scorer_model_id == config.RERANK_MODEL
+        assert engine.triple_recognizer.scorer is local
+        assert engine.reranker.scorer is local
+        assert engine.reranker.model_id == config.RERANK_MODEL
+        assert engine.reranker.acceptance_floor == pytest.approx(
+            runtime.artifact.rerank.chat_floor
+        )
+        assert engine.reranker.evidence_floor_override is None
+        assert engine.reranker.fallback_scorer is None
+    finally:
+        runtime.close()
+
+
+def test_openrouter_mode_keeps_triples_local_and_wires_cloud_passage_fallback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=_embed, embedding_dim=16)
+    ).build(
+        [make_note("n1", "One", "first source passage")],
+        database,
+        replace_derived=True,
+    )
+    local = PairScorerStub()
+    remote = PairScorerStub()
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_pair_reranker", lambda: local
+    )
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime._openrouter_pair_reranker", lambda: remote
+    )
+
+    runtime = RetrievalRuntime(database)
+    try:
+        engine = runtime.make_engine("chat", EvidenceRegistry())
+        assert runtime.local_pair_scorer is local
+        assert runtime.pair_scorer is remote
+        assert runtime.pair_scorer_model_id == config.RERANK_API_MODEL
+        assert engine.triple_recognizer.scorer is local
+        assert engine.reranker.scorer is remote
+        assert engine.reranker.model_id == config.RERANK_API_MODEL
+        assert engine.reranker.acceptance_floor == pytest.approx(0.5)
+        assert engine.reranker.evidence_floor_override == pytest.approx(0.15)
+        assert engine.reranker.fallback_scorer is local
+        assert engine.reranker.fallback_acceptance_floor == pytest.approx(
+            runtime.artifact.rerank.chat_floor
+        )
+        assert engine.reranker.fallback_model_id == config.RERANK_MODEL
+    finally:
+        runtime.close()
+
+
 def test_runtime_rejects_snapshot_from_inactive_embedding_model(tmp_path) -> None:
     database = tmp_path / "knowledge.db"
     BuildCoordinator(

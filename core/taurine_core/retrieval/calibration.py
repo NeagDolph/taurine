@@ -218,6 +218,7 @@ class AbstentionPolicy:
         *,
         recognized_triple_confidence: float = 0.0,
         evidence_target_ids: Sequence[str] | None = None,
+        evidence_floor_override: float | None = None,
     ) -> RetrievalDecision:
         qualified, disqualified = self._qualified(accepted_hits)
         heads = _head_names(qualified)
@@ -228,7 +229,14 @@ class AbstentionPolicy:
             if math.isfinite(float(score))
         )
         top = max(finite_scores, default=0.0)
-        if top < self.rules.evidence_floor:
+        evidence_floor = (
+            self.rules.evidence_floor
+            if evidence_floor_override is None
+            else float(evidence_floor_override)
+        )
+        if not 0.0 <= evidence_floor <= 1.0:
+            raise ValueError("evidence floor override must be within [0, 1]")
+        if top < evidence_floor:
             return RetrievalDecision(
                 accepted=False,
                 confidence=top,

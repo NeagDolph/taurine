@@ -621,6 +621,8 @@ class SharedRetrievalEngine:
             query.text, rerank_candidates, deadline_at=deadline_at
         )
         latency["rerank"] = _elapsed_ms(rerank_started)
+        base_debug["reranker_model_id"] = reranked.model_id
+        base_debug["rerank_floor_source"] = reranked.floor_source
         fallback = ""
         if reranked.degraded:
             fallback = "calibrated_direct_only"
@@ -662,6 +664,7 @@ class SharedRetrievalEngine:
             evidence_target_ids=tuple(
                 row.candidate.passage_id for row in selected
             ),
+            evidence_floor_override=reranked.evidence_floor_override,
         )
         rerank_trace = _rerank_trace(reranked.decisions)
         if not post_decision.accepted:

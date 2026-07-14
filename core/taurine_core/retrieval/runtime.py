@@ -30,7 +30,11 @@ from taurine_core.retrieval.calibration import AbstentionPolicy, HeadCalibrator
 from taurine_core.retrieval.evidence import SharedRetrievalEngine
 from taurine_core.retrieval.heads import RawHeadCandidate
 from taurine_core.retrieval.registry import EvidenceRegistry
-from taurine_core.retrieval.rerank import LocalPassageReranker
+from taurine_core.retrieval.rerank import (
+    LocalPassageReranker,
+    OpenRouterRerankClient,
+    RerankError,
+)
 from taurine_core.retrieval.snapshot import IndexSnapshot, load_index_snapshot
 from taurine_core.retrieval.triples import FactRecallIndex, TripleRecognizer
 from taurine_core.retrieval.types import RetrievalMode
@@ -139,6 +143,28 @@ class _UnavailablePairScorer:
         raise LocalModelUnavailable("bundled local reranker is unavailable")
 
 
+class _UnavailableRemotePairScorer:
+    def score_pairs(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        instruction: str,
+        deadline_at: float | None = None,
+    ) -> Sequence[float]:
+        del query, documents, instruction, deadline_at
+        raise RerankError("OpenRouter passage reranker is unavailable")
+
+
+def _openrouter_pair_reranker() -> OpenRouterRerankClient:
+    import os
+
+    return OpenRouterRerankClient(
+        os.environ.get("OPEN_ROUTER_API_KEY", ""),
+        model_id=config.RERANK_API_MODEL,
+    )
+
+
 class RetrievalRuntime:
     """Own the active snapshot inputs and create session-scoped engines."""
 
@@ -167,15 +193,36 @@ class RetrievalRuntime:
             self.calibration_status = "calibration_mismatch"
         self._validate_snapshot(self._snapshot)
         log = logging.getLogger("taurine.retrieval")
+        self.pair_scorer_model_id = config.rerank_model_id()
         try:
-            self.pair_scorer: Any = local_pair_reranker()
+            self.local_pair_scorer: Any = local_pair_reranker()
         except LocalModelUnavailable as exc:
-            self.pair_scorer = _UnavailablePairScorer()
-            log.warning(
-                "local reranker unavailable (%s) — rerank quality degraded; "
-                "run: uv run python -m taurine_core.download_models",
-                exc,
-            )
+            self.local_pair_scorer = _UnavailablePairScorer()
+            if config.INFERENCE_BACKEND == "local":
+                log.warning(
+                    "local reranker unavailable (%s) — rerank quality degraded; "
+                    "run: uv run python -m taurine_core.download_models",
+                    exc,
+                )
+            else:
+                log.warning(
+                    "local Qwen triple recognizer and rerank fallback unavailable (%s); "
+                    "run: uv run python -m taurine_core.download_models",
+                    exc,
+                )
+        if config.INFERENCE_BACKEND == "openrouter":
+            try:
+                self.pair_scorer: Any = _openrouter_pair_reranker()
+            except RerankError as exc:
+                self.pair_scorer = _UnavailableRemotePairScorer()
+                log.warning("OpenRouter passage reranker unavailable (%s)", exc)
+        else:
+            self.pair_scorer = self.local_pair_scorer
+        self.active_model_manifest = {
+            **self.artifact.model_manifest,
+            "embedding": config.embed_model_id(),
+            "reranker": self.pair_scorer_model_id,
+        }
 
     def make_engine(
         self,
@@ -215,7 +262,7 @@ class RetrievalRuntime:
         triple_recognizer = TripleRecognizer(
             FactRecallIndex(snapshot, store, calibrator),
             store,
-            self.pair_scorer,
+            self.local_pair_scorer,
             mode=mode,
             recognition_floor=recognition_floor,
             fallback_embedding_floor=fallback_floor,
@@ -228,6 +275,25 @@ class RetrievalRuntime:
             if mode == "live"
             else self.artifact.rerank.chat_floor
         )
+        if config.INFERENCE_BACKEND == "openrouter":
+            api_floors = config.RERANK_API_FLOOR_OVERRIDES
+            passage_reranker = LocalPassageReranker(
+                self.pair_scorer,
+                mode=mode,
+                acceptance_floor=float(api_floors["accept"]),
+                model_id=self.pair_scorer_model_id,
+                evidence_floor_override=float(api_floors["fallback"]),
+                fallback_scorer=self.local_pair_scorer,
+                fallback_acceptance_floor=rerank_floor,
+                fallback_model_id=config.RERANK_MODEL,
+            )
+        else:
+            passage_reranker = LocalPassageReranker(
+                self.pair_scorer,
+                mode=mode,
+                acceptance_floor=rerank_floor,
+                model_id=self.pair_scorer_model_id,
+            )
         return SharedRetrievalEngine(
             snapshot,
             store,
@@ -235,11 +301,7 @@ class RetrievalRuntime:
             AbstentionPolicy(self.artifact, mode=mode),
             query_embedder=lambda text: embed_queries([text])[0],
             registry=registry,
-            reranker=LocalPassageReranker(
-                self.pair_scorer,
-                mode=mode,
-                acceptance_floor=rerank_floor,
-            ),
+            reranker=passage_reranker,
             entity_resolver=lambda surface, etype, query: self._resolve_entity(
                 snapshot,
                 store,
