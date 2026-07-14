@@ -120,6 +120,45 @@ def extract_notes(
     return {note.note_id: results[note.note_id] for note in notes}
 
 
+def extract_notes_dispatch(
+    notes: list[NoteRecord],
+    *,
+    tokenizer: OffsetTokenizerPort | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    backend: str | None = None,
+) -> dict[str, Extraction]:
+    """Select the configured extractor while preserving GLiNER2 by default."""
+    selected = backend or config.EXTRACTOR_BACKEND
+    if selected == "gliner2":
+        return extract_notes(notes, tokenizer=tokenizer, progress=progress)
+
+    from taurine_core.indexer import extract_relex
+
+    if selected == "relex":
+        return extract_relex.extract_notes(notes, tokenizer=tokenizer, progress=progress)
+    if selected == "hybrid":
+        gliner_results = extract_notes(notes, tokenizer=tokenizer, progress=None)
+        relex_results = extract_relex.extract_notes(notes, tokenizer=tokenizer, progress=None)
+        merged = {
+            note.note_id: extract_relex.merge_hybrid(
+                gliner_results.get(
+                    note.note_id,
+                    Extraction(failed=True, error="GLiNER2 result missing"),
+                ),
+                relex_results.get(
+                    note.note_id,
+                    Extraction(failed=True, error="relex result missing"),
+                ),
+            )
+            for note in notes
+        }
+        if progress is not None:
+            progress(len(merged), len(notes))
+        return merged
+    _LOGGER.warning("unknown extractor backend %r; using GLiNER2", selected)
+    return extract_notes(notes, tokenizer=tokenizer, progress=progress)
+
+
 def _extractor_model() -> Any | None:
     return spans.shared_model()
 

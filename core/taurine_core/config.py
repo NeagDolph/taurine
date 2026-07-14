@@ -395,6 +395,14 @@ GLINER_CHUNK_SIZE = GLINER_LONG_CHUNK_TOKENS       # legacy alias until extracto
 GLINER_CHUNK_OVERLAP = GLINER_LONG_OVERLAP_TOKENS # legacy alias until extractor cutover
 GLINER_ENTITY_MIN_CONF = 0.5             # calibration-pending entity floor
 GLINER_RELATION_MIN_CONF = 0.45          # calibration-pending relation floor
+# Extraction backend stays on current GLiNER2 behavior until the quality gate
+# selects a replacement.
+EXTRACTOR_BACKEND = "gliner2"
+RELEX_MODEL = "knowledgator/gliner-relex-large-v1.0"
+RELEX_ENTITY_THRESHOLD = 0.4
+RELEX_RELATION_THRESHOLD = 0.8
+RELEX_ADJACENCY_THRESHOLD = 0.55
+RELEX_MAX_TOKENS = 2048
 # entities above this active-note df fraction are connective stopwords
 # (owner-name/pronoun hubs); contains edges remain for PPR hub dilution
 ENTITY_SHARED_DF_FRACTION_CAP = 0.06

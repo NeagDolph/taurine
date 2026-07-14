@@ -197,6 +197,26 @@ def test_extraction_cache_key_covers_schema_thresholds_and_chunking(
         assert key() != baseline
 
 
+def test_extraction_cache_fingerprint_scopes_relex_backend_and_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "EXTRACTOR_BACKEND", "gliner2")
+    gliner2 = build_cache_module._schema_fingerprint()
+
+    monkeypatch.setattr(config, "RELEX_RELATION_THRESHOLD", 0.91)
+    assert build_cache_module._schema_fingerprint() == gliner2
+
+    monkeypatch.setattr(config, "EXTRACTOR_BACKEND", "relex")
+    relex = build_cache_module._schema_fingerprint()
+    assert relex != gliner2
+
+    monkeypatch.setattr(config, "RELEX_ENTITY_THRESHOLD", 0.35)
+    assert build_cache_module._schema_fingerprint() != relex
+
+    monkeypatch.setattr(config, "EXTRACTOR_BACKEND", "hybrid")
+    assert build_cache_module._schema_fingerprint() not in {gliner2, relex}
+
+
 def test_corrupt_extraction_cache_row_degrades_to_miss(tmp_path: Path) -> None:
     """L8: one bad row costs one recompute, never the build."""
     calls: list[list[str]] = []

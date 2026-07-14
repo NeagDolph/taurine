@@ -344,7 +344,9 @@ def _schema_fingerprint() -> str:
     the per-family relation prompts), chunking knobs, the extractor model id,
     and the calibrated per-type threshold tables baked into accepted rows."""
     calibration = extract._calibration().extraction
-    payload = {
+    backend = str(config.EXTRACTOR_BACKEND)
+    payload: dict[str, Any] = {
+        "backend": backend,
         "extractor": extract._EXTRACTOR_ID,
         "entities": dict(config.INGEST_ENTITY_TYPES),
         "relations": {
@@ -364,6 +366,23 @@ def _schema_fingerprint() -> str:
             "promotion": dict(sorted(calibration.promotion_thresholds.items())),
         },
     }
+    if backend != "gliner2":
+        payload["relex"] = {
+            "model": config.RELEX_MODEL,
+            "max_tokens": int(config.RELEX_MAX_TOKENS),
+            "thresholds": {
+                "entity": float(config.RELEX_ENTITY_THRESHOLD),
+                "relation": float(config.RELEX_RELATION_THRESHOLD),
+                "adjacency": float(config.RELEX_ADJACENCY_THRESHOLD),
+            },
+            "endpoint_constraints": {
+                name: {
+                    "subject": sorted(spec.subject_etypes),
+                    "object": sorted(spec.object_etypes),
+                }
+                for name, spec in sorted(PREDICATES.items())
+            },
+        }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
