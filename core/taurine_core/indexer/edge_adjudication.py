@@ -214,7 +214,7 @@ def adjudicate_facts(
         for fact in ordered
         if fact.status in {"active", "candidate"} and _needs_adjudication(fact, sources)
     ]
-    if judge is None or not eligible:
+    if not eligible:
         return _fact_outcome(ordered, {}, failed_batches=0, malformed_rows=0)
 
     draft_by_passage = {
@@ -241,8 +241,26 @@ def adjudicate_facts(
     pending = [
         fact for fact in eligible if fact.fact_id in keys and fact.fact_id not in cached
     ]
-    batches = _fact_batches(pending, draft_by_passage, note_titles)
     judgments: dict[str, FactJudgment] = dict(cached)
+    if bool(config.NLI_SCREEN_ENABLED) and pending:
+        try:
+            from taurine_core import models_local
+            from taurine_core.indexer.nli_screen import screen
+
+            scorer = models_local.local_nli_scorer(config.EVIDENCE_NLI_MODEL)
+        except Exception as exc:
+            _LOG.warning("NLI fact screen unavailable; using LLM lane: %s", exc)
+        else:
+            screened = screen(pending, draft_by_passage, scorer)
+            judgments.update(screened.kept)
+            pending = screened.pending
+
+    if judge is None:
+        return _fact_outcome(
+            ordered, judgments, failed_batches=0, malformed_rows=0
+        )
+
+    batches = _fact_batches(pending, draft_by_passage, note_titles)
     failed = 0
     malformed = 0
     if batches:

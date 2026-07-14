@@ -228,3 +228,95 @@ def test_extraction_cli_runs_each_backend_on_read_only_sample(
     # Opening in read-only mode is part of the CLI contract: no SQLite sidecars.
     assert not (tmp_path / "knowledge.db-wal").exists()
     assert not (tmp_path / "knowledge.db-shm").exists()
+
+
+def test_fit_keep_floor_selects_smallest_floor_meeting_precision() -> None:
+    examples = [
+        quality_bench.AdjudicationScore("0", 0.99, True),
+        quality_bench.AdjudicationScore("1", 0.96, True),
+        quality_bench.AdjudicationScore("2", 0.91, False),
+        quality_bench.AdjudicationScore("3", 0.80, True),
+    ]
+
+    fitted = quality_bench.fit_keep_floor(
+        examples,
+        floors=(0.8, 0.9, 0.95, 0.99),
+        target_precision=0.95,
+    )
+
+    assert fitted["keep_floor"] == 0.95
+    assert fitted["keep_precision"] == 1.0
+    assert fitted["calls_eliminated"] == 0.5
+    assert fitted["screened_keeps"] == 2
+
+
+def test_adjudication_scoring_counts_exclusions_without_calling_nli() -> None:
+    examples = [
+        quality_bench.AdjudicationExample("1", "p", "h", True),
+        quality_bench.AdjudicationExample(
+            "2", "excluded", "excluded", False, screenable=False
+        ),
+    ]
+
+    class Scorer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def score(self, premise: str, hypothesis: str) -> float:
+            self.calls += 1
+            return 0.99
+
+    scorer = Scorer()
+    scores = quality_bench.score_adjudication_examples(examples, scorer)
+
+    assert scorer.calls == 1
+    assert quality_bench.evaluate_keep_floor(scores, 0.99)["calls_eliminated"] == 0.5
+
+
+def test_adjudication_cli_uses_train_floor_for_heldout_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    examples = [
+        quality_bench.AdjudicationExample("4", "p", "h", True),
+        quality_bench.AdjudicationExample("8", "p", "h", True),
+        quality_bench.AdjudicationExample("1", "p", "h", True),
+        quality_bench.AdjudicationExample("2", "p", "h", False),
+    ]
+    scores = iter((0.96, 0.95, 0.97, 0.10))
+
+    class Scorer:
+        def score(self, premise: str, hypothesis: str) -> float:
+            return next(scores)
+
+    monkeypatch.setattr(
+        quality_bench,
+        "_load_adjudication_examples",
+        lambda cache, knowledge: (examples, {"cached_fact_rows": 1335, "matched_rows": 4}),
+    )
+    monkeypatch.setattr(quality_bench, "_load_nli_scorer", lambda: Scorer())
+    output = tmp_path / "nli.json"
+
+    exit_code = quality_bench.main(
+        [
+            "adjudication",
+            "--cache",
+            "cache.db",
+            "--knowledge",
+            "knowledge.db",
+            "--timestamp-source",
+            "fixture-time",
+            "--out",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    report = json.loads(output.read_text())
+    assert report["variant"] == "nli_fact_screen"
+    assert report["metrics"]["keep_floor"] == 0.7
+    assert report["metrics"]["train"]["keep_precision"] == 1.0
+    assert report["metrics"]["heldout"]["keep_precision"] == 1.0
+    assert report["metrics"]["label_coverage"] == {
+        "cached_fact_rows": 1335,
+        "matched_rows": 4,
+    }

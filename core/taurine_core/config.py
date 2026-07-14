@@ -255,6 +255,12 @@ ENTITY_NEIGHBORHOOD_FACTS = 6            # resolved query entities surface their
 ADJUDICATION_TEXT_MAX_CHARS = 4000       # passage text supplied per fact-judge call
 ADJUDICATION_REJECT_BELOW = 0.3          # judged score < this ⇒ status 'rejected'
 ADJUDICATION_DOWNWEIGHT_BELOW = 0.7      # scores in [reject, this) multiply the fact edge weight
+NLI_SCREEN_ENABLED = False               # current behavior until calibration is verified
+# 2026-07-13 fit: train precision/calls 0.9167/2.75%; heldout 0.8000/3.70%.
+# The 0.95 precision + 40% savings gate was not met, so the lane stays disabled.
+NLI_KEEP_FLOOR = 0.99
+NLI_AUTO_REJECT = False                  # destructive rejection remains LLM-only
+NLI_REJECT_CEIL = 0.05                   # inactive while NLI_AUTO_REJECT is false
 SEMANTIC_REASON_BATCH = 20               # cross-note semantic pairs per judge call
 SEMANTIC_REASON_SNIPPET_CHARS = 300      # per-passage snippet supplied to the judge
 # Reasons are an optional retrieval hint on the strongest cross-note links, not

@@ -1,0 +1,37 @@
+{
+  "cost": {
+    "llm_calls": 0,
+    "nli_calls": 133
+  },
+  "metrics": {
+    "heldout": {
+      "calls_eliminated": 0.037037,
+      "examples": 135,
+      "keep_floor": 0.99,
+      "keep_precision": 0.8,
+      "screened_keeps": 5,
+      "target_met": false
+    },
+    "keep_floor": 0.99,
+    "label_coverage": {
+      "cached_fact_rows": 1335,
+      "eligible_examples": 133,
+      "excluded_rows": 444,
+      "knowledge_fact_rows": 976,
+      "matched_cache_keys": 571,
+      "matched_fact_rows": 582
+    },
+    "llm_keep_definition": "score >= 0.3",
+    "target_precision": 0.95,
+    "train": {
+      "calls_eliminated": 0.027523,
+      "examples": 436,
+      "keep_floor": 0.99,
+      "keep_precision": 0.916667,
+      "screened_keeps": 12,
+      "target_met": false
+    }
+  },
+  "timestamp_source": "approved-plan-2026-07-13",
+  "variant": "nli_fact_screen"
+}
