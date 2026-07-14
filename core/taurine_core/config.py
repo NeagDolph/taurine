@@ -153,6 +153,18 @@ PROJECTION_MAX_DEGREE = 12               # product map only; never retrieval
 # forest ignores the floor, so every note keeps its best route (no new
 # isolated nodes) — only the mesh of weak incidental links disappears.
 PROJECTION_FILL_MIN_WEIGHT = 0.35
+PROJECTION_ENTITY_ETYPE_WEIGHTS = {
+    "person": 1.0,
+    "organization": 1.0,
+    "project": 1.0,
+    "product": 1.0,
+    "place": 0.7,
+    "event": 0.3,
+    "concept": 0.3,
+    "date_or_deadline": 0.0,
+}
+PROJECTION_ENTITY_ETYPE_DEFAULT = 0.5
+PROJECTION_ENTITY_MIN_SHARED = 2
 
 # ── build-time note clusters (map lens; persisted per build) ──────────
 # Clustering edge weight re-weights projection mechanisms: the entity

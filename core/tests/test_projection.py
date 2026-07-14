@@ -223,6 +223,7 @@ def test_mechanism_aggregation_is_strongest_plus_bounded_support() -> None:
         _graph(edges),
         passages=(ProjectionPassage("p1", "n1"), ProjectionPassage("p2", "n2")),
         entity_labels={f"e{i}": f"E{i}" for i in range(6)},
+        entity_types={f"e{i}": "person" for i in range(6)},
         max_degree=12,
     )
     assert len(rows) == 1
@@ -230,6 +231,61 @@ def test_mechanism_aggregation_is_strongest_plus_bounded_support() -> None:
     # noisy-or of six 0.16s would be ~0.65; strongest+support = 0.16 + 5*0.05 capped
     assert entity_weight == pytest.approx(0.4 * 0.4 + 0.15, abs=1e-6)
     assert rows[0].weight < 0.5
+
+
+def test_projection_weights_each_entity_contribution_by_etype() -> None:
+    edges = tuple(
+        BaseEdge(passage_id, entity_id, "contains", strength)
+        for passage_id, entity_id, strength in (
+            ("p1", "person-1", 0.8),
+            ("p2", "person-1", 0.9),
+            ("p3", "concept-1", 0.8),
+            ("p4", "concept-1", 0.9),
+            ("p5", "custom-1", 0.8),
+            ("p6", "custom-1", 0.9),
+        )
+    )
+
+    rows = build_projection(
+        _graph(edges),
+        passages=tuple(ProjectionPassage(f"p{i}", f"n{i}") for i in range(1, 7)),
+        entity_labels={
+            "person-1": "Maya",
+            "concept-1": "Layoffs",
+            "custom-1": "Custom",
+        },
+        entity_types={
+            "person-1": "person",
+            "concept-1": "concept",
+            "custom-1": "custom",
+        },
+        max_degree=12,
+    )
+
+    weights = {
+        row.shared[0]: row.mechanisms["entity"]
+        for row in rows
+    }
+    assert weights["Maya"] == pytest.approx(0.8 * 0.9)
+    assert weights["Layoffs"] == pytest.approx(0.8 * 0.9 * 0.3)
+    assert weights["Custom"] == pytest.approx(0.8 * 0.9 * 0.5)
+
+
+def test_projection_date_entities_contribute_zero() -> None:
+    rows = build_projection(
+        _graph(
+            (
+                BaseEdge("p1", "date-1", "contains", 1.0),
+                BaseEdge("p2", "date-1", "contains", 1.0),
+            )
+        ),
+        passages=(ProjectionPassage("p1", "n1"), ProjectionPassage("p2", "n2")),
+        entity_labels={"date-1": "Tomorrow"},
+        entity_types={"date-1": "date_or_deadline"},
+        max_degree=12,
+    )
+
+    assert rows == ()
 
 
 def test_fill_phase_prunes_low_value_edges_but_forest_keeps_connectivity(monkeypatch) -> None:
@@ -252,3 +308,102 @@ def test_fill_phase_prunes_low_value_edges_but_forest_keeps_connectivity(monkeyp
     # forest edges survive below the floor (connectivity), mesh edge pruned
     assert ("n1", "n2") in pairs and ("n2", "n3") in pairs
     assert ("n1", "n3") not in pairs
+
+
+def test_fill_phase_prunes_single_shared_concept_entity_only_edge(monkeypatch) -> None:
+    from taurine_core import config
+
+    monkeypatch.setattr(config, "PROJECTION_FILL_MIN_WEIGHT", 0.25)
+    edges = _semantic_chain() + (
+        BaseEdge("p1", "concept-1", "contains", 1.0),
+        BaseEdge("p3", "concept-1", "contains", 1.0),
+    )
+
+    rows = build_projection(
+        _graph(edges),
+        passages=tuple(ProjectionPassage(f"p{i}", f"n{i}") for i in (1, 2, 3)),
+        entity_labels={"concept-1": "Layoffs"},
+        entity_types={"concept-1": "concept"},
+        max_degree=12,
+    )
+
+    pairs = {(row.src_note_id, row.dst_note_id) for row in rows}
+    assert ("n1", "n3") not in pairs
+
+
+def test_fill_phase_keeps_single_shared_entity_with_semantic_support() -> None:
+    edges = _semantic_chain() + (
+        BaseEdge("p1", "p3", "semantic", 0.1),
+        BaseEdge("p3", "p1", "semantic", 0.1),
+        BaseEdge("p1", "concept-1", "contains", 1.0),
+        BaseEdge("p3", "concept-1", "contains", 1.0),
+    )
+
+    rows = build_projection(
+        _graph(edges),
+        passages=tuple(ProjectionPassage(f"p{i}", f"n{i}") for i in (1, 2, 3)),
+        entity_labels={"concept-1": "Layoffs"},
+        entity_types={"concept-1": "concept"},
+        max_degree=12,
+    )
+
+    edge = next(
+        row
+        for row in rows
+        if (row.src_note_id, row.dst_note_id) == ("n1", "n3")
+    )
+    assert set(edge.mechanisms) == {"semantic", "entity"}
+
+
+def test_spanning_forest_keeps_single_shared_entity_edge() -> None:
+    rows = build_projection(
+        _graph(
+            (
+                BaseEdge("p1", "concept-1", "contains", 1.0),
+                BaseEdge("p2", "concept-1", "contains", 1.0),
+            )
+        ),
+        passages=(ProjectionPassage("p1", "n1"), ProjectionPassage("p2", "n2")),
+        entity_labels={"concept-1": "Layoffs"},
+        entity_types={"concept-1": "concept"},
+        max_degree=12,
+    )
+
+    assert len(rows) == 1
+    assert rows[0].edge_type == "entity"
+
+
+def test_fill_phase_keeps_two_strong_shared_entities() -> None:
+    edges = _semantic_chain() + tuple(
+        BaseEdge(passage_id, entity_id, "contains", 0.7)
+        for entity_id in ("person-1", "project-1")
+        for passage_id in ("p1", "p3")
+    )
+
+    rows = build_projection(
+        _graph(edges),
+        passages=tuple(ProjectionPassage(f"p{i}", f"n{i}") for i in (1, 2, 3)),
+        entity_labels={"person-1": "Maya", "project-1": "Apollo"},
+        entity_types={"person-1": "person", "project-1": "project"},
+        max_degree=12,
+    )
+
+    edge = next(
+        row
+        for row in rows
+        if (row.src_note_id, row.dst_note_id) == ("n1", "n3")
+    )
+    assert edge.edge_type == "entity"
+    assert edge.shared == ("Apollo", "Maya")
+
+
+def _semantic_chain() -> tuple[BaseEdge, ...]:
+    return tuple(
+        BaseEdge(src, dst, "semantic", weight)
+        for src, dst, weight in (
+            ("p1", "p2", 0.9),
+            ("p2", "p1", 0.9),
+            ("p2", "p3", 0.8),
+            ("p3", "p2", 0.8),
+        )
+    )
