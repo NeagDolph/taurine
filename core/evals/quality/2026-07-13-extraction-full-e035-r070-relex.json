@@ -1,0 +1,20 @@
+{
+  "cost": {
+    "wall_time_seconds": 664.936525
+  },
+  "metrics": {
+    "adjacency_threshold": 0.55,
+    "entity_threshold": 0.35,
+    "extracted_facts": 1123,
+    "failed_notes": 0,
+    "mentions": 8737,
+    "new_fact_yield": 1099,
+    "notes": 577,
+    "relation_threshold": 0.7,
+    "silver_fact_recall": 0.101695,
+    "silver_facts": 236,
+    "silver_facts_matched": 24
+  },
+  "timestamp_source": "production-db-2026-07-13",
+  "variant": "relex"
+}

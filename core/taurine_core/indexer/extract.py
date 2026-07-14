@@ -138,6 +138,10 @@ def extract_notes_dispatch(
         return extract_relex.extract_notes(notes, tokenizer=tokenizer, progress=progress)
     if selected == "hybrid":
         gliner_results = extract_notes(notes, tokenizer=tokenizer, progress=None)
+        # Hybrid needs GLiNER2 outputs, not both multi-GB models resident at
+        # once. Release its process cache before loading Relex; active callers
+        # retain their own references and later span queries reload lazily.
+        spans.release_shared_model()
         relex_results = extract_relex.extract_notes(notes, tokenizer=tokenizer, progress=None)
         merged = {
             note.note_id: extract_relex.merge_hybrid(

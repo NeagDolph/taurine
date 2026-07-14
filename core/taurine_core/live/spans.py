@@ -54,6 +54,23 @@ def shared_model() -> Any | None:
     return _get_model()
 
 
+def release_shared_model() -> None:
+    """Drop the process cache between sequential heavyweight model lanes."""
+    global _MODEL
+    _MODEL = None
+    try:
+        import gc
+        import torch
+
+        gc.collect()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def _get_model() -> Any | None:
     global _MODEL, _MODEL_LOAD_FAILED
     if _MODEL is not None:

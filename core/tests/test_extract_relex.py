@@ -386,6 +386,7 @@ def test_dispatch_honors_default_and_explicit_backend(
 
     monkeypatch.setattr(extract, "extract_notes", gliner)
     monkeypatch.setattr(extract_relex, "extract_notes", relex)
+    monkeypatch.setattr(extract.spans, "release_shared_model", lambda: calls.append("release"))
     monkeypatch.setattr(config, "EXTRACTOR_BACKEND", "gliner2")
 
     assert extract.extract_notes_dispatch([note])["n1"].schema_id == "gliner"
@@ -396,7 +397,7 @@ def test_dispatch_honors_default_and_explicit_backend(
     assert extract.extract_notes_dispatch([note], backend="hybrid")[
         "n1"
     ].schema_id.startswith("hybrid-")
-    assert calls == ["gliner2", "relex", "gliner2", "relex"]
+    assert calls == ["gliner2", "relex", "gliner2", "release", "relex"]
 
 
 def test_hybrid_relex_failure_degrades_to_gliner_result(
