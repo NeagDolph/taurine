@@ -18,6 +18,7 @@ from taurine_core.retrieval.evidence import (
     _mmr_select,
     _temporal_retrieval_graph,
 )
+from taurine_core.retrieval import evidence as evidence_module
 from taurine_core.retrieval.heads import RawHeadCandidate
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.retrieval.rerank import LocalPassageReranker
@@ -387,6 +388,81 @@ def test_shared_engine_uses_whole_corpus_dense_reset_and_never_reads_projection(
     assert pack.trace.debug["dense_reset_considered"] == len(_passages())
     assert set(pack.trace.teleport) >= {"p1", "p2"}
     assert store.passage_reads
+
+
+def _rerank_decision(passage_id: str, *, score: float) -> PassageRerankDecision:
+    return PassageRerankDecision(
+        candidate=PassageRerankCandidate(
+            passage_id=passage_id,
+            note_id=f"n-{passage_id}",
+            title=passage_id,
+            source="obsidian",
+            text="text",
+            recall_score=score,
+        ),
+        score=score,
+        accepted=True,
+        rank=1,
+        reason="accepted_passage_rerank",
+    )
+
+
+def test_near_duplicate_evidence_suppression_keeps_higher_rerank_score() -> None:
+    snapshot = type(
+        "Snapshot",
+        (),
+        {
+            "passage_ids": ("lower", "higher", "distinct"),
+            "passage_matrix": np.asarray(
+                ((1.0, 0.0), (0.9999, 0.01), (0.0, 1.0)), dtype=np.float32
+            ),
+        },
+    )()
+    selected = (
+        _rerank_decision("lower", score=0.80),
+        _rerank_decision("higher", score=0.95),
+        _rerank_decision("distinct", score=0.85),
+    )
+
+    kept, suppressed = evidence_module._suppress_near_duplicate_passages(
+        selected, snapshot
+    )
+
+    assert {row.candidate.passage_id for row in kept} == {"higher", "distinct"}
+    assert suppressed == 1
+
+
+def test_near_duplicate_evidence_suppression_fails_open_without_embeddings() -> None:
+    snapshot = type(
+        "Snapshot",
+        (),
+        {
+            "passage_ids": ("available",),
+            "passage_matrix": np.asarray(((1.0, 0.0),), dtype=np.float32),
+        },
+    )()
+    selected = (
+        _rerank_decision("available", score=0.95),
+        _rerank_decision("missing", score=0.90),
+    )
+
+    kept, suppressed = evidence_module._suppress_near_duplicate_passages(
+        selected, snapshot
+    )
+
+    assert kept == selected
+    assert suppressed == 0
+
+
+def test_final_evidence_pack_suppresses_near_duplicate_passages(tmp_path: Path) -> None:
+    engine, _registry, _store = _engine(tmp_path)
+
+    pack = engine.retrieve(RetrievalQuery("Maya", "chat", now=10.0))
+
+    passage_ids = {row.passage_id for row in pack.passages}
+    assert "p1" in passage_ids
+    assert "p2" not in passage_ids
+    assert pack.trace.debug["near_duplicate_passages_suppressed"] == 1
 
 
 def test_mmr_enforces_two_passages_per_note_and_mode_budget(tmp_path: Path) -> None:

@@ -301,6 +301,7 @@ LIVE_RERANK_CANDIDATES = 30
 CHAT_RERANK_CANDIDATES = 60
 LIVE_EVIDENCE_PASSAGES = 8
 CHAT_EVIDENCE_PASSAGES = 12
+EVIDENCE_NEAR_DUP_SIM = 0.98             # suppress lower-scored near-duplicates in final packs
 TEMPORAL_HISTORY_DOWNWEIGHT = 0.5        # historical/superseded facts under "any"/past intents
 HUB_ACTIVATION_EDGE_WEIGHT = 0.5         # synthesized contains weight for query-activated hubs (§10.5)
 HUB_ACTIVATION_MAX_EDGES = 64            # synthesized contains links per activated hub

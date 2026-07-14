@@ -624,6 +624,9 @@ class SharedRetrievalEngine:
                 else min(configured_limit, max(0, int(passage_limit)))
             ),
         )
+        selected, near_duplicate_suppressed = _suppress_near_duplicate_passages(
+            selected, self.snapshot
+        )
         latency["mmr"] = _elapsed_ms(selection_started)
         evidence_scores = tuple(row.score for row in selected)
         post_decision = self.abstention.post_rerank(
@@ -713,6 +716,15 @@ class SharedRetrievalEngine:
                 "pre_abstention": pre_decision.reason,
                 "neighborhood_fact_ids": sorted(neighborhood_fact_ids),
                 "entity_anchor_passages": len(entity_anchor),
+                **(
+                    {
+                        "near_duplicate_passages_suppressed": (
+                            near_duplicate_suppressed
+                        )
+                    }
+                    if near_duplicate_suppressed
+                    else {}
+                ),
             },
             extra_fact_ids=set(presentable_conflicted) | neighborhood_fact_ids,
         )
@@ -1495,6 +1507,40 @@ def _mmr_select(
         for passage_id in sorted(remaining)
     )
     return tuple(selected), tuple(exclusions)
+
+
+def _suppress_near_duplicate_passages(
+    selected: Sequence[PassageRerankDecision],
+    snapshot: IndexSnapshot,
+) -> tuple[tuple[PassageRerankDecision, ...], int]:
+    """Drop lower-scored near-duplicates from the final, already-bounded set."""
+
+    vector_by_id = {
+        passage_id: snapshot.passage_matrix[index]
+        for index, passage_id in enumerate(snapshot.passage_ids)
+    }
+    ranked = sorted(
+        enumerate(selected),
+        key=lambda item: (-float(item[1].score), item[1].candidate.passage_id),
+    )
+    kept_indices: list[int] = []
+    for index, row in ranked:
+        vector = vector_by_id.get(row.candidate.passage_id)
+        if vector is not None and any(
+            _cosine(
+                vector,
+                vector_by_id.get(selected[kept].candidate.passage_id),
+            )
+            >= float(config.EVIDENCE_NEAR_DUP_SIM)
+            for kept in kept_indices
+        ):
+            continue
+        kept_indices.append(index)
+    kept = set(kept_indices)
+    return (
+        tuple(row for index, row in enumerate(selected) if index in kept),
+        len(selected) - len(kept),
+    )
 
 
 def _assemble_facts(
