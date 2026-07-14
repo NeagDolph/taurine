@@ -1745,6 +1745,7 @@ def relation_completer_for(llm: Any) -> Callable[[Sequence[CompletionNote]], obj
                             # deterministic completions keep fact identities
                             # stable across rebuilds so adjudication cache hits
                             temperature=0.0,
+                            max_tokens=config.COMPLETION_MAX_TOKENS,
                         )
                     except Exception as exc:  # noqa: BLE001 — per-batch fail-open
                         _LOG.warning(

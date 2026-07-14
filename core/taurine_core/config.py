@@ -232,9 +232,16 @@ CHAT_TITLE_MAX_WORDS = 6
 # skipped, adjudicated=0 everywhere, build completes. Temperature 0 always.
 ADJUDICATION_MODEL = "openai/gpt-oss-120b"
 ADJUDICATION_CONCURRENCY = 6             # bounded parallel judge calls (all lanes)
-ADJUDICATION_FACTS_PER_CALL = 25         # facts per judge call (grouped by note)
+# 25-fact packed batches produced truncation-length malformed responses on the
+# 2026-07-13 verification build (7 failed batches, 53 malformed rows); 12 keeps
+# most of the call reduction with responses safely inside the token cap.
+ADJUDICATION_FACTS_PER_CALL = 12         # facts per judge call (packed across notes)
 ADJUDICATION_MAX_TOKENS = 4096           # cap runaway judge generations (fail-open)
-COMPLETION_MODEL = ADJUDICATION_MODEL    # structured extraction; the judge validates its output
+# gpt-oss-120b collapsed this lane (618→9 facts, 88% offset-parse rejection on
+# the 2026-07-13 verification build); flash was the only probed model emitting
+# valid grounded rows on the densest completion notes.
+COMPLETION_MODEL = "deepseek/deepseek-v4-flash"
+COMPLETION_MAX_TOKENS = 8192             # cap runaway completions (one 94KB malformed response observed)
 COMPLETION_NO_RELATION_MIN_PERCENTILE = 0.5  # no-relation gate needs median-or-better value
 COMPLETION_TOOL_HOP_CAP = 40             # extra tool/anchor notes per build in the completion lane
 COMPLETION_NOTES_PER_CALL = 12           # completion batch size (single giant call overflowed context)
