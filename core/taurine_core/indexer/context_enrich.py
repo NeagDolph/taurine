@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -82,6 +83,61 @@ class EnrichmentResult:
     contexts: dict[str, str]  # passage_id -> non-empty situating context
     enriched_count: int
     failed_batches: int
+
+
+def template_context(
+    note: NoteRecord,
+    passage: EnrichmentPassage,
+    position: str,
+) -> str:
+    """Build a deterministic situating prefix from note metadata only."""
+
+    del passage  # the signature makes the passage association explicit
+    source = str(getattr(note, "source", "") or "").casefold()
+    title = " ".join(str(getattr(note, "title", "") or "").split())
+    if source == "imessage":
+        head = "iMessage thread"
+        participants = _title_value(title, "iMessage:")
+        if participants:
+            participant_count = len(
+                [value for value in participants.split(",") if value.strip()]
+            )
+            preposition = "between" if participant_count > 1 else "with"
+            head += f" {preposition} {participants}"
+    elif source in {"gmail", "outlook"}:
+        head = "Email"
+        subject = _title_value(title, "Email:")
+        if subject:
+            head += f" about {subject}"
+    else:
+        return ""
+
+    clauses = [head]
+    display_line = str(
+        getattr(note, "display_line", "") or getattr(note, "gist", "") or ""
+    )
+    sender_match = re.match(r"\s*\[([^\]\r\n]+)\]", display_line)
+    if sender_match and (sender := " ".join(sender_match.group(1).split())):
+        clauses.append(f"from {sender}")
+
+    try:
+        created = float(getattr(note, "created", 0.0) or 0.0)
+        if created > 0:
+            clauses.append(
+                datetime.fromtimestamp(created, tz=timezone.utc).strftime("%B %Y")
+            )
+    except (OSError, OverflowError, TypeError, ValueError):
+        pass
+
+    if position in {"start of", "middle of", "end of"}:
+        clauses.append(f"{position} the thread")
+    return ("; ".join(clauses) + ".")[:_CONTEXT_MAX_CHARS]
+
+
+def _title_value(title: str, prefix: str) -> str:
+    if not title.casefold().startswith(prefix.casefold()):
+        return ""
+    return title[len(prefix) :].strip()
 
 
 def build_enrichment_batches(
@@ -154,7 +210,89 @@ def enrich_passages(
     cache: Any | None = None,
     model_id: str = config.CONTEXT_ENRICH_MODEL,
 ) -> EnrichmentResult:
-    """Situate episodic passages in bounded concurrent batches; fail-open.
+    """Situate episodic passages using the configured enrichment mode."""
+
+    mode = str(getattr(config, "CONTEXT_ENRICH_MODE", "llm") or "llm").casefold()
+    if mode not in {"llm", "template", "hybrid"}:
+        _LOG.warning("unknown context enrichment mode %r; using llm", mode)
+        mode = "llm"
+    if mode == "llm":
+        return _enrich_passages_llm(
+            notes,
+            enricher,
+            cache=cache,
+            model_id=model_id,
+        )
+
+    template_contexts = _template_contexts(notes)
+    if mode == "template":
+        return EnrichmentResult(template_contexts, len(template_contexts), 0)
+
+    gated_notes = tuple(
+        (note, drafts)
+        for note, drafts in notes
+        if note.source in ENRICHABLE_SOURCES
+        and drafts
+        and (
+            len(note.text) > int(config.CONTEXT_LLM_MIN_CHARS)
+            or len(drafts) >= int(config.CONTEXT_LLM_MIN_PASSAGES)
+        )
+    )
+    llm_result = _enrich_passages_llm(
+        gated_notes,
+        enricher,
+        cache=cache,
+        model_id=model_id,
+    )
+    contexts = dict(template_contexts)
+    contexts.update(llm_result.contexts)
+    return EnrichmentResult(
+        contexts=contexts,
+        enriched_count=len(contexts),
+        failed_batches=llm_result.failed_batches,
+    )
+
+
+def _template_contexts(
+    notes: Sequence[tuple[NoteRecord, Sequence[PassageDraft]]],
+) -> dict[str, str]:
+    contexts: dict[str, str] = {}
+    for note, drafts in sorted(notes, key=lambda pair: pair[0].note_id):
+        if note.source not in ENRICHABLE_SOURCES or not drafts:
+            continue
+        ordered = sorted(drafts, key=lambda draft: draft.ordinal)
+        denominator = max(1, len(ordered) - 1)
+        for index, draft in enumerate(ordered):
+            fraction = index / denominator
+            if fraction < 1 / 3:
+                position = "start of"
+            elif fraction > 2 / 3:
+                position = "end of"
+            else:
+                position = "middle of"
+            context = template_context(
+                note,
+                EnrichmentPassage(
+                    ordinal=draft.ordinal,
+                    passage_id=draft.passage_id,
+                    text=draft.text,
+                    content_hash=draft.content_hash,
+                ),
+                position,
+            )
+            if context:
+                contexts[draft.passage_id] = context
+    return contexts
+
+
+def _enrich_passages_llm(
+    notes: Sequence[tuple[NoteRecord, Sequence[PassageDraft]]],
+    enricher: Callable[[EnrichmentBatch], Any] | None,
+    *,
+    cache: Any | None,
+    model_id: str,
+) -> EnrichmentResult:
+    """Existing bounded LLM/cache path, kept isolated from templates.
 
     ``cache`` is a BuildCache (or anything with cached_contexts /
     store_contexts). No enricher ⇒ empty contexts, exactly today's behavior.

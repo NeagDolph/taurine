@@ -14,10 +14,12 @@ import numpy as np
 import pytest
 
 from taurine_core import config
+from taurine_core.indexer import context_enrich as context_enrich_module
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies
 from taurine_core.indexer.build_cache import BuildCache
 from taurine_core.indexer.context_enrich import (
     EnrichmentBatch,
+    EnrichmentPassage,
     build_enrichment_batches,
     context_enricher_for,
     enrich_passages,
@@ -34,16 +36,19 @@ def _note(
     source: str = "imessage",
     title: str = "Group chat with Adi and Ernest",
     text: str = "",
+    gist: str = "",
+    created: float = 1_750_000_000.0,
 ) -> NoteRecord:
     body = text or "Adi: potluck saturday?\nErnest: sounds good, Tuesday works.\n" * 8
     return NoteRecord(
         note_id=note_id,
         title=title,
         source=source,
-        created=1_750_000_000.0,
+        created=created,
         modified=1_750_100_000.0,
         content_hash=hashlib.sha256(body.encode()).hexdigest(),
         text=body,
+        gist=gist,
     )
 
 
@@ -75,6 +80,74 @@ def _response(batch: EnrichmentBatch, prefix: str = "ctx") -> dict:
             str(row.ordinal): f"{prefix} for {row.passage_id}" for row in batch.passages
         }
     }
+
+
+# -- deterministic templates -------------------------------------------------
+
+
+def test_template_context_formats_imessage_metadata() -> None:
+    note = _note(
+        title="iMessage: Rowan, Doug, Sanj",
+        gist="[Doug] first line of latest message…",
+    )
+    passage = EnrichmentPassage(0, "p0", "Tuesday works.", "hash")
+
+    context = context_enrich_module.template_context(note, passage, "start of")
+
+    assert context == (
+        "iMessage thread between Rowan, Doug, Sanj; from Doug; June 2025; "
+        "start of the thread."
+    )
+
+
+def test_template_context_formats_gmail_metadata() -> None:
+    note = _note(
+        source="gmail",
+        title="Email: Wing consulate APIs document",
+        gist="[Priya Shah] Please review the attached API notes…",
+    )
+    passage = EnrichmentPassage(1, "p1", "The endpoint changed.", "hash")
+
+    context = context_enrich_module.template_context(note, passage, "middle of")
+
+    assert context == (
+        "Email about Wing consulate APIs document; from Priya Shah; June 2025; "
+        "middle of the thread."
+    )
+
+
+@pytest.mark.parametrize("title", ["iMessage: Rowan", "Rowan"])
+def test_template_context_handles_single_or_unprefixed_imessage_title(title: str) -> None:
+    note = _note(title=title, gist="not bracketed", created=0.0)
+    passage = EnrichmentPassage(0, "p0", "Hello.", "hash")
+
+    context = context_enrich_module.template_context(note, passage, "end of")
+
+    expected_participants = " with Rowan" if title.startswith("iMessage:") else ""
+    assert context == f"iMessage thread{expected_participants}; end of the thread."
+    assert "unknown" not in context.casefold()
+
+
+def test_template_context_omits_missing_email_metadata_and_clamps_length() -> None:
+    note = _note(
+        source="gmail",
+        title="Email: " + "very long subject " * 30,
+        gist="",
+        created=0.0,
+    )
+    passage = EnrichmentPassage(0, "p0", "Hello.", "hash")
+
+    context = context_enrich_module.template_context(note, passage, "start of")
+
+    assert context.startswith("Email about very long subject")
+    assert len(context) <= 240
+    assert "from" not in context
+
+
+def test_context_enrich_config_defaults_preserve_llm_behavior() -> None:
+    assert config.CONTEXT_ENRICH_MODE == "llm"
+    assert config.CONTEXT_LLM_MIN_CHARS == 2000
+    assert config.CONTEXT_LLM_MIN_PASSAGES == 3
 
 
 # -- batching ----------------------------------------------------------------
@@ -184,6 +257,146 @@ def test_unknown_ordinals_and_non_string_contexts_are_ignored() -> None:
 
     assert result.contexts == {"p0": "good context"}
     assert result.failed_batches == 0
+
+
+# -- mode dispatch ------------------------------------------------------------
+
+
+def test_template_mode_enriches_all_passages_without_llm_or_build_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "template")
+    note = _note(
+        title="iMessage: Rowan, Doug, Sanj",
+        gist="[Doug] latest message",
+    )
+
+    def unexpected_llm(batch: EnrichmentBatch) -> dict:
+        raise AssertionError(f"template mode called LLM for {batch.note_id}")
+
+    class UnexpectedCache:
+        def cached_contexts(self, keys):
+            raise AssertionError(f"template mode read BuildCache for {keys}")
+
+        def store_contexts(self, rows):
+            raise AssertionError(f"template mode wrote BuildCache for {rows}")
+
+    result = enrich_passages(
+        ((note, _drafts(3)),),
+        unexpected_llm,
+        cache=UnexpectedCache(),
+    )
+
+    assert result.contexts == {
+        "p0": (
+            "iMessage thread between Rowan, Doug, Sanj; from Doug; June 2025; "
+            "start of the thread."
+        ),
+        "p1": (
+            "iMessage thread between Rowan, Doug, Sanj; from Doug; June 2025; "
+            "middle of the thread."
+        ),
+        "p2": (
+            "iMessage thread between Rowan, Doug, Sanj; from Doug; June 2025; "
+            "end of the thread."
+        ),
+    }
+    assert result.enriched_count == 3
+    assert result.failed_batches == 0
+
+
+def test_hybrid_small_note_keeps_templates_without_llm_or_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "hybrid")
+    calls: list[EnrichmentBatch] = []
+
+    def enricher(batch: EnrichmentBatch) -> dict:
+        calls.append(batch)
+        return _response(batch, "llm")
+
+    class UnexpectedCache:
+        def cached_contexts(self, keys):
+            raise AssertionError(f"ungated hybrid note read BuildCache for {keys}")
+
+        def store_contexts(self, rows):
+            raise AssertionError(f"ungated hybrid note wrote BuildCache for {rows}")
+
+    result = enrich_passages(
+        ((_note(title="iMessage: Rowan"), _drafts(2)),),
+        enricher,
+        cache=UnexpectedCache(),
+    )
+
+    assert calls == []
+    assert set(result.contexts) == {"p0", "p1"}
+    assert all(value.startswith("iMessage thread with Rowan") for value in result.contexts.values())
+    assert result.failed_batches == 0
+
+
+@pytest.mark.parametrize(
+    ("note", "drafts"),
+    [
+        (_note(text="x" * 2001), _drafts(1)),
+        (_note(text="short thread"), _drafts(3)),
+    ],
+    ids=("long-text", "three-passages"),
+)
+def test_hybrid_gate_calls_llm_and_replaces_templates(
+    monkeypatch: pytest.MonkeyPatch,
+    note: NoteRecord,
+    drafts: tuple[PassageDraft, ...],
+) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "hybrid")
+    calls: list[EnrichmentBatch] = []
+
+    def enricher(batch: EnrichmentBatch) -> dict:
+        calls.append(batch)
+        return _response(batch, "llm")
+
+    result = enrich_passages(((note, drafts),), enricher)
+
+    assert len(calls) == 1
+    assert result.contexts == {
+        draft.passage_id: f"llm for {draft.passage_id}" for draft in drafts
+    }
+    assert result.failed_batches == 0
+
+
+def test_hybrid_llm_failure_leaves_template_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "hybrid")
+
+    def broken(batch: EnrichmentBatch) -> dict:
+        raise RuntimeError(f"provider down for {batch.note_id}")
+
+    result = enrich_passages(
+        ((_note(title="iMessage: Rowan", text="x" * 2001), _drafts(2)),),
+        broken,
+    )
+
+    assert set(result.contexts) == {"p0", "p1"}
+    assert all(value.startswith("iMessage thread with Rowan") for value in result.contexts.values())
+    assert result.enriched_count == 2
+    assert result.failed_batches == 1
+
+
+def test_explicit_llm_mode_matches_existing_empty_and_enriched_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "llm")
+    notes = ((_note(), _drafts(2)),)
+
+    empty = enrich_passages(notes, None)
+    enriched = enrich_passages(notes, lambda batch: _response(batch))
+
+    assert empty == context_enrich_module.EnrichmentResult({}, 0, 0)
+    assert enriched == context_enrich_module.EnrichmentResult(
+        {"p0": "ctx for p0", "p1": "ctx for p1"},
+        2,
+        0,
+    )
 
 
 # -- caching -----------------------------------------------------------------
