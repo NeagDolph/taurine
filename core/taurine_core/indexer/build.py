@@ -52,7 +52,7 @@ from taurine_core.indexer.edge_adjudication import (
 )
 from taurine_core.indexer.embed import embed_facts, embed_passages, embed_texts
 from taurine_core.indexer.entities import EntityResolver, MentionInput
-from taurine_core.indexer.extract import extract_notes
+from taurine_core.indexer.extract import extract_notes_dispatch as extract_notes
 from taurine_core.indexer.doc_kind import snapshot_document
 from taurine_core.indexer.facts import PREDICATES, promote_fact, reconcile_temporal_facts
 from taurine_core.indexer.knowledge_store import KnowledgeStore, compute_graph_hash

@@ -1,0 +1,20 @@
+{
+  "cost": {
+    "wall_time_seconds": 148.523818
+  },
+  "metrics": {
+    "adjacency_threshold": null,
+    "entity_threshold": null,
+    "extracted_facts": 89,
+    "failed_notes": 0,
+    "mentions": 2854,
+    "new_fact_yield": 81,
+    "notes": 100,
+    "relation_threshold": null,
+    "silver_fact_recall": 0.126984,
+    "silver_facts": 63,
+    "silver_facts_matched": 8
+  },
+  "timestamp_source": "production-db-2026-07-13",
+  "variant": "gliner2"
+}

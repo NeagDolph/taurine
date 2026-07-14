@@ -44,7 +44,7 @@ from taurine_core.indexer.build_cache import BuildCache
 from taurine_core.indexer.embed import embed_texts
 from taurine_core import idea_search
 from taurine_core.indexer.communities import fallback_clusters
-from taurine_core.indexer.extract import extract_notes
+from taurine_core.indexer.extract import extract_notes_dispatch as extract_notes
 from taurine_core.indexer.knowledge_store import KnowledgeSchemaError
 from taurine_core.models_local import passage_tokenizer
 from taurine_core.indexer.profile import ProfileGenerator, ProfileProgress

@@ -27,6 +27,8 @@ class PredicateSpec:
     temporal: bool = True
     exclusive_object: bool = False
     base_weight: float = 0.25
+    subject_etypes: frozenset[str] = frozenset()
+    object_etypes: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,67 @@ PREDICATES: dict[str, PredicateSpec] = {
     ),
     "completed": _predicate("completed", "completed", inverse="completed_by"),
     "supersedes": _predicate("supersedes", "supersedes", inverse="superseded_by"),
+}
+
+# Relex 0.2.27 does not accept a pairs_filter. These registry constraints are
+# applied post-hoc to the `type` values on its head/tail endpoint records.
+_ANY_ETYPE = frozenset(config.INGEST_ENTITY_TYPES)
+_ACTOR_ETYPES = frozenset({"person", "organization", "project"})
+_WORK_ETYPES = frozenset({"organization", "project", "product", "event", "concept"})
+_THING_ETYPES = frozenset(
+    {"organization", "project", "product", "event", "concept", "place"}
+)
+_PREDICATE_ENDPOINT_ETYPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "works_with": (_ACTOR_ETYPES, _ACTOR_ETYPES),
+    "works_at": (frozenset({"person"}), frozenset({"organization"})),
+    "member_of": (_ACTOR_ETYPES, frozenset({"organization", "project"})),
+    "part_of": (_WORK_ETYPES, _WORK_ETYPES),
+    "located_at": (
+        frozenset(_ANY_ETYPE - {"date_or_deadline"}),
+        frozenset({"place"}),
+    ),
+    "scheduled_for": (
+        frozenset(_ANY_ETYPE - {"date_or_deadline", "place"}),
+        frozenset({"date_or_deadline"}),
+    ),
+    "paid_or_owes": (
+        frozenset({"person", "organization"}),
+        frozenset({"person", "organization", "product", "concept"}),
+    ),
+    "owns_or_has": (_ACTOR_ETYPES, _THING_ETYPES),
+    "uses": (
+        frozenset(_ANY_ETYPE - {"date_or_deadline"}),
+        frozenset({"organization", "product", "concept", "place"}),
+    ),
+    "about": (_ANY_ETYPE, _ANY_ETYPE),
+    "met_with": (
+        frozenset({"person", "organization", "event"}),
+        frozenset({"person", "organization", "event"}),
+    ),
+    "related_to": (_ANY_ETYPE, _ANY_ETYPE),
+    "decided": (frozenset({"person", "organization"}), _WORK_ETYPES),
+    "prefers": (frozenset({"person", "organization"}), _ANY_ETYPE),
+    "blocked_by": (
+        frozenset(_ANY_ETYPE - {"date_or_deadline", "place"}),
+        frozenset(_ANY_ETYPE - {"date_or_deadline", "place"}),
+    ),
+    "responsible_for": (
+        frozenset({"person", "organization", "project", "product"}),
+        _WORK_ETYPES,
+    ),
+    "completed": (
+        frozenset({"person", "organization", "project", "product"}),
+        _WORK_ETYPES,
+    ),
+    "supersedes": (_WORK_ETYPES, _WORK_ETYPES),
+}
+PREDICATES = {
+    name: replace(
+        spec,
+        subject_etypes=_PREDICATE_ENDPOINT_ETYPES[name][0],
+        object_etypes=_PREDICATE_ENDPOINT_ETYPES[name][1],
+    )
+    for name, spec in PREDICATES.items()
 }
 
 
