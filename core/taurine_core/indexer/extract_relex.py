@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from taurine_core import config
@@ -26,6 +27,12 @@ _MODEL: Any | None = None
 _MODEL_LOAD_FAILED = False
 
 
+@dataclass
+class _MPSRecoveryState:
+    consecutive_cpu_fallbacks: int = 0
+    sticky_cpu: bool = False
+
+
 def extract_notes(
     notes: list[NoteRecord],
     *,
@@ -43,21 +50,29 @@ def extract_notes(
         }
 
     results: dict[str, Extraction] = {}
-    for note in notes:
-        try:
-            text, entities, relations = _predict_with_oom_fallback(
-                model, note.text, tokenizer
-            )
-            results[note.note_id] = _normalize_result(text, entities, relations)
-        except Exception as exc:  # one bad note/model response never fails the build
-            _LOG.warning("Relex extraction failed for note %s: %s", note.note_id, exc)
-            results[note.note_id] = Extraction(
-                failed=True, error="relex inference failed"
-            )
-        finally:
-            _release_device_cache()
-        if progress is not None:
-            progress(len(results), len(notes))
+    recovery = _MPSRecoveryState()
+    release_every = max(1, int(config.RELEX_MPS_CACHE_RELEASE_EVERY))
+    try:
+        for index, note in enumerate(notes, start=1):
+            try:
+                text, entities, relations = _predict_with_oom_fallback(
+                    model, note.text, tokenizer, recovery
+                )
+                results[note.note_id] = _normalize_result(text, entities, relations)
+            except Exception as exc:  # one bad note/model response never fails the build
+                _LOG.warning(
+                    "Relex extraction failed for note %s: %s", note.note_id, exc
+                )
+                results[note.note_id] = Extraction(
+                    failed=True, error="relex inference failed"
+                )
+            if index % release_every == 0:
+                _release_cache_for_pass(model, recovery)
+            if progress is not None:
+                progress(len(results), len(notes))
+    finally:
+        if recovery.sticky_cpu:
+            _restore_mps_after_pass(model)
     return {note.note_id: results[note.note_id] for note in notes}
 
 
@@ -83,33 +98,133 @@ def _load_model() -> Any:
     return _to_inference_device(model)
 
 
-def _release_device_cache() -> None:
-    """Bound per-note MPS intermediates while retaining the cached model."""
+def _release_device_cache() -> bool:
+    """Release cached MPS allocations, returning False on management errors."""
     try:
         import torch
 
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
-    except Exception:
-        pass
+    except Exception as exc:
+        _LOG.warning("Relex MPS cache release failed: %s", exc)
+        return False
+    return True
+
+
+def _release_cache_for_pass(model: Any, recovery: _MPSRecoveryState) -> None:
+    if _release_device_cache() is not False:
+        return
+    _use_cpu_for_rest_of_pass(
+        model,
+        recovery,
+        "Relex MPS cache management failed; using CPU for the rest of this pass",
+    )
+
+
+def _use_cpu_for_rest_of_pass(
+    model: Any,
+    recovery: _MPSRecoveryState,
+    message: str,
+) -> None:
+    if recovery.sticky_cpu:
+        return
+    recovery.sticky_cpu = True
+    _LOG.warning(message)
+    try:
+        model.to("cpu")
+    except Exception as exc:
+        _LOG.warning("Relex could not move model to CPU: %s", exc)
+
+
+def _restore_mps_after_pass(model: Any) -> None:
+    try:
+        model.to("mps")
+    except Exception as exc:
+        _LOG.warning("Relex could not restore MPS after CPU fallback pass: %s", exc)
 
 
 def _predict_with_oom_fallback(
     model: Any,
     note_text: str,
     tokenizer: Any,
+    recovery: _MPSRecoveryState,
 ) -> tuple[str, object, object]:
     text = _bounded_text(note_text, tokenizer)
+    if recovery.sticky_cpu:
+        entities, relations = _predict(model, text)
+        return text, entities, relations
+
     try:
         entities, relations = _predict(model, text)
     except Exception as exc:
-        if "mps backend out of memory" not in str(exc).casefold():
+        if not _is_mps_oom(exc):
+            recovery.consecutive_cpu_fallbacks = 0
             raise
-        _LOG.warning("Relex MPS OOM; moving model to CPU and retrying full context")
-        model.to("cpu")
-        _release_device_cache()
-        entities, relations = _predict(model, text)
+
+        _LOG.warning(
+            "Relex MPS OOM; clearing cache and retrying note once on MPS"
+        )
+        if _release_device_cache() is False:
+            entities, relations = _predict_note_on_cpu(model, text, recovery)
+            return text, entities, relations
+
+        try:
+            entities, relations = _predict(model, text)
+        except Exception as retry_exc:
+            if not _is_mps_oom(retry_exc):
+                recovery.consecutive_cpu_fallbacks = 0
+                raise
+            _LOG.warning(
+                "Relex MPS OOM after cache retry; running this note on CPU"
+            )
+            entities, relations = _predict_note_on_cpu(model, text, recovery)
+        else:
+            recovery.consecutive_cpu_fallbacks = 0
+    else:
+        recovery.consecutive_cpu_fallbacks = 0
     return text, entities, relations
+
+
+def _predict_note_on_cpu(
+    model: Any,
+    text: str,
+    recovery: _MPSRecoveryState,
+) -> tuple[object, object]:
+    try:
+        model.to("cpu")
+    except Exception as exc:
+        recovery.sticky_cpu = True
+        _LOG.warning("Relex could not move model to CPU: %s", exc)
+
+    recovery.consecutive_cpu_fallbacks += 1
+    try:
+        return _predict(model, text)
+    finally:
+        maximum = max(
+            1, int(config.RELEX_MPS_MAX_CONSECUTIVE_FALLBACKS)
+        )
+        if recovery.consecutive_cpu_fallbacks >= maximum:
+            if not recovery.sticky_cpu:
+                recovery.sticky_cpu = True
+                _LOG.warning(
+                    "Relex fell back to CPU for %d consecutive notes; "
+                    "using CPU for the rest of this pass",
+                    recovery.consecutive_cpu_fallbacks,
+                )
+        elif not recovery.sticky_cpu:
+            try:
+                model.to("mps")
+            except Exception as exc:
+                recovery.sticky_cpu = True
+                _LOG.warning(
+                    "Relex could not restore MPS after note fallback; "
+                    "using CPU for the rest of this pass: %s",
+                    exc,
+                )
+
+
+def _is_mps_oom(exc: Exception) -> bool:
+    return "mps backend out of memory" in str(exc).casefold()
 
 
 def _predict(model: Any, text: str) -> tuple[object, object]:

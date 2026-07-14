@@ -463,6 +463,8 @@ RELEX_ENTITY_THRESHOLD = 0.35
 RELEX_RELATION_THRESHOLD = 0.7
 RELEX_ADJACENCY_THRESHOLD = 0.55
 RELEX_MAX_TOKENS = 2048
+RELEX_MPS_MAX_CONSECUTIVE_FALLBACKS = 3  # sticky CPU after this many heavy notes
+RELEX_MPS_CACHE_RELEASE_EVERY = 25       # periodic allocator-fragmentation hygiene
 # entities above this active-note df fraction are connective stopwords
 # (owner-name/pronoun hubs); contains edges remain for PPR hub dilution
 ENTITY_SHARED_DF_FRACTION_CAP = 0.06

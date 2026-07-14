@@ -224,11 +224,14 @@ def test_relex_respects_max_token_window(monkeypatch: pytest.MonkeyPatch) -> Non
     assert model.calls[0]["text"] == "zero one"
 
 
-def test_relex_releases_device_cache_after_each_note(
+def test_relex_releases_device_cache_at_configured_cadence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = FakeRelexModel({})
     _install_model(monkeypatch, model)
+    monkeypatch.setattr(
+        config, "RELEX_MPS_CACHE_RELEASE_EVERY", 25, raising=False
+    )
     releases: list[None] = []
     monkeypatch.setattr(
         extract_relex,
@@ -237,13 +240,158 @@ def test_relex_releases_device_cache_after_each_note(
     )
 
     extract_relex.extract_notes(
-        [make_note("n1", "One", "one"), make_note("n2", "Two", "two")]
+        [make_note(f"n{index}", "Note", "text") for index in range(51)]
     )
 
     assert len(releases) == 2
 
 
-def test_relex_retries_mps_oom_on_cpu_with_the_same_context(
+def test_relex_retries_once_on_mps_after_one_oom_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DeviceModel(FakeRelexModel):
+        def __init__(self):
+            super().__init__({})
+            self.device = "mps"
+            self.ooms_remaining = 1
+
+        def to(self, device: str):
+            self.device = device
+            return self
+
+        def predict_relations(self, text: str, **kwargs):
+            self.calls.append({"text": text, "device": self.device, **kwargs})
+            if self.device == "mps" and self.ooms_remaining:
+                self.ooms_remaining -= 1
+                raise RuntimeError("MPS backend out of memory")
+            return [], []
+
+    model = DeviceModel()
+    _install_model(monkeypatch, model)
+    monkeypatch.setattr(
+        config, "RELEX_MPS_CACHE_RELEASE_EVERY", 25, raising=False
+    )
+    releases: list[None] = []
+    monkeypatch.setattr(
+        extract_relex,
+        "_release_device_cache",
+        lambda: releases.append(None),
+    )
+
+    results = extract_relex.extract_notes(
+        [make_note("n1", "Recover", "recover"), make_note("n2", "Next", "next")]
+    )
+
+    assert all(not result.failed for result in results.values())
+    assert [call["device"] for call in model.calls] == ["mps", "mps", "mps"]
+    assert len(releases) == 1
+
+
+def test_relex_runs_double_oom_note_on_cpu_then_returns_to_mps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DeviceModel(FakeRelexModel):
+        def __init__(self):
+            super().__init__({})
+            self.device = "mps"
+            self.to_calls: list[str] = []
+
+        def to(self, device: str):
+            self.to_calls.append(device)
+            self.device = device
+            return self
+
+        def predict_relations(self, text: str, **kwargs):
+            self.calls.append({"text": text, "device": self.device, **kwargs})
+            if text == "heavy" and self.device == "mps":
+                raise RuntimeError("MPS backend out of memory")
+            return [], []
+
+    model = DeviceModel()
+    _install_model(monkeypatch, model)
+    monkeypatch.setattr(
+        config, "RELEX_MPS_MAX_CONSECUTIVE_FALLBACKS", 3, raising=False
+    )
+    monkeypatch.setattr(
+        config, "RELEX_MPS_CACHE_RELEASE_EVERY", 25, raising=False
+    )
+    monkeypatch.setattr(extract_relex, "_release_device_cache", lambda: None)
+
+    results = extract_relex.extract_notes(
+        [make_note("n1", "Heavy", "heavy"), make_note("n2", "Light", "light")]
+    )
+
+    assert all(not result.failed for result in results.values())
+    assert [call["device"] for call in model.calls] == [
+        "mps",
+        "mps",
+        "cpu",
+        "mps",
+    ]
+    assert model.to_calls == ["cpu", "mps"]
+
+
+def test_relex_three_consecutive_cpu_fallbacks_go_sticky_for_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class DeviceModel(FakeRelexModel):
+        def __init__(self):
+            super().__init__({})
+            self.device = "mps"
+            self.to_calls: list[str] = []
+
+        def to(self, device: str):
+            self.to_calls.append(device)
+            self.device = device
+            return self
+
+        def predict_relations(self, text: str, **kwargs):
+            self.calls.append({"text": text, "device": self.device, **kwargs})
+            if text.startswith("heavy") and self.device == "mps":
+                raise RuntimeError("MPS backend out of memory")
+            return [], []
+
+    model = DeviceModel()
+    _install_model(monkeypatch, model)
+    monkeypatch.setattr(
+        config, "RELEX_MPS_MAX_CONSECUTIVE_FALLBACKS", 3, raising=False
+    )
+    monkeypatch.setattr(
+        config, "RELEX_MPS_CACHE_RELEASE_EVERY", 25, raising=False
+    )
+    monkeypatch.setattr(extract_relex, "_release_device_cache", lambda: None)
+
+    results = extract_relex.extract_notes(
+        [
+            make_note("n1", "Heavy", "heavy-1"),
+            make_note("n2", "Heavy", "heavy-2"),
+            make_note("n3", "Heavy", "heavy-3"),
+            make_note("n4", "Light", "light"),
+        ]
+    )
+
+    assert all(not result.failed for result in results.values())
+    assert [call["device"] for call in model.calls] == [
+        "mps",
+        "mps",
+        "cpu",
+        "mps",
+        "mps",
+        "cpu",
+        "mps",
+        "mps",
+        "cpu",
+        "cpu",
+    ]
+    assert model.to_calls == ["cpu", "mps", "cpu", "mps", "cpu", "mps"]
+    assert sum(
+        "using CPU for the rest of this pass" in record.getMessage()
+        for record in caplog.records
+    ) == 1
+
+
+def test_relex_restore_error_keeps_successful_cpu_result_and_stays_on_cpu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class DeviceModel(FakeRelexModel):
@@ -252,26 +400,38 @@ def test_relex_retries_mps_oom_on_cpu_with_the_same_context(
             self.device = "mps"
 
         def to(self, device: str):
+            if device == "mps":
+                raise RuntimeError("cannot restore MPS")
             self.device = device
             return self
 
         def predict_relations(self, text: str, **kwargs):
             self.calls.append({"text": text, "device": self.device, **kwargs})
-            if self.device == "mps":
+            if text == "heavy" and self.device == "mps":
                 raise RuntimeError("MPS backend out of memory")
             return [], []
 
     model = DeviceModel()
     _install_model(monkeypatch, model)
-    text = " ".join(f"word-{index}" for index in range(1200))
+    monkeypatch.setattr(
+        config, "RELEX_MPS_MAX_CONSECUTIVE_FALLBACKS", 3, raising=False
+    )
+    monkeypatch.setattr(
+        config, "RELEX_MPS_CACHE_RELEASE_EVERY", 25, raising=False
+    )
+    monkeypatch.setattr(extract_relex, "_release_device_cache", lambda: None)
 
-    result = extract_relex.extract_notes(
-        [make_note("n1", "Fallback", text)], tokenizer=OffsetTokenizer()
-    )["n1"]
+    results = extract_relex.extract_notes(
+        [make_note("n1", "Heavy", "heavy"), make_note("n2", "Light", "light")]
+    )
 
-    assert result.failed is False
-    assert [call["device"] for call in model.calls] == ["mps", "cpu"]
-    assert [len(call["text"].split()) for call in model.calls] == [1200, 1200]
+    assert all(not result.failed for result in results.values())
+    assert [call["device"] for call in model.calls] == [
+        "mps",
+        "mps",
+        "cpu",
+        "cpu",
+    ]
 
 
 def test_relex_model_load_failure_fails_open_for_every_note(
