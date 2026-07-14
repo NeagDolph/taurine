@@ -14,10 +14,10 @@ ASR_RECONNECT_MIN_S = 1.0
 ASR_RECONNECT_MAX_S = 30.0
 
 # ── embedding / chunking ───────────────────────────────────────────────
-# Both Qwen3 backends share asymmetric retrieval: documents embed bare and
-# queries receive EMBED_QUERY_PROMPT. The local toggle preserves the existing
-# 0.6B MPS path; the pilot defaults to OpenRouter's 8B model.
-EMBED_BACKEND = "openrouter"             # "openrouter" (pilot) | "local"
+# Embeddings and passage reranking switch together. Both embedding backends
+# share asymmetric retrieval: documents embed bare and queries receive
+# EMBED_QUERY_PROMPT. The local mode preserves the existing 0.6B MPS paths.
+INFERENCE_BACKEND = "openrouter"         # "openrouter" (pilot) | "local"
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 EMBED_LOCAL_DIM = 1024
 EMBED_API_MODEL = "qwen/qwen3-embedding-8b"
@@ -36,19 +36,19 @@ CHUNK_MAX_TOKENS = 300                   # sentence-boundary chunking
 
 
 def embed_model_id() -> str:
-    if EMBED_BACKEND == "openrouter":
+    if INFERENCE_BACKEND == "openrouter":
         return EMBED_API_MODEL
-    if EMBED_BACKEND == "local":
+    if INFERENCE_BACKEND == "local":
         return EMBED_MODEL
-    raise ValueError(f"unsupported embedding backend: {EMBED_BACKEND!r}")
+    raise ValueError(f"unsupported inference backend: {INFERENCE_BACKEND!r}")
 
 
 def embed_dim() -> int:
-    if EMBED_BACKEND == "openrouter":
+    if INFERENCE_BACKEND == "openrouter":
         return EMBED_API_DIM
-    if EMBED_BACKEND == "local":
+    if INFERENCE_BACKEND == "local":
         return EMBED_LOCAL_DIM
-    raise ValueError(f"unsupported embedding backend: {EMBED_BACKEND!r}")
+    raise ValueError(f"unsupported inference backend: {INFERENCE_BACKEND!r}")
 
 # ── LLM (ALL calls via OpenRouter) ─────────────────────────────────────
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -338,6 +338,15 @@ ENTITY_RESET_W = 1.0
 QUERY_ENTITY_RESET_W = 0.5
 SESSION_RESET_W = 0.35
 RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
+# Neil's target is cohere/rerank-v4-pro; swap when OpenRouter adds that slug.
+RERANK_API_MODEL = "cohere/rerank-v3.5"
+RERANK_MAX_CANDIDATES = 24
+RERANK_API_ATTEMPTS = 3
+RERANK_API_BACKOFF_S = 0.5
+RERANK_API_TIMEOUT_S = 30.0
+# Temporary Cohere-scale floors only. The orchestrator refits keyed artifact
+# floors via self_calibrate after merge; never apply the Qwen floors to Cohere.
+RERANK_API_FLOOR_OVERRIDES = {"accept": 0.5, "fallback": 0.15}
 LIVE_RERANK_CANDIDATES = 30
 CHAT_RERANK_CANDIDATES = 60
 LIVE_EVIDENCE_PASSAGES = 8
@@ -349,6 +358,14 @@ HUB_ACTIVATION_MAX_EDGES = 64            # synthesized contains links per activa
 RETRIEVAL_FALLBACK_FLOOR_RATIO = 0.75    # chat/tool fallback lane floor = ratio × head acceptance floor
 RETRIEVAL_FALLBACK_PASSAGES = 4          # fallback pack cap: 4 passages / 0 facts / 0 paths / ≤1 per note
 EVIDENCE_NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
+
+
+def rerank_model_id() -> str:
+    if INFERENCE_BACKEND == "openrouter":
+        return RERANK_API_MODEL
+    if INFERENCE_BACKEND == "local":
+        return RERANK_MODEL
+    raise ValueError(f"unsupported inference backend: {INFERENCE_BACKEND!r}")
 
 # ── grounding / graph traversal (latent retrieval, no LLM) ─────────────
 GROUNDING_HYSTERESIS = 1.15              # challenger must beat incumbent by this factor

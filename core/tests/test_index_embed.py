@@ -9,26 +9,30 @@ import pytest
 from taurine_core import config
 
 
-def test_embedding_backend_helpers_resolve_model_and_dimension(monkeypatch):
-    monkeypatch.setattr(config, "EMBED_BACKEND", "local")
+def test_inference_backend_helpers_resolve_model_dimension_and_reranker(monkeypatch):
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "local")
     assert config.embed_model_id() == config.EMBED_MODEL
     assert config.embed_dim() == 1024
+    assert config.rerank_model_id() == config.RERANK_MODEL
 
-    monkeypatch.setattr(config, "EMBED_BACKEND", "openrouter")
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "openrouter")
     assert config.embed_model_id() == config.EMBED_API_MODEL
     assert config.embed_dim() == 4096
+    assert config.rerank_model_id() == config.RERANK_API_MODEL
 
-    monkeypatch.setattr(config, "EMBED_BACKEND", "unknown")
-    with pytest.raises(ValueError, match="unsupported embedding backend"):
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "unknown")
+    with pytest.raises(ValueError, match="unsupported inference backend"):
         config.embed_model_id()
-    with pytest.raises(ValueError, match="unsupported embedding backend"):
+    with pytest.raises(ValueError, match="unsupported inference backend"):
         config.embed_dim()
+    with pytest.raises(ValueError, match="unsupported inference backend"):
+        config.rerank_model_id()
 
 
 def test_embed_texts_and_queries_normalize_rows_and_load_model_once(monkeypatch):
     from taurine_core.indexer import embed
 
-    monkeypatch.setattr(config, "EMBED_BACKEND", "local")
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "local")
     calls: list[str] = []
     encode_calls: list[tuple[tuple[str, ...], str | None]] = []
 
@@ -85,7 +89,7 @@ def test_embed_texts_and_queries_normalize_rows_and_load_model_once(monkeypatch)
 def test_embed_texts_empty_input_returns_empty_matrix(monkeypatch):
     from taurine_core.indexer import embed
 
-    monkeypatch.setattr(config, "EMBED_BACKEND", "local")
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "local")
     monkeypatch.setattr(embed, "_MODEL", object())
 
     result = embed.embed_texts([])
@@ -151,7 +155,7 @@ def test_openrouter_dispatch_prefixes_queries_but_not_documents(monkeypatch):
             rows = np.ones((len(texts), config.embed_dim()), dtype=np.float32)
             return rows / np.linalg.norm(rows, axis=1, keepdims=True)
 
-    monkeypatch.setattr(config, "EMBED_BACKEND", "openrouter")
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "openrouter")
     monkeypatch.setattr(embed, "_get_openrouter_client", lambda: FakeClient())
 
     documents = embed.embed_texts(["bare document"])
@@ -421,7 +425,7 @@ def test_chunk_text_splits_overlong_sentence(monkeypatch):
 def test_real_local_embedding_model_smoke(monkeypatch):
     from taurine_core.indexer.embed import embed_queries, embed_texts
 
-    monkeypatch.setattr(config, "EMBED_BACKEND", "local")
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "local")
     result = embed_texts(["roadmap planning"])
     query = embed_queries(["roadmap planning"])
 

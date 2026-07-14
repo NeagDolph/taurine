@@ -38,12 +38,12 @@ def embedder(texts: list[str]) -> np.ndarray:
 
 
 def test_build_dependencies_resolve_embedding_backend_at_construction(monkeypatch) -> None:
-    monkeypatch.setattr(config, "EMBED_BACKEND", "local")
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "local")
     local = BuildDependencies(tokenizer=Tokenizer(), embedder=embedder)
     assert local.embedding_model_id == config.EMBED_MODEL
     assert local.embedding_dim == 1024
 
-    monkeypatch.setattr(config, "EMBED_BACKEND", "openrouter")
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "openrouter")
     remote = BuildDependencies(tokenizer=Tokenizer(), embedder=embedder)
     assert remote.embedding_model_id == config.EMBED_API_MODEL
     assert remote.embedding_dim == 4096

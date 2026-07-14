@@ -16,7 +16,7 @@ from taurine_core.retrieval.runtime import RetrievalRuntime
 
 @pytest.fixture(autouse=True)
 def _fixture_embedding_space(monkeypatch):
-    monkeypatch.setattr(config, "EMBED_BACKEND", "openrouter")
+    monkeypatch.setattr(config, "INFERENCE_BACKEND", "openrouter")
     monkeypatch.setattr(config, "EMBED_API_DIM", 16)
 
 

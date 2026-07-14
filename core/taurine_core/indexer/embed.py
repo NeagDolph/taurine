@@ -280,10 +280,10 @@ def embed_queries(texts: list[str], *, prompt: str | None = None) -> np.ndarray:
 def _embed(texts: list[str], *, prompt: str | None = None) -> np.ndarray:
     if not texts:
         return np.empty((0, config.embed_dim()), dtype=np.float32)
-    if config.EMBED_BACKEND == "openrouter":
+    if config.INFERENCE_BACKEND == "openrouter":
         framed = texts if prompt is None else [prompt + text for text in texts]
         return _get_openrouter_client().embed(framed)
-    if config.EMBED_BACKEND != "local":
+    if config.INFERENCE_BACKEND != "local":
         config.embed_dim()  # raises the shared unsupported-backend error
     return _embed_local(texts, prompt=prompt)
 

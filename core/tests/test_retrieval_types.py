@@ -153,6 +153,12 @@ def test_overhaul_configuration_matches_approved_defaults() -> None:
     assert config.QUERY_ENTITY_RESET_W == pytest.approx(0.5)
     assert config.SESSION_RESET_W == pytest.approx(0.35)
     assert config.RERANK_MODEL == "Qwen/Qwen3-Reranker-0.6B"
+    assert config.RERANK_API_MODEL == "cohere/rerank-v3.5"
+    assert config.RERANK_MAX_CANDIDATES == 24
+    assert config.RERANK_API_FLOOR_OVERRIDES == {
+        "accept": pytest.approx(0.5),
+        "fallback": pytest.approx(0.15),
+    }
     assert config.LIVE_RERANK_CANDIDATES == 30
     assert config.CHAT_RERANK_CANDIDATES == 60
     assert config.LIVE_EVIDENCE_PASSAGES == 8
