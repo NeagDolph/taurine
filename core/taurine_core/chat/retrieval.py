@@ -107,9 +107,7 @@ class ChatRetriever:
     ) -> EvidencePack:
         """Run Stage A; accumulator advancement stays pending until commit_turn."""
 
-        self._pre_turn = self.snapshot()
-        self._turn_read_ids = []
-        self._pending_reset = None
+        self.begin_turn()
         context = tuple(str(row) for row in conversation_context[-2:] if str(row).strip())
         rewritten = (
             str(rewritten_query).strip()
@@ -153,6 +151,14 @@ class ChatRetriever:
         elif not dependent:
             self._pending_reset = {}
         return pack
+
+    def begin_turn(self) -> dict[str, float]:
+        """Snapshot accepted state before Stage A or speculative tool search."""
+        self._pre_turn = self.snapshot()
+        self._turn_base = None
+        self._turn_read_ids = []
+        self._pending_reset = None
+        return dict(self._seed_reset)
 
     def commit_turn(self) -> None:
         """Advance accepted-turn state after the turn finalized successfully.
@@ -207,6 +213,7 @@ class ChatRetriever:
         k: int,
         temporal: TemporalFilter,
         now: float,
+        session_reset_override: Mapping[str, float] | None = None,
     ) -> EvidencePack:
         """Run a tool query without advancing accepted-turn state."""
 
@@ -222,9 +229,13 @@ class ChatRetriever:
         # Mid-turn tool queries see this turn's pending accepted reset (if
         # Stage A accepted) without committing it (H7).
         session_reset = (
-            self._pending_reset
-            if self._pending_reset is not None
-            else self._accepted_reset
+            dict(session_reset_override)
+            if session_reset_override is not None
+            else (
+                self._pending_reset
+                if self._pending_reset is not None
+                else self._accepted_reset
+            )
         )
         pack = self._tool_engine.retrieve(
             request,

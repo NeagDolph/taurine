@@ -4,8 +4,10 @@ One ChatEngine per server; turns are per-chat single-flight with
 CHAT_MAX_CONCURRENT_TURNS across chats. A turn:
 
 1. persist the user message; create the empty assistant row (→ chat_ack)
-2. Stage-A context pack (→ chat_retrieval); fallback (low-confidence) packs
-   render under an explicit LOW-CONFIDENCE header, abstentions as a gap notice
+2. Speculatively launch raw-message retrieval while the turn is prepared. At
+   the first prompt boundary, inject it as PRE-RETRIEVED EVIDENCE if ready,
+   wait only PRE_RETRIEVAL_MAX_WAIT_S otherwise, and fail open. The toggle-off
+   path retains the legacy rewritten Stage-A flow (→ chat_retrieval)
 3. stream_chat(CHAT_MODEL, reasoning=CHAT_REASONING, tools=TOOL_DEFINITIONS):
    reasoning deltas → chat_thinking, content deltas → chat_delta; on
    tool_call: emit chat_activity(running), execute, emit chat_activity(done),
@@ -62,7 +64,7 @@ from ..schemas import (
 from ..retrieval.types import EvidencePack
 from ..retrieval.validate import EvidenceValidator
 from .retrieval import ChatRetriever
-from .tools import TOOL_DEFINITIONS, execute_tool
+from .tools import TOOL_DEFINITIONS, execute_tool, render_search_result
 
 # async callback the server provides: emits one ws event dict/model to the client
 EmitFn = Callable[[Any], Coroutine[Any, Any, None]]
@@ -107,6 +109,60 @@ class _StreamFailure(Exception):
         super().__init__(str(error))
         self.error = error
         self.opened = opened
+
+
+async def _speculative_pack(
+    task: asyncio.Task[EvidencePack],
+    *,
+    max_wait_s: float | None,
+) -> EvidencePack | None:
+    """Read a speculative result without cancelling its worker on timeout."""
+    try:
+        if max_wait_s is None:
+            return await asyncio.shield(task)
+        return await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=max(0.0, float(max_wait_s)),
+        )
+    except TimeoutError:
+        return None
+    except Exception:
+        return None
+
+
+def _run_speculative_retrieval(
+    retriever: Any,
+    message: str,
+    *,
+    now: float,
+) -> EvidencePack:
+    """Use the production search_evidence path with a rollback snapshot."""
+    search = getattr(retriever, "search_evidence", None)
+    if callable(search):
+        begin = getattr(retriever, "begin_turn", None)
+        search_kwargs: dict[str, Any] = {}
+        if callable(begin):
+            search_kwargs["session_reset_override"] = begin()
+        return search(
+            message,
+            k=config.CHAT_SEARCH_TOOL_K,
+            temporal="any",
+            now=now,
+            **search_kwargs,
+        )
+    # Narrow compatibility seam for older tests/custom retrievers.
+    return retriever.context_pack(
+        message,
+        now=now,
+        conversation_context=(),
+        rewritten_query=None,
+    )
+
+
+def _consume_speculative_failure(task: asyncio.Task[EvidencePack]) -> None:
+    """Retrieve orphaned task exceptions after a prompt-boundary timeout."""
+    if not task.cancelled():
+        task.exception()
 
 
 class ChatEngine:
@@ -251,6 +307,42 @@ class ChatEngine:
     ) -> None:
         turn_started = time.monotonic()
         wall_now = time.time()
+
+        def make_retriever() -> Any:
+            if self._retriever_factory is not None:
+                value = self._retriever_factory(chat_id)
+            else:
+                # Test seams may replace ChatRetriever. Production wiring
+                # supplies a factory bound to the immutable knowledge snapshot.
+                value = ChatRetriever(self.index, chat_id)  # type: ignore[call-arg]
+            if restore_pre_turn:
+                restore = getattr(value, "restore_pre_turn", None)
+                if callable(restore):
+                    restore()
+            if seed_note_ids:
+                seed = getattr(value, "seed_notes", None)
+                if callable(seed):
+                    seed(seed_note_ids)
+            return value
+
+        retriever: Any | None = None
+        speculative_retriever: Any | None = None
+        speculative_task: asyncio.Task[EvidencePack] | None = None
+        if config.CHAT_PRE_RETRIEVAL:
+            # Start before message persistence/ack so retrieval overlaps all
+            # remaining turn preparation, not merely the prompt-boundary wait.
+            retriever = make_retriever()
+            speculative_retriever = retriever
+            speculative_task = asyncio.create_task(
+                asyncio.to_thread(
+                    _run_speculative_retrieval,
+                    retriever,
+                    text,
+                    now=wall_now,
+                )
+            )
+            speculative_task.add_done_callback(_consume_speculative_failure)
+            await asyncio.sleep(0)  # schedule the worker before synchronous turn setup
         if persist_user:
             user_message_id = self.index.add_chat_message(
                 ChatMessage(chat_id=chat_id, role="user", content=text, created=wall_now)
@@ -269,20 +361,8 @@ class ChatEngine:
             )
         )
 
-        if self._retriever_factory is not None:
-            retriever = self._retriever_factory(chat_id)
-        else:
-            # Test seams may replace ChatRetriever. Production wiring supplies
-            # a factory bound to the active immutable knowledge snapshot.
-            retriever = ChatRetriever(self.index, chat_id)  # type: ignore[call-arg]
-        if restore_pre_turn:
-            restore = getattr(retriever, "restore_pre_turn", None)
-            if callable(restore):
-                restore()
-        if seed_note_ids:
-            seed = getattr(retriever, "seed_notes", None)
-            if callable(seed):
-                seed(seed_note_ids)
+        if retriever is None:
+            retriever = make_retriever()
         context_pack: EvidencePack | None = None
         content_parts: list[str] = []
         thinking_parts: list[str] = []
@@ -442,39 +522,52 @@ class ChatEngine:
                 for message in self.index.chat_messages(chat_id)
                 if message.role == "user" and message.id != user_message_id
             )[-2:]
-            rewritten_query = await self._rewrite_query_for_retrieval(
-                retriever,
-                text,
-                history_for_rewrite,
-            )
-            # Retrieval is CPU-bound (embedding, reranker, graph paths); it
-            # must never run on the event loop or every websocket freezes.
-            context_pack = await asyncio.to_thread(
-                retriever.context_pack,
-                text,
-                now=wall_now,
-                conversation_context=history_for_rewrite,
-                rewritten_query=rewritten_query,
-            )
-            self.logger.log(
-                "chat_retrieval",
-                chat_id=chat_id,
-                original_query=context_pack.trace.original_query,
-                rewritten_query=context_pack.trace.rewritten_query,
-                decision=context_pack.decision.reason,
-                confidence=context_pack.decision.confidence,
-                selected_ids=list(context_pack.trace.selected_ids),
-                active_build_id=context_pack.trace.active_build_id,
-            )
-            await emit(
-                ChatRetrievalEvent(
-                    chat_id=chat_id,
-                    message_id=assistant_id,
-                    evidence=EvidencePackPayload.from_domain(context_pack),
-                    retrieved_ids=list(context_pack.trace.selected_ids),
-                    consulted_ids=list(context_pack.trace.read_ids),
+            pre_retrieved = speculative_task is not None
+            if speculative_task is not None:
+                context_pack = await _speculative_pack(
+                    speculative_task,
+                    max_wait_s=config.PRE_RETRIEVAL_MAX_WAIT_S,
                 )
-            )
+                if context_pack is None:
+                    # Keep the slow/erroring worker isolated: it may finish in
+                    # its thread, but an unused pack must not affect this turn's
+                    # accepted-state commit or failed-turn rollback.
+                    retriever = make_retriever()
+            else:
+                rewritten_query = await self._rewrite_query_for_retrieval(
+                    retriever,
+                    text,
+                    history_for_rewrite,
+                )
+                # Toggle-off is the legacy Stage-A path, byte-for-byte at the
+                # prompt boundary, including dependent-query rewriting.
+                context_pack = await asyncio.to_thread(
+                    retriever.context_pack,
+                    text,
+                    now=wall_now,
+                    conversation_context=history_for_rewrite,
+                    rewritten_query=rewritten_query,
+                )
+            if context_pack is not None:
+                self.logger.log(
+                    "chat_retrieval",
+                    chat_id=chat_id,
+                    original_query=context_pack.trace.original_query,
+                    rewritten_query=context_pack.trace.rewritten_query,
+                    decision=context_pack.decision.reason,
+                    confidence=context_pack.decision.confidence,
+                    selected_ids=list(context_pack.trace.selected_ids),
+                    active_build_id=context_pack.trace.active_build_id,
+                )
+                await emit(
+                    ChatRetrievalEvent(
+                        chat_id=chat_id,
+                        message_id=assistant_id,
+                        evidence=EvidencePackPayload.from_domain(context_pack),
+                        retrieved_ids=list(context_pack.trace.selected_ids),
+                        consulted_ids=list(context_pack.trace.read_ids),
+                    )
+                )
             messages = self._build_messages(
                 chat_id,
                 text,
@@ -482,6 +575,7 @@ class ChatEngine:
                 retriever=retriever,
                 current_user_id=user_message_id,
                 assistant_id=assistant_id,
+                pre_retrieved=pre_retrieved,
             )
             round_index = 0
             tool_count = 0
@@ -578,15 +672,40 @@ class ChatEngine:
                             step=running,
                         )
                     )
-                    started = time.monotonic()
-                    # Tool execution is retrieval work — keep it off the loop.
-                    result_json, done_step = await asyncio.to_thread(
-                        execute_tool,
-                        str(call.get("name") or ""),
-                        call.get("arguments") if isinstance(call.get("arguments"), dict) else {},
-                        retriever,
-                        now=time.time(),
+                    arguments = (
+                        call.get("arguments")
+                        if isinstance(call.get("arguments"), dict)
+                        else {}
                     )
+                    started = time.monotonic()
+                    cached_pack: EvidencePack | None = None
+                    if _matches_speculative_query(call, text):
+                        cached_pack = context_pack
+                        if cached_pack is None and speculative_task is not None:
+                            cached_pack = await _speculative_pack(
+                                speculative_task,
+                                max_wait_s=None,
+                            )
+                        if cached_pack is not None and speculative_retriever is not None:
+                            # If the first prompt timed out, use the retriever
+                            # whose registry owns the cached E#/F# identities.
+                            if tool_count == 0:
+                                retriever = speculative_retriever
+                            context_pack = cached_pack
+                    if cached_pack is not None:
+                        result_json, done_step = render_search_result(
+                            cached_pack,
+                            str(arguments.get("query") or "").strip(),
+                        )
+                    else:
+                        # Tool execution is retrieval work — keep it off the loop.
+                        result_json, done_step = await asyncio.to_thread(
+                            execute_tool,
+                            str(call.get("name") or ""),
+                            arguments,
+                            retriever,
+                            now=time.time(),
+                        )
                     latency_ms = (time.monotonic() - started) * 1000.0
                     done_step.status = "done"
                     done_step.tool_name = str(call.get("name") or "")
@@ -614,7 +733,6 @@ class ChatEngine:
                             step=done_step,
                         )
                     )
-                    arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
                     assistant_tool_calls.append(
                         {
                             "id": call.get("id", ""),
@@ -817,11 +935,12 @@ class ChatEngine:
         self,
         chat_id: str,
         user_text: str,
-        context_pack: EvidencePack,
+        context_pack: EvidencePack | None,
         *,
         retriever: Any = None,
         current_user_id: int,
         assistant_id: int,
+        pre_retrieved: bool = False,
     ) -> list[dict[str, Any]]:
         history = [
             message
@@ -836,16 +955,24 @@ class ChatEngine:
             if message.role == "assistant" and not message.content:
                 continue
             messages.append({"role": message.role, "content": message.content})
-        # M6: expose bounded non-selected fact-support passages — they become
-        # read/citable and render as compact quotes under their facts.
-        expose = getattr(retriever, "expose_fact_support", None)
-        support = expose(context_pack) if callable(expose) else {}
-        messages.append(
-            {
-                "role": "user",
-                "content": f"<evidence>\n{_evidence_block(context_pack, support)}\n</evidence>\n\n{user_text}",
-            }
-        )
+        content = user_text
+        if context_pack is not None:
+            # M6: expose bounded non-selected fact-support passages — they
+            # become read/citable and render as compact quotes under facts.
+            expose = getattr(retriever, "expose_fact_support", None)
+            support = expose(context_pack) if callable(expose) else {}
+            evidence = _evidence_block(context_pack, support)
+            if pre_retrieved:
+                content = (
+                    "<pre_retrieved_evidence>\n"
+                    "Pre-retrieved evidence for the user's message:\n"
+                    f"{evidence}\n"
+                    "</pre_retrieved_evidence>\n\n"
+                    f"{user_text}"
+                )
+            else:
+                content = f"<evidence>\n{evidence}\n</evidence>\n\n{user_text}"
+        messages.append({"role": "user", "content": content})
         return messages
 
     async def _maybe_title(self, chat_id: str, first_user_text: str, emit: EmitFn) -> None:
@@ -966,6 +1093,17 @@ def _tool_kind(name: str) -> str:
     if name == "expand_evidence":
         return "expand"
     return "search"
+
+
+def _matches_speculative_query(call: Mapping[str, Any], user_text: str) -> bool:
+    if str(call.get("name") or "") != "search_evidence":
+        return False
+    arguments = call.get("arguments")
+    if not isinstance(arguments, dict):
+        return False
+    query = str(arguments.get("query") or "").strip()
+    raw = str(user_text).strip()
+    return bool(query and raw) and query.casefold() == raw.casefold()
 
 
 def _running_label(call: dict[str, Any]) -> str:

@@ -256,6 +256,8 @@ CHAT_SEARCH_TOOL_K = 8                   # default k for search_evidence
 CHAT_NOTE_READ_MAX_CHARS = 6000
 CHAT_HISTORY_MAX_TURNS = 12
 CHAT_TITLE_MAX_WORDS = 6
+CHAT_PRE_RETRIEVAL = True
+PRE_RETRIEVAL_MAX_WAIT_S = 2.5           # prompt-boundary wait; fail open when slow
 
 # ── grounded edge adjudication (edge-quality spec items 1/5b/6) ────────
 # Optional build lane, same pattern as relation completion: absent LLM ⇒

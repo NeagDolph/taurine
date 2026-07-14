@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -44,6 +45,7 @@ class FakeRetriever:
         self.committed = 0
         self.discarded = 0
         self.sufficient = True
+        self.searches: list[tuple[str, int, str]] = []
         self.registry = EvidenceRegistry()
         self.registry.register("note", "n1", {"note_id": "n1"})
         self.registry.register(
@@ -102,6 +104,12 @@ class FakeRetriever:
 
     def resolve(self, ref: str) -> str | None:
         return {"N1": "n1", "n1": "n1"}.get(ref)
+
+    def search_evidence(
+        self, query: str, *, k: int, temporal: str, now: float
+    ) -> EvidencePack:
+        self.searches.append((query, k, temporal))
+        return self.context_pack(query, now=now)
 
     def save(self) -> None:
         self.saved += 1
@@ -290,6 +298,136 @@ async def test_chat_omits_user_profile_block_when_card_is_missing(store: Any) ->
     )
 
     assert "<user_profile>" not in llm.calls[0]["messages"][0]["content"]
+
+
+def test_pre_retrieval_config_defaults_enabled_with_bounded_wait() -> None:
+    assert config.CHAT_PRE_RETRIEVAL is True
+    assert config.PRE_RETRIEVAL_MAX_WAIT_S == 2.5
+
+
+@pytest.mark.asyncio
+async def test_ready_pre_retrieval_is_labeled_in_first_llm_prompt(store: Any) -> None:
+    llm = FakeLLM(
+        streams=[[StreamEvent(kind="content", text="Answer [E1]."), StreamEvent(kind="done")]]
+    )
+
+    await ChatEngine(store, llm, MemoryLogger(), validator_factory=_accept_all).send(
+        "", "What changed?", lambda _event: _capture(_event, [])
+    )
+
+    first_user = llm.calls[0]["messages"][-1]["content"]
+    assert "<pre_retrieved_evidence>" in first_user
+    assert "Pre-retrieved evidence for the user's message" in first_user
+    assert "Roadmap gist" in first_user
+    assert first_user.endswith("What changed?")
+    assert FakeRetriever.instances[-1].searches == [
+        ("What changed?", config.CHAT_SEARCH_TOOL_K, "any")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_slow_pre_retrieval_starts_llm_without_evidence(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "PRE_RETRIEVAL_MAX_WAIT_S", 0.01, raising=False)
+    retrieval_started = threading.Event()
+    release_retrieval = threading.Event()
+
+    class SlowRetriever(FakeRetriever):
+        def context_pack(self, message: str, *, now: float, conversation_context=(), rewritten_query=None):
+            retrieval_started.set()
+            assert release_retrieval.wait(timeout=2.0)
+            return super().context_pack(
+                message, now=now,
+                conversation_context=conversation_context,
+                rewritten_query=rewritten_query,
+            )
+
+    class ReleaseOnStreamLLM(FakeLLM):
+        async def stream_chat(self, *args: Any, **kwargs: Any) -> AsyncIterator[StreamEvent]:
+            assert retrieval_started.is_set()
+            assert not release_retrieval.is_set()
+            release_retrieval.set()
+            async for event in super().stream_chat(*args, **kwargs):
+                yield event
+
+    llm = ReleaseOnStreamLLM(
+        streams=[[StreamEvent(kind="content", text="Answer"), StreamEvent(kind="done")]]
+    )
+    events: list[dict[str, Any]] = []
+
+    await ChatEngine(
+        store, llm, MemoryLogger(),
+        retriever_factory=lambda chat_id: SlowRetriever(store, chat_id),
+        validator_factory=_accept_all,
+    ).send("", "Question", lambda event: _capture(event, events))
+
+    assert llm.calls[0]["messages"][-1]["content"] == "Question"
+    assert not any(event["type"] == "chat_retrieval" for event in events)
+    assert _terminal_types(events) == ["chat_done"]
+
+
+@pytest.mark.asyncio
+async def test_matching_tool_call_reuses_pre_retrieved_pack(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executions = 0
+
+    def unexpected_execute(*_args: Any, **_kwargs: Any) -> tuple[str, ChatActivityStep]:
+        nonlocal executions
+        executions += 1
+        raise AssertionError("matching speculative query must not execute retrieval again")
+
+    monkeypatch.setattr(engine_module, "execute_tool", unexpected_execute)
+    llm = FakeLLM(
+        streams=[
+            [
+                StreamEvent(
+                    kind="tool_call",
+                    tool_call={
+                        "id": "cached-1", "name": "search_evidence",
+                        "arguments": {"query": "question"},
+                    },
+                ),
+                StreamEvent(kind="done"),
+            ],
+            [StreamEvent(kind="content", text="Roadmap gist [E1]."), StreamEvent(kind="done")],
+        ]
+    )
+
+    await ChatEngine(store, llm, MemoryLogger(), validator_factory=_accept_all).send(
+        "", "Question", lambda _event: _capture(_event, [])
+    )
+
+    assert executions == 0
+    tool_message = next(
+        message for message in llm.calls[1]["messages"] if message.get("role") == "tool"
+    )
+    assert '"evidence_id":"E1"' in tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_pre_retrieval_toggle_off_preserves_legacy_prompt_and_events(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "CHAT_PRE_RETRIEVAL", False, raising=False)
+    llm = FakeLLM(
+        streams=[[StreamEvent(kind="content", text="Answer"), StreamEvent(kind="done")]]
+    )
+    events: list[dict[str, Any]] = []
+
+    await ChatEngine(store, llm, MemoryLogger(), validator_factory=_accept_all).send(
+        "", "Question", lambda event: _capture(event, events)
+    )
+
+    assert [event["type"] for event in events[:4]] == [
+        "chat_meta", "chat_ack", "chat_retrieval", "chat_delta",
+    ]
+    assert llm.calls[0]["messages"][-1]["content"] == (
+        '<evidence>\n[E1] [N1] "Roadmap" (obsidian, chars 0-12)\nRoadmap gist\n'
+        '[F1] Roadmap — relates_to → Beta; status=active; valid=?..?; supported by [E1]\n'
+        "</evidence>\n\nQuestion"
+    )
 
 
 @pytest.mark.asyncio
@@ -621,7 +759,7 @@ async def test_midstream_llm_error_emits_error_and_persists_partial_without_fall
 
 
 @pytest.mark.asyncio
-async def test_context_pack_exception_emits_error_persists_empty_partial_and_does_not_raise(
+async def test_pre_retrieval_error_fails_open_and_turn_completes(
     store: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -635,27 +773,21 @@ async def test_context_pack_exception_emits_error_persists_empty_partial_and_doe
 
     monkeypatch.setattr(engine_module, "ChatRetriever", RaisingRetriever, raising=False)
     logger = MemoryLogger()
+    llm = FakeLLM(
+        streams=[[StreamEvent(kind="content", text="Answer"), StreamEvent(kind="done")]]
+    )
     events: list[dict[str, Any]] = []
 
-    await ChatEngine(store, FakeLLM(streams=[]), logger).send(
+    await ChatEngine(store, llm, logger, validator_factory=_accept_all).send(
         "",
         "question",
         lambda event: _capture(event, events),
     )
 
-    chat_id = next(event["chat"]["chat_id"] for event in events if event["type"] == "chat_meta")
-    error = [event for event in events if event["type"] == "chat_error"][-1]
-    assert error["code"] == "llm"
-    assert error["detail"] == "context exploded"
-    assert _terminal_types(events) == ["chat_error"]
-    persisted = store.chat_messages(chat_id)[1]
-    assert persisted.content == ""
-    assert persisted.cancelled is False
-    assert persisted.interrupted is True
-    assert any(
-        kind == "chat_error" and payload["detail"] == "context exploded"
-        for kind, payload in logger.records
-    )
+    assert _terminal_types(events) == ["chat_done"]
+    assert not any(event["type"] == "chat_error" for event in events)
+    assert not any(event["type"] == "chat_retrieval" for event in events)
+    assert llm.calls[0]["messages"][-1]["content"] == "question"
 
 
 @pytest.mark.asyncio
@@ -750,7 +882,10 @@ async def test_chat_runs_one_constrained_repair_and_revalidates_it(store: Any) -
 
 
 @pytest.mark.asyncio
-async def test_dependent_query_uses_one_structured_flash_rewrite(store: Any) -> None:
+async def test_dependent_query_uses_one_structured_flash_rewrite_when_pre_retrieval_is_off(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "CHAT_PRE_RETRIEVAL", False)
     rewrites: list[str | None] = []
 
     class RewriteRetriever(EvidenceRetriever):

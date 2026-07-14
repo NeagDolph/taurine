@@ -244,6 +244,28 @@ def test_tool_search_uses_tool_mode_without_advancing_accepted_turn_state() -> N
     assert engines[0] is not engines[-1]
 
 
+def test_speculative_tool_search_discard_restores_pre_turn_snapshot() -> None:
+    retriever, _engines = _make(FakeIndex())
+    baseline = retriever.snapshot()
+
+    retriever.begin_turn()
+    retriever.search_evidence("Roadmap", k=4, temporal="any", now=101.0)
+    retriever.discard_turn()
+
+    assert retriever.snapshot() == baseline
+
+
+def test_begin_turn_clears_the_prior_turn_audit_pack() -> None:
+    retriever, _engines = _make(FakeIndex())
+    retriever.context_pack("Roadmap", now=100.0)
+    retriever.commit_turn()
+
+    retriever.begin_turn()
+    current = retriever.search_evidence("Armaan review", k=4, temporal="any", now=101.0)
+
+    assert retriever.turn_pack().query.text == current.query.text
+
+
 def test_accepted_tool_search_promotes_abstained_stage_a_for_turn_audit() -> None:
     retriever, _ = _make(FakeIndex())
     stage_a = retriever.context_pack("nothing", now=100.0)

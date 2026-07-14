@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from taurine_core import config
+from taurine_core.retrieval.types import EvidencePack
 from taurine_core.schemas import ChatActivityStep, EvidencePackPayload
 
 from .retrieval import ChatRetriever
@@ -97,22 +98,7 @@ def execute_tool(
                 temporal=temporal,  # type: ignore[arg-type]
                 now=now,
             )
-            # §0.1: fallback packs carry decision.fallback=True and every
-            # passage row is marked low_confidence in the payload.
-            payload = EvidencePackPayload.from_domain(pack).model_dump(mode="json")
-            if pack.decision.accepted:
-                label = f'Searched "{query}" → {len(pack.passages)} passages'
-            elif getattr(pack.decision, "fallback", False):
-                label = (
-                    f'Searched "{query}" → {len(pack.passages)} low-confidence passages'
-                )
-            else:
-                label = f'Searched "{query}" → no supported evidence'
-            return _json(payload), ChatActivityStep(
-                kind="search",
-                label=label,
-                note_ids=[row.note_id for row in pack.notes],
-            )
+            return render_search_result(pack, query)
 
         if name == "read_note":
             note_ref = str(arguments.get("note") or "").strip()
@@ -169,6 +155,27 @@ def execute_tool(
         return _failure(str(exc), kind=_tool_kind(name))
 
     return _failure(f"unknown tool: {name}", kind="search")
+
+
+def render_search_result(
+    pack: EvidencePack,
+    query: str,
+) -> tuple[str, ChatActivityStep]:
+    """Render search output for both executed and speculative tool results."""
+    # §0.1: fallback packs carry decision.fallback=True and every passage row
+    # is marked low_confidence in the payload.
+    payload = EvidencePackPayload.from_domain(pack).model_dump(mode="json")
+    if pack.decision.accepted:
+        label = f'Searched "{query}" → {len(pack.passages)} passages'
+    elif getattr(pack.decision, "fallback", False):
+        label = f'Searched "{query}" → {len(pack.passages)} low-confidence passages'
+    else:
+        label = f'Searched "{query}" → no supported evidence'
+    return _json(payload), ChatActivityStep(
+        kind="search",
+        label=label,
+        note_ids=[row.note_id for row in pack.notes],
+    )
 
 
 def _json(payload: dict[str, Any]) -> str:
