@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
+import time
 from typing import Literal, Sequence
+
+import httpx
 
 from taurine_core import config
 from taurine_core.models_local import (
@@ -22,6 +26,103 @@ PASSAGE_RERANK_INSTRUCTION = (
     "Determine whether the exact source passage contains evidence relevant to "
     "answering the query. Judge the passage text, not its retrieval hint."
 )
+
+
+class RerankError(RuntimeError):
+    """Sanitized failure from the OpenRouter passage-rerank backend."""
+
+
+class OpenRouterRerankClient:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model_id: str,
+        transport: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if not api_key:
+            raise RerankError("OPEN_ROUTER_API_KEY is required for OpenRouter reranking")
+        self._api_key = api_key
+        self.model_id = str(model_id)
+        self._sleep = sleep
+        self._client = httpx.Client(
+            transport=transport,
+            timeout=float(config.RERANK_API_TIMEOUT_S),
+        )
+
+    def score_pairs(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        instruction: str,
+        deadline_at: float | None = None,
+    ) -> tuple[float, ...]:
+        del instruction
+        rows = tuple(str(document) for document in documents)
+        if not rows:
+            return ()
+        attempts = max(1, int(config.RERANK_API_ATTEMPTS))
+        for attempt in range(attempts):
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                raise ModelDeadlineExceeded("OpenRouter reranking deadline exceeded")
+            try:
+                response = self._client.post(
+                    f"{config.OPENROUTER_BASE_URL}/rerank",
+                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    json={
+                        "model": self.model_id,
+                        "query": query,
+                        "documents": list(rows),
+                        "top_n": len(rows),
+                    },
+                )
+            except httpx.TransportError as exc:
+                if attempt + 1 >= attempts:
+                    raise RerankError(
+                        "OpenRouter reranking transport failed "
+                        f"after {attempts} attempts"
+                    ) from exc
+                self._backoff(attempt)
+                continue
+            status = int(response.status_code)
+            if 200 <= status < 300:
+                return self._parse(response, len(rows))
+            retryable = status == 429 or 500 <= status < 600
+            if retryable and attempt + 1 < attempts:
+                self._backoff(attempt)
+                continue
+            raise RerankError(f"OpenRouter reranking returned HTTP {status}")
+        raise AssertionError("rerank retry loop exhausted without returning or raising")
+
+    def _backoff(self, attempt: int) -> None:
+        self._sleep(float(config.RERANK_API_BACKOFF_S) * (2**attempt))
+
+    @staticmethod
+    def _parse(response: httpx.Response, count: int) -> tuple[float, ...]:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RerankError("OpenRouter reranking returned invalid JSON") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+            raise RerankError("OpenRouter reranking returned invalid results")
+        results = payload["results"]
+        if len(results) != count or any(not isinstance(row, dict) for row in results):
+            raise RerankError("OpenRouter reranking returned the wrong row count")
+        try:
+            by_index = {
+                int(row["index"]): float(row["relevance_score"])
+                for row in results
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RerankError("OpenRouter reranking returned invalid rows") from exc
+        if set(by_index) != set(range(count)) or len(by_index) != count:
+            raise RerankError("OpenRouter reranking returned invalid row indexes")
+        scores = tuple(by_index[index] for index in range(count))
+        if any(not math.isfinite(score) for score in scores):
+            raise RerankError("OpenRouter reranking returned non-finite scores")
+        return scores
 
 
 @dataclass(frozen=True)
