@@ -409,8 +409,11 @@ GLINER_RELATION_MIN_CONF = 0.45          # calibration-pending relation floor
 # selects a replacement.
 EXTRACTOR_BACKEND = "gliner2"
 RELEX_MODEL = "knowledgator/gliner-relex-large-v1.0"
-RELEX_ENTITY_THRESHOLD = 0.4
-RELEX_RELATION_THRESHOLD = 0.8
+# 3×3 sweep best point (2026-07-13): equal recall to stricter settings with
+# +77% novel yield, and judge-sampled precision of the novel pool matched
+# GLiNER2's, so the extra volume is real signal for the adjudicator to filter.
+RELEX_ENTITY_THRESHOLD = 0.35
+RELEX_RELATION_THRESHOLD = 0.7
 RELEX_ADJACENCY_THRESHOLD = 0.55
 RELEX_MAX_TOKENS = 2048
 # entities above this active-note df fraction are connective stopwords
