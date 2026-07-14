@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -82,6 +83,57 @@ class EnrichmentResult:
     contexts: dict[str, str]  # passage_id -> non-empty situating context
     enriched_count: int
     failed_batches: int
+
+
+def template_context(
+    note: NoteRecord,
+    passage: EnrichmentPassage,
+    position: str,
+) -> str:
+    """Build a deterministic situating prefix from note metadata only."""
+
+    del passage  # the signature makes the passage association explicit
+    source = str(getattr(note, "source", "") or "").casefold()
+    title = " ".join(str(getattr(note, "title", "") or "").split())
+    if source == "imessage":
+        head = "iMessage thread"
+        participants = _title_value(title, "iMessage:")
+        if participants:
+            head += f" between {participants}"
+    elif source in {"gmail", "outlook"}:
+        head = "Email"
+        subject = _title_value(title, "Email:")
+        if subject:
+            head += f" about {subject}"
+    else:
+        return ""
+
+    clauses = [head]
+    display_line = str(
+        getattr(note, "display_line", "") or getattr(note, "gist", "") or ""
+    )
+    sender_match = re.match(r"\s*\[([^\]\r\n]+)\]", display_line)
+    if sender_match and (sender := " ".join(sender_match.group(1).split())):
+        clauses.append(f"from {sender}")
+
+    try:
+        created = float(getattr(note, "created", 0.0) or 0.0)
+        if created > 0:
+            clauses.append(
+                datetime.fromtimestamp(created, tz=timezone.utc).strftime("%B %Y")
+            )
+    except (OSError, OverflowError, TypeError, ValueError):
+        pass
+
+    if position in {"start of", "middle of", "end of"}:
+        clauses.append(f"{position} the thread")
+    return ("; ".join(clauses) + ".")[:_CONTEXT_MAX_CHARS]
+
+
+def _title_value(title: str, prefix: str) -> str:
+    if not title.casefold().startswith(prefix.casefold()):
+        return ""
+    return title[len(prefix) :].strip()
 
 
 def build_enrichment_batches(

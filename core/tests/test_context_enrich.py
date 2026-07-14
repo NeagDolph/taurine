@@ -14,10 +14,12 @@ import numpy as np
 import pytest
 
 from taurine_core import config
+from taurine_core.indexer import context_enrich as context_enrich_module
 from taurine_core.indexer.build import BuildCoordinator, BuildDependencies
 from taurine_core.indexer.build_cache import BuildCache
 from taurine_core.indexer.context_enrich import (
     EnrichmentBatch,
+    EnrichmentPassage,
     build_enrichment_batches,
     context_enricher_for,
     enrich_passages,
@@ -34,16 +36,19 @@ def _note(
     source: str = "imessage",
     title: str = "Group chat with Adi and Ernest",
     text: str = "",
+    gist: str = "",
+    created: float = 1_750_000_000.0,
 ) -> NoteRecord:
     body = text or "Adi: potluck saturday?\nErnest: sounds good, Tuesday works.\n" * 8
     return NoteRecord(
         note_id=note_id,
         title=title,
         source=source,
-        created=1_750_000_000.0,
+        created=created,
         modified=1_750_100_000.0,
         content_hash=hashlib.sha256(body.encode()).hexdigest(),
         text=body,
+        gist=gist,
     )
 
 
@@ -75,6 +80,74 @@ def _response(batch: EnrichmentBatch, prefix: str = "ctx") -> dict:
             str(row.ordinal): f"{prefix} for {row.passage_id}" for row in batch.passages
         }
     }
+
+
+# -- deterministic templates -------------------------------------------------
+
+
+def test_template_context_formats_imessage_metadata() -> None:
+    note = _note(
+        title="iMessage: Rowan, Doug, Sanj",
+        gist="[Doug] first line of latest message…",
+    )
+    passage = EnrichmentPassage(0, "p0", "Tuesday works.", "hash")
+
+    context = context_enrich_module.template_context(note, passage, "start of")
+
+    assert context == (
+        "iMessage thread between Rowan, Doug, Sanj; from Doug; June 2025; "
+        "start of the thread."
+    )
+
+
+def test_template_context_formats_gmail_metadata() -> None:
+    note = _note(
+        source="gmail",
+        title="Email: Wing consulate APIs document",
+        gist="[Priya Shah] Please review the attached API notes…",
+    )
+    passage = EnrichmentPassage(1, "p1", "The endpoint changed.", "hash")
+
+    context = context_enrich_module.template_context(note, passage, "middle of")
+
+    assert context == (
+        "Email about Wing consulate APIs document; from Priya Shah; June 2025; "
+        "middle of the thread."
+    )
+
+
+@pytest.mark.parametrize("title", ["iMessage: Rowan", "Rowan"])
+def test_template_context_handles_single_or_unprefixed_imessage_title(title: str) -> None:
+    note = _note(title=title, gist="not bracketed", created=0.0)
+    passage = EnrichmentPassage(0, "p0", "Hello.", "hash")
+
+    context = context_enrich_module.template_context(note, passage, "end of")
+
+    expected_participants = " between Rowan" if title.startswith("iMessage:") else ""
+    assert context == f"iMessage thread{expected_participants}; end of the thread."
+    assert "unknown" not in context.casefold()
+
+
+def test_template_context_omits_missing_email_metadata_and_clamps_length() -> None:
+    note = _note(
+        source="gmail",
+        title="Email: " + "very long subject " * 30,
+        gist="",
+        created=0.0,
+    )
+    passage = EnrichmentPassage(0, "p0", "Hello.", "hash")
+
+    context = context_enrich_module.template_context(note, passage, "start of")
+
+    assert context.startswith("Email about very long subject")
+    assert len(context) <= 240
+    assert "from" not in context
+
+
+def test_context_enrich_config_defaults_preserve_llm_behavior() -> None:
+    assert config.CONTEXT_ENRICH_MODE == "llm"
+    assert config.CONTEXT_LLM_MIN_CHARS == 2000
+    assert config.CONTEXT_LLM_MIN_PASSAGES == 3
 
 
 # -- batching ----------------------------------------------------------------
