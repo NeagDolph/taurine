@@ -244,7 +244,9 @@ COMPLETION_MODEL = "deepseek/deepseek-v4-flash"
 COMPLETION_MAX_TOKENS = 8192             # cap runaway completions (one 94KB malformed response observed)
 COMPLETION_NO_RELATION_MIN_PERCENTILE = 0.5  # no-relation gate needs median-or-better value
 COMPLETION_TOOL_HOP_CAP = 40             # extra tool/anchor notes per build in the completion lane
-COMPLETION_NOTES_PER_CALL = 12           # completion batch size (single giant call overflowed context)
+# 12-note batches drove flash responses past the output cap (7/25 batches
+# truncated mid-JSON at ~21KB ≈ 8192 tokens on the 2026-07-13 flash rebuild)
+COMPLETION_NOTES_PER_CALL = 6            # completion batch size: response must fit COMPLETION_MAX_TOKENS
 COMPLETION_CONCURRENCY = 4               # parallel completion batches
 ENTITY_NEIGHBORHOOD_FACTS = 6            # resolved query entities surface their top facts in the pack
 ADJUDICATION_TEXT_MAX_CHARS = 4000       # passage text supplied per fact-judge call
