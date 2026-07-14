@@ -544,7 +544,9 @@ def test_malformed_verdicts_are_never_cached(tmp_path: Path) -> None:
 # -- item 5b: semantic-edge reasons ----------------------------------------------
 
 
-def _pair(src: str = "pa", dst: str = "pb") -> SemanticPair:
+def _pair(
+    src: str = "pa", dst: str = "pb", *, cosine: float | None = None
+) -> SemanticPair:
     return SemanticPair(
         src_passage_id=src,
         dst_passage_id=dst,
@@ -554,6 +556,7 @@ def _pair(src: str = "pa", dst: str = "pb") -> SemanticPair:
         dst_text="Bring the grill for the Saturday park potluck.",
         src_content_hash=hashlib.sha256(src.encode()).hexdigest(),
         dst_content_hash=hashlib.sha256(dst.encode()).hexdigest(),
+        cosine=cosine,
     )
 
 
@@ -571,6 +574,40 @@ class ScriptedReasonJudge:
             if key in self.reasons:
                 out[row["key"]] = self.reasons[key]
         return {"pairs": out}
+
+
+def test_near_duplicate_semantic_pair_is_auto_kept_without_judge_or_cache() -> None:
+    class UnexpectedCache:
+        def cached_judgments(self, keys):
+            raise AssertionError(f"near duplicate reached cache lookup: {keys}")
+
+        def store_judgments(self, rows):
+            raise AssertionError(f"near duplicate reached cache store: {rows}")
+
+    def unexpected_judge(system_prompt: str, payload: dict) -> dict:
+        raise AssertionError(f"near duplicate reached judge: {system_prompt} {payload}")
+
+    pair = _pair(cosine=0.98)
+
+    outcome = adjudicate_semantic_edges(
+        [pair], judge=unexpected_judge, cache=UnexpectedCache()
+    )
+
+    assert outcome.reasons == {pair.pair: "Near-duplicate content"}
+    assert outcome.dropped == frozenset()
+    assert outcome.reasoned_count == 0
+    assert outcome.auto_kept_near_dup == 1
+
+
+def test_semantic_pair_without_cosine_still_uses_the_judge() -> None:
+    pair = _pair(cosine=None)
+    judge = ScriptedReasonJudge({("Alpha", "Beta"): "same Saturday potluck"})
+
+    outcome = adjudicate_semantic_edges([pair], judge=judge)
+
+    assert judge.calls == 1
+    assert outcome.reasons == {pair.pair: "same Saturday potluck"}
+    assert outcome.auto_kept_near_dup == 0
 
 
 def test_semantic_reasons_are_kept_clamped_and_none_drops_the_edge() -> None:
@@ -850,7 +887,10 @@ def test_build_downweight_multiplies_the_fact_edge_weight(tmp_path: Path) -> Non
     assert halved == pytest.approx(full * 0.5, rel=1e-6)
 
 
-def test_build_semantic_reasons_persist_and_none_drops_the_edge(tmp_path: Path) -> None:
+def test_build_semantic_reasons_persist_and_none_drops_the_edge(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(config, "NEAR_DUP_AUTO_KEEP_SIM", 1.01)
     notes = [
         make_note("a", "Alpha", "Potluck planning with Adi on Saturday."),
         make_note("b", "Beta", "Bring the grill for the Saturday potluck."),
@@ -895,6 +935,40 @@ def test_build_semantic_reasons_persist_and_none_drops_the_edge(tmp_path: Path) 
         )
         # dropped edges left the stored rows AND the in-memory graph (hash holds)
         assert store.verify_graph_hash(report.build_id)
+    finally:
+        store.close()
+
+
+def test_build_threads_semantic_cosine_into_near_duplicate_auto_keep(
+    tmp_path: Path,
+) -> None:
+    notes = [
+        make_note("a", "Alpha", "Potluck planning with Adi on Saturday."),
+        make_note("b", "Beta", "Potluck planning with Adi on Saturday."),
+    ]
+
+    def judge(system_prompt: str, payload: dict) -> dict:
+        assert not payload.get("pairs"), "near duplicate unexpectedly reached judge"
+        return {"facts": [], "pairs": {}}
+
+    deps = BuildDependencies(
+        tokenizer=Tokenizer(),
+        embedder=constant_embedder,
+        embedding_dim=16,
+        edge_adjudicator=judge,
+    )
+    target = tmp_path / "knowledge.db"
+
+    report = BuildCoordinator(deps).build(notes, target, replace_derived=True)
+
+    assert report.semantic_near_dup_auto_kept_count == 1
+    store = KnowledgeStore(target, read_only=True)
+    try:
+        (row,) = store._conn.execute(
+            "SELECT cosine, reason FROM passage_semantic_edges"
+        ).fetchall()
+        assert row["cosine"] == pytest.approx(1.0)
+        assert row["reason"] == "Near-duplicate content"
     finally:
         store.close()
 

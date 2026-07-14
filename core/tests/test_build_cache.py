@@ -210,7 +210,7 @@ def test_extraction_cache_fingerprint_scopes_relex_backend_and_thresholds(
     relex = build_cache_module._schema_fingerprint()
     assert relex != gliner2
 
-    monkeypatch.setattr(config, "RELEX_ENTITY_THRESHOLD", 0.35)
+    monkeypatch.setattr(config, "RELEX_ENTITY_THRESHOLD", 0.36)
     assert build_cache_module._schema_fingerprint() != relex
 
     monkeypatch.setattr(config, "EXTRACTOR_BACKEND", "hybrid")

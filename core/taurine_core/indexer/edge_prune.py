@@ -82,6 +82,7 @@ class PruneResult:
     reasoned_count: int
     dropped_count: int
     failed_batches: int = 0
+    auto_kept_near_dup: int = 0
 
 
 def make_features(

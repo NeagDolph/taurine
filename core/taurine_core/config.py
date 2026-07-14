@@ -263,6 +263,11 @@ NLI_AUTO_REJECT = False                  # destructive rejection remains LLM-onl
 NLI_REJECT_CEIL = 0.05                   # inactive while NLI_AUTO_REJECT is false
 SEMANTIC_REASON_BATCH = 20               # cross-note semantic pairs per judge call
 SEMANTIC_REASON_SNIPPET_CHARS = 300      # per-passage snippet supplied to the judge
+# The 2026-07-14 cascade experiment's disagreement samples showed gpt-oss
+# keeps near-identical pairs essentially always; flash's drops of them were
+# its clearest errors. Bypass the judge for that deterministic high-similarity
+# region while leaving cosine-missing pairs on the existing fail-open lane.
+NEAR_DUP_AUTO_KEEP_SIM = 0.97
 # Reasons are an optional retrieval hint on the strongest cross-note links, not
 # a per-edge requirement. Only the top-weighted cross-note semantic edges are
 # judged; the long tail keeps an empty reason (never dropped). This is the main

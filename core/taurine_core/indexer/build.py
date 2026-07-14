@@ -166,6 +166,7 @@ class BuildReport:
     semantic_reasoned_edge_count: int = 0
     semantic_reason_dropped_count: int = 0
     semantic_reason_failed_batches: int = 0
+    semantic_near_dup_auto_kept_count: int = 0
     merge_gray_zone_pair_count: int = 0
     merge_adjudicated_count: int = 0
     merge_approved_count: int = 0
@@ -927,6 +928,7 @@ class BuildCoordinator:
                     dst_text=draft_of_passage[edge.dst_id].text,
                     src_content_hash=draft_of_passage[edge.src_id].content_hash,
                     dst_content_hash=draft_of_passage[edge.dst_id].content_hash,
+                    cosine=edge.weight,
                 )
                 for edge in cross_note_semantic
             )
@@ -1004,13 +1006,14 @@ class BuildCoordinator:
                     judge=self.dependencies.edge_adjudicator,
                     cache=self.dependencies.adjudication_cache,
                 )
-            if semantic_reasons.dropped:
+            if semantic_reasons.dropped or semantic_reasons.auto_kept_near_dup:
                 _LOG.info(
                     "build %s: %d cross-note semantic edges dropped (no concrete "
-                    "reason), %d reasoned",
+                    "reason), %d reasoned, %d near-duplicates auto-kept",
                     build_id,
                     semantic_reasons.dropped_count,
                     semantic_reasons.reasoned_count,
+                    semantic_reasons.auto_kept_near_dup,
                 )
                 base_graph = materialize_base_graph(
                     build_id=build_id,
@@ -1295,6 +1298,9 @@ class BuildCoordinator:
                 semantic_reasoned_edge_count=semantic_reasons.reasoned_count,
                 semantic_reason_dropped_count=semantic_reasons.dropped_count,
                 semantic_reason_failed_batches=semantic_reasons.failed_batches,
+                semantic_near_dup_auto_kept_count=(
+                    semantic_reasons.auto_kept_near_dup
+                ),
                 merge_gray_zone_pair_count=gray_zone_pair_count,
                 merge_adjudicated_count=merge_outcome.judged_count,
                 merge_approved_count=merge_outcome.approved_count,

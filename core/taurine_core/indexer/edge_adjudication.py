@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Sequence
@@ -576,6 +577,7 @@ class SemanticPair:
     dst_text: str
     src_content_hash: str
     dst_content_hash: str
+    cosine: float | None = None
 
     @property
     def pair(self) -> tuple[str, str]:
@@ -589,6 +591,7 @@ class SemanticReasonOutcome:
     reasoned_count: int
     dropped_count: int
     failed_batches: int
+    auto_kept_near_dup: int = 0
 
 
 _NO_REASON = "NONE"
@@ -605,9 +608,24 @@ def adjudicate_semantic_edges(
     empty reasons."""
 
     ordered = tuple(sorted(pairs, key=lambda row: row.pair))
-    if judge is None or not ordered:
+    if not ordered:
         return SemanticReasonOutcome({}, frozenset(), 0, 0, 0)
-    keys = {row.pair: _reason_key(model_id, row) for row in ordered}
+    auto_kept = tuple(row for row in ordered if _is_near_duplicate(row))
+    auto_kept_pairs = {row.pair for row in auto_kept}
+    pending_judge = tuple(row for row in ordered if row.pair not in auto_kept_pairs)
+    reasons: dict[tuple[str, str], str] = {
+        row.pair: "Near-duplicate content" for row in auto_kept
+    }
+    if judge is None or not pending_judge:
+        return SemanticReasonOutcome(
+            reasons=reasons,
+            dropped=frozenset(),
+            reasoned_count=0,
+            dropped_count=0,
+            failed_batches=0,
+            auto_kept_near_dup=len(auto_kept),
+        )
+    keys = {row.pair: _reason_key(model_id, row) for row in pending_judge}
     verdicts: dict[tuple[str, str], str] = {}
     if cache is not None:
         by_key = cache.cached_judgments(sorted(set(keys.values())))
@@ -615,7 +633,7 @@ def adjudicate_semantic_edges(
             row = by_key.get(key)
             if isinstance(row, Mapping) and isinstance(row.get("reason"), str):
                 verdicts[pair] = str(row["reason"])
-    pending = [row for row in ordered if row.pair not in verdicts]
+    pending = [row for row in pending_judge if row.pair not in verdicts]
     batch_size = max(1, int(config.SEMANTIC_REASON_BATCH))
     batches = [
         tuple(pending[start : start + batch_size])
@@ -644,9 +662,8 @@ def adjudicate_semantic_edges(
                         for pair, reason in sorted(parsed.items())
                     ]
                 )
-    reasons: dict[tuple[str, str], str] = {}
     dropped: set[tuple[str, str]] = set()
-    for row in ordered:
+    for row in pending_judge:
         verdict = verdicts.get(row.pair)
         if verdict is None:
             continue  # fail-open: edge kept, reason ''
@@ -657,10 +674,18 @@ def adjudicate_semantic_edges(
     return SemanticReasonOutcome(
         reasons=reasons,
         dropped=frozenset(dropped),
-        reasoned_count=len(reasons),
+        reasoned_count=len(reasons) - len(auto_kept),
         dropped_count=len(dropped),
         failed_batches=failed,
+        auto_kept_near_dup=len(auto_kept),
     )
+
+
+def _is_near_duplicate(row: SemanticPair) -> bool:
+    if row.cosine is None:
+        return False
+    cosine = float(row.cosine)
+    return math.isfinite(cosine) and cosine >= float(config.NEAR_DUP_AUTO_KEEP_SIM)
 
 
 def _reason_payload(batch: Sequence[SemanticPair]) -> dict:
