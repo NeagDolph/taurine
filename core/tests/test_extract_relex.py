@@ -507,3 +507,7 @@ def test_production_build_and_server_use_backend_dispatch() -> None:
 
     assert build.extract_notes is extract.extract_notes_dispatch
     assert server.extract_notes is extract.extract_notes_dispatch
+
+
+def test_extractor_backend_defaults_to_union() -> None:
+    assert config.EXTRACTOR_BACKEND == "union"

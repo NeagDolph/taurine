@@ -435,9 +435,9 @@ GLINER_CHUNK_SIZE = GLINER_LONG_CHUNK_TOKENS       # legacy alias until extracto
 GLINER_CHUNK_OVERLAP = GLINER_LONG_OVERLAP_TOKENS # legacy alias until extractor cutover
 GLINER_ENTITY_MIN_CONF = 0.5             # calibration-pending entity floor
 GLINER_RELATION_MIN_CONF = 0.45          # calibration-pending relation floor
-# Extraction backend stays on current GLiNER2 behavior until the quality gate
-# selects a replacement.
-EXTRACTOR_BACKEND = "gliner2"
+# 2026-07-14 pilot benchmark: union reached 20.6% silver recall versus 12.7%
+# for GLiNER2, with equal judge-verified precision on the novel relation pool.
+EXTRACTOR_BACKEND = "union"
 RELEX_MODEL = "knowledgator/gliner-relex-large-v1.0"
 # 3×3 sweep best point (2026-07-13): equal recall to stricter settings with
 # +77% novel yield, and judge-sampled precision of the novel pool matched
