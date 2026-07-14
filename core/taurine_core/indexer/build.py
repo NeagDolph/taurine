@@ -1070,6 +1070,9 @@ class BuildCoordinator:
                     for note, draft in passage_rows
                 ),
                 {entity.entity_id: entity.canonical for entity in resolution.entities},
+                entity_types={
+                    entity.entity_id: entity.etype for entity in resolution.entities
+                },
                 max_degree=config.PROJECTION_MAX_DEGREE,
             )
             store.write_projection(projection, build_id=build_id)

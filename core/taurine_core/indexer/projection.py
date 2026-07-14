@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
+from taurine_core import config
 from taurine_core.indexer.base_graph import BaseGraph
 
 
@@ -29,10 +30,17 @@ class ProjectionEdge:
 class _Candidate:
     scores: dict[str, list[float]] = field(default_factory=dict)
     shared: set[str] = field(default_factory=set)
+    shared_entity_ids: set[str] = field(default_factory=set)
     fact_ids: set[str] = field(default_factory=set)
 
     def add(self, mechanism: str, score: float) -> None:
         self.scores.setdefault(mechanism, []).append(min(1.0, max(0.0, float(score))))
+
+
+@dataclass(frozen=True)
+class _RenderedCandidate:
+    edge: ProjectionEdge
+    shared_entity_count: int
 
 
 def build_projection(
@@ -40,6 +48,7 @@ def build_projection(
     passages: Sequence[ProjectionPassage],
     entity_labels: Mapping[str, str],
     *,
+    entity_types: Mapping[str, str] | None = None,
     max_degree: int,
 ) -> tuple[ProjectionEdge, ...]:
     passage_note = {row.passage_id: row.note_id for row in passages}
@@ -64,11 +73,27 @@ def build_projection(
             strengths[note_id] = max(strengths.get(note_id, 0.0), edge.weight)
 
     for entity_id, strengths in sorted(entity_note_strength.items()):
+        etype = entity_types.get(entity_id, "") if entity_types is not None else ""
+        etype_weight = max(
+            0.0,
+            float(
+                config.PROJECTION_ENTITY_ETYPE_WEIGHTS.get(
+                    etype,
+                    config.PROJECTION_ENTITY_ETYPE_DEFAULT,
+                )
+            ),
+        )
+        if etype_weight <= 0.0:
+            continue
         note_ids = sorted(strengths)
         for index, left in enumerate(note_ids):
             for right in note_ids[index + 1 :]:
+                contribution = strengths[left] * strengths[right] * etype_weight
+                if contribution <= 0.0:
+                    continue
                 candidate = _candidate(candidates, left, right)
-                candidate.add("entity", strengths[left] * strengths[right])
+                candidate.add("entity", contribution)
+                candidate.shared_entity_ids.add(entity_id)
                 label = entity_labels.get(entity_id)
                 if label:
                     candidate.shared.add(label)
@@ -96,7 +121,13 @@ def build_projection(
                 candidate.fact_ids.update(edge.fact_ids)
 
     rendered = [_render(pair, candidate) for pair, candidate in candidates.items()]
-    rendered.sort(key=lambda row: (-row.weight, row.src_note_id, row.dst_note_id))
+    rendered.sort(
+        key=lambda row: (
+            -row.edge.weight,
+            row.edge.src_note_id,
+            row.edge.dst_note_id,
+        )
+    )
     selected = _select_edges(rendered, max(0, int(max_degree)))
     return tuple(sorted(selected, key=lambda row: (row.src_note_id, row.dst_note_id)))
 
@@ -110,7 +141,7 @@ def _candidate(
     return candidates.setdefault(pair, _Candidate())
 
 
-def _render(pair: tuple[str, str], candidate: _Candidate) -> ProjectionEdge:
+def _render(pair: tuple[str, str], candidate: _Candidate) -> _RenderedCandidate:
     # Within a mechanism: strongest signal + a bounded support bonus (§10.7's
     # "maximum plus bounded supporting-edge bonus"). Noisy-or here saturated —
     # six shared friend-names or overlapping passage pairs pinned the pair at
@@ -128,22 +159,34 @@ def _render(pair: tuple[str, str], candidate: _Candidate) -> ProjectionEdge:
         edge_type = "entity"
     else:
         edge_type = "mixed"
-    return ProjectionEdge(
-        src_note_id=pair[0],
-        dst_note_id=pair[1],
-        edge_type=edge_type,
-        weight=weight,
-        shared=tuple(sorted(candidate.shared, key=lambda value: (value.casefold(), value))),
-        fact_ids=tuple(sorted(candidate.fact_ids)),
-        mechanisms=mechanisms,
+    return _RenderedCandidate(
+        edge=ProjectionEdge(
+            src_note_id=pair[0],
+            dst_note_id=pair[1],
+            edge_type=edge_type,
+            weight=weight,
+            shared=tuple(
+                sorted(candidate.shared, key=lambda value: (value.casefold(), value))
+            ),
+            fact_ids=tuple(sorted(candidate.fact_ids)),
+            mechanisms=mechanisms,
+        ),
+        shared_entity_count=len(candidate.shared_entity_ids),
     )
 
 
-def _select_edges(edges: list[ProjectionEdge], max_degree: int) -> list[ProjectionEdge]:
+def _select_edges(
+    candidates: list[_RenderedCandidate],
+    max_degree: int,
+) -> list[ProjectionEdge]:
     if max_degree <= 0:
         return []
     notes = sorted(
-        {note_id for edge in edges for note_id in (edge.src_note_id, edge.dst_note_id)}
+        {
+            note_id
+            for candidate in candidates
+            for note_id in (candidate.edge.src_note_id, candidate.edge.dst_note_id)
+        }
     )
     parent = {note_id: note_id for note_id in notes}
     degree = {note_id: 0 for note_id in notes}
@@ -167,20 +210,31 @@ def _select_edges(edges: list[ProjectionEdge], max_degree: int) -> list[Projecti
     # when that route is weak, and a hub note bridging more components than
     # max_degree still connects them all. The cap and the low-value floor
     # apply only to the fill phase below.
-    for edge in edges:
+    for candidate in candidates:
+        edge = candidate.edge
         left_root, right_root = find(edge.src_note_id), find(edge.dst_note_id)
         if left_root == right_root:
             continue
         add(edge)
         parent[max(left_root, right_root)] = min(left_root, right_root)
 
-    from taurine_core import config
-
     fill_floor = float(config.PROJECTION_FILL_MIN_WEIGHT)
-    for edge in edges:
+    min_shared = max(0, int(config.PROJECTION_ENTITY_MIN_SHARED))
+    for candidate in candidates:
+        edge = candidate.edge
         if (edge.src_note_id, edge.dst_note_id) in selected_pairs:
             continue
         if edge.weight < fill_floor:
+            continue
+        has_non_entity_support = any(
+            edge.mechanisms.get(mechanism, 0.0) > 0.0
+            for mechanism in ("semantic", "fact")
+        )
+        if (
+            edge.mechanisms.get("entity", 0.0) > 0.0
+            and not has_non_entity_support
+            and candidate.shared_entity_count < min_shared
+        ):
             continue
         if degree[edge.src_note_id] >= max_degree or degree[edge.dst_note_id] >= max_degree:
             continue
