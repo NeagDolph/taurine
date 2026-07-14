@@ -259,6 +259,146 @@ def test_unknown_ordinals_and_non_string_contexts_are_ignored() -> None:
     assert result.failed_batches == 0
 
 
+# -- mode dispatch ------------------------------------------------------------
+
+
+def test_template_mode_enriches_all_passages_without_llm_or_build_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "template")
+    note = _note(
+        title="iMessage: Rowan, Doug, Sanj",
+        gist="[Doug] latest message",
+    )
+
+    def unexpected_llm(batch: EnrichmentBatch) -> dict:
+        raise AssertionError(f"template mode called LLM for {batch.note_id}")
+
+    class UnexpectedCache:
+        def cached_contexts(self, keys):
+            raise AssertionError(f"template mode read BuildCache for {keys}")
+
+        def store_contexts(self, rows):
+            raise AssertionError(f"template mode wrote BuildCache for {rows}")
+
+    result = enrich_passages(
+        ((note, _drafts(3)),),
+        unexpected_llm,
+        cache=UnexpectedCache(),
+    )
+
+    assert result.contexts == {
+        "p0": (
+            "iMessage thread between Rowan, Doug, Sanj; from Doug; June 2025; "
+            "start of the thread."
+        ),
+        "p1": (
+            "iMessage thread between Rowan, Doug, Sanj; from Doug; June 2025; "
+            "middle of the thread."
+        ),
+        "p2": (
+            "iMessage thread between Rowan, Doug, Sanj; from Doug; June 2025; "
+            "end of the thread."
+        ),
+    }
+    assert result.enriched_count == 3
+    assert result.failed_batches == 0
+
+
+def test_hybrid_small_note_keeps_templates_without_llm_or_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "hybrid")
+    calls: list[EnrichmentBatch] = []
+
+    def enricher(batch: EnrichmentBatch) -> dict:
+        calls.append(batch)
+        return _response(batch, "llm")
+
+    class UnexpectedCache:
+        def cached_contexts(self, keys):
+            raise AssertionError(f"ungated hybrid note read BuildCache for {keys}")
+
+        def store_contexts(self, rows):
+            raise AssertionError(f"ungated hybrid note wrote BuildCache for {rows}")
+
+    result = enrich_passages(
+        ((_note(title="iMessage: Rowan"), _drafts(2)),),
+        enricher,
+        cache=UnexpectedCache(),
+    )
+
+    assert calls == []
+    assert set(result.contexts) == {"p0", "p1"}
+    assert all(value.startswith("iMessage thread between Rowan") for value in result.contexts.values())
+    assert result.failed_batches == 0
+
+
+@pytest.mark.parametrize(
+    ("note", "drafts"),
+    [
+        (_note(text="x" * 2001), _drafts(1)),
+        (_note(text="short thread"), _drafts(3)),
+    ],
+    ids=("long-text", "three-passages"),
+)
+def test_hybrid_gate_calls_llm_and_replaces_templates(
+    monkeypatch: pytest.MonkeyPatch,
+    note: NoteRecord,
+    drafts: tuple[PassageDraft, ...],
+) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "hybrid")
+    calls: list[EnrichmentBatch] = []
+
+    def enricher(batch: EnrichmentBatch) -> dict:
+        calls.append(batch)
+        return _response(batch, "llm")
+
+    result = enrich_passages(((note, drafts),), enricher)
+
+    assert len(calls) == 1
+    assert result.contexts == {
+        draft.passage_id: f"llm for {draft.passage_id}" for draft in drafts
+    }
+    assert result.failed_batches == 0
+
+
+def test_hybrid_llm_failure_leaves_template_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "hybrid")
+
+    def broken(batch: EnrichmentBatch) -> dict:
+        raise RuntimeError(f"provider down for {batch.note_id}")
+
+    result = enrich_passages(
+        ((_note(title="iMessage: Rowan", text="x" * 2001), _drafts(2)),),
+        broken,
+    )
+
+    assert set(result.contexts) == {"p0", "p1"}
+    assert all(value.startswith("iMessage thread between Rowan") for value in result.contexts.values())
+    assert result.enriched_count == 2
+    assert result.failed_batches == 1
+
+
+def test_explicit_llm_mode_matches_existing_empty_and_enriched_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "CONTEXT_ENRICH_MODE", "llm")
+    notes = ((_note(), _drafts(2)),)
+
+    empty = enrich_passages(notes, None)
+    enriched = enrich_passages(notes, lambda batch: _response(batch))
+
+    assert empty == context_enrich_module.EnrichmentResult({}, 0, 0)
+    assert enriched == context_enrich_module.EnrichmentResult(
+        {"p0": "ctx for p0", "p1": "ctx for p1"},
+        2,
+        0,
+    )
+
+
 # -- caching -----------------------------------------------------------------
 
 

@@ -206,7 +206,89 @@ def enrich_passages(
     cache: Any | None = None,
     model_id: str = config.CONTEXT_ENRICH_MODEL,
 ) -> EnrichmentResult:
-    """Situate episodic passages in bounded concurrent batches; fail-open.
+    """Situate episodic passages using the configured enrichment mode."""
+
+    mode = str(getattr(config, "CONTEXT_ENRICH_MODE", "llm") or "llm").casefold()
+    if mode not in {"llm", "template", "hybrid"}:
+        _LOG.warning("unknown context enrichment mode %r; using llm", mode)
+        mode = "llm"
+    if mode == "llm":
+        return _enrich_passages_llm(
+            notes,
+            enricher,
+            cache=cache,
+            model_id=model_id,
+        )
+
+    template_contexts = _template_contexts(notes)
+    if mode == "template":
+        return EnrichmentResult(template_contexts, len(template_contexts), 0)
+
+    gated_notes = tuple(
+        (note, drafts)
+        for note, drafts in notes
+        if note.source in ENRICHABLE_SOURCES
+        and drafts
+        and (
+            len(note.text) > int(config.CONTEXT_LLM_MIN_CHARS)
+            or len(drafts) >= int(config.CONTEXT_LLM_MIN_PASSAGES)
+        )
+    )
+    llm_result = _enrich_passages_llm(
+        gated_notes,
+        enricher,
+        cache=cache,
+        model_id=model_id,
+    )
+    contexts = dict(template_contexts)
+    contexts.update(llm_result.contexts)
+    return EnrichmentResult(
+        contexts=contexts,
+        enriched_count=len(contexts),
+        failed_batches=llm_result.failed_batches,
+    )
+
+
+def _template_contexts(
+    notes: Sequence[tuple[NoteRecord, Sequence[PassageDraft]]],
+) -> dict[str, str]:
+    contexts: dict[str, str] = {}
+    for note, drafts in sorted(notes, key=lambda pair: pair[0].note_id):
+        if note.source not in ENRICHABLE_SOURCES or not drafts:
+            continue
+        ordered = sorted(drafts, key=lambda draft: draft.ordinal)
+        denominator = max(1, len(ordered) - 1)
+        for index, draft in enumerate(ordered):
+            fraction = index / denominator
+            if fraction < 1 / 3:
+                position = "start of"
+            elif fraction > 2 / 3:
+                position = "end of"
+            else:
+                position = "middle of"
+            context = template_context(
+                note,
+                EnrichmentPassage(
+                    ordinal=draft.ordinal,
+                    passage_id=draft.passage_id,
+                    text=draft.text,
+                    content_hash=draft.content_hash,
+                ),
+                position,
+            )
+            if context:
+                contexts[draft.passage_id] = context
+    return contexts
+
+
+def _enrich_passages_llm(
+    notes: Sequence[tuple[NoteRecord, Sequence[PassageDraft]]],
+    enricher: Callable[[EnrichmentBatch], Any] | None,
+    *,
+    cache: Any | None,
+    model_id: str,
+) -> EnrichmentResult:
+    """Existing bounded LLM/cache path, kept isolated from templates.
 
     ``cache`` is a BuildCache (or anything with cached_contexts /
     store_contexts). No enricher ⇒ empty contexts, exactly today's behavior.
