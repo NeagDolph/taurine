@@ -190,7 +190,9 @@ def test_imessage_extracts_bounded_chat_transcripts_with_attribution_and_hashes(
     assert record.modified == pytest.approx(newest.timestamp(), abs=1.0)
     assert record.created == pytest.approx(inside_window.timestamp(), abs=1.0)
     assert record.text.splitlines() == [
+        f"— {inside_window.astimezone().strftime('%Y-%m-%d')} —",
         "[them] inside window",
+        f"— {newest.astimezone().strftime('%Y-%m-%d')} —",
         "[me] newest reply",
     ]
     assert "outside window" not in record.text
@@ -234,7 +236,9 @@ def test_imessage_keeps_messages_older_than_six_months_within_the_year(
     record = IMessageConnector().extract({"require_contact": False})[0]
 
     assert record.text.splitlines() == [
+        f"— {(now - timedelta(days=240)).astimezone().strftime('%Y-%m-%d')} —",
         "[them] eight months ago",
+        f"— {(now - timedelta(days=1)).astimezone().strftime('%Y-%m-%d')} —",
         "[me] recent",
     ]
 
@@ -263,12 +267,17 @@ def test_imessage_caps_at_max_messages_keeping_the_newest(
 
     record = IMessageConnector().extract({"require_contact": False})[0]
     lines = record.text.splitlines()
+    message_lines = [line for line in lines if not line.startswith("— ")]
 
     # only the most-recent N kept, in chronological order (oldest kept first)
-    assert len(lines) == config.IMESSAGE_MAX_MESSAGES
-    assert lines[0] == f"[them] message-{total - config.IMESSAGE_MAX_MESSAGES}"
-    assert lines[-1] == f"[them] message-{total - 1}"
-    assert f"[them] message-{total - config.IMESSAGE_MAX_MESSAGES - 1}" not in lines
+    assert len(message_lines) == config.IMESSAGE_MAX_MESSAGES
+    assert message_lines[0] == f"[them] message-{total - config.IMESSAGE_MAX_MESSAGES}"
+    assert message_lines[-1] == f"[them] message-{total - 1}"
+    assert (
+        f"[them] message-{total - config.IMESSAGE_MAX_MESSAGES - 1}"
+        not in message_lines
+    )
+    assert all(line.endswith(" —") for line in lines if line.startswith("— "))
     assert record.title == "iMessage: +15550000000"
 
 
@@ -308,7 +317,9 @@ def test_imessage_handles_old_second_precision_apple_dates(tmp_path: Path, monke
     record = IMessageConnector().extract({"require_contact": False})[0]
 
     assert record.modified == pytest.approx(when.timestamp(), abs=1.0)
-    assert record.text == "[me] legacy date"
+    assert record.text == (
+        f"— {when.astimezone().strftime('%Y-%m-%d')} —\n[me] legacy date"
+    )
 
 
 def test_imessage_raises_connector_error_for_unexpected_schema(tmp_path: Path) -> None:

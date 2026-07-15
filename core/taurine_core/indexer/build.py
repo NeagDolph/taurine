@@ -56,7 +56,11 @@ from taurine_core.indexer.extract import extract_notes_dispatch as extract_notes
 from taurine_core.indexer.doc_kind import snapshot_document
 from taurine_core.indexer.facts import PREDICATES, promote_fact, reconcile_temporal_facts
 from taurine_core.indexer.knowledge_store import KnowledgeStore, compute_graph_hash
-from taurine_core.indexer.passages import TokenizerPort, build_passages
+from taurine_core.indexer.passages import (
+    PASSAGE_BUILD_VERSION,
+    TokenizerPort,
+    build_passages,
+)
 from taurine_core.indexer.projection import ProjectionPassage, build_projection
 from taurine_core.indexer.relation_completion import (
     COMPLETION_SYSTEM_PROMPT,
@@ -308,6 +312,7 @@ class BuildCoordinator:
         # runtime compares model identities while tolerating these fingerprints.
         config_manifest = {
             "builder": "knowledge-build-v1",
+            "passages": PASSAGE_BUILD_VERSION,
             "config_hash": calibration.config_hash,
             "model_fingerprints": json.dumps(
                 {
@@ -397,7 +402,7 @@ class BuildCoordinator:
                 drafts = build_passages(
                     note,
                     self.dependencies.tokenizer,
-                    version="passages-v1",
+                    version=PASSAGE_BUILD_VERSION,
                 )
                 store.write_passages(
                     note.note_id,

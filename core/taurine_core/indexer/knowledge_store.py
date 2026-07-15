@@ -106,6 +106,7 @@ class PassageContext:
     created: float
     modified: float
     build_id: str
+    passage_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -439,8 +440,8 @@ class KnowledgeStore:
                     INSERT INTO passages(
                         passage_id, note_id, ordinal, char_start, char_end,
                         token_count, text, content_hash, context, created,
-                        modified, build_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+                        modified, build_id, passage_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
                     """,
                     (
                         passage.passage_id,
@@ -454,6 +455,7 @@ class KnowledgeStore:
                         float(created),
                         float(modified),
                         build_id,
+                        passage.passage_date,
                     ),
                 )
                 self._conn.execute(
@@ -552,7 +554,8 @@ class KnowledgeStore:
         rows = self._conn.execute(
             f"""
             SELECT p.passage_id, p.note_id, n.title, n.source, p.text,
-                   p.char_start, p.char_end, p.created, p.modified, p.build_id
+                   p.char_start, p.char_end, p.created, p.modified, p.build_id,
+                   p.passage_date
             FROM passages p
             JOIN notes n ON n.note_id = p.note_id
             WHERE {' AND '.join(clauses)}
@@ -571,6 +574,11 @@ class KnowledgeStore:
                 created=float(row["created"]),
                 modified=float(row["modified"]),
                 build_id=str(row["build_id"]),
+                passage_date=(
+                    str(row["passage_date"])
+                    if row["passage_date"] is not None
+                    else None
+                ),
             )
             for row in rows
         }
@@ -1690,6 +1698,7 @@ CREATE TABLE passages (
     created REAL NOT NULL,
     modified REAL NOT NULL,
     build_id TEXT NOT NULL,
+    passage_date TEXT,
     UNIQUE(note_id, ordinal),
     CHECK(char_start >= 0 AND char_end > char_start),
     CHECK(length(text) > 0)

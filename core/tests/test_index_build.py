@@ -1089,6 +1089,14 @@ def test_model_fingerprints_ride_config_manifest_not_model_manifest(
     assert report.model_manifest == expected_manifest
 
 
+def test_passage_algorithm_version_is_part_of_build_fingerprint(tmp_path: Path) -> None:
+    report = BuildCoordinator(
+        BuildDependencies(tokenizer=Tokenizer(), embedder=embedder, embedding_dim=16)
+    ).build([], tmp_path / "knowledge.db", replace_derived=True)
+
+    assert report.config_manifest["passages"] == "passages-v2"
+
+
 def test_model_fingerprint_tracks_local_artifact_changes(tmp_path: Path, monkeypatch) -> None:
     import os as _os
 

@@ -91,10 +91,12 @@ def test_store_round_trips_embeddings_and_passage_level_bm25(tmp_path: Path) -> 
         store.write_passage_embeddings(embedded)
 
         stored = store.passage_embeddings()
+        contexts = store.passage_contexts(("p1", "p2"))
         hits = store.search_passages_bm25("July review", 5)
 
         assert [row.passage_id for row in stored] == ["p1", "p2"]
         assert np.array_equal(stored[1].vector, np.array([0.0, 1.0], dtype=np.float32))
+        assert [row.passage_date for row in contexts] == ["2026-07-14", None]
         assert hits[0].passage_id == "p2"
         assert hits[0].raw_score > 0.0
         assert hits[0].token_coverage == pytest.approx(1.0)
@@ -130,4 +132,5 @@ def _passage(passage_id: str, ordinal: int, text: str) -> PassageDraft:
         token_count=len(text.split()),
         text=text,
         content_hash=f"hash-{passage_id}",
+        passage_date="2026-07-14" if passage_id == "p1" else None,
     )

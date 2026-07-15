@@ -12,6 +12,12 @@ from taurine_core import config
 from taurine_core.schemas import NoteRecord
 
 
+PASSAGE_BUILD_VERSION = "passages-v2"
+_IMESSAGE_DAY_MARKER = re.compile(
+    r"(?m)^— (?P<date>\d{4}-\d{2}-\d{2}) —(?=\n|$)"
+)
+
+
 class TokenizerResult(TypedDict):
     input_ids: Sequence[int]
     offset_mapping: Sequence[tuple[int, int]]
@@ -36,6 +42,7 @@ class PassageDraft:
     token_count: int
     text: str
     content_hash: str
+    passage_date: str | None = None
 
 
 def build_passages(
@@ -66,41 +73,69 @@ def build_passages(
     overlap = max(0, min(int(config.PASSAGE_OVERLAP_TOKENS), target - 1))
     boundaries = _boundary_token_indices(note.text, offsets)
 
+    ranges = (
+        _imessage_day_ranges(note.text)
+        if note.source == "imessage"
+        else ((0, len(note.text), None),)
+    )
     rows: list[PassageDraft] = []
-    start = 0
-    while start < len(offsets):
-        end = _window_end(
-            start,
-            len(offsets),
-            target=target,
-            maximum=maximum,
-            boundaries=boundaries,
+    for range_start, range_end, passage_date in ranges:
+        token_indices = tuple(
+            index
+            for index, (char_start, char_end) in enumerate(offsets)
+            if char_start >= range_start and char_end <= range_end
         )
-        char_start = offsets[start][0]
-        char_end = offsets[end - 1][1]
-        passage_text = note.text[char_start:char_end]
-        if passage_text.strip():
-            rows.append(
-                PassageDraft(
-                    passage_id=_passage_id(
-                        note.note_id,
-                        note.content_hash,
-                        char_start,
-                        char_end,
-                        version,
-                    ),
-                    ordinal=len(rows),
-                    char_start=char_start,
-                    char_end=char_end,
-                    token_count=end - start,
-                    text=passage_text,
-                    content_hash=_sha256(passage_text),
-                )
+        if not token_indices:
+            continue
+        start = token_indices[0]
+        token_end = token_indices[-1] + 1
+        while start < token_end:
+            end = _window_end(
+                start,
+                token_end,
+                target=target,
+                maximum=maximum,
+                boundaries=boundaries,
             )
-        if end >= len(offsets):
-            break
-        start = max(start + 1, end - overlap)
+            char_start = offsets[start][0]
+            char_end = offsets[end - 1][1]
+            passage_text = note.text[char_start:char_end]
+            if passage_text.strip():
+                rows.append(
+                    PassageDraft(
+                        passage_id=_passage_id(
+                            note.note_id,
+                            note.content_hash,
+                            char_start,
+                            char_end,
+                            version,
+                        ),
+                        ordinal=len(rows),
+                        char_start=char_start,
+                        char_end=char_end,
+                        token_count=end - start,
+                        text=passage_text,
+                        content_hash=_sha256(passage_text),
+                        passage_date=passage_date,
+                    )
+                )
+            if end >= token_end:
+                break
+            start = max(start + 1, end - overlap)
     return tuple(rows)
+
+
+def _imessage_day_ranges(text: str) -> tuple[tuple[int, int, str | None], ...]:
+    markers = tuple(_IMESSAGE_DAY_MARKER.finditer(text))
+    if not markers:
+        return ((0, len(text), None),)
+    ranges: list[tuple[int, int, str | None]] = []
+    if text[: markers[0].start()].strip():
+        ranges.append((0, markers[0].start(), None))
+    for index, marker in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        ranges.append((marker.start(), end, marker.group("date")))
+    return tuple(ranges)
 
 
 def _window_end(

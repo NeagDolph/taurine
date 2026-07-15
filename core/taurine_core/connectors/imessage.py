@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from taurine_core import config as taurine_config
@@ -248,18 +249,23 @@ def _record_for_chat(
     ):
         return None
 
-    lines_desc: list[str] = []
-    for message in selected:
+    transcript_lines: list[str] = []
+    current_day = ""
+    for message in reversed(selected):
+        day = datetime.fromtimestamp(message.timestamp).strftime("%Y-%m-%d")
+        if day != current_day:
+            transcript_lines.append(f"— {day} —")
+            current_day = day
         if message.is_from_me:
             speaker = "me"
         else:
             speaker = _resolve_handle(message.handle_id, contacts) or "them"
-        lines_desc.append(f"[{speaker}] {message.text}")
+        transcript_lines.append(f"[{speaker}] {message.text}")
 
     # Intentionally no character cap: CONNECTOR_DOC_MAX_CHARS belongs to file
     # connectors (and email applies its own transcript policy). iMessage is
     # bounded only by its per-chat time window and runaway-safety message cap.
-    transcript = "\n".join(reversed(lines_desc))
+    transcript = "\n".join(transcript_lines)
     content_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
     participant_names = [
         _resolve_handle(handle, contacts) or handle for handle in handle_ids

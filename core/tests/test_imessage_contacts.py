@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from datetime import datetime, timedelta
+import hashlib
 from pathlib import Path
 
 from taurine_core.connectors.imessage import (
@@ -110,6 +112,37 @@ def test_extract_uses_contact_names_in_title_and_speakers(tmp_path: Path) -> Non
     assert record.title == "iMessage: Jonah Chang"
     assert "[Jonah Chang] hey!" in record.text
     assert "[me] yo" in record.text
+
+
+def test_extract_inserts_local_day_markers_into_transcript_and_hash(
+    tmp_path: Path,
+) -> None:
+    contacts_db = tmp_path / "AddressBook-v22.abcddb"
+    _make_contacts_db(contacts_db, [("Jonah", "Chang", "", "+15128509385", "")])
+    chat_db = tmp_path / "chat.db"
+    _make_chat_db(chat_db, "+15128509385", [("late", False), ("morning", True)])
+
+    local_now = datetime.now().astimezone()
+    first = local_now.replace(hour=23, minute=50, second=0, microsecond=0) - timedelta(days=1)
+    second = first + timedelta(minutes=20)
+    conn = sqlite3.connect(chat_db)
+    for rowid, timestamp in ((1, first.timestamp()), (2, second.timestamp())):
+        apple_ns = int((timestamp - APPLE_EPOCH_UNIX) * 1_000_000_000)
+        conn.execute("UPDATE message SET date = ? WHERE ROWID = ?", (apple_ns, rowid))
+    conn.commit()
+    conn.close()
+
+    record = IMessageConnector().extract(
+        {"db": str(chat_db), "contacts_glob": str(contacts_db)}
+    )[0]
+
+    first_day = first.strftime("%Y-%m-%d")
+    second_day = second.strftime("%Y-%m-%d")
+    assert record.text == (
+        f"— {first_day} —\n[Jonah Chang] late\n"
+        f"— {second_day} —\n[me] morning"
+    )
+    assert record.content_hash == hashlib.sha256(record.text.encode("utf-8")).hexdigest()
 
 
 def test_default_config_requires_contact_names() -> None:

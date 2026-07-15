@@ -79,15 +79,53 @@ def test_passage_ids_are_deterministic_and_versioned() -> None:
     assert [row.content_hash for row in first] == [row.content_hash for row in upgraded]
 
 
+def test_imessage_day_markers_are_hard_boundaries_with_global_offsets(
+    monkeypatch,
+) -> None:
+    from taurine_core import config
+
+    monkeypatch.setattr(config, "PASSAGE_TARGET_TOKENS", 6)
+    monkeypatch.setattr(config, "PASSAGE_MAX_TOKENS", 8)
+    monkeypatch.setattr(config, "PASSAGE_OVERLAP_TOKENS", 2)
+    text = (
+        "— 2026-07-14 —\n[me] alpha beta gamma delta epsilon zeta eta theta\n"
+        "— 2026-07-15 —\n[them] iota kappa lambda mu nu xi omicron pi"
+    )
+    note = _note(text, source="imessage")
+
+    rows = build_passages(note, OffsetTokenizer(), version="passages-v2")
+
+    assert {row.passage_date for row in rows} == {"2026-07-14", "2026-07-15"}
+    assert next(row for row in rows if row.passage_date == "2026-07-14").text.startswith(
+        "— 2026-07-14 —"
+    )
+    assert next(row for row in rows if row.passage_date == "2026-07-15").text.startswith(
+        "— 2026-07-15 —"
+    )
+    assert all(not ({"2026-07-14", "2026-07-15"} <= set(row.text.split())) for row in rows)
+    assert all(row.text == text[row.char_start : row.char_end] for row in rows)
+
+
+def test_non_imessage_passages_have_no_passage_date() -> None:
+    rows = build_passages(
+        _note("— 2026-07-14 —\nordinary note", source="obsidian"),
+        OffsetTokenizer(),
+        version="passages-v2",
+    )
+
+    assert rows and all(row.passage_date is None for row in rows)
+
+
 def test_whitespace_only_note_creates_no_passages() -> None:
     assert build_passages(_note(" \n\t "), OffsetTokenizer(), version="passages-v1") == ()
 
 
-def _note(text: str) -> NoteRecord:
+def _note(text: str, *, source: str = "apple_notes") -> NoteRecord:
     return NoteRecord(
         note_id="note-1",
         title="Test note",
         modified=10.0,
         content_hash="note-content-hash",
         text=text,
+        source=source,
     )
