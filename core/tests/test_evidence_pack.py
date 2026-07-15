@@ -20,10 +20,14 @@ from taurine_core.retrieval.evidence import (
     _temporal_retrieval_graph,
 )
 from taurine_core.retrieval import evidence as evidence_module
-from taurine_core.retrieval.heads import RawHeadCandidate
+from taurine_core.retrieval.heads import HeadResult, RawHeadCandidate
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.retrieval.rerank import LocalPassageReranker
-from taurine_core.retrieval.rerank import PassageRerankCandidate, PassageRerankDecision
+from taurine_core.retrieval.rerank import (
+    PassageRerankCandidate,
+    PassageRerankDecision,
+    PassageRerankResult,
+)
 from taurine_core.retrieval.snapshot import IndexSnapshot
 from taurine_core.retrieval.triples import (
     FactContext,
@@ -31,7 +35,7 @@ from taurine_core.retrieval.triples import (
     TripleRecognitionDecision,
     TripleRecognitionResult,
 )
-from taurine_core.retrieval.types import RetrievalQuery, TemporalIntent
+from taurine_core.retrieval.types import HeadHit, RetrievalQuery, TemporalIntent
 from taurine_core.schemas import NoteRecord
 
 
@@ -148,6 +152,38 @@ class FakeScorer:
         if isinstance(self.scores, Exception):
             raise self.scores
         return tuple(self.scores)[: len(documents)]
+
+
+class RecordingReranker:
+    def __init__(self) -> None:
+        self.candidates: tuple[PassageRerankCandidate, ...] = ()
+
+    def rerank(
+        self,
+        query: str,
+        candidates: Sequence[PassageRerankCandidate],
+        *,
+        deadline_at: float | None = None,
+    ) -> PassageRerankResult:
+        del query, deadline_at
+        self.candidates = tuple(candidates)
+        decisions = tuple(
+            PassageRerankDecision(
+                candidate=candidate,
+                score=0.9,
+                accepted=True,
+                rank=rank,
+                reason="accepted_passage_rerank",
+            )
+            for rank, candidate in enumerate(self.candidates, 1)
+        )
+        return PassageRerankResult(
+            decisions,
+            decisions,
+            False,
+            "reranked",
+            "recording-reranker",
+        )
 
 
 class ExplodingProjection:
@@ -413,6 +449,66 @@ def test_shared_engine_uses_whole_corpus_dense_reset_and_never_reads_projection(
     assert store.passage_reads
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_in_pool"),
+    (("chat", True), ("tool", True), ("live", False)),
+)
+def test_dense_rejected_candidates_are_rerank_candidates_only_for_conversational_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_in_pool: bool,
+) -> None:
+    dense_only_id = "p-dense-only"
+    rejected_dense = HeadHit(
+        "passage",
+        dense_only_id,
+        0.46,
+        0.35,
+        1,
+        "dense",
+        "below_calibrated_acceptance_floor",
+    )
+    monkeypatch.setattr(
+        evidence_module.DensePassageHead,
+        "search",
+        lambda self, query_vector, *, k: HeadResult((), (rejected_dense,)),
+    )
+    rows = (
+        *_passages(),
+        PassageRow(
+            dense_only_id,
+            "n-dense-only",
+            "Dense only",
+            "obsidian",
+            "Only dense recalled this passage.",
+            0,
+            32,
+            1.0,
+            2.0,
+        ),
+    )
+    calibrator, abstention = _calibrator(mode)
+    engine = SharedRetrievalEngine(
+        _snapshot(tmp_path, rows),
+        FakeStore(rows),
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=RecordingReranker(),
+    )
+    recorder = RecordingReranker()
+    engine.reranker = recorder  # type: ignore[assignment]
+
+    engine.retrieve(RetrievalQuery("Maya", mode, now=10.0))  # type: ignore[arg-type]
+
+    by_id = {row.passage_id: row for row in recorder.candidates}
+    assert (dense_only_id in by_id) is expected_in_pool
+    if expected_in_pool:
+        assert by_id[dense_only_id].recall_score == pytest.approx(0.46)
+
+
 def _rerank_decision(passage_id: str, *, score: float) -> PassageRerankDecision:
     return PassageRerankDecision(
         candidate=PassageRerankCandidate(
@@ -558,6 +654,78 @@ def test_chat_high_precision_head_fills_pack_with_below_floor_rerank_rows(
     assert sorted(row.rerank_score for row in pack.passages[1:]) == pytest.approx(
         [0.06, 0.10, 0.20]
     )
+
+
+@pytest.mark.parametrize(
+    ("accepted_count", "expected_passages"),
+    ((3, 8), (4, 4)),
+)
+def test_chat_low_confidence_fill_triggers_below_four_and_stops_at_eight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    accepted_count: int,
+    expected_passages: int,
+) -> None:
+    monkeypatch.setattr(config, "EVIDENCE_NEAR_DUP_SIM", 1.01)
+    rows = tuple(
+        PassageRow(
+            f"p{index:02d}",
+            f"n{index:02d}",
+            f"Passage {index}",
+            "obsidian",
+            f"Evidence {index}",
+            0,
+            10,
+            1.0,
+            2.0,
+        )
+        for index in range(10)
+    )
+    passage_ids = tuple(row.passage_id for row in rows)
+    snapshot = IndexSnapshot(
+        build_id="build-1",
+        database_path=tmp_path / "knowledge.db",
+        calibration_hash="calibration-hash",
+        passage_ids=passage_ids,
+        passage_matrix=np.eye(len(rows), dtype=np.float32),
+        fact_ids=(),
+        fact_matrix=np.empty((0, len(rows)), dtype=np.float32),
+        alias_index={},
+        base_graph=materialize_base_graph(
+            build_id="build-1",
+            node_ids=passage_ids,
+            node_kinds=("passage",) * len(rows),
+            edges=(),
+        ),
+        projection=(),
+        quality_ranks={},
+    )
+    calibrator, abstention = _calibrator("chat")
+    scores = (0.9,) * accepted_count + (0.2,) * (len(rows) - accepted_count)
+    engine = SharedRetrievalEngine(
+        snapshot,
+        FakeStore(
+            rows,
+            bm25=tuple(
+                BM25PassageHit(row.passage_id, 20.0, 1.0) for row in rows
+            ),
+        ),
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.ones(len(rows), dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=LocalPassageReranker(
+            FakeScorer(scores),
+            mode="chat",
+            acceptance_floor=0.30,
+            evidence_floor_override=0.05,
+        ),
+    )
+
+    pack = engine.retrieve(RetrievalQuery("evidence", "chat", now=10.0))
+
+    assert len(pack.passages) == expected_passages
+    assert sum(not row.low_confidence for row in pack.passages) == accepted_count
 
 
 def test_chat_post_rerank_abstention_returns_scored_fallback_rows(
@@ -1188,6 +1356,75 @@ def test_rerank_cap_orders_triple_support_before_expansions() -> None:
     assert candidates[1].triple_support == pytest.approx(0.8)
 
 
+def test_rerank_cap_reserves_six_slots_for_fact_support_under_dense_flood() -> None:
+    from taurine_core.retrieval.evidence import _order_rerank_candidates
+    from taurine_core.retrieval.ppr import PPRResult
+
+    dense_ids = tuple(f"dense-{index:02d}" for index in range(24))
+    fact_ids = tuple(f"fact-{index:02d}" for index in range(8))
+    passage_by_id = {
+        passage_id: PassageRow(
+            passage_id,
+            f"n-{passage_id}",
+            passage_id,
+            "obsidian",
+            "text",
+            0,
+            4,
+            1.0,
+            2.0,
+        )
+        for passage_id in (*dense_ids, *fact_ids)
+    }
+    dense_hits = tuple(
+        HeadHit(
+            "passage",
+            passage_id,
+            0.9 - index * 0.001,
+            0.9 - index * 0.001,
+            index + 1,
+            "dense",
+            "accepted_dense",
+        )
+        for index, passage_id in enumerate(dense_ids)
+    )
+    ppr = PPRResult(
+        accepted=True,
+        reason="converged",
+        build_id="build-1",
+        ranks={},
+        teleport={},
+        passage_mass=0.0,
+        entity_mass=0.0,
+        iterations=1,
+        residual=0.0,
+        contributions={},
+    )
+    triple_support = {
+        passage_id: 0.8 - index * 0.01
+        for index, passage_id in enumerate(fact_ids)
+    }
+
+    candidates = _order_rerank_candidates(
+        set(passage_by_id),
+        passage_by_id,
+        dense_hits,
+        {},
+        ppr,
+        triple_support,
+        {},
+        {},
+        cap=config.RERANK_MAX_CANDIDATES,
+        reserved_candidate_ids=set(fact_ids),
+        reserved_slots=6,
+    )
+
+    chosen = {row.passage_id for row in candidates}
+    assert len(candidates) == config.RERANK_MAX_CANDIDATES
+    assert set(fact_ids[:6]) <= chosen
+    assert len(chosen & set(dense_ids)) == config.RERANK_MAX_CANDIDATES - 6
+
+
 # ---------------------------------------------------------------------------
 # M2 — temporal coherence and conflicted-fact presentation
 # ---------------------------------------------------------------------------
@@ -1408,12 +1645,14 @@ def test_explicitly_seeded_hub_entity_becomes_traversable(tmp_path: Path) -> Non
     assert "e-date" in pack.trace.teleport
 
 
-def test_unseeded_hub_entity_stays_dangling(tmp_path: Path) -> None:
+def test_unseeded_hub_entity_stays_out_of_graph_teleport(tmp_path: Path) -> None:
     engine = _hub_engine(tmp_path)
 
     pack = engine.retrieve(RetrievalQuery("What is the plan?", "chat", now=10.0))
 
-    assert all(row.passage_id != "p2" for row in pack.passages)
+    # Ungated dense candidacy may independently surface p2 in chat, but it must
+    # not activate the unseeded hub or alter the calibrated graph teleport.
+    assert "p2" not in pack.trace.teleport
     assert "e-date" not in pack.trace.teleport
 
 

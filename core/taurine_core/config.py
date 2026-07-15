@@ -349,6 +349,12 @@ RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 # Neil's target is cohere/rerank-v4-pro; swap when OpenRouter adds that slug.
 RERANK_API_MODEL = "cohere/rerank-v3.5"
 RERANK_MAX_CANDIDATES = 24
+# Round-3 measured the 8B-fitted dense curve's ~0.47 null ceiling above the
+# 0.35-0.46 true-match band on casual queries. Chat/tool therefore let Cohere
+# gate raw dense candidates; calibration remains confidence-only. Live is
+# explicitly excluded in the retrieval engine.
+DENSE_UNGATED_CANDIDACY = True
+CHAT_NON_DENSE_RESERVED_CANDIDATES = 6  # preserve entity/exact/fact anchors under dense flood
 RERANK_API_ATTEMPTS = 3
 RERANK_API_BACKOFF_S = 0.5
 RERANK_API_TIMEOUT_S = 30.0
@@ -361,6 +367,8 @@ LIVE_RERANK_CANDIDATES = 30
 CHAT_RERANK_CANDIDATES = 60
 LIVE_EVIDENCE_PASSAGES = 8
 CHAT_EVIDENCE_PASSAGES = 12             # dense ablation budget; keep at least 8
+CHAT_FILL_TRIGGER = 4                    # fill only when accepted rerank evidence is sparse
+CHAT_FILL_MAX_PASSAGES = 8               # never dilute a sparse answer all the way to 12
 EVIDENCE_NEAR_DUP_SIM = 0.98             # suppress lower-scored near-duplicates in final packs
 TEMPORAL_HISTORY_DOWNWEIGHT = 0.5        # historical/superseded facts under "any"/past intents
 HUB_ACTIVATION_EDGE_WEIGHT = 0.5         # synthesized contains weight for query-activated hubs (§10.5)

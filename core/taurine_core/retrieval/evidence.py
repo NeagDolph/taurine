@@ -317,6 +317,7 @@ class SharedRetrievalEngine:
             if query.mode == "live"
             else config.CHAT_RERANK_CANDIDATES
         )
+        conversational_mode = query.mode in {"chat", "tool"}
         bm25 = isolated(
             "bm25",
             lambda: BM25PassageHead(self.store, self.calibrator).search(
@@ -383,6 +384,27 @@ class SharedRetrievalEngine:
             *entity.rejected,
             *triple_hits.rejected,
         )
+        ungated_dense_hits: tuple[HeadHit, ...] = ()
+        if conversational_mode and bool(config.DENSE_UNGATED_CANDIDACY):
+            # Candidacy is intentionally separate from confidence: round 3
+            # measured true conversational matches below the dense curve's 8B
+            # null ceiling. Preserve the calibrated rejection for abstention
+            # accounting while giving Cohere the raw cosine for admission.
+            dense_top_k = sorted(dense.all_hits, key=lambda hit: hit.rank)[
+                : max(0, int(candidate_cap))
+            ]
+            dense_rejected = set(dense.rejected)
+            ungated_dense_hits = tuple(
+                replace(
+                    hit,
+                    calibrated_score=float(hit.raw_score),
+                    reason="ungated_dense_candidacy",
+                )
+                for hit in dense_top_k
+                if hit in dense_rejected
+                if hit.target_kind == "passage" and math.isfinite(hit.raw_score)
+            )
+        candidacy_hits = (*accepted_hits, *ungated_dense_hits)
         trace_rejected_hits = _bounded_rejected_hits(
             rejected_hits, dense_limit=candidate_cap
         )
@@ -397,6 +419,8 @@ class SharedRetrievalEngine:
             "dense_reset_considered": len(self.snapshot.passage_ids),
             "calibration_status": self.calibration_status,
         }
+        if conversational_mode:
+            base_debug["dense_ungated_candidates"] = len(ungated_dense_hits)
         if head_errors:
             base_debug["unavailable_heads"] = dict(sorted(head_errors.items()))
         if set(head_errors) == ran_heads:
@@ -444,7 +468,7 @@ class SharedRetrievalEngine:
             )
 
         fused = weighted_score_aware_rrf(
-            accepted_hits,
+            candidacy_hits,
             head_weights=self.head_weights,
             rrf_k=self.calibrator.rrf_k,
         )
@@ -533,12 +557,18 @@ class SharedRetrievalEngine:
         note_by_passage = {
             row.passage_id: row.note_id for row in passage_rows
         }
-        direct_passages = {
+        calibrated_direct_passages = {
             hit.target_id
             for hit in accepted_hits
             if hit.target_kind == "passage"
         }
-        direct_passages.update(entity_passage_ids)
+        candidacy_direct_passages = {
+            hit.target_id
+            for hit in candidacy_hits
+            if hit.target_kind == "passage"
+        }
+        calibrated_direct_passages.update(entity_passage_ids)
+        candidacy_direct_passages.update(entity_passage_ids)
         triple_support: dict[str, float] = {}
         for triple_row in triple.triples:
             for passage_id in triple_row.source_passage_ids:
@@ -556,7 +586,11 @@ class SharedRetrievalEngine:
                 key=lambda row: (-row[1], row[0]),
             )[:candidate_cap]
         )
-        candidate_ids = set(direct_passages) | set(ppr_passages) | set(triple_support)
+        candidate_ids = (
+            set(candidacy_direct_passages)
+            | set(ppr_passages)
+            | set(triple_support)
+        )
 
         path_started = monotonic()
         # M15/§11.9: hub entities are penalized on paths. Hubs explicitly
@@ -574,13 +608,17 @@ class SharedRetrievalEngine:
             for entity_id in (row.subject_entity_id, row.object_entity_id)
         }
         seed_ids = tuple(
-            sorted(direct_passages | resolved_entity_ids | recognized_endpoint_ids)
+            sorted(
+                calibrated_direct_passages
+                | resolved_entity_ids
+                | recognized_endpoint_ids
+            )
         )
         paths_by_target: dict[str, tuple[PathCandidate, ...]] = {}
         path_support: dict[str, float] = {}
         fact_by_id = {str(row.fact_id): row for row in fact_rows}
         for passage_id in ppr_passages:
-            if passage_id in direct_passages:
+            if passage_id in calibrated_direct_passages:
                 continue
             # Paths are supplementary evidence: the whole phase gets a hard
             # wall-clock budget so one dense query cannot stall retrieval.
@@ -607,20 +645,38 @@ class SharedRetrievalEngine:
         # neighborhood facts' source passages join the pool so the facts stay
         # citable (M6 requires a supplied/selected support passage)
         fact_by_id_all = {str(row.fact_id): row for row in fact_rows}
+        neighborhood_fact_passage_ids: set[str] = set()
         for fact_id in neighborhood_fact_ids:
             context = fact_by_id_all.get(fact_id)
             if context is not None and str(context.source_passage_id) in passage_by_id:
-                candidate_ids.add(str(context.source_passage_id))
+                source_passage_id = str(context.source_passage_id)
+                candidate_ids.add(source_passage_id)
+                neighborhood_fact_passage_ids.add(source_passage_id)
+        reserved_candidate_ids = (
+            set(entity_passage_ids)
+            | set(triple_support)
+            | neighborhood_fact_passage_ids
+        )
         rerank_candidates = _order_rerank_candidates(
             candidate_ids,
             passage_by_id,
-            accepted_hits,
+            candidacy_hits,
             fused,
             ppr,
             triple_support,
             path_support,
             paths_by_target,
-            cap=candidate_cap,
+            cap=(
+                int(config.RERANK_MAX_CANDIDATES)
+                if conversational_mode
+                else candidate_cap
+            ),
+            reserved_candidate_ids=reserved_candidate_ids,
+            reserved_slots=(
+                int(config.CHAT_NON_DENSE_RESERVED_CANDIDATES)
+                if conversational_mode
+                else 0
+            ),
             semantic_reasons=self._semantic_reasons,
             entity_anchor={
                 passage_id: tuple(sorted(set(names)))
@@ -638,7 +694,7 @@ class SharedRetrievalEngine:
         if reranked.degraded:
             fallback = "calibrated_direct_only"
             ranked = _direct_fallback(
-                direct_passages, accepted_hits, passage_by_id
+                calibrated_direct_passages, accepted_hits, passage_by_id
             )
         else:
             ranked = reranked.accepted
@@ -652,9 +708,9 @@ class SharedRetrievalEngine:
             limit=selection_limit,
         )
         if (
-            query.mode in {"chat", "tool"}
+            conversational_mode
             and not reranked.degraded
-            and len(selected) < selection_limit
+            and len(selected) < int(config.CHAT_FILL_TRIGGER)
         ):
             evidence_floor = (
                 self.abstention.rules.evidence_floor
@@ -672,7 +728,7 @@ class SharedRetrievalEngine:
                 self.snapshot,
                 mmr_lambda=self.calibrator.mmr_lambda,
                 source_diversity_penalty=self.calibrator.source_diversity_penalty,
-                limit=selection_limit,
+                limit=min(selection_limit, int(config.CHAT_FILL_MAX_PASSAGES)),
                 initial=selected,
             )
             exclusions = (*exclusions, *fill_exclusions)
@@ -1347,20 +1403,33 @@ def _order_rerank_candidates(
     paths_by_target: Mapping[str, tuple[PathCandidate, ...]],
     *,
     cap: int,
+    reserved_candidate_ids: set[str] | frozenset[str] = frozenset(),
+    reserved_slots: int = 0,
     semantic_reasons: Mapping[tuple[str, str], str] = {},
     entity_anchor: Mapping[str, tuple[str, ...]] = {},
 ) -> tuple[PassageRerankCandidate, ...]:
     """H6: fill the bounded rerank pool by tier so incomparable score families
     never evict each other: (1) direct head hits by calibrated score desc,
     (2) recognized-triple support passages by recognition score desc, (3)
-    PPR/path expansions by PPR mass desc (path weight as tie-break)."""
+    PPR/path expansions by PPR mass desc (path weight as tie-break). Reserve a
+    bounded tail of the pool for entity/exact/fact anchored passages."""
 
     known = {
         passage_id for passage_id in candidate_ids if passage_id in passage_by_id
     }
+    supplementary_ids = (
+        set(triple_support) | set(path_support) | set(paths_by_target)
+    )
     direct_scores: dict[str, float] = {}
     for hit in accepted_hits:
-        if hit.target_kind == "passage" and hit.target_id in known:
+        if (
+            hit.target_kind == "passage"
+            and hit.target_id in known
+            and not (
+                hit.reason == "ungated_dense_candidacy"
+                and hit.target_id in supplementary_ids
+            )
+        ):
             score = float(hit.calibrated_score)
             if math.isfinite(score):
                 direct_scores[hit.target_id] = max(
@@ -1398,11 +1467,30 @@ def _order_rerank_candidates(
             (passage_id, mass if mass > 0.0 else path_weights.get(passage_id, 0.0))
         )
     seen: set[str] = set()
-    candidates: list[PassageRerankCandidate] = []
+    unique_ordered: list[tuple[str, float]] = []
     for passage_id, tier_score in ordered:
         if passage_id in seen:
             continue
         seen.add(passage_id)
+        unique_ordered.append((passage_id, tier_score))
+
+    bounded_cap = max(0, int(cap))
+    reservation = min(bounded_cap, max(0, int(reserved_slots)))
+    reserved = [
+        row for row in unique_ordered if row[0] in reserved_candidate_ids
+    ][:reservation]
+    reserved_ids = {passage_id for passage_id, _score in reserved}
+    general = [
+        row for row in unique_ordered if row[0] not in reserved_ids
+    ][: bounded_cap - len(reserved)]
+    selected_ids = {
+        passage_id for passage_id, _score in (*reserved, *general)
+    }
+
+    candidates: list[PassageRerankCandidate] = []
+    for passage_id, tier_score in unique_ordered:
+        if passage_id not in selected_ids:
+            continue
         row = passage_by_id[passage_id]
         fused_hit = fused.get(("passage", passage_id))
         candidates.append(
@@ -1427,8 +1515,6 @@ def _order_rerank_candidates(
                 path_weight=float(path_weights.get(passage_id, 0.0)),
             )
         )
-        if len(candidates) >= max(0, int(cap)):
-            break
     return tuple(candidates)
 
 

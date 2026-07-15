@@ -169,6 +169,10 @@ def test_overhaul_configuration_matches_approved_defaults() -> None:
     assert config.CHAT_RERANK_CANDIDATES == 60
     assert config.LIVE_EVIDENCE_PASSAGES == 8
     assert config.CHAT_EVIDENCE_PASSAGES == 12
+    assert config.DENSE_UNGATED_CANDIDACY is True
+    assert config.CHAT_FILL_TRIGGER == 4
+    assert config.CHAT_FILL_MAX_PASSAGES == 8
+    assert config.CHAT_NON_DENSE_RESERVED_CANDIDATES == 6
     assert config.EVIDENCE_NLI_MODEL == "cross-encoder/nli-deberta-v3-base"
     assert config.LIVE_WINDOW_MIN_S == pytest.approx(12.0)
     assert config.LIVE_WINDOW_MAX_S == pytest.approx(45.0)
