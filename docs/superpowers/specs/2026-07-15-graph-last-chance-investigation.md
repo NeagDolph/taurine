@@ -38,3 +38,6 @@ Run graph retrieval with trace; find the passage(s) dense used to answer correct
 2. TV shows (persistent dense win): broad-aggregation queries — PPR concentrates on few strong notes; dense sweeps breadth. Check: distinct-note diversity of graph candidate pool vs dense top-24; MMR two-per-note cap; head K values into fusion; consider diversity-aware recall (larger dense-head K + per-note caps earlier).
 3. Age/dates: the "turn 23" passage — check if graph dense head even recalls it (head K too small?) vs fusion drowning it.
 4. Verify indexing: confirm show-mention passages exist with embeddings in graph candidate paths.
+
+## Round-3 diagnostic (2026-07-15, diversity_diag.py)
+SMOKING GUN: graph pack has ~ZERO overlap with pure-dense top-24 (shows 0/24, age 0/24, dating 1/24) and half the note diversity (7-10 notes vs 18-21). The graph's final evidence comes almost entirely from PPR/entity/fact paths — dense-head candidates are drowned before the pack. Next discriminating check: dump the graph's dense HEAD candidates pre-fusion for these queries; if dense-top-24 present there → fusion/PPR weights drown them (fix: fusion rebalance or reserved dense slots); if absent → dense head K too small or query-embedding path differs (fix: raise K / verify embedding parity). Then implement + round-3 ablation.
