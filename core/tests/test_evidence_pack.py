@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Sequence
 
 import numpy as np
@@ -129,11 +130,31 @@ class FakeStore:
                 by_note[row.note_id] = NoteRow(row.note_id, row.title, row.source, row.modified)
         return tuple(by_note[note_id] for note_id in sorted(by_note))
 
-    def fact_contexts(self, fact_ids: tuple[str, ...] | None = None) -> tuple[FactContext, ...]:
+    def fact_contexts(
+        self,
+        fact_ids: tuple[str, ...] | None = None,
+        *,
+        include_candidates: bool = False,
+        build_id: str | None = None,
+        entity_ids: tuple[str, ...] | None = None,
+        active_only: bool = False,
+    ) -> tuple[FactContext, ...]:
+        del include_candidates, build_id
         if fact_ids is None:
-            return self._facts
-        wanted = set(fact_ids)
-        return tuple(row for row in self._facts if row.fact_id in wanted)
+            rows = self._facts
+        else:
+            wanted = set(fact_ids)
+            rows = tuple(row for row in self._facts if row.fact_id in wanted)
+        if entity_ids is not None:
+            entities = set(entity_ids)
+            rows = tuple(
+                row
+                for row in rows
+                if row.subject_entity_id in entities or row.object_entity_id in entities
+            )
+        if active_only:
+            rows = tuple(row for row in rows if row.status == "active")
+        return rows
 
 
 class FakeScorer:
@@ -184,6 +205,23 @@ class RecordingReranker:
             "reranked",
             "recording-reranker",
         )
+
+
+class DenseFactsRecordingReranker(RecordingReranker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.candidate_cap: int | None = None
+
+    def rerank(
+        self,
+        query: str,
+        candidates: Sequence[PassageRerankCandidate],
+        *,
+        deadline_at: float | None = None,
+        candidate_cap: int | None = None,
+    ) -> PassageRerankResult:
+        self.candidate_cap = candidate_cap
+        return super().rerank(query, candidates, deadline_at=deadline_at)
 
 
 class ExplodingProjection:
@@ -507,6 +545,186 @@ def test_dense_rejected_candidates_are_rerank_candidates_only_for_conversational
     assert (dense_only_id in by_id) is expected_in_pool
     if expected_in_pool:
         assert by_id[dense_only_id].recall_score == pytest.approx(0.46)
+
+
+@pytest.mark.parametrize("mode", ["chat", "tool"])
+def test_dense_facts_sweeps_ungated_top_48_unions_bm25_and_skips_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    dense_rows = tuple(
+        PassageRow(
+            f"d{index:02d}",
+            f"nd{index:02d}",
+            f"Dense {index}",
+            "obsidian",
+            f"Dense passage {index}",
+            0,
+            20,
+            1.0,
+            2.0,
+        )
+        for index in range(50)
+    )
+    lexical = PassageRow(
+        "lexical", "n-lexical", "Lexical", "gmail", "A lexical-only match.",
+        0, 21, 1.0, 2.0,
+    )
+    rows = (*_passages(), *dense_rows, lexical)
+    rejected = tuple(
+        HeadHit(
+            "passage",
+            row.passage_id,
+            0.50 - rank / 1000.0,
+            0.10,
+            rank,
+            "dense",
+            "below_calibrated_acceptance_floor",
+        )
+        for rank, row in enumerate(dense_rows, 1)
+    )
+    monkeypatch.setattr(
+        evidence_module.DensePassageHead,
+        "search",
+        lambda self, query_vector, *, k: HeadResult((), rejected),
+    )
+    calibrator, abstention = _calibrator("chat")
+    recorder = DenseFactsRecordingReranker()
+
+    class ExplodingTriple:
+        def recognize(self, *args, **kwargs):
+            raise AssertionError("dense_facts must return before triple recognition")
+
+    engine = SharedRetrievalEngine(
+        _snapshot(tmp_path, rows),
+        FakeStore(rows, bm25=(BM25PassageHit("lexical", 20.0, 1.0),)),
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=recorder,  # type: ignore[arg-type]
+        triple_recognizer=ExplodingTriple(),  # type: ignore[arg-type]
+        chat_retrieval_mode="dense_facts",
+    )
+
+    pack = engine.retrieve(
+        RetrievalQuery("sweep", mode, now=10.0)  # type: ignore[arg-type]
+    )
+
+    assert pack.decision.accepted is True
+    assert recorder.candidate_cap == 48
+    assert len(recorder.candidates) == 48
+    assert "lexical" in {row.passage_id for row in recorder.candidates}
+    assert len(pack.passages) == 12
+    assert pack.paths == ()
+    assert pack.trace.ppr == {}
+    assert pack.trace.triple_decisions == ()
+    assert pack.trace.debug["retrieval_mode"] == "dense_facts"
+
+
+def test_dense_facts_abstains_only_when_dense_bm25_sweep_is_empty(
+    tmp_path: Path,
+) -> None:
+    rows = _passages()
+    calibrator, abstention = _calibrator("chat")
+    engine = SharedRetrievalEngine(
+        _snapshot(tmp_path, rows),
+        FakeStore(rows),
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.zeros(3, dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=DenseFactsRecordingReranker(),  # type: ignore[arg-type]
+        chat_retrieval_mode="dense_facts",
+    )
+
+    pack = engine.retrieve(RetrievalQuery("nothing", "chat", now=10.0))
+
+    assert pack.decision.accepted is False
+    assert pack.decision.reason == "empty_dense_sweep"
+    assert pack.passages == ()
+
+
+def test_dense_facts_overlays_active_alias_facts_by_adjudication_then_recency(
+    tmp_path: Path,
+) -> None:
+    rows = _passages()
+
+    def fact(index: int, *, status: str = "active", touching: bool = True):
+        score = 0.9 if index < 7 else 0.8
+        return SimpleNamespace(
+            fact_id=f"overlay-{index}",
+            subject_entity_id="e-maya" if touching else "e-other",
+            subject="Maya" if touching else "Other",
+            predicate=f"relates_to_{index}",
+            predicate_description="relates to",
+            object_entity_id=f"e-object-{index}",
+            object=f"Object {index}",
+            source_passage_id="p1",
+            source_note_id="n1",
+            assertion_start=0,
+            assertion_end=4,
+            assertion_text="Maya",
+            confidence=0.7,
+            observed_at=float(index + 1),
+            valid_from=None,
+            valid_to=None,
+            status=status,
+            build_id="build-1",
+            adjudication_score=score,
+            adjudicated=True,
+            logical_key=(
+                "e-maya" if touching else "e-other",
+                f"relates_to_{index}",
+                f"e-object-{index}",
+            ),
+        )
+
+    facts = (
+        *(fact(index) for index in range(14)),
+        fact(90, status="superseded"),
+        fact(91, touching=False),
+    )
+    calibrator, abstention = _calibrator("chat")
+    registry = EvidenceRegistry()
+    engine = SharedRetrievalEngine(
+        _snapshot(tmp_path, rows),
+        FakeStore(rows, facts),  # type: ignore[arg-type]
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        registry=registry,
+        reranker=DenseFactsRecordingReranker(),  # type: ignore[arg-type]
+        chat_retrieval_mode="dense_facts",
+    )
+
+    pack = engine.retrieve(RetrievalQuery("Tell me about Maya", "chat", now=10.0))
+
+    assert [row.object for row in pack.facts] == [
+        *(f"Object {index}" for index in range(6, -1, -1)),
+        *(f"Object {index}" for index in range(13, 8, -1)),
+    ]
+    assert len(pack.facts) == 12
+    assert all(row.status == "active" for row in pack.facts)
+    assert all(row.fact_ref.startswith("F") for row in pack.facts)
+    assert all(row.source_evidence_ids for row in pack.facts)
+    assert registry.refs("read") == pack.trace.read_ids
+
+
+def test_graph_flag_and_live_mode_keep_the_graph_pipeline(tmp_path: Path) -> None:
+    graph_engine, _registry, _store = _engine(tmp_path)
+    graph_engine.chat_retrieval_mode = "graph"
+    graph_pack = graph_engine.retrieve(
+        RetrievalQuery("What does Maya own?", "chat", now=10.0)
+    )
+    live_engine, _live_registry, _live_store = _engine(tmp_path, mode="live")
+    live_engine.chat_retrieval_mode = "dense_facts"
+    live_pack = live_engine.retrieve(RetrievalQuery("Maya", "live", now=10.0))
+
+    assert graph_pack.trace.ppr["iterations"] > 0
+    assert graph_pack.trace.triple_decisions
+    assert live_pack.trace.ppr["iterations"] > 0
 
 
 def _rerank_decision(passage_id: str, *, score: float) -> PassageRerankDecision:

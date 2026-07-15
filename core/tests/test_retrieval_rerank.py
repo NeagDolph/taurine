@@ -384,6 +384,20 @@ def test_passage_reranker_caps_scoring_at_24_and_preserves_unscored_tail(
     assert result.decisions[-1].reason == "outside_rerank_candidate_cap"
 
 
+def test_passage_reranker_allows_dense_sweep_candidate_cap_override() -> None:
+    scorer = FakeScorer(tuple(0.9 for _ in range(48)))
+    candidates = tuple(_candidate(index) for index in range(55))
+
+    result = LocalPassageReranker(
+        scorer, mode="chat", acceptance_floor=0.5
+    ).rerank("query", candidates, candidate_cap=48)
+
+    assert len(scorer.calls[0][1]) == 48
+    assert len(result.accepted) == 48
+    assert result.decisions[47].accepted is True
+    assert result.decisions[48].reason == "outside_rerank_candidate_cap"
+
+
 @pytest.mark.parametrize(
     ("error", "reason"),
     [

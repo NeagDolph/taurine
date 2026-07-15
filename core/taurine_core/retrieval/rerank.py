@@ -242,6 +242,7 @@ class LocalPassageReranker:
         candidates: Sequence[PassageRerankCandidate],
         *,
         deadline_at: float | None = None,
+        candidate_cap: int | None = None,
     ) -> PassageRerankResult:
         ordered_candidates = tuple(
             sorted(
@@ -249,8 +250,9 @@ class LocalPassageReranker:
                 key=lambda row: (-_safe_recall(row.recall_score), row.passage_id),
             )
         )
-        bounded = ordered_candidates[: self._candidate_cap]
-        unscored = ordered_candidates[self._candidate_cap :]
+        cap = self._candidate_cap if candidate_cap is None else max(0, int(candidate_cap))
+        bounded = ordered_candidates[:cap]
+        unscored = ordered_candidates[cap:]
         if not bounded:
             return PassageRerankResult(
                 (), (), False, "no_passage_candidates", "", "none", None

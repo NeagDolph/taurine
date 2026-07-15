@@ -94,7 +94,15 @@ class EvidenceStore(Protocol):
 
     def note_contexts(self, note_ids: Sequence[str]) -> tuple[NoteContext, ...]: ...
 
-    def fact_contexts(self, fact_ids: tuple[str, ...] | None = None) -> tuple[Any, ...]: ...
+    def fact_contexts(
+        self,
+        fact_ids: tuple[str, ...] | None = None,
+        *,
+        include_candidates: bool = False,
+        build_id: str | None = None,
+        entity_ids: tuple[str, ...] | None = None,
+        active_only: bool = False,
+    ) -> tuple[Any, ...]: ...
 
     def passage_ids_for_entities(
         self,
@@ -229,6 +237,7 @@ class SharedRetrievalEngine:
         head_weights: Mapping[str, float] | None = None,
         fallback_on_abstain: bool = False,
         calibration_status: str = "verified",
+        chat_retrieval_mode: str = "graph",
     ) -> None:
         self.snapshot = snapshot
         self.store = store
@@ -243,6 +252,7 @@ class SharedRetrievalEngine:
         # §0.1 chat/tool fallback lane; live must always keep this False.
         self.fallback_on_abstain = bool(fallback_on_abstain)
         self.calibration_status = str(calibration_status)
+        self.chat_retrieval_mode = str(chat_retrieval_mode)
         self._hub_ids: frozenset[str] | None = None
         # item 5b: grounded per-edge reasons ride semantic-edge metadata from
         # the store; surfaced as rerank hints and in evidence path rendering
@@ -276,6 +286,10 @@ class SharedRetrievalEngine:
             if passage_limit is None
             else min(configured_limit, max(0, int(passage_limit)))
         )
+        dense_facts_mode = (
+            query.mode in {"chat", "tool"}
+            and self.chat_retrieval_mode == "dense_facts"
+        )
 
         try:
             query_vector: np.ndarray | None = np.asarray(
@@ -306,7 +320,12 @@ class SharedRetrievalEngine:
             isolated(
                 "dense",
                 lambda: DensePassageHead(self.snapshot, self.calibrator).search(
-                    query_vector, k=len(self.snapshot.passage_ids)
+                    query_vector,
+                    k=(
+                        int(config.DENSE_SWEEP_K)
+                        if dense_facts_mode
+                        else len(self.snapshot.passage_ids)
+                    ),
                 ),
             )
             if query_vector is not None
@@ -349,6 +368,20 @@ class SharedRetrievalEngine:
         required_entity_ids = {
             hit.target_id for hit in entity.accepted if hit.target_kind == "entity"
         }
+        if dense_facts_mode:
+            latency["heads"] = _elapsed_ms(head_started)
+            return self._retrieve_dense_facts(
+                query,
+                dense=dense,
+                bm25=bm25,
+                exact=exact,
+                entity=entity,
+                resolved_entity_ids=resolved_entity_ids,
+                latency=latency,
+                head_errors=head_errors,
+                deadline_at=deadline_at,
+                selection_limit=selection_limit,
+            )
         if self.triple_recognizer is not None and query_vector is not None:
             try:
                 triple = self.triple_recognizer.recognize(
@@ -845,6 +878,248 @@ class SharedRetrievalEngine:
         )
         latency["pack"] = _elapsed_ms(pack_started)
         return replace(pack, trace=replace(pack.trace, latency_ms=dict(latency)))
+
+    def _retrieve_dense_facts(
+        self,
+        query: RetrievalQuery,
+        *,
+        dense: HeadResult,
+        bm25: HeadResult,
+        exact: HeadResult,
+        entity: HeadResult,
+        resolved_entity_ids: set[str],
+        latency: dict[str, float],
+        head_errors: Mapping[str, str],
+        deadline_at: float | None,
+        selection_limit: int,
+    ) -> EvidencePack:
+        """Dense/BM25 chat sweep with a bounded active-fact SQL overlay."""
+
+        sweep_k = max(0, int(config.DENSE_SWEEP_K))
+        accepted_hits = (
+            *dense.accepted,
+            *bm25.accepted,
+            *exact.accepted,
+            *entity.accepted,
+        )
+        rejected_hits = _bounded_rejected_hits(
+            (*dense.rejected, *bm25.rejected, *exact.rejected, *entity.rejected),
+            dense_limit=sweep_k,
+        )
+        ranked_ids, recall_scores, candidate_heads = _dense_sweep_union(
+            dense,
+            bm25,
+            cap=sweep_k,
+        )
+        passage_by_id = {
+            str(row.passage_id): row
+            for row in self.store.passage_contexts(ranked_ids)
+        }
+        candidates = tuple(
+            PassageRerankCandidate(
+                passage_id=passage_id,
+                note_id=str(passage_by_id[passage_id].note_id),
+                title=str(passage_by_id[passage_id].title),
+                source=str(passage_by_id[passage_id].source),
+                text=str(passage_by_id[passage_id].text),
+                recall_score=recall_scores[passage_id],
+                hint=" + ".join(candidate_heads[passage_id]),
+            )
+            for passage_id in ranked_ids
+            if passage_id in passage_by_id
+        )
+        debug: dict[str, object] = {
+            "retrieval_mode": "dense_facts",
+            "dense_sweep_candidates": len(candidates),
+            "dense_sweep_k": sweep_k,
+            "calibration_status": self.calibration_status,
+        }
+        if head_errors:
+            debug["unavailable_heads"] = dict(sorted(head_errors.items()))
+        empty_triple = TripleRecognitionResult(
+            (), (), {}, False, "dense_facts_no_triple"
+        )
+        if not candidates:
+            return _abstained_pack(
+                query,
+                RetrievalDecision(False, 0.0, "empty_dense_sweep"),
+                accepted_hits,
+                rejected_hits,
+                self.snapshot,
+                latency,
+                empty_triple,
+                debug=debug,
+            )
+
+        rerank_started = monotonic()
+        reranked = self.reranker.rerank(
+            query.text,
+            candidates,
+            deadline_at=deadline_at,
+            candidate_cap=sweep_k,
+        )
+        latency["rerank"] = _elapsed_ms(rerank_started)
+        debug.update(
+            {
+                "reranker_model_id": reranked.model_id,
+                "rerank_floor_source": reranked.floor_source,
+                "rerank_degraded": reranked.degraded,
+            }
+        )
+        selected = tuple(
+            row
+            for row in sorted(reranked.decisions, key=lambda item: item.rank)
+            if row.reason != "outside_rerank_candidate_cap"
+        )[: max(0, int(selection_limit))]
+
+        pack_started = monotonic()
+        selected_passage_ids = {
+            row.candidate.passage_id for row in selected
+        }
+        note_ref_by_id: dict[str, str] = {}
+        evidence_ref_by_passage: dict[str, str] = {}
+        evidence_passages: list[EvidencePassage] = []
+        for decision in selected:
+            passage = passage_by_id[decision.candidate.passage_id]
+            note_id = str(passage.note_id)
+            note_ref = note_ref_by_id.get(note_id)
+            if note_ref is None:
+                note_ref = self.registry.register("note", note_id, {"note_id": note_id})
+                self.registry.mark_read(note_ref)
+                note_ref_by_id[note_id] = note_ref
+            evidence_ref = self.registry.register(
+                "passage", str(passage.passage_id), passage_payload(passage)
+            )
+            self.registry.mark_read(evidence_ref)
+            evidence_ref_by_passage[str(passage.passage_id)] = evidence_ref
+            evidence_passages.append(
+                EvidencePassage(
+                    evidence_id=evidence_ref,
+                    passage_id=str(passage.passage_id),
+                    note_id=note_id,
+                    title=str(passage.title),
+                    source=str(passage.source),
+                    text=str(passage.text),
+                    char_start=int(passage.char_start),
+                    char_end=int(passage.char_end),
+                    created=float(passage.created),
+                    modified=float(passage.modified),
+                    retrieval_score=float(decision.candidate.recall_score),
+                    rerank_score=float(decision.score),
+                    low_confidence=not decision.accepted,
+                    passage_date=evidence_date(passage),
+                )
+            )
+
+        fact_rows = (
+            self.store.fact_contexts(
+                build_id=self.snapshot.build_id,
+                entity_ids=tuple(sorted(resolved_entity_ids)),
+                active_only=True,
+            )
+            if resolved_entity_ids
+            else ()
+        )
+        overlay_groups = _dense_fact_overlay_groups(
+            fact_rows,
+            resolved_entity_ids,
+            cap=int(config.CHAT_FACT_OVERLAY_MAX),
+        )
+        overlay_rows = tuple(row for group in overlay_groups for row in group)
+        source_ids = tuple(
+            dict.fromkeys(str(row.source_passage_id) for row in overlay_rows)
+        )
+        source_by_id = {
+            str(row.passage_id): row
+            for row in self.store.passage_contexts(source_ids)
+        }
+        for passage_id in source_ids:
+            passage = source_by_id.get(passage_id)
+            if passage is None or passage_id in evidence_ref_by_passage:
+                continue
+            evidence_ref = self.registry.register(
+                "passage", passage_id, passage_payload(passage)
+            )
+            self.registry.mark_read(evidence_ref)
+            evidence_ref_by_passage[passage_id] = evidence_ref
+
+        variant_order = {
+            _fact_variant(group[0]): index
+            for index, group in enumerate(overlay_groups)
+        }
+        evidence_facts = _assemble_facts(
+            self.registry,
+            empty_triple,
+            overlay_rows,
+            evidence_ref_by_passage,
+            (),
+            build_id=self.snapshot.build_id,
+            supplied_passage_ids=selected_passage_ids,
+            extra_fact_ids={str(row.fact_id) for row in overlay_rows},
+            require_supplied_source=False,
+            variant_order=variant_order,
+        )
+        debug["fact_overlay_count"] = len(evidence_facts)
+
+        note_rows = {
+            str(row.note_id): row
+            for row in self.store.note_contexts(tuple(sorted(note_ref_by_id)))
+        }
+        evidence_notes = _assemble_notes(
+            note_rows,
+            note_ref_by_id,
+            evidence_passages,
+            support_bonus=self.calibrator.note_support_bonus,
+            support_bonus_cap=self.calibrator.note_support_bonus_cap,
+        )
+        current_refs = {
+            *note_ref_by_id.values(),
+            *evidence_ref_by_passage.values(),
+            *(row.fact_ref for row in evidence_facts),
+        }
+        read_ids = tuple(
+            ref for ref in self.registry.refs("read") if ref in current_refs
+        )
+        confidence = max((float(row.score) for row in selected), default=0.0)
+        selected_heads = tuple(
+            head
+            for head in ("dense", "bm25")
+            if any(head in heads for heads in candidate_heads.values())
+        )
+        decision = RetrievalDecision(
+            True,
+            confidence,
+            "accepted_dense_facts",
+            accepted_heads=selected_heads,
+            rejected_heads=tuple(sorted(head_errors)),
+        )
+        latency["pack"] = _elapsed_ms(pack_started)
+        trace = RetrievalTrace(
+            original_query=query.text,
+            rewritten_query=query.text,
+            head_hits=tuple(accepted_hits),
+            rejected_hits=tuple(rejected_hits),
+            entity_resolutions=_entity_trace(
+                (*exact.accepted, *exact.rejected, *entity.accepted, *entity.rejected)
+            ),
+            rerank=_rerank_trace(reranked.decisions),
+            selected_ids=read_ids,
+            read_ids=read_ids,
+            cited_ids=(),
+            active_build_id=self.snapshot.build_id,
+            calibration_hash=self.snapshot.calibration_hash,
+            latency_ms=dict(latency),
+            debug=debug,
+        )
+        return EvidencePack(
+            decision=decision,
+            query=query,
+            passages=tuple(evidence_passages),
+            facts=evidence_facts,
+            paths=(),
+            notes=evidence_notes,
+            trace=trace,
+        )
 
     def _assemble_pack(
         self,
@@ -1716,6 +1991,108 @@ def _suppress_near_duplicate_passages(
     )
 
 
+def _dense_sweep_union(
+    dense: HeadResult,
+    bm25: HeadResult,
+    *,
+    cap: int,
+) -> tuple[tuple[str, ...], dict[str, float], dict[str, tuple[str, ...]]]:
+    """Fuse ungated dense hits with accepted BM25 hits into a bounded sweep."""
+
+    scores: dict[str, float] = {}
+    best_rank: dict[str, int] = {}
+    heads: dict[str, set[str]] = {}
+    for head_name, hits in (
+        ("dense", dense.all_hits),
+        ("bm25", bm25.accepted),
+    ):
+        for hit in hits:
+            if hit.target_kind != "passage":
+                continue
+            passage_id = str(hit.target_id)
+            rank = max(1, int(hit.rank))
+            scores[passage_id] = scores.get(passage_id, 0.0) + 1.0 / (60.0 + rank)
+            best_rank[passage_id] = min(best_rank.get(passage_id, rank), rank)
+            heads.setdefault(passage_id, set()).add(head_name)
+    ranked = tuple(
+        sorted(
+            scores,
+            key=lambda passage_id: (
+                -scores[passage_id],
+                best_rank[passage_id],
+                passage_id,
+            ),
+        )[: max(0, int(cap))]
+    )
+    return (
+        ranked,
+        {passage_id: scores[passage_id] for passage_id in ranked},
+        {
+            passage_id: tuple(
+                head for head in ("dense", "bm25") if head in heads[passage_id]
+            )
+            for passage_id in ranked
+        },
+    )
+
+
+def _fact_variant(
+    row: Any,
+) -> tuple[tuple[str, str, str], str, object, object]:
+    return (
+        tuple(row.logical_key),
+        str(row.status),
+        getattr(row, "valid_from", None),
+        getattr(row, "valid_to", None),
+    )
+
+
+def _dense_fact_overlay_groups(
+    fact_rows: Sequence[Any],
+    resolved_entity_ids: set[str],
+    *,
+    cap: int,
+) -> tuple[tuple[Any, ...], ...]:
+    """Select active fact variants touching aliases resolved from the query."""
+
+    grouped: dict[
+        tuple[tuple[str, str, str], str, object, object], list[Any]
+    ] = {}
+    for row in fact_rows:
+        if str(row.status) != "active":
+            continue
+        if not (
+            str(row.subject_entity_id) in resolved_entity_ids
+            or str(row.object_entity_id) in resolved_entity_ids
+        ):
+            continue
+        grouped.setdefault(_fact_variant(row), []).append(row)
+
+    def group_sort_key(
+        item: tuple[
+            tuple[tuple[str, str, str], str, object, object], list[Any]
+        ],
+    ) -> tuple[float, float, str]:
+        variant, rows = item
+        adjudication = max(
+            (
+                float(score)
+                for row in rows
+                if (score := getattr(row, "adjudication_score", None)) is not None
+            ),
+            default=float("-inf"),
+        )
+        observed = max(float(getattr(row, "observed_at", 0.0)) for row in rows)
+        return (-adjudication, -observed, repr(variant))
+
+    return tuple(
+        tuple(sorted(rows, key=lambda row: str(row.fact_id)))
+        for _variant, rows in sorted(grouped.items(), key=group_sort_key)[
+            : max(0, int(cap))
+        ]
+    )
+
+
 def _assemble_facts(
     registry: EvidenceRegistry,
     triple: TripleRecognitionResult,
@@ -1726,6 +2103,10 @@ def _assemble_facts(
     build_id: str,
     supplied_passage_ids: set[str],
     extra_fact_ids: set[str] = frozenset(),  # type: ignore[assignment]
+    require_supplied_source: bool = True,
+    variant_order: Mapping[
+        tuple[tuple[str, str, str], str, object, object], int
+    ] | None = None,
 ) -> tuple[EvidenceFact, ...]:
     path_fact_ids = {fact_id for path in paths for fact_id in path.fact_ids}
     recognized_by_fact = {
@@ -1748,7 +2129,17 @@ def _assemble_facts(
         )
         grouped.setdefault(variant, []).append(context)
     facts: list[EvidenceFact] = []
-    for variant, rows in sorted(grouped.items(), key=lambda item: repr(item[0])):
+    def group_sort_key(
+        item: tuple[
+            tuple[tuple[str, str, str], str, object, object], list[Any]
+        ],
+    ) -> tuple[int, str]:
+        variant = item[0]
+        if variant_order is None:
+            return (0, repr(variant))
+        return (variant_order.get(variant, len(variant_order)), repr(variant))
+
+    for variant, rows in sorted(grouped.items(), key=group_sort_key):
         logical_key, status, valid_from, valid_to = variant
         ordered = tuple(sorted(rows, key=lambda row: str(row.fact_id)))
         source_ids = tuple(
@@ -1756,9 +2147,10 @@ def _assemble_facts(
             for row in ordered
             if row.source_passage_id in evidence_ref_by_passage
         )
-        if not source_ids or not any(
+        has_supplied_source = any(
             str(row.source_passage_id) in supplied_passage_ids for row in ordered
-        ):
+        )
+        if not source_ids or (require_supplied_source and not has_supplied_source):
             continue
         recognized = next(
             (recognized_by_fact[str(row.fact_id)] for row in ordered if str(row.fact_id) in recognized_by_fact),

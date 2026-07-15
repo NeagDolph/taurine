@@ -324,6 +324,7 @@ class RetrievalRuntime:
             # §0.1: chat/tool get the liberal fallback lane; live stays strict.
             fallback_on_abstain=mode in {"chat", "tool"},
             calibration_status=self.calibration_status,
+            chat_retrieval_mode=config.CHAT_RETRIEVAL_MODE,
         )
 
     def make_validator(self, registry: EvidenceRegistry) -> EvidenceValidator:

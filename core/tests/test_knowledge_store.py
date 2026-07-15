@@ -174,6 +174,15 @@ def test_insert_facts_applies_supersession_links_order_independently(
             for row in store._conn.execute("SELECT fact_id, superseded_by FROM facts")
         }
         assert rows == {"fact-aaa": "fact-zzz", "fact-mmm": None, "fact-zzz": None}
+        assert [
+            row.fact_id
+            for row in store.fact_contexts(
+                entity_ids=("e-new",), active_only=True, build_id="build-1"
+            )
+        ] == ["fact-zzz"]
+        assert store.fact_contexts(
+            entity_ids=("e-old",), active_only=True, build_id="build-1"
+        ) == ()
     finally:
         store.close()
 

@@ -117,6 +117,14 @@ def test_openrouter_mode_uses_provisional_cohere_floors_for_chat_only(
     try:
         engine = runtime.make_engine("chat", EvidenceRegistry())
         live_engine = runtime.make_engine("live", EvidenceRegistry())
+        assert config.CHAT_RETRIEVAL_MODE == "dense_facts"
+        assert config.DENSE_SWEEP_K == 48
+        assert config.CHAT_PACK_BUDGET == 12
+        assert config.CHAT_FACT_OVERLAY_MAX == 12
+        assert engine.chat_retrieval_mode == "dense_facts"
+        assert runtime.make_engine(
+            "tool", EvidenceRegistry()
+        ).chat_retrieval_mode == "dense_facts"
         assert runtime.local_pair_scorer is local
         assert runtime.pair_scorer is remote
         assert runtime.pair_scorer_model_id == config.RERANK_API_MODEL

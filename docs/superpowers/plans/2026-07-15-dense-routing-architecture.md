@@ -75,7 +75,7 @@
 - [x] Run the clock tests and confirm the static prompts fail.
 - [x] Construct chat and summary system strings per request using the local timezone and its abbreviation.
 - [x] Run focused unit-2 tests, unchanged live tests, then the full suite.
-- [ ] Commit only unit-2 files with the required trailer.
+- [x] Commit only unit-2 files with the required trailer.
 
 ### Task 3: Dense-facts default chat routing
 
@@ -94,23 +94,23 @@
 - Adds: an optional reranker candidate-cap override used only by dense-facts chat/tool retrieval.
 - Preserves: `SharedRetrievalEngine.retrieve(...) -> EvidencePack` and existing registry/citation contracts.
 
-- [ ] Add config/routing tests proving chat and tool use dense-facts by default, `graph` preserves the old route, and live never enters dense-facts.
-- [ ] Run them and confirm the mode/config branch is absent.
-- [ ] Add retrieval tests proving dense top-48 candidacy ignores the dense acceptance curve, BM25 candidates join before one bounded rerank, top 12 are returned, and only an empty union abstains.
-- [ ] Run them and confirm the graph pipeline gates/abstains.
-- [ ] Add fact-overlay tests proving exact/entity aliases select only active touching facts, grouped variants are ordered by adjudication score then observed recency, capped at 12, registered as `[F#]`, and backed by readable source refs.
-- [ ] Run them and confirm no SQL-style overlay exists.
-- [ ] Implement an early dense-facts branch after dense/BM25/entity resolution and before triple recognition/PPR; retain rerank-floor labels on passage rows without invoking graph low-confidence fill or graph abstention.
-- [ ] Assemble the dense passage pack and active fact overlay with existing registry payload helpers and citation validation identities.
-- [ ] Run focused unit-3 tests, all existing live-mode tests, then the full suite.
-- [ ] Commit only unit-3 files with the required trailer.
+- [x] Add config/routing tests proving chat and tool use dense-facts by default, `graph` preserves the old route, and live never enters dense-facts.
+- [x] Run them and confirm the mode/config branch is absent.
+- [x] Add retrieval tests proving dense top-48 candidacy ignores the dense acceptance curve, BM25 candidates join before one bounded rerank, top 12 are returned, and only an empty union abstains.
+- [x] Run them and confirm the graph pipeline gates/abstains.
+- [x] Add fact-overlay tests proving exact/entity aliases select only active touching facts, grouped variants are ordered by adjudication score then observed recency, capped at 12, registered as `[F#]`, and backed by readable source refs.
+- [x] Run them and confirm no SQL-style overlay exists.
+- [x] Implement an early dense-facts branch after dense/BM25/entity resolution and before triple recognition/PPR; retain rerank-floor labels on passage rows without invoking graph low-confidence fill or graph abstention.
+- [x] Assemble the dense passage pack and active fact overlay with existing registry payload helpers and citation validation identities.
+- [x] Run focused unit-3 tests, all existing live-mode tests, then the full suite.
+- [x] Commit only unit-3 files with the required trailer.
 
 ### Task 4: Final verification and handoff
 
 **Files:**
 - Inspect only: all committed diffs and repository status.
 
-- [ ] Re-read both authoritative specs and match every requirement to code/tests.
-- [ ] Run `.venv/bin/python -m pytest` fresh and record the pass/skip count.
-- [ ] Inspect `git status`, `git diff HEAD~3..HEAD`, and the three commit trailers; confirm unrelated pre-existing changes remain unstaged/uncommitted.
-- [ ] Report commit hashes, suite count, and any deviations with reasons.
+- [x] Re-read both authoritative specs and match every requirement to code/tests.
+- [x] Run `.venv/bin/python -m pytest` fresh and record the pass/skip count.
+- [x] Inspect `git status`, `git diff HEAD~3..HEAD`, and the three commit trailers; confirm unrelated pre-existing changes remain unstaged/uncommitted.
+- [x] Report commit hashes, suite count, and any deviations with reasons.

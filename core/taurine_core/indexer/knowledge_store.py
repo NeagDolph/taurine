@@ -1279,22 +1279,35 @@ class KnowledgeStore:
         *,
         include_candidates: bool = False,
         build_id: str | None = None,
+        entity_ids: tuple[str, ...] | None = None,
+        active_only: bool = False,
     ) -> tuple[FactContext, ...]:
-        if fact_ids == ():
+        if fact_ids == () or entity_ids == ():
             return ()
         clauses: list[str] = []
         parameters: list[Any] = []
         # rejected facts are audit rows: excluded from recall, embeddings,
         # traversal, and serving no matter what the caller asks for
-        clauses.append("f.status <> 'rejected'")
-        if not include_candidates:
-            clauses.append("f.status <> 'candidate'")
+        if active_only:
+            clauses.append("f.status = 'active'")
+        else:
+            clauses.append("f.status <> 'rejected'")
+            if not include_candidates:
+                clauses.append("f.status <> 'candidate'")
         if build_id is not None:
             clauses.append("f.build_id = ?")
             parameters.append(build_id)
         if fact_ids is not None:
             clauses.append(f"f.fact_id IN ({','.join('?' for _ in fact_ids)})")
             parameters.extend(fact_ids)
+        if entity_ids is not None:
+            placeholders = ",".join("?" for _ in entity_ids)
+            clauses.append(
+                f"(f.subject_entity_id IN ({placeholders}) "
+                f"OR f.object_entity_id IN ({placeholders}))"
+            )
+            parameters.extend(entity_ids)
+            parameters.extend(entity_ids)
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self._conn.execute(
             f"""

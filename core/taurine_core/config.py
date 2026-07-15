@@ -277,6 +277,10 @@ CHAT_NOTE_READ_MAX_CHARS = 6000
 CHAT_HISTORY_MAX_TURNS = 12
 CHAT_TITLE_MAX_WORDS = 6
 CHAT_PRE_RETRIEVAL = True
+CHAT_RETRIEVAL_MODE = "dense_facts"      # "dense_facts" default; "graph" rollback
+DENSE_SWEEP_K = 48
+CHAT_PACK_BUDGET = 12
+CHAT_FACT_OVERLAY_MAX = 12
 PRE_RETRIEVAL_MAX_WAIT_S = 2.5           # prompt-boundary wait; fail open when slow
 
 # ── grounded edge adjudication (edge-quality spec items 1/5b/6) ────────
@@ -388,7 +392,7 @@ LIVE_RERANK_CANDIDATES = 30
 LIVE_RETRIEVAL_DEADLINE_S = 3.0
 CHAT_RERANK_CANDIDATES = 60
 LIVE_EVIDENCE_PASSAGES = 8
-CHAT_EVIDENCE_PASSAGES = 12             # dense ablation budget; keep at least 8
+CHAT_EVIDENCE_PASSAGES = CHAT_PACK_BUDGET
 CHAT_FILL_TRIGGER = 4                    # fill only when accepted rerank evidence is sparse
 CHAT_FILL_MAX_PASSAGES = 8               # never dilute a sparse answer all the way to 12
 EVIDENCE_NEAR_DUP_SIM = 0.98             # suppress lower-scored near-duplicates in final packs
