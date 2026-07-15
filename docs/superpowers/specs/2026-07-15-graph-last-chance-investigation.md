@@ -26,3 +26,15 @@ Run graph retrieval with trace; find the passage(s) dense used to answer correct
 - Installed: pilot v3 (158MB), backups: pre-v3-0714, pre-v2-0714, pre-8b-pilot-0714
 - Latency fixed: 1.2-4.1s. Battery 15/16 (employer-now fails, same root cause suspected)
 - ablation script: scratchpad/ablation.py; results: scratchpad/ablation.json; report: /Users/neil/taurine/ablation-report.md
+
+## Round 2 rankings (Neil, post-starvation-fix)
+- Graph much better: peptides, hackathons (dense missed results this round). Slightly better: Klaviyo, drugs, roommates.
+- Dense slightly better: Mahith (FLIPPED from graph win), Quillan (FLIPPED), dates, age, graduation. Dense much better: TV shows (persistent).
+- Same: projects, university. Anime both wrong.
+- Neil: "try other strategies — increase amount of items, allow more traversal, or issue in indexing process. Keep investigating."
+
+## Round-3 hypotheses
+1. FLIPS (Mahith/Quillan): low-confidence fill may DILUTE precision answers — consider fill only when accepted < 4, or rank-aware fill budget.
+2. TV shows (persistent dense win): broad-aggregation queries — PPR concentrates on few strong notes; dense sweeps breadth. Check: distinct-note diversity of graph candidate pool vs dense top-24; MMR two-per-note cap; head K values into fusion; consider diversity-aware recall (larger dense-head K + per-note caps earlier).
+3. Age/dates: the "turn 23" passage — check if graph dense head even recalls it (head K too small?) vs fusion drowning it.
+4. Verify indexing: confirm show-mention passages exist with embeddings in graph candidate paths.
