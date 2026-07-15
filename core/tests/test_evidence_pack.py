@@ -7,6 +7,7 @@ from typing import Sequence
 import numpy as np
 import pytest
 
+from taurine_core import config
 from taurine_core.evaluation.graph_retrieval import load_calibration
 from taurine_core.indexer.base_graph import BaseEdge, materialize_base_graph
 from taurine_core.indexer.knowledge_store import BM25PassageHit, KnowledgeStore
@@ -529,6 +530,87 @@ def test_mmr_enforces_two_passages_per_note_and_mode_budget(tmp_path: Path) -> N
     same_note = next(row for row in pack.notes if row.note_id == "same")
     assert same_note.score <= max(row.rerank_score for row in pack.passages if row.note_id == "same") + 0.1
     assert pack.trace.mmr_exclusions
+
+
+def test_chat_high_precision_head_fills_pack_with_below_floor_rerank_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "EVIDENCE_NEAR_DUP_SIM", 1.01)
+    engine, _registry, _store = _engine(
+        tmp_path,
+        scorer=(0.31, 0.20, 0.10, 0.06),
+    )
+    engine.reranker = LocalPassageReranker(
+        FakeScorer((0.31, 0.20, 0.10, 0.06)),
+        mode="chat",
+        acceptance_floor=0.30,
+        evidence_floor_override=0.05,
+    )
+
+    pack = engine.retrieve(RetrievalQuery("Maya", "chat", now=10.0))
+
+    assert pack.decision.accepted is True
+    assert pack.trace.debug["pre_abstention"] == "accepted_high_precision_head"
+    assert len(pack.passages) == 4
+    assert [row.low_confidence for row in pack.passages] == [False, True, True, True]
+    assert pack.passages[0].rerank_score == pytest.approx(0.31)
+    assert sorted(row.rerank_score for row in pack.passages[1:]) == pytest.approx(
+        [0.06, 0.10, 0.20]
+    )
+
+
+def test_chat_post_rerank_abstention_returns_scored_fallback_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "EVIDENCE_NEAR_DUP_SIM", 1.01)
+    engine, _registry, store = _engine(
+        tmp_path,
+        scorer=(0.20, 0.15, 0.10, 0.06),
+    )
+    store._bm25 = (BM25PassageHit("p4", 20.0, 1.0),)
+    engine.triple_recognizer = None
+    engine.fallback_on_abstain = True
+    engine.reranker = LocalPassageReranker(
+        FakeScorer((0.20, 0.15, 0.10, 0.06)),
+        mode="chat",
+        acceptance_floor=0.30,
+        evidence_floor_override=0.05,
+    )
+
+    pack = engine.retrieve(RetrievalQuery("launch details", "chat", now=10.0))
+
+    assert pack.decision.accepted is False
+    assert pack.decision.fallback is True
+    assert pack.decision.reason == "fallback_low_confidence"
+    assert len(pack.passages) == 4
+    assert all(row.low_confidence for row in pack.passages)
+    assert sorted(row.rerank_score for row in pack.passages) == pytest.approx(
+        [0.06, 0.10, 0.15, 0.20]
+    )
+
+
+def test_live_high_precision_head_does_not_fill_from_below_floor_rerank_rows(
+    tmp_path: Path,
+) -> None:
+    engine, _registry, _store = _engine(
+        tmp_path,
+        mode="live",
+        scorer=(0.31, 0.20, 0.10, 0.06),
+    )
+    engine.reranker = LocalPassageReranker(
+        FakeScorer((0.31, 0.20, 0.10, 0.06)),
+        mode="live",
+        acceptance_floor=0.30,
+        evidence_floor_override=0.05,
+    )
+
+    pack = engine.retrieve(RetrievalQuery("Maya", "live", now=10.0))
+
+    assert pack.decision.accepted is True
+    assert len(pack.passages) == 1
+    assert pack.passages[0].low_confidence is False
 
 
 def test_degraded_reranker_falls_back_only_to_calibrated_direct_passages(tmp_path: Path) -> None:

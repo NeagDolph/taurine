@@ -90,7 +90,7 @@ def test_local_mode_keeps_qwen_for_triples_and_passage_reranking(
         runtime.close()
 
 
-def test_openrouter_mode_keeps_triples_local_and_wires_cloud_passage_fallback(
+def test_openrouter_mode_uses_provisional_cohere_floors_for_chat_only(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -114,14 +114,17 @@ def test_openrouter_mode_keeps_triples_local_and_wires_cloud_passage_fallback(
     runtime = RetrievalRuntime(database)
     try:
         engine = runtime.make_engine("chat", EvidenceRegistry())
+        live_engine = runtime.make_engine("live", EvidenceRegistry())
         assert runtime.local_pair_scorer is local
         assert runtime.pair_scorer is remote
         assert runtime.pair_scorer_model_id == config.RERANK_API_MODEL
         assert engine.triple_recognizer.scorer is local
         assert engine.reranker.scorer is remote
         assert engine.reranker.model_id == config.RERANK_API_MODEL
-        assert engine.reranker.acceptance_floor == pytest.approx(0.5)
-        assert engine.reranker.evidence_floor_override == pytest.approx(0.15)
+        assert engine.reranker.acceptance_floor == pytest.approx(0.30)
+        assert engine.reranker.evidence_floor_override == pytest.approx(0.05)
+        assert live_engine.reranker.acceptance_floor == pytest.approx(0.5)
+        assert live_engine.reranker.evidence_floor_override == pytest.approx(0.15)
         assert engine.reranker.fallback_scorer is local
         assert engine.reranker.fallback_acceptance_floor == pytest.approx(
             runtime.artifact.rerank.chat_floor

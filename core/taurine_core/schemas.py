@@ -301,7 +301,8 @@ class EvidencePackPayload(BaseModel):
                         **row.__dict__,
                         "path_ids": list(row.path_ids),
                         "low_confidence": bool(
-                            getattr(pack.decision, "fallback", False)
+                            row.low_confidence
+                            or getattr(pack.decision, "fallback", False)
                         ),
                     }
                 )

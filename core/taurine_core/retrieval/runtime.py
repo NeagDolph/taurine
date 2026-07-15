@@ -276,7 +276,11 @@ class RetrievalRuntime:
             else self.artifact.rerank.chat_floor
         )
         if config.INFERENCE_BACKEND == "openrouter":
-            api_floors = config.RERANK_API_FLOOR_OVERRIDES
+            api_floors = (
+                config.LIVE_RERANK_API_FLOOR_OVERRIDES
+                if mode == "live"
+                else config.RERANK_API_FLOOR_OVERRIDES
+            )
             passage_reranker = LocalPassageReranker(
                 self.pair_scorer,
                 mode=mode,

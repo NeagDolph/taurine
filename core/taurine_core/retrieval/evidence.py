@@ -638,17 +638,39 @@ class SharedRetrievalEngine:
             if query.mode == "live"
             else config.CHAT_EVIDENCE_PASSAGES
         )
+        selection_limit = (
+            configured_limit
+            if passage_limit is None
+            else min(configured_limit, max(0, int(passage_limit)))
+        )
         selected, exclusions = _mmr_select(
             ranked,
             self.snapshot,
             mmr_lambda=self.calibrator.mmr_lambda,
             source_diversity_penalty=self.calibrator.source_diversity_penalty,
-            limit=(
-                configured_limit
-                if passage_limit is None
-                else min(configured_limit, max(0, int(passage_limit)))
-            ),
+            limit=selection_limit,
         )
+        if query.mode == "chat" and not reranked.degraded and len(selected) < selection_limit:
+            evidence_floor = (
+                self.abstention.rules.evidence_floor
+                if reranked.evidence_floor_override is None
+                else float(reranked.evidence_floor_override)
+            )
+            below_floor = tuple(
+                row
+                for row in reranked.decisions
+                if row.reason == "below_passage_rerank_floor"
+                and float(row.score) >= evidence_floor
+            )
+            selected, fill_exclusions = _mmr_select(
+                below_floor,
+                self.snapshot,
+                mmr_lambda=self.calibrator.mmr_lambda,
+                source_diversity_penalty=self.calibrator.source_diversity_penalty,
+                limit=selection_limit,
+                initial=selected,
+            )
+            exclusions = (*exclusions, *fill_exclusions)
         selected, near_duplicate_suppressed = _suppress_near_duplicate_passages(
             selected, self.snapshot
         )
@@ -678,6 +700,7 @@ class SharedRetrievalEngine:
                 latency,
                 triple,
                 debug=base_debug,
+                reranked_rows=selected if query.mode == "chat" else (),
             )
             if fallback_pack is not None:
                 return fallback_pack
@@ -852,6 +875,7 @@ class SharedRetrievalEngine:
                     retrieval_score=row.candidate.recall_score,
                     rerank_score=row.score,
                     path_ids=tuple(path_refs_by_target.get(passage.passage_id, ())),
+                    low_confidence=not row.accepted,
                 )
             )
 
@@ -1059,30 +1083,36 @@ class SharedRetrievalEngine:
         triple: TripleRecognitionResult,
         *,
         debug: Mapping[str, object],
+        reranked_rows: Sequence[PassageRerankDecision] = (),
     ) -> EvidencePack | None:
         """§0.1 chat/tool fallback lane: a bounded best-effort pack after an
-        abstention. Passages only (no facts, no paths, ≤1 per note, cap 4),
-        registered and marked read like normal evidence; the decision stays
-        unaccepted with ``fallback=True``. Returns None when disabled or when
-        nothing clears the fallback floor.
+        abstention. Pre-PPR fallback remains capped at four passages and one
+        per note; post-rerank chat fallback keeps the normal chat budget/MMR
+        selection. Both are passages only, registered and marked read like
+        normal evidence, with an unaccepted ``fallback=True`` decision.
         """
 
         if not self.fallback_on_abstain:
             return None
-        best: dict[str, float] = {}
-        for head, result in (("dense", dense), ("bm25", bm25)):
-            if result.status != "ok":
-                continue
-            floor = self._fallback_floor(head)
-            for hit in (*result.accepted, *result.rejected):
-                if hit.target_kind != "passage":
+        if reranked_rows:
+            ordered = [
+                (row.candidate.passage_id, float(row.score)) for row in reranked_rows
+            ]
+        else:
+            best: dict[str, float] = {}
+            for head, result in (("dense", dense), ("bm25", bm25)):
+                if result.status != "ok":
                     continue
-                score = float(hit.calibrated_score)
-                if math.isfinite(score) and score >= floor:
-                    best[hit.target_id] = max(best.get(hit.target_id, 0.0), score)
-        if not best:
-            return None
-        ordered = sorted(best.items(), key=lambda row: (-row[1], row[0]))
+                floor = self._fallback_floor(head)
+                for hit in (*result.accepted, *result.rejected):
+                    if hit.target_kind != "passage":
+                        continue
+                    score = float(hit.calibrated_score)
+                    if math.isfinite(score) and score >= floor:
+                        best[hit.target_id] = max(best.get(hit.target_id, 0.0), score)
+            if not best:
+                return None
+            ordered = sorted(best.items(), key=lambda row: (-row[1], row[0]))
         contexts = {
             row.passage_id: row
             for row in self.store.passage_contexts(
@@ -1091,10 +1121,19 @@ class SharedRetrievalEngine:
         }
         chosen: list[tuple[PassageContext, float]] = []
         seen_notes: set[str] = set()
-        cap = max(0, int(config.RETRIEVAL_FALLBACK_PASSAGES))
+        cap = max(
+            0,
+            int(
+                config.CHAT_EVIDENCE_PASSAGES
+                if reranked_rows
+                else config.RETRIEVAL_FALLBACK_PASSAGES
+            ),
+        )
         for passage_id, score in ordered:
             row = contexts.get(passage_id)
-            if row is None or row.note_id in seen_notes or len(chosen) >= cap:
+            if row is None or len(chosen) >= cap:
+                continue
+            if not reranked_rows and row.note_id in seen_notes:
                 continue
             seen_notes.add(row.note_id)
             chosen.append((row, score))
@@ -1132,6 +1171,7 @@ class SharedRetrievalEngine:
                     modified=row.modified,
                     retrieval_score=score,
                     rerank_score=score,
+                    low_confidence=True,
                 )
             )
         notes = _assemble_notes(
@@ -1474,6 +1514,7 @@ def _mmr_select(
     mmr_lambda: float = 0.2,
     source_diversity_penalty: float = 0.0,
     limit: int,
+    initial: Sequence[PassageRerankDecision] = (),
 ) -> tuple[
     tuple[PassageRerankDecision, ...],
     tuple[Mapping[str, object], ...],
@@ -1483,9 +1524,13 @@ def _mmr_select(
         passage_id: snapshot.passage_matrix[index]
         for index, passage_id in enumerate(snapshot.passage_ids)
     }
-    remaining = set(by_id)
-    selected: list[PassageRerankDecision] = []
+    selected = list(initial[: max(0, int(limit))])
+    selected_ids = {row.candidate.passage_id for row in selected}
+    remaining = set(by_id) - selected_ids
     per_note: dict[str, int] = {}
+    for row in selected:
+        note_id = row.candidate.note_id
+        per_note[note_id] = per_note.get(note_id, 0) + 1
     exclusions: list[Mapping[str, object]] = []
     while remaining and len(selected) < max(0, int(limit)):
         scored: list[tuple[float, float, str]] = []

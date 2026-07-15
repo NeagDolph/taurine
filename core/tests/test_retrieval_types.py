@@ -78,6 +78,7 @@ def test_evidence_pack_serializes_to_public_payload_without_private_trace_text()
         retrieval_score=0.8,
         rerank_score=0.9,
         path_ids=("P1",),
+        low_confidence=True,
     )
     fact = EvidenceFact(
         fact_ref="F1",
@@ -130,6 +131,7 @@ def test_evidence_pack_serializes_to_public_payload_without_private_trace_text()
 
     assert payload["decision"]["accepted"] is True
     assert payload["passages"][0]["evidence_id"] == "E1"
+    assert payload["passages"][0]["low_confidence"] is True
     assert payload["facts"][0]["fact_ref"] == "F1"
     assert payload["paths"][0]["path_id"] == "P1"
     assert payload["notes"][0]["note_ref"] == "N1"
@@ -156,6 +158,10 @@ def test_overhaul_configuration_matches_approved_defaults() -> None:
     assert config.RERANK_API_MODEL == "cohere/rerank-v3.5"
     assert config.RERANK_MAX_CANDIDATES == 24
     assert config.RERANK_API_FLOOR_OVERRIDES == {
+        "accept": pytest.approx(0.30),
+        "fallback": pytest.approx(0.05),
+    }
+    assert config.LIVE_RERANK_API_FLOOR_OVERRIDES == {
         "accept": pytest.approx(0.5),
         "fallback": pytest.approx(0.15),
     }

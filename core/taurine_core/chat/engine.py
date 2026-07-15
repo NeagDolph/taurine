@@ -37,6 +37,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Mapping, Sequence
 from uuid import uuid4
 
@@ -61,7 +62,7 @@ from ..schemas import (
     ChatUsage,
     EvidencePackPayload,
 )
-from ..retrieval.types import EvidencePack
+from ..retrieval.types import EvidencePack, EvidencePassage
 from ..retrieval.validate import EvidenceValidator
 from .retrieval import ChatRetriever
 from .tools import TOOL_DEFINITIONS, execute_tool, render_search_result
@@ -1015,7 +1016,8 @@ def _system_prompt(profile_block: str = "") -> str:
         "insufficient, use tools or state the gap. Evidence under a LOW-CONFIDENCE "
         "header (or marked low_confidence) did not clear retrieval's confidence floor: "
         "treat it as a hint, verify it before asserting, and say so explicitly if you "
-        "rely on it. Be direct and write markdown."
+        "rely on it. When only LOW-CONFIDENCE evidence exists, answer with it and label "
+        "the uncertainty rather than refusing. Be direct and write markdown."
     )
     if not profile_block:
         return prompt
@@ -1040,18 +1042,32 @@ def _evidence_block(
             f"{pack.decision.reason} (confidence {pack.decision.confidence:.2f})."
         )
     lines: list[str] = []
-    if fallback:
+    accepted_passages = (
+        () if fallback else tuple(row for row in pack.passages if not row.low_confidence)
+    )
+    low_confidence_passages = tuple(
+        row for row in pack.passages if fallback or row.low_confidence
+    )
+
+    notes = {row.note_id: row.note_ref for row in pack.notes}
+
+    def append_passage(item: EvidencePassage) -> None:
+        lines.append(
+            f'[{item.evidence_id}] [{notes.get(item.note_id, item.note_id)}] "{item.title}" '
+            f"({item.source}, chars {item.char_start}-{item.char_end})\n"
+            f"[{_passage_month(item)}] {item.text}"
+        )
+
+    for item in accepted_passages:
+        append_passage(item)
+    if low_confidence_passages:
         lines.append(
             "LOW-CONFIDENCE CONTEXT — retrieval did not clear its confidence "
             "floor; treat these passages as hints, verify before asserting, "
             "and say so if you rely on them."
         )
-    notes = {row.note_id: row.note_ref for row in pack.notes}
-    for item in pack.passages:
-        lines.append(
-            f'[{item.evidence_id}] [{notes.get(item.note_id, item.note_id)}] "{item.title}" '
-            f"({item.source}, chars {item.char_start}-{item.char_end})\n{item.text}"
-        )
+        for item in low_confidence_passages:
+            append_passage(item)
     if fallback:
         # Fallback packs are passages only — facts/paths sections omitted.
         return "\n".join(lines) if lines else "none"
@@ -1077,6 +1093,19 @@ def _evidence_block(
     for path in pack.paths:
         lines.append(f"[{path.path_id}] {path.rendered}")
     return "\n".join(lines) if lines else "none"
+
+
+def _passage_month(item: EvidencePassage) -> str:
+    """Render the note's best available timestamp at month precision."""
+
+    for value in (item.modified, item.created):
+        try:
+            timestamp = float(value)
+            if timestamp > 0.0:
+                return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m")
+        except (OverflowError, OSError, ValueError):
+            continue
+    return "unknown-date"
 
 
 def _age_label(age_days: float) -> str:

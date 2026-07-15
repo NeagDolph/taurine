@@ -68,6 +68,8 @@ class EvidencePassage:
     retrieval_score: float
     rerank_score: float
     path_ids: tuple[str, ...] = ()
+    # Chat/tool evidence that did not clear the rerank acceptance floor.
+    low_confidence: bool = False
 
 
 @dataclass(frozen=True)

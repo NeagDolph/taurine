@@ -352,13 +352,15 @@ RERANK_MAX_CANDIDATES = 24
 RERANK_API_ATTEMPTS = 3
 RERANK_API_BACKOFF_S = 0.5
 RERANK_API_TIMEOUT_S = 30.0
-# Temporary Cohere-scale floors only. The orchestrator refits keyed artifact
-# floors via self_calibrate after merge; never apply the Qwen floors to Cohere.
-RERANK_API_FLOOR_OVERRIDES = {"accept": 0.5, "fallback": 0.15}
+# Provisional from Cohere score anatomy; the orchestrator validates these on
+# the 15-question calibration set before replacing them with fitted floors.
+RERANK_API_FLOOR_OVERRIDES = {"accept": 0.30, "fallback": 0.05}
+# Live remains byte-for-byte strict while chat calibrates the Cohere scale.
+LIVE_RERANK_API_FLOOR_OVERRIDES = {"accept": 0.5, "fallback": 0.15}
 LIVE_RERANK_CANDIDATES = 30
 CHAT_RERANK_CANDIDATES = 60
 LIVE_EVIDENCE_PASSAGES = 8
-CHAT_EVIDENCE_PASSAGES = 12
+CHAT_EVIDENCE_PASSAGES = 12             # dense ablation budget; keep at least 8
 EVIDENCE_NEAR_DUP_SIM = 0.98             # suppress lower-scored near-duplicates in final packs
 TEMPORAL_HISTORY_DOWNWEIGHT = 0.5        # historical/superseded facts under "any"/past intents
 HUB_ACTIVATION_EDGE_WEIGHT = 0.5         # synthesized contains weight for query-activated hubs (§10.5)
@@ -391,6 +393,8 @@ SOURCE_RANK = {
     "imessage": 0.85,                    # text messages: a bit lower
     "gmail": 0.85,                       # email threads: iMessage tier
     "outlook": 0.85,
+    "google_calendar": 0.85,             # events: episodic communication tier
+    "google_docs": 1.00,                 # authored documents: written notes tier
     "claude_mem": 0.70,                  # agent memories: a bit lower still
     "codex_mem": 0.70,
 }
@@ -408,6 +412,8 @@ RECENCY_HALF_LIFE_DAYS = {
     "imessage": 30.0,                    # episodic sources decay fast
     "gmail": 30.0,                       # email is episodic too
     "outlook": 30.0,
+    "google_calendar": 30.0,             # event relevance is time-sensitive
+    "google_docs": 120.0,                # authored documents are evergreen
     "claude_mem": 60.0,
     "codex_mem": 60.0,
     "apple_notes": 90.0,

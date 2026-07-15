@@ -424,7 +424,7 @@ async def test_pre_retrieval_toggle_off_preserves_legacy_prompt_and_events(
         "chat_meta", "chat_ack", "chat_retrieval", "chat_delta",
     ]
     assert llm.calls[0]["messages"][-1]["content"] == (
-        '<evidence>\n[E1] [N1] "Roadmap" (obsidian, chars 0-12)\nRoadmap gist\n'
+        '<evidence>\n[E1] [N1] "Roadmap" (obsidian, chars 0-12)\n[2026-07] Roadmap gist\n'
         '[F1] Roadmap — relates_to → Beta; status=active; valid=?..?; supported by [E1]\n'
         "</evidence>\n\nQuestion"
     )
@@ -1167,6 +1167,10 @@ async def test_fallback_pack_renders_low_confidence_header_and_validates(store: 
 
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "LOW-CONFIDENCE" in system_prompt  # discipline sentence (§0.1)
+    assert (
+        "When only LOW-CONFIDENCE evidence exists, answer with it and label the "
+        "uncertainty rather than refusing."
+    ) in system_prompt
     evidence_message = llm.calls[0]["messages"][-1]["content"]
     assert "LOW-CONFIDENCE CONTEXT" in evidence_message
     assert "The launch is July 18." in evidence_message
@@ -1176,6 +1180,36 @@ async def test_fallback_pack_renders_low_confidence_header_and_validates(store: 
     assert done["cited_ids"] == ["E1"]
     assert done["evidence"]["decision"]["fallback"] is True
     assert done["evidence"]["passages"][0]["low_confidence"] is True
+
+
+def test_chat_evidence_dates_passages_and_labels_only_below_floor_rows() -> None:
+    pack = EvidencePack(
+        decision=RetrievalDecision(True, 0.8, "accepted_high_precision_head"),
+        query=RetrievalQuery("When?", "chat", 0.0),
+        passages=(
+            EvidencePassage(
+                "E1", "p1", "n1", "Current", "obsidian", "Current evidence.",
+                0, 17, 1.0, 1714521600.0, 0.8, 0.8,
+            ),
+            EvidencePassage(
+                "E2", "p2", "n2", "Old", "imessage", "Older uncertain evidence.",
+                0, 25, 1667260800.0, 0.0, 0.7, 0.2, low_confidence=True,
+            ),
+        ),
+        facts=(),
+        paths=(),
+        notes=(
+            EvidenceNote("N1", "n1", "Current", "obsidian", 1714521600.0, 0.8, ("E1",)),
+            EvidenceNote("N2", "n2", "Old", "imessage", 1667260800.0, 0.2, ("E2",)),
+        ),
+        trace=RetrievalTrace(original_query="When?"),
+    )
+
+    block = engine_module._evidence_block(pack)
+
+    assert "[2024-05] Current evidence." in block
+    assert "[2022-11] Older uncertain evidence." in block
+    assert block.index("[E1]") < block.index("LOW-CONFIDENCE CONTEXT") < block.index("[E2]")
 
 
 @pytest.mark.asyncio
