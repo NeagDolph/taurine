@@ -28,7 +28,17 @@ from pathlib import Path
 
 import httpx
 
-_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+# One consent covers every Google connector: mail, calendar events, and docs
+# (drive.metadata.readonly is required to LIST docs; documents.readonly only
+# permits reading them by id).
+_GMAIL_SCOPE = " ".join(
+    (
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/documents.readonly",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
+    )
+)
 _GMAIL_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 _GMAIL_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _MS_DEVICECODE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"

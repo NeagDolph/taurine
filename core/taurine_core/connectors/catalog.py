@@ -3,6 +3,8 @@ from __future__ import annotations
 from .claude_memories import ClaudeMemoriesConnector
 from .codex_memories import CodexMemoriesConnector
 from .gmail import GmailConnector
+from .google_calendar import GoogleCalendarConnector
+from .google_docs import GoogleDocsConnector
 from .imessage import IMessageConnector
 from .local_folders import LocalFoldersConnector
 from .obsidian import ObsidianConnector
@@ -16,6 +18,8 @@ CONNECTORS: list = [
     ObsidianConnector(),
     IMessageConnector(),
     GmailConnector(),
+    GoogleCalendarConnector(),
+    GoogleDocsConnector(),
     OutlookConnector(),
 ]
 

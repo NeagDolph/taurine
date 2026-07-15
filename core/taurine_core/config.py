@@ -124,6 +124,14 @@ EMAIL_NOREPLY_LOCALPARTS = frozenset(
     account accounts security admin system automated digest reminder reminders
     """.split()
 )
+# ── google calendar / docs connectors (share the Gmail OAuth token) ────
+GCAL_PAST_DAYS = 60                      # events window: how far back
+GCAL_FUTURE_DAYS = 60                    # events window: how far ahead
+GCAL_MAX_EVENTS = 500                    # cap on event instances fetched per sync
+GDOCS_WINDOW_DAYS = 365                  # docs modified older than this are skipped
+GDOCS_MAX_DOCS = 200                     # newest-first cap per sync
+GOOGLE_SYNC_MIN_INTERVAL_S = 3600.0      # in-process extract cache, mirrors email
+
 # subjects matching this AND never replied to → transactional noise (billing,
 # receipts, account/security boilerplate, marketing). Replying rescues.
 EMAIL_TRANSACTIONAL_SUBJECT_RE = (
