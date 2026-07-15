@@ -589,6 +589,52 @@ def test_chat_post_rerank_abstention_returns_scored_fallback_rows(
     assert sorted(row.rerank_score for row in pack.passages) == pytest.approx(
         [0.06, 0.10, 0.15, 0.20]
     )
+    assert pack.passages[0].retrieval_score == pytest.approx(1.0)
+    assert pack.passages[0].rerank_score == pytest.approx(0.20)
+
+
+def test_tool_post_rerank_abstention_reuses_scored_fallback_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "EVIDENCE_NEAR_DUP_SIM", 1.01)
+    engine, _registry, store = _engine(
+        tmp_path,
+        mode="tool",
+        scorer=(0.20, 0.15, 0.10, 0.06),
+    )
+    store._bm25 = (BM25PassageHit("p4", 20.0, 1.0),)
+    engine.fallback_on_abstain = True
+    engine.reranker = LocalPassageReranker(
+        FakeScorer((0.20, 0.15, 0.10, 0.06)),
+        mode="tool",
+        acceptance_floor=0.30,
+        evidence_floor_override=0.05,
+    )
+
+    pack = engine.retrieve(
+        RetrievalQuery("launch details", "tool", now=10.0),
+        passage_limit=4,
+    )
+
+    assert pack.decision.fallback is True
+    assert len(pack.passages) == 4
+    assert sorted(row.rerank_score for row in pack.passages) == pytest.approx(
+        [0.06, 0.10, 0.15, 0.20]
+    )
+
+
+def test_chat_fallback_honors_zero_passage_limit(tmp_path: Path) -> None:
+    engine, registry = _fallback_engine(tmp_path, "chat", fallback_on_abstain=True)
+
+    pack = engine.retrieve(
+        RetrievalQuery("vaguely related", "chat", now=10.0),
+        passage_limit=0,
+    )
+
+    assert pack.passages == ()
+    assert pack.decision.fallback is False
+    assert registry.refs("read") == ()
 
 
 def test_live_high_precision_head_does_not_fill_from_below_floor_rerank_rows(

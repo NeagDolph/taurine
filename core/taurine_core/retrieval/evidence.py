@@ -264,6 +264,16 @@ class SharedRetrievalEngine:
         started = monotonic()
         latency: dict[str, float] = {}
         head_errors: dict[str, str] = {}
+        configured_limit = (
+            config.LIVE_EVIDENCE_PASSAGES
+            if query.mode == "live"
+            else config.CHAT_EVIDENCE_PASSAGES
+        )
+        selection_limit = (
+            configured_limit
+            if passage_limit is None
+            else min(configured_limit, max(0, int(passage_limit)))
+        )
 
         try:
             query_vector: np.ndarray | None = np.asarray(
@@ -418,6 +428,7 @@ class SharedRetrievalEngine:
                 latency,
                 triple,
                 debug=base_debug,
+                limit=min(selection_limit, int(config.RETRIEVAL_FALLBACK_PASSAGES)),
             )
             if fallback_pack is not None:
                 return fallback_pack
@@ -633,16 +644,6 @@ class SharedRetrievalEngine:
             ranked = reranked.accepted
 
         selection_started = monotonic()
-        configured_limit = (
-            config.LIVE_EVIDENCE_PASSAGES
-            if query.mode == "live"
-            else config.CHAT_EVIDENCE_PASSAGES
-        )
-        selection_limit = (
-            configured_limit
-            if passage_limit is None
-            else min(configured_limit, max(0, int(passage_limit)))
-        )
         selected, exclusions = _mmr_select(
             ranked,
             self.snapshot,
@@ -650,7 +651,11 @@ class SharedRetrievalEngine:
             source_diversity_penalty=self.calibrator.source_diversity_penalty,
             limit=selection_limit,
         )
-        if query.mode == "chat" and not reranked.degraded and len(selected) < selection_limit:
+        if (
+            query.mode in {"chat", "tool"}
+            and not reranked.degraded
+            and len(selected) < selection_limit
+        ):
             evidence_floor = (
                 self.abstention.rules.evidence_floor
                 if reranked.evidence_floor_override is None
@@ -700,7 +705,10 @@ class SharedRetrievalEngine:
                 latency,
                 triple,
                 debug=base_debug,
-                reranked_rows=selected if query.mode == "chat" else (),
+                limit=selection_limit,
+                reranked_rows=(
+                    selected if query.mode in {"chat", "tool"} else None
+                ),
             )
             if fallback_pack is not None:
                 return fallback_pack
@@ -1083,20 +1091,27 @@ class SharedRetrievalEngine:
         triple: TripleRecognitionResult,
         *,
         debug: Mapping[str, object],
-        reranked_rows: Sequence[PassageRerankDecision] = (),
+        limit: int,
+        reranked_rows: Sequence[PassageRerankDecision] | None = None,
     ) -> EvidencePack | None:
         """§0.1 chat/tool fallback lane: a bounded best-effort pack after an
         abstention. Pre-PPR fallback remains capped at four passages and one
-        per note; post-rerank chat fallback keeps the normal chat budget/MMR
-        selection. Both are passages only, registered and marked read like
-        normal evidence, with an unaccepted ``fallback=True`` decision.
+        per note; post-rerank chat/tool fallback keeps the requested budget
+        and MMR selection. Both are passages only, registered and marked read
+        like normal evidence, with an unaccepted ``fallback=True`` decision.
         """
 
-        if not self.fallback_on_abstain:
+        cap = max(0, int(limit))
+        if not self.fallback_on_abstain or cap == 0:
             return None
-        if reranked_rows:
+        if reranked_rows is not None:
             ordered = [
-                (row.candidate.passage_id, float(row.score)) for row in reranked_rows
+                (
+                    row.candidate.passage_id,
+                    float(row.candidate.recall_score),
+                    float(row.score),
+                )
+                for row in reranked_rows
             ]
         else:
             best: dict[str, float] = {}
@@ -1112,31 +1127,28 @@ class SharedRetrievalEngine:
                         best[hit.target_id] = max(best.get(hit.target_id, 0.0), score)
             if not best:
                 return None
-            ordered = sorted(best.items(), key=lambda row: (-row[1], row[0]))
+            ordered = [
+                (passage_id, score, score)
+                for passage_id, score in sorted(
+                    best.items(), key=lambda row: (-row[1], row[0])
+                )
+            ]
         contexts = {
             row.passage_id: row
             for row in self.store.passage_contexts(
-                tuple(passage_id for passage_id, _score in ordered)
+                tuple(passage_id for passage_id, _recall, _rerank in ordered)
             )
         }
-        chosen: list[tuple[PassageContext, float]] = []
+        chosen: list[tuple[PassageContext, float, float]] = []
         seen_notes: set[str] = set()
-        cap = max(
-            0,
-            int(
-                config.CHAT_EVIDENCE_PASSAGES
-                if reranked_rows
-                else config.RETRIEVAL_FALLBACK_PASSAGES
-            ),
-        )
-        for passage_id, score in ordered:
+        for passage_id, retrieval_score, rerank_score in ordered:
             row = contexts.get(passage_id)
             if row is None or len(chosen) >= cap:
                 continue
-            if not reranked_rows and row.note_id in seen_notes:
+            if reranked_rows is None and row.note_id in seen_notes:
                 continue
             seen_notes.add(row.note_id)
-            chosen.append((row, score))
+            chosen.append((row, retrieval_score, rerank_score))
         if not chosen:
             return None
         note_rows = {
@@ -1145,7 +1157,7 @@ class SharedRetrievalEngine:
         }
         note_ref_by_id: dict[str, str] = {}
         passages: list[EvidencePassage] = []
-        for row, score in chosen:
+        for row, retrieval_score, rerank_score in chosen:
             note_ref = note_ref_by_id.get(row.note_id)
             if note_ref is None:
                 note_ref = self.registry.register(
@@ -1169,8 +1181,8 @@ class SharedRetrievalEngine:
                     char_end=row.char_end,
                     created=row.created,
                     modified=row.modified,
-                    retrieval_score=score,
-                    rerank_score=score,
+                    retrieval_score=retrieval_score,
+                    rerank_score=rerank_score,
                     low_confidence=True,
                 )
             )
@@ -1190,7 +1202,7 @@ class SharedRetrievalEngine:
         )
         fallback_decision = RetrievalDecision(
             accepted=False,
-            confidence=max(score for _row, score in chosen),
+            confidence=max(rerank_score for _row, _recall, rerank_score in chosen),
             reason="fallback_low_confidence",
             accepted_heads=decision.accepted_heads,
             rejected_heads=decision.rejected_heads,
