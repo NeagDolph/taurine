@@ -159,6 +159,18 @@ class _UnavailableRemotePairScorer:
 def _openrouter_pair_reranker() -> OpenRouterRerankClient:
     import os
 
+    # Prefer Cohere's native rerank endpoint when a key is present (one hop
+    # fewer, same model and identical scores); fall back to the OpenRouter
+    # proxy otherwise.
+    cohere_key = os.environ.get("COHERE_API_KEY", "")
+    if config.RERANK_API_PROVIDER == "cohere" and cohere_key:
+        return OpenRouterRerankClient(
+            cohere_key,
+            model_id=config.COHERE_RERANK_MODEL,
+            base_url=config.COHERE_BASE_URL,
+            provider="Cohere",
+            key_env="COHERE_API_KEY",
+        )
     return OpenRouterRerankClient(
         os.environ.get("OPEN_ROUTER_API_KEY", ""),
         model_id=config.RERANK_API_MODEL,

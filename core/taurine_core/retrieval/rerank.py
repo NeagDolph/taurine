@@ -33,18 +33,31 @@ class RerankError(RuntimeError):
 
 
 class OpenRouterRerankClient:
+    """Cohere-shaped /rerank client; also speaks to api.cohere.com directly.
+
+    OpenRouter's /rerank proxy and Cohere's native v2/rerank share request
+    and response schemas, so one client serves both — base_url/provider
+    select the host. Scores are bit-identical (same underlying model), so
+    the calibrated floors remain valid either way.
+    """
+
     def __init__(
         self,
         api_key: str,
         *,
         model_id: str,
+        base_url: str | None = None,
+        provider: str = "OpenRouter",
+        key_env: str = "OPEN_ROUTER_API_KEY",
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not api_key:
-            raise RerankError("OPEN_ROUTER_API_KEY is required for OpenRouter reranking")
+            raise RerankError(f"{key_env} is required for {provider} reranking")
         self._api_key = api_key
         self.model_id = str(model_id)
+        self._base_url = str(base_url or config.OPENROUTER_BASE_URL)
+        self._provider = provider
         self._sleep = sleep
         self._client = httpx.Client(
             transport=transport,
@@ -66,10 +79,10 @@ class OpenRouterRerankClient:
         attempts = max(1, int(config.RERANK_API_ATTEMPTS))
         for attempt in range(attempts):
             if deadline_at is not None and time.monotonic() >= deadline_at:
-                raise ModelDeadlineExceeded("OpenRouter reranking deadline exceeded")
+                raise ModelDeadlineExceeded(f"{self._provider} reranking deadline exceeded")
             try:
                 response = self._client.post(
-                    f"{config.OPENROUTER_BASE_URL}/rerank",
+                    f"{self._base_url}/rerank",
                     headers={"Authorization": f"Bearer {self._api_key}"},
                     json={
                         "model": self.model_id,
@@ -81,7 +94,7 @@ class OpenRouterRerankClient:
             except httpx.TransportError as exc:
                 if attempt + 1 >= attempts:
                     raise RerankError(
-                        "OpenRouter reranking transport failed "
+                        f"{self._provider} reranking transport failed "
                         f"after {attempts} attempts"
                     ) from exc
                 self._backoff(attempt)
@@ -93,7 +106,7 @@ class OpenRouterRerankClient:
             if retryable and attempt + 1 < attempts:
                 self._backoff(attempt)
                 continue
-            raise RerankError(f"OpenRouter reranking returned HTTP {status}")
+            raise RerankError(f"{self._provider} reranking returned HTTP {status}")
         raise AssertionError("rerank retry loop exhausted without returning or raising")
 
     def _backoff(self, attempt: int) -> None:

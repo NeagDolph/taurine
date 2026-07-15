@@ -348,6 +348,9 @@ SESSION_RESET_W = 0.35
 RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 # Neil's target is cohere/rerank-v4-pro; swap when OpenRouter adds that slug.
 RERANK_API_MODEL = "cohere/rerank-v3.5"
+RERANK_API_PROVIDER = "cohere"           # "cohere" (direct, needs COHERE_API_KEY) | "openrouter"
+COHERE_BASE_URL = "https://api.cohere.com/v2"
+COHERE_RERANK_MODEL = "rerank-v3.5"      # same model as the proxy — scores identical
 RERANK_MAX_CANDIDATES = 24
 # Round-3 measured the 8B-fitted dense curve's ~0.47 null ceiling above the
 # 0.35-0.46 true-match band on casual queries. Chat/tool therefore let Cohere
@@ -364,6 +367,11 @@ RERANK_API_FLOOR_OVERRIDES = {"accept": 0.30, "fallback": 0.05}
 # Live remains byte-for-byte strict while chat calibrates the Cohere scale.
 LIVE_RERANK_API_FLOOR_OVERRIDES = {"accept": 0.5, "fallback": 0.15}
 LIVE_RERANK_CANDIDATES = 30
+# Live retrieval deadline. 0.75s was calibrated for all-local inference;
+# with query embedding and reranking now cloud round-trips, one retrieval
+# spends ~0.3-0.7s per call before local work. The 8s ambient throttle
+# leaves ample headroom.
+LIVE_RETRIEVAL_DEADLINE_S = 3.0
 CHAT_RERANK_CANDIDATES = 60
 LIVE_EVIDENCE_PASSAGES = 8
 CHAT_EVIDENCE_PASSAGES = 12             # dense ablation budget; keep at least 8

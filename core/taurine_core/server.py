@@ -1054,6 +1054,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
                 clock,
                 span_extractor=span_extractor,
                 query_embedder=live_ambient.default_query_embedder,
+                deadline_budget_s=config.LIVE_RETRIEVAL_DEADLINE_S,
             ),
             grounding=grounding,
             trigger=SummaryTrigger(clock.now),
