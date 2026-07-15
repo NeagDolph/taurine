@@ -1,6 +1,6 @@
 {
  "artifact_version": "1",
- "hash": "sha256:5ba172ff4960ea9829f16b5858627c362a4a140a323aae98db33347032ae91d4",
+ "hash": "sha256:69acee9bbcfe07ea799d6b471da93af75b67d3fb178d06c51597d6221b5dd0f5",
  "model_manifest": {
   "embedding": "Qwen/Qwen3-Embedding-0.6B",
   "reranker": "Qwen/Qwen3-Reranker-0.6B",
@@ -70,36 +70,28 @@
        0.0
       ],
       [
-       0.3796,
-       0.3125
-      ],
-      [
        0.473,
-       0.3126
+       0.02
       ],
       [
-       0.5477,
-       0.4857
+       0.52,
+       0.5
       ],
       [
-       0.6395,
-       0.5789
-      ],
-      [
-       0.7521,
-       0.999
+       0.561,
+       0.9
       ],
       [
        1.0,
        1.0
       ]
      ],
-     "acceptance_floor": 0.415,
-     "sample_count": 99,
-     "trained_at": "self-calibrated-gpl",
+     "acceptance_floor": 0.5,
+     "sample_count": 8,
+     "trained_at": "hand-calibrated-2026-07-15-daily-chunks",
      "held_out": {
-      "rerank_pos_beats_top_negative": 0.921,
-      "heldout_queries": 38.0
+      "null_max": 0.473,
+      "real_min": 0.561
      }
     },
     "bm25": {
@@ -229,36 +221,24 @@
        0.0
       ],
       [
-       0.3796,
-       0.3125
+       0.44,
+       0.05
       ],
       [
-       0.473,
-       0.3126
-      ],
-      [
-       0.5477,
-       0.4857
-      ],
-      [
-       0.6395,
-       0.5789
-      ],
-      [
-       0.7521,
-       0.999
+       0.5,
+       0.6
       ],
       [
        1.0,
        1.0
       ]
      ],
-     "acceptance_floor": 0.355,
-     "sample_count": 99,
-     "trained_at": "self-calibrated-gpl",
+     "acceptance_floor": 0.3,
+     "sample_count": 8,
+     "trained_at": "hand-calibrated-2026-07-15-daily-chunks",
      "held_out": {
-      "rerank_pos_beats_top_negative": 0.921,
-      "heldout_queries": 38.0
+      "null_max": 0.473,
+      "real_min": 0.561
      }
     },
     "bm25": {
@@ -388,36 +368,24 @@
        0.0
       ],
       [
-       0.3796,
-       0.3125
+       0.44,
+       0.05
       ],
       [
-       0.473,
-       0.3126
-      ],
-      [
-       0.5477,
-       0.4857
-      ],
-      [
-       0.6395,
-       0.5789
-      ],
-      [
-       0.7521,
-       0.999
+       0.5,
+       0.6
       ],
       [
        1.0,
        1.0
       ]
      ],
-     "acceptance_floor": 0.355,
-     "sample_count": 99,
-     "trained_at": "self-calibrated-gpl",
+     "acceptance_floor": 0.3,
+     "sample_count": 8,
+     "trained_at": "hand-calibrated-2026-07-15-daily-chunks",
      "held_out": {
-      "rerank_pos_beats_top_negative": 0.921,
-      "heldout_queries": 38.0
+      "null_max": 0.473,
+      "real_min": 0.561
      }
     },
     "bm25": {
@@ -552,7 +520,7 @@
   "tool_ambiguity_high": 0.82
  },
  "rerank": {
-  "live_floor": 0.26,
+  "live_floor": 0.66,
   "chat_floor": 0.2
  },
  "nli": {
