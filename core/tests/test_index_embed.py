@@ -18,7 +18,17 @@ def test_inference_backend_helpers_resolve_model_dimension_and_reranker(monkeypa
     monkeypatch.setattr(config, "INFERENCE_BACKEND", "openrouter")
     assert config.embed_model_id() == config.EMBED_API_MODEL
     assert config.embed_dim() == 4096
+    # provider follows key presence: cohere-direct with a key, proxy without
+    monkeypatch.delenv("COHERE_API_KEY", raising=False)
     assert config.rerank_model_id() == config.RERANK_API_MODEL
+    assert config.rerank_api_floors("live") == config.RERANK_API_FLOOR_OVERRIDES_BY_MODEL[
+        "cohere/rerank-v3.5"
+    ]["live"]
+    monkeypatch.setenv("COHERE_API_KEY", "dummy")
+    assert config.rerank_model_id() == config.COHERE_RERANK_MODEL
+    assert config.rerank_api_floors("live") == config.RERANK_API_FLOOR_OVERRIDES_BY_MODEL[
+        "rerank-v4.0-pro"
+    ]["live"]
 
     monkeypatch.setattr(config, "INFERENCE_BACKEND", "unknown")
     with pytest.raises(ValueError, match="unsupported inference backend"):

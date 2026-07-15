@@ -162,10 +162,9 @@ def _openrouter_pair_reranker() -> OpenRouterRerankClient:
     # Prefer Cohere's native rerank endpoint when a key is present (one hop
     # fewer, same model and identical scores); fall back to the OpenRouter
     # proxy otherwise.
-    cohere_key = os.environ.get("COHERE_API_KEY", "")
-    if config.RERANK_API_PROVIDER == "cohere" and cohere_key:
+    if config.rerank_api_provider() == "cohere":
         return OpenRouterRerankClient(
-            cohere_key,
+            os.environ.get("COHERE_API_KEY", ""),
             model_id=config.COHERE_RERANK_MODEL,
             base_url=config.COHERE_BASE_URL,
             provider="Cohere",
@@ -288,11 +287,7 @@ class RetrievalRuntime:
             else self.artifact.rerank.chat_floor
         )
         if config.INFERENCE_BACKEND == "openrouter":
-            api_floors = (
-                config.LIVE_RERANK_API_FLOOR_OVERRIDES
-                if mode == "live"
-                else config.RERANK_API_FLOOR_OVERRIDES
-            )
+            api_floors = config.rerank_api_floors(mode)
             passage_reranker = LocalPassageReranker(
                 self.pair_scorer,
                 mode=mode,

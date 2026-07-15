@@ -350,7 +350,7 @@ RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 RERANK_API_MODEL = "cohere/rerank-v3.5"
 RERANK_API_PROVIDER = "cohere"           # "cohere" (direct, needs COHERE_API_KEY) | "openrouter"
 COHERE_BASE_URL = "https://api.cohere.com/v2"
-COHERE_RERANK_MODEL = "rerank-v3.5"      # same model as the proxy — scores identical
+COHERE_RERANK_MODEL = "rerank-v4.0-pro"  # direct-only: OpenRouter proxy does not carry v4
 RERANK_MAX_CANDIDATES = 24
 # Round-3 measured the 8B-fitted dense curve's ~0.47 null ceiling above the
 # 0.35-0.46 true-match band on casual queries. Chat/tool therefore let Cohere
@@ -364,6 +364,20 @@ RERANK_API_TIMEOUT_S = 30.0
 # Provisional from Cohere score anatomy; the orchestrator validates these on
 # the 15-question calibration set before replacing them with fitted floors.
 RERANK_API_FLOOR_OVERRIDES = {"accept": 0.30, "fallback": 0.05}
+# Floors are score-distribution-specific. rerank-v4.0-pro scores run far
+# hotter than v3.5 (corpus median 0.333 vs 0.021); these v4 values are the
+# v3.5 floors quantile-mapped over 191 (query, passage) score pairs drawn
+# from the real corpus — provisional until real calibration labels exist.
+RERANK_API_FLOOR_OVERRIDES_BY_MODEL = {
+    "rerank-v4.0-pro": {
+        "chat": {"accept": 0.65, "fallback": 0.45},
+        "live": {"accept": 0.80, "fallback": 0.60},
+    },
+    "cohere/rerank-v3.5": {
+        "chat": {"accept": 0.30, "fallback": 0.05},
+        "live": {"accept": 0.50, "fallback": 0.15},
+    },
+}
 # Live remains byte-for-byte strict while chat calibrates the Cohere scale.
 LIVE_RERANK_API_FLOOR_OVERRIDES = {"accept": 0.5, "fallback": 0.15}
 LIVE_RERANK_CANDIDATES = 30
@@ -386,12 +400,31 @@ RETRIEVAL_FALLBACK_PASSAGES = 4          # fallback pack cap: 4 passages / 0 fac
 EVIDENCE_NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
 
 
+def rerank_api_provider() -> str:
+    """Effective API rerank provider: cohere-direct needs its key present."""
+    import os
+
+    if RERANK_API_PROVIDER == "cohere" and os.environ.get("COHERE_API_KEY"):
+        return "cohere"
+    return "openrouter"
+
+
 def rerank_model_id() -> str:
     if INFERENCE_BACKEND == "openrouter":
+        if rerank_api_provider() == "cohere":
+            return COHERE_RERANK_MODEL
         return RERANK_API_MODEL
     if INFERENCE_BACKEND == "local":
         return RERANK_MODEL
     raise ValueError(f"unsupported inference backend: {INFERENCE_BACKEND!r}")
+
+
+def rerank_api_floors(mode: str) -> dict:
+    """Accept/fallback floors matched to the ACTIVE api rerank model."""
+    table = RERANK_API_FLOOR_OVERRIDES_BY_MODEL.get(rerank_model_id())
+    if table is not None:
+        return table["live" if mode == "live" else "chat"]
+    return LIVE_RERANK_API_FLOOR_OVERRIDES if mode == "live" else RERANK_API_FLOOR_OVERRIDES
 
 # ── grounding / graph traversal (latent retrieval, no LLM) ─────────────
 GROUNDING_HYSTERESIS = 1.15              # challenger must beat incumbent by this factor

@@ -110,6 +110,8 @@ def test_openrouter_mode_uses_provisional_cohere_floors_for_chat_only(
     monkeypatch.setattr(
         "taurine_core.retrieval.runtime._openrouter_pair_reranker", lambda: remote
     )
+    # pin the provider: ambient COHERE_API_KEY must not flip model/floors
+    monkeypatch.delenv("COHERE_API_KEY", raising=False)
 
     runtime = RetrievalRuntime(database)
     try:
