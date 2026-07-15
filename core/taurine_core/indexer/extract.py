@@ -137,12 +137,29 @@ def extract_notes_dispatch(
     if selected == "relex":
         return extract_relex.extract_notes(notes, tokenizer=tokenizer, progress=progress)
     if selected in {"hybrid", "union"}:
-        gliner_results = extract_notes(notes, tokenizer=tokenizer, progress=None)
+        # Both passes report through the caller's progress callback, mapping
+        # pass 1 to [0, N/2] and pass 2 to [N/2, N]. This is not cosmetic:
+        # the sync status UI feeds off these ticks, and the build's cancel
+        # check runs inside the callback — with progress=None a full-corpus
+        # two-model extraction shows "0/N" for its entire runtime and cannot
+        # be cancelled until it finishes.
+        total = len(notes)
+        pass1 = (
+            None
+            if progress is None
+            else lambda done, _t: progress(done // 2, total)
+        )
+        gliner_results = extract_notes(notes, tokenizer=tokenizer, progress=pass1)
         # Hybrid needs GLiNER2 outputs, not both multi-GB models resident at
         # once. Release its process cache before loading Relex; active callers
         # retain their own references and later span queries reload lazily.
         spans.release_shared_model()
-        relex_results = extract_relex.extract_notes(notes, tokenizer=tokenizer, progress=None)
+        pass2 = (
+            None
+            if progress is None
+            else lambda done, _t: progress(total // 2 + done // 2, total)
+        )
+        relex_results = extract_relex.extract_notes(notes, tokenizer=tokenizer, progress=pass2)
         combine = (
             extract_relex.merge_union
             if selected == "union"
