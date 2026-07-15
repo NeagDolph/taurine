@@ -37,11 +37,11 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Mapping, Sequence
 from uuid import uuid4
 
 from .. import config
+from ..dates import current_datetime_line, evidence_date, timestamp_date
 from ..indexer.store import Index
 from ..llm import OpenRouterClient
 from ..ports import LLMError, SpanExtractorPort
@@ -1008,7 +1008,7 @@ class ChatEngine:
 
 
 def _system_prompt(profile_block: str = "") -> str:
-    prompt = (
+    prompt = current_datetime_line(time.time()) + "\n" + (
         "You answer questions over the user's personal knowledge base. Every factual "
         "sentence must cite an exact [E#] passage, a supported [F#] fact, or both. [N#] "
         "is navigation metadata and cannot ground a factual claim. Cite only identifiers "
@@ -1032,7 +1032,7 @@ def _system_prompt(profile_block: str = "") -> str:
 
 def _evidence_block(
     pack: EvidencePack,
-    support: Mapping[str, tuple[str, str, str]] | None = None,
+    support: Mapping[str, tuple[str, ...]] | None = None,
 ) -> str:
     fallback = bool(getattr(pack.decision, "fallback", False))
     if not pack.decision.accepted and not fallback:
@@ -1053,9 +1053,9 @@ def _evidence_block(
 
     def append_passage(item: EvidencePassage) -> None:
         lines.append(
-            f'[{item.evidence_id}] [{notes.get(item.note_id, item.note_id)}] "{item.title}" '
-            f"({item.source}, chars {item.char_start}-{item.char_end})\n"
-            f"[{_passage_month(item)}] {item.text}"
+            f"[{item.evidence_id}] ({evidence_date(item)}) {item.text}\n"
+            f'  [{notes.get(item.note_id, item.note_id)}] "{item.title}" '
+            f"({item.source}, chars {item.char_start}-{item.char_end})"
         )
 
     for item in accepted_passages:
@@ -1073,7 +1073,11 @@ def _evidence_block(
         return "\n".join(lines) if lines else "none"
     rendered_refs = {row.evidence_id for row in pack.passages}
     for fact in pack.facts:
-        valid = f"; valid={fact.valid_from or '?'}..{fact.valid_to or '?'}"
+        valid = (
+            f"; observed={timestamp_date(fact.observed_at)}; "
+            f"valid={timestamp_date(fact.valid_from)}"
+            f"..{timestamp_date(fact.valid_to, unknown='open')}"
+        )
         # M6: advertise only support refs the model can actually cite —
         # rendered passages plus the exposed (read) support snippet.
         exposed = (support or {}).get(fact.fact_ref)
@@ -1088,24 +1092,11 @@ def _evidence_block(
             f"status={fact.status}{valid}; supported by {sources}"
         )
         if exposed is not None:
-            ref, title, snippet = exposed
-            lines.append(f'  [{ref}] "{title}": "{snippet}"')
+            ref, title, date, snippet = exposed
+            lines.append(f'  [{ref}] ({date}) "{title}": "{snippet}"')
     for path in pack.paths:
         lines.append(f"[{path.path_id}] {path.rendered}")
     return "\n".join(lines) if lines else "none"
-
-
-def _passage_month(item: EvidencePassage) -> str:
-    """Render the note's best available timestamp at month precision."""
-
-    for value in (item.modified, item.created):
-        try:
-            timestamp = float(value)
-            if timestamp > 0.0:
-                return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m")
-        except (OverflowError, OSError, ValueError):
-            continue
-    return "unknown-date"
 
 
 def _age_label(age_days: float) -> str:

@@ -25,7 +25,11 @@ class ToolRetriever:
             decision=RetrievalDecision(True, .91, "accepted", ("dense", "triple")),
             query=RetrievalQuery(query, "tool", now),
             passages=(
-                EvidencePassage("E1", "p1", "n1", "Roadmap", "obsidian", "Launch moved to July 18.", 4, 28, 1, 2, .7, .9),
+                EvidencePassage(
+                    "E1", "p1", "n1", "Roadmap", "obsidian",
+                    "Launch moved to July 18.", 4, 28, 1, 2, .7, .9,
+                    passage_date="2026-07-18",
+                ),
             ),
             facts=(
                 EvidenceFact("F1", ("f1",), "Roadmap", "launch_date", "July 18", "forward", "active", 2, None, None, .9, ("E1",)),
@@ -75,6 +79,7 @@ def test_search_evidence_returns_exact_registered_evidence() -> None:
     assert payload["decision"]["accepted"] is True
     assert payload["passages"][0]["evidence_id"] == "E1"
     assert payload["passages"][0]["text"] == "Launch moved to July 18."
+    assert payload["passages"][0]["passage_date"] == "2026-07-18"
     assert payload["facts"][0]["fact_ref"] == "F1"
     assert retriever.calls == [("search", "roadmap", 4, "current", 10.0)]
     assert step.kind == "search"

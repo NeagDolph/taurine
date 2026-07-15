@@ -70,6 +70,8 @@ class EvidencePassage:
     path_ids: tuple[str, ...] = ()
     # Chat/tool evidence that did not clear the rerank acceptance floor.
     low_confidence: bool = False
+    # Exact local iMessage day, else the note modified/created date at serving.
+    passage_date: str | None = None
 
 
 @dataclass(frozen=True)

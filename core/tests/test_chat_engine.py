@@ -423,11 +423,12 @@ async def test_pre_retrieval_toggle_off_preserves_legacy_prompt_and_events(
     assert [event["type"] for event in events[:4]] == [
         "chat_meta", "chat_ack", "chat_retrieval", "chat_delta",
     ]
-    assert llm.calls[0]["messages"][-1]["content"] == (
-        '<evidence>\n[E1] [N1] "Roadmap" (obsidian, chars 0-12)\n[2026-07] Roadmap gist\n'
-        '[F1] Roadmap — relates_to → Beta; status=active; valid=?..?; supported by [E1]\n'
-        "</evidence>\n\nQuestion"
-    )
+    content = llm.calls[0]["messages"][-1]["content"]
+    assert content.startswith("<evidence>\n[E1] (")
+    assert ') Roadmap gist\n  [N1] "Roadmap" (obsidian, chars 0-12)' in content
+    assert "status=active; observed=" in content
+    assert "valid=?..open; supported by [E1]" in content
+    assert content.endswith("</evidence>\n\nQuestion")
 
 
 @pytest.mark.asyncio
@@ -1045,11 +1046,15 @@ async def test_fact_support_snippet_is_rendered_and_citable(store: Any) -> None:
                 trace=replace(pack.trace, read_ids=("N1", "E1", "F1")),
             )
 
-        def expose_fact_support(self, pack: EvidencePack) -> dict[str, tuple[str, str, str]]:
+        def expose_fact_support(
+            self, pack: EvidencePack
+        ) -> dict[str, tuple[str, str, str, str]]:
             del pack
             self.exposed += 1
             self.registry.mark_read("E2")
-            return {"F1": ("E2", "Roadmap", "Armaan owns the review.")}
+            return {
+                "F1": ("E2", "Roadmap", "2026-07-15", "Armaan owns the review.")
+            }
 
         def turn_pack(self) -> EvidencePack:
             pack = self.context_pack("audit", now=1.0)
@@ -1074,7 +1079,7 @@ async def test_fact_support_snippet_is_rendered_and_citable(store: Any) -> None:
 
     evidence_message = llm.calls[0]["messages"][-1]["content"]
     assert 'supported by [E1] [E2]' in evidence_message
-    assert '[E2] "Roadmap": "Armaan owns the review."' in evidence_message
+    assert '[E2] (2026-07-15) "Roadmap": "Armaan owns the review."' in evidence_message
     done = next(event for event in events if event["type"] == "chat_done")["message"]
     assert done["content"] == "Armaan owns the review [E2]."
     assert done["cited_ids"] == ["E2"]
@@ -1183,6 +1188,8 @@ async def test_fallback_pack_renders_low_confidence_header_and_validates(store: 
 
 
 def test_chat_evidence_dates_passages_and_labels_only_below_floor_rows() -> None:
+    from datetime import datetime
+
     pack = EvidencePack(
         decision=RetrievalDecision(True, 0.8, "accepted_high_precision_head"),
         query=RetrievalQuery("When?", "chat", 0.0),
@@ -1193,7 +1200,8 @@ def test_chat_evidence_dates_passages_and_labels_only_below_floor_rows() -> None
             ),
             EvidencePassage(
                 "E2", "p2", "n2", "Old", "imessage", "Older uncertain evidence.",
-                0, 25, 1667260800.0, 0.0, 0.7, 0.2, low_confidence=True,
+                0, 25, 1667260800.0, 0.0, 0.7, 0.2,
+                low_confidence=True, passage_date="2022-10-31",
             ),
         ),
         facts=(),
@@ -1207,9 +1215,40 @@ def test_chat_evidence_dates_passages_and_labels_only_below_floor_rows() -> None
 
     block = engine_module._evidence_block(pack)
 
-    assert "[2024-05] Current evidence." in block
-    assert "[2022-11] Older uncertain evidence." in block
+    modified_date = datetime.fromtimestamp(1714521600.0).astimezone().strftime("%Y-%m-%d")
+    assert f"[E1] ({modified_date}) Current evidence." in block
+    assert "[E2] (2022-10-31) Older uncertain evidence." in block
     assert block.index("[E1]") < block.index("LOW-CONFIDENCE CONTEXT") < block.index("[E2]")
+
+
+def test_chat_system_prompt_datetime_is_recomputed_between_turns(
+    store: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime
+
+    llm = FakeLLM(streams=[])
+    engine = ChatEngine(store, llm, MemoryLogger())
+    clock = [1_720_000_000.0]
+    monkeypatch.setattr(engine_module.time, "time", lambda: clock[0])
+
+    first = engine._build_messages(
+        "chat-clock", "first", None, current_user_id=-1, assistant_id=-2
+    )[0]["content"]
+    clock[0] += 3_600.0
+    second = engine._build_messages(
+        "chat-clock", "second", None, current_user_id=-3, assistant_id=-4
+    )[0]["content"]
+
+    expected_first = datetime.fromtimestamp(1_720_000_000.0).astimezone().strftime(
+        "Current date and time: %Y-%m-%d %H:%M %Z."
+    )
+    expected_second = datetime.fromtimestamp(1_720_003_600.0).astimezone().strftime(
+        "Current date and time: %Y-%m-%d %H:%M %Z."
+    )
+    assert first.splitlines()[0] == expected_first
+    assert second.splitlines()[0] == expected_second
+    assert first.splitlines()[0] != second.splitlines()[0]
 
 
 @pytest.mark.asyncio

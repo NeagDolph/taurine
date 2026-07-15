@@ -233,6 +233,7 @@ class EvidencePassagePayload(BaseModel):
     char_end: int
     created: float
     modified: float
+    passage_date: Optional[str] = None
     retrieval_score: float
     rerank_score: float
     path_ids: list[str] = []

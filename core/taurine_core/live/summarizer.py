@@ -13,6 +13,7 @@ import numpy as np
 from rapidfuzz import fuzz
 
 from taurine_core import config
+from taurine_core.dates import current_datetime_line, evidence_date, timestamp_date
 from taurine_core.indexer import store
 from taurine_core.indexer.store import Index
 from taurine_core.llm import OpenRouterClient
@@ -107,10 +108,11 @@ class Summarizer:
             open_actionables,
             profile_block=user_profile_block(self.index),
         )
+        system_prompt = current_datetime_line(time.time()) + "\n" + SYSTEM_PROMPT
         try:
             raw = await self.llm.complete_json(
                 config.SUMMARY_MODEL,
-                SYSTEM_PROMPT,
+                system_prompt,
                 prompt,
                 timeout_s=config.SUMMARY_TIMEOUT_S,
             )
@@ -119,7 +121,7 @@ class Summarizer:
             try:
                 raw = await self.llm.complete_json(
                     config.SUMMARY_FALLBACK_MODEL,
-                    SYSTEM_PROMPT,
+                    system_prompt,
                     prompt,
                     timeout_s=config.SUMMARY_TIMEOUT_S,
                 )
@@ -300,11 +302,15 @@ def _grounding_block(update: GroundingUpdate) -> str:
     lines: list[str] = []
     for row in update.support_passages:
         lines.append(
-            f'[{row.evidence_id}] [{_note_ref(row.note_id, update)}] '
-            f'"{row.title}" ({row.source}) — {row.text}'
+            f"[{row.evidence_id}] ({evidence_date(row)}) {row.text}\n"
+            f'  [{_note_ref(row.note_id, update)}] "{row.title}" ({row.source})'
         )
     for row in update.support_facts:
-        validity = f"valid {row.valid_from or 'unknown'}..{row.valid_to or 'open'}"
+        validity = (
+            f"observed={timestamp_date(row.observed_at)}; "
+            f"valid={timestamp_date(row.valid_from)}"
+            f"..{timestamp_date(row.valid_to, unknown='open')}"
+        )
         lines.append(
             f"[{row.fact_ref}] {row.subject} --{row.predicate}--> {row.object} "
             f"({row.status}; {validity}; sources {','.join(row.source_evidence_ids)})"

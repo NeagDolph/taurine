@@ -6,7 +6,9 @@ from typing import Any
 import pytest
 
 from taurine_core import config
+from taurine_core.dates import timestamp_date
 from taurine_core.live.grounding import GroundingUpdate
+from taurine_core.live import summarizer as summarizer_module
 from taurine_core.live.summarizer import Summarizer
 from taurine_core.ports import LLMError
 from taurine_core.retrieval.registry import EvidenceRegistry
@@ -84,7 +86,30 @@ async def test_prompt_supplies_exact_t_e_f_p_n_and_uncitable_profile(
     assert "[T1]" in prompt
     for ref in ("E1", "F1", "P1", "N1"):
         assert f"[{ref}]" in prompt
+    assert "[E1] (2026-07-14) Maya owns the launch." in prompt
+    assert f"observed={timestamp_date(2.0)}" in prompt
     assert "not evidence" in llm.calls[0].system
+
+
+async def test_live_summary_prompt_datetime_is_request_scoped_and_reused_for_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime
+
+    registry, update = _evidence()
+    llm = FakeLLM([LLMError("primary"), {"no_update": True}])
+    timestamp = 1_720_000_000.0
+    monkeypatch.setattr(summarizer_module.time, "time", lambda: timestamp)
+
+    result = await _summarizer(llm, registry, Entails()).summarize(
+        None, '[T1] [channel 0] "Maya owns the launch."', update, []
+    )
+
+    expected = datetime.fromtimestamp(timestamp).astimezone().strftime(
+        "Current date and time: %Y-%m-%d %H:%M %Z."
+    )
+    assert result is not None and result.no_update
+    assert [call.system.splitlines()[0] for call in llm.calls] == [expected, expected]
 
 
 async def test_accepts_sentence_level_validated_summary_and_evidence_snapshot() -> None:
@@ -342,7 +367,7 @@ def _evidence() -> tuple[EvidenceRegistry, GroundingUpdate]:
     registry.mark_read("P1")
     passage = EvidencePassage(
         "E1", "p1", "n1", "Launch", "obsidian", "Maya owns the launch.",
-        0, 21, 1.0, 2.0, 0.9, 0.95,
+        0, 21, 1.0, 2.0, 0.9, 0.95, passage_date="2026-07-14",
     )
     return registry, GroundingUpdate(
         decision=RetrievalDecision(True, 0.95, "accepted", ("dense", "triple")),

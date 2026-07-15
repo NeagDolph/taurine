@@ -8,6 +8,7 @@ import re
 from dataclasses import replace
 from typing import Any, Callable, Literal, Mapping, Sequence
 
+from taurine_core.dates import evidence_date
 from taurine_core.indexer.store import Index
 from taurine_core.ports import SpanExtractorPort
 from taurine_core.retrieval.evidence import SharedRetrievalEngine
@@ -340,6 +341,7 @@ class ChatRetriever:
                 modified=float(row.modified),
                 retrieval_score=0.0,
                 rerank_score=0.0,
+                passage_date=evidence_date(row),
             )
 
         missing_note_ids = [
@@ -412,7 +414,7 @@ class ChatRetriever:
 
     def expose_fact_support(
         self, pack: EvidencePack
-    ) -> dict[str, tuple[str, str, str]]:
+    ) -> dict[str, tuple[str, str, str, str]]:
         """M6: make non-selected fact-support passages citable.
 
         For each pack fact, at most one support ref that is not already a
@@ -422,7 +424,7 @@ class ChatRetriever:
         refs whose registry payload carries text are exposed."""
 
         rendered = {row.evidence_id for row in pack.passages}
-        exposed: dict[str, tuple[str, str, str]] = {}
+        exposed: dict[str, tuple[str, str, str, str]] = {}
         used_refs: set[str] = set()
         for fact in pack.facts:
             if len(exposed) >= _FACT_SUPPORT_MAX_TOTAL:
@@ -447,6 +449,7 @@ class ChatRetriever:
                 exposed[fact.fact_ref] = (
                     ref,
                     title,
+                    evidence_date(rows[0]) if rows else "unknown-date",
                     text[:_FACT_SUPPORT_SNIPPET_CHARS],
                 )
                 used_refs.add(ref)
@@ -576,6 +579,7 @@ class ChatRetriever:
                     "text": text,
                     "char_start": absolute_start,
                     "char_end": absolute_end,
+                    "passage_date": evidence_date(row),
                 }
             )
             consumed += len(text)
@@ -687,7 +691,7 @@ class ChatRetriever:
                     (evidence_ref, note_ref, path_ref, *matching_facts)
                 )
                 results.append(
-                    {"evidence_id": evidence_ref, "note": note_ref, "title": str(row.title), "source": str(row.source), "text": str(row.text), "fact_refs": matching_facts, "path": path_ref}
+                    {"evidence_id": evidence_ref, "note": note_ref, "title": str(row.title), "source": str(row.source), "text": str(row.text), "passage_date": evidence_date(row), "fact_refs": matching_facts, "path": path_ref}
                 )
                 paths.append({"path_id": path_ref, "rendered": rendered_path, "node_ids": list(next_nodes), "edge_kinds": list(next_kinds), "fact_refs": matching_facts})
                 if len(results) >= limit:
@@ -785,6 +789,7 @@ class ChatRetriever:
                         "title": str(passage.title),
                         "source": str(passage.source),
                         "text": str(passage.text),
+                        "passage_date": evidence_date(passage),
                     }
                 )
             identity = fact_source_identity(

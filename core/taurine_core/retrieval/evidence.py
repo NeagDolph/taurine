@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 import numpy as np
 
 from taurine_core import config
+from taurine_core.dates import evidence_date
 from taurine_core.indexer.base_graph import (
     BaseEdge,
     FactGraphInput,
@@ -72,6 +73,7 @@ class PassageContext(Protocol):
     char_end: int
     created: float
     modified: float
+    passage_date: str | None
 
 
 class NoteContext(Protocol):
@@ -940,6 +942,7 @@ class SharedRetrievalEngine:
                     rerank_score=row.score,
                     path_ids=tuple(path_refs_by_target.get(passage.passage_id, ())),
                     low_confidence=not row.accepted,
+                    passage_date=evidence_date(passage),
                 )
             )
 
@@ -1240,6 +1243,7 @@ class SharedRetrievalEngine:
                     retrieval_score=retrieval_score,
                     rerank_score=rerank_score,
                     low_confidence=True,
+                    passage_date=evidence_date(row),
                 )
             )
         notes = _assemble_notes(

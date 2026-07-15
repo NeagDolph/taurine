@@ -47,7 +47,7 @@
 - [x] Run the store/build tests and confirm the missing column/version failures.
 - [x] Persist `passage_date`, bump the passage algorithm version to `passages-v2`, and include it in the build config manifest so identical source snapshots receive a new build identity.
 - [x] Run the focused unit-1 tests, then the full suite.
-- [ ] Commit only unit-1 files with the required trailer.
+- [x] Commit only unit-1 files with the required trailer.
 
 ### Task 2: Dates in every evidence prompt
 
@@ -67,14 +67,14 @@
 - Produces: `EvidencePassage.passage_date` and `EvidencePassagePayload.passage_date`.
 - Produces: a first-line `Current date and time: YYYY-MM-DD HH:MM ZZZ.` string generated for every chat request and every live-summary request.
 
-- [ ] Add tests for exact `YYYY-MM-DD` evidence rendering: passage date first, otherwise modified, otherwise created.
-- [ ] Run them and confirm current month-only rendering fails.
-- [ ] Thread `passage_date` into every evidence-passage construction/payload and use one shared date formatter in initial chat evidence, live-summary evidence, and chat tool JSON payloads.
-- [ ] Add a two-turn chat test with `time.time()` advanced between prompt builds and assert distinct first lines.
-- [ ] Add a live-summary test asserting the same request-time line is first in both primary and fallback system prompts.
-- [ ] Run the clock tests and confirm the static prompts fail.
-- [ ] Construct chat and summary system strings per request using the local timezone and its abbreviation.
-- [ ] Run focused unit-2 tests, unchanged live tests, then the full suite.
+- [x] Add tests for exact `YYYY-MM-DD` evidence rendering: passage date first, otherwise modified, otherwise created.
+- [x] Run them and confirm current month-only rendering fails.
+- [x] Thread `passage_date` into every evidence-passage construction/payload and use one shared date formatter in initial chat evidence, live-summary evidence, and chat tool JSON payloads.
+- [x] Add a two-turn chat test with `time.time()` advanced between prompt builds and assert distinct first lines.
+- [x] Add a live-summary test asserting the same request-time line is first in both primary and fallback system prompts.
+- [x] Run the clock tests and confirm the static prompts fail.
+- [x] Construct chat and summary system strings per request using the local timezone and its abbreviation.
+- [x] Run focused unit-2 tests, unchanged live tests, then the full suite.
 - [ ] Commit only unit-2 files with the required trailer.
 
 ### Task 3: Dense-facts default chat routing

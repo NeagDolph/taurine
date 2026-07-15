@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from taurine_core.dates import timestamp_date
 from taurine_core.chat.retrieval import ChatRetriever
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.retrieval.types import (
@@ -336,6 +337,7 @@ def test_read_note_is_query_relevant_registered_and_paginated() -> None:
     assert page["truncated"] is True
     assert page["next_cursor"]
     assert page["passages"][0]["text"] == "Armaan owns the review."
+    assert page["passages"][0]["passage_date"] == timestamp_date(2.0)
     assert page["passages"][0]["evidence_id"].startswith("E")
     assert page["passages"][0]["evidence_id"] in retriever.registry.refs("read")
     record = retriever.registry.resolve(page["passages"][0]["evidence_id"])
@@ -466,6 +468,7 @@ def test_expose_fact_support_marks_bounded_support_refs_read() -> None:
         evidence_id=selected, passage_id="p1", note_id="n1", title="Roadmap",
         source="obsidian", text="The roadmap launches on July 18.", char_start=20,
         char_end=52, created=1.0, modified=2.0, retrieval_score=.8, rerank_score=.9,
+        passage_date="2026-07-18",
     )
     pack = EvidencePack(
         decision=RetrievalDecision(True, .9, "accepted"),
@@ -485,7 +488,8 @@ def test_expose_fact_support_marks_bounded_support_refs_read() -> None:
     assert exposed["F1"][0] == support_a
     assert exposed["F2"][0] == support_b
     assert exposed["F1"][1] == "Roadmap"  # title resolved from the store
-    assert exposed["F1"][2] == "Armaan owns the review."
+    assert exposed["F1"][2] == timestamp_date(2.0)
+    assert exposed["F1"][3] == "Armaan owns the review."
     for ref in (support_a, support_b):
         record = registry.resolve(ref)
         assert record is not None and "read" in record.states
@@ -521,6 +525,7 @@ def test_note_and_directed_fact_expansion_use_registered_graph_node_ids() -> Non
         max_hops=1,
         limit=4,
     )
+    assert note_result["results"][0]["passage_date"] == timestamp_date(2.0)
     fact_ref = retriever.registry.register(
         "fact",
         "build-1\x1fe-a\x1fdepends_on\x1fe-b",
