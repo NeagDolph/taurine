@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { MessageMarkdown, type CitationTarget } from '../../components/chat/MessageMarkdown'
-import { ChatClient, type ChatEvent, type ChatMessage } from '../../lib/chat'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { ChatClient, type ChatEvent } from '../../lib/chat'
 import type { ChatNotesEdit } from './MeetingChat'
 
 export interface AiAnchor {
@@ -17,17 +16,19 @@ interface AiInlineProps {
   selection: string
   onClose(): void
   onNotesEdit(edit: ChatNotesEdit): void
-  onOpenNote(noteId: string): void
-  onInsert(md: string): void
+  /** Streamed answer markdown — written directly into the note as gray lines. */
+  onAnswer(md: string, done: boolean): void
+  /** A new ask is starting — the editor resets its stream anchor. */
+  onAskStarted(): void
 }
 
 type Phase = 'idle' | 'running' | 'done' | 'error'
 
 /**
- * In-editor "Ask AI" (slash-menu) — a floating prompt anchored at the cursor
- * that runs a turn of the meeting chat agent (KB search, [M#] meeting
- * context, edit_notes). Shares the meeting's chat thread, so inline asks
- * appear in the bottom drawer history too.
+ * In-editor "Ask AI" (slash-menu): a slim prompt anchored at the cursor that
+ * runs a turn of the meeting chat agent. The answer never renders here — it
+ * streams straight into the note as AI-authored (gray) content, Granola
+ * style. Shares the meeting's chat thread, so asks appear in the drawer too.
  */
 export function AiInline({
   meetingId,
@@ -37,20 +38,25 @@ export function AiInline({
   selection,
   onClose,
   onNotesEdit,
-  onOpenNote,
-  onInsert
+  onAnswer,
+  onAskStarted
 }: AiInlineProps): React.JSX.Element | null {
   const [prompt, setPrompt] = useState('')
   const [phase, setPhase] = useState<Phase>('idle')
-  const [answer, setAnswer] = useState('')
   const [activity, setActivity] = useState('')
-  const [message, setMessage] = useState<ChatMessage | null>(null)
   const [error, setError] = useState('')
   const [connected, setConnected] = useState(false)
   const clientRef = useRef<ChatClient | null>(null)
   const chatIdRef = useRef<string | null>(chatId)
   const messageIdRef = useRef<number | null>(null)
+  const answerRef = useRef('')
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const onAnswerRef = useRef(onAnswer)
+  const onNotesEditRef = useRef(onNotesEdit)
+  useEffect(() => {
+    onAnswerRef.current = onAnswer
+    onNotesEditRef.current = onNotesEdit
+  }, [onAnswer, onNotesEdit])
 
   const handleEvent = useCallback(
     (event: ChatEvent): void => {
@@ -61,7 +67,8 @@ export function AiInline({
           return
         case 'chat_delta':
           if (event.message_id === messageIdRef.current) {
-            setAnswer((current) => current + event.delta)
+            answerRef.current += event.delta
+            onAnswerRef.current(answerRef.current, false)
           }
           return
         case 'chat_activity':
@@ -71,7 +78,7 @@ export function AiInline({
           return
         case 'chat_notes_edit':
           if (event.meetingId === meetingId) {
-            onNotesEdit({
+            onNotesEditRef.current({
               editId: event.editId,
               anchor: event.anchor,
               occurrence: event.occurrence,
@@ -82,8 +89,10 @@ export function AiInline({
           return
         case 'chat_done':
           if (event.message_id === messageIdRef.current) {
-            setMessage(event.message)
-            setAnswer(event.message.content)
+            // The validated final content is authoritative (repair/stripping
+            // may have changed it relative to the streamed deltas).
+            answerRef.current = event.message.content
+            onAnswerRef.current(answerRef.current, true)
             setPhase('done')
             setActivity('')
           }
@@ -96,7 +105,7 @@ export function AiInline({
           return
       }
     },
-    [meetingId, onNotesEdit]
+    [meetingId]
   )
   const handleEventRef = useRef(handleEvent)
   useEffect(() => {
@@ -130,9 +139,8 @@ export function AiInline({
     if (open) {
       setPrompt('')
       setPhase('idle')
-      setAnswer('')
-      setMessage(null)
       setError('')
+      setActivity('')
     }
   }
   useEffect(() => {
@@ -152,32 +160,23 @@ export function AiInline({
     const question = prompt.trim()
     const client = clientRef.current
     if (!question || !client || phase === 'running') return
+    const framing =
+      '[Inline ask — your reply is written directly into the meeting notes at the cursor. ' +
+      'Write note-ready markdown: no preamble, no "here is", just the content.]'
     const wrapped = selection
-      ? `Regarding this part of my notes:\n> ${selection.replaceAll('\n', '\n> ')}\n\n${question}`
-      : question
+      ? `${framing}\nRegarding this part of my notes:\n> ${selection.replaceAll('\n', '\n> ')}\n\n${question}`
+      : `${framing}\n${question}`
+    onAskStarted()
     if (!client.send(chatIdRef.current ?? '', wrapped, [], meetingId)) {
       setError('Not connected')
       setPhase('error')
       return
     }
+    answerRef.current = ''
     setPhase('running')
-    setAnswer('')
-    setMessage(null)
     setError('')
     setActivity('Thinking…')
   }
-
-  const citations = useMemo(() => {
-    const map = new Map<string, CitationTarget>()
-    const evidence = message?.evidence
-    for (const item of evidence?.notes ?? []) {
-      map.set(item.note_ref, { title: item.title, noteId: item.note_id })
-    }
-    for (const passage of evidence?.passages ?? []) {
-      map.set(passage.evidence_id, { title: passage.text, noteId: passage.note_id })
-    }
-    return map
-  }, [message])
 
   if (!open || !anchor) return null
 
@@ -188,14 +187,14 @@ export function AiInline({
       role="dialog"
       aria-label="Ask AI"
     >
-      <div className="flex items-center gap-2 px-3 pt-2.5">
+      <div className="flex items-center gap-2 px-3 py-1.5">
         <span className="text-[13px]">✨</span>
         <input
           ref={inputRef}
           className="h-8 min-w-0 flex-1 border-0 bg-transparent text-[13px] text-fg outline-none placeholder:text-fg/35"
           value={prompt}
           placeholder={
-            selection ? 'Ask about the selected text…' : 'Ask your knowledge base anything…'
+            selection ? 'Ask about the selected text…' : 'Ask — the answer is written into your notes…'
           }
           aria-label="Ask AI"
           disabled={phase === 'running'}
@@ -204,53 +203,23 @@ export function AiInline({
             if (event.key === 'Enter') ask()
           }}
         />
-        <button
-          className="icon-button"
-          type="button"
-          aria-label="Close Ask AI"
-          onClick={onClose}
-        >
+        <button className="icon-button" type="button" aria-label="Close Ask AI" onClick={onClose}>
           ✕
         </button>
       </div>
 
       {phase === 'running' ? (
-        <div className="flex items-center gap-2 px-3.5 pb-3 pt-1.5">
+        <div className="flex items-center gap-2 border-t border-white/[0.07] px-3.5 py-2">
           <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
-          <span className="text-xs text-fg/55">{activity || 'Working…'}</span>
-          {answer ? null : <span className="sr-only">Waiting for the first tokens</span>}
+          <span className="text-xs text-fg/55">{activity || 'Writing into your notes…'}</span>
         </div>
       ) : null}
 
-      {answer ? (
-        <div className="max-h-[38vh] overflow-y-auto border-t border-white/[0.07] px-3.5 py-2.5 text-[13px] leading-relaxed">
-          <MessageMarkdown
-            markdown={answer}
-            citations={citations}
-            onOpenNote={onOpenNote}
-            streaming={phase === 'running'}
-          />
-        </div>
-      ) : null}
-
-      {phase === 'error' ? (
-        <p className="m-0 border-t border-white/[0.07] px-3.5 py-2.5 text-xs text-bad">{error}</p>
-      ) : null}
-
-      {phase === 'done' && answer ? (
-        <div className="flex items-center gap-2 border-t border-white/[0.07] px-3 py-2">
+      {phase === 'done' ? (
+        <div className="flex items-center gap-2 border-t border-white/[0.07] px-3.5 py-2">
+          <span className="text-xs text-ok">✓ Added to your notes</span>
           <button
-            className="primary-button compact"
-            type="button"
-            onClick={() => {
-              onInsert(answer)
-              onClose()
-            }}
-          >
-            Insert into notes
-          </button>
-          <button
-            className="secondary-button compact"
+            className="turn-action"
             type="button"
             disabled={!connected}
             onClick={() => {
@@ -262,6 +231,10 @@ export function AiInline({
             Ask again
           </button>
         </div>
+      ) : null}
+
+      {phase === 'error' ? (
+        <p className="m-0 border-t border-white/[0.07] px-3.5 py-2 text-xs text-bad">{error}</p>
       ) : null}
     </div>
   )

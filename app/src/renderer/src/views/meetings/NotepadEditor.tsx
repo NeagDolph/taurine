@@ -203,7 +203,91 @@ export function NotepadEditor({
   const [aiSelection, setAiSelection] = useState('')
   const aiBlockIdRef = useRef<string | null>(null)
 
+
+  // Streamed Ask-AI answers write straight into the note (Granola style):
+  // the growing markdown replaces its own previously inserted blocks on a
+  // throttle, and every flush registers provenance so the content renders
+  // gray from the first paint.
+  const aiStreamRef = useRef<{
+    blockIds: string[]
+    latestMd: string
+    writtenMd: string
+    timer: number | null
+    writing: boolean
+  }>({ blockIds: [], latestMd: '', writtenMd: '', timer: null, writing: false })
+
+  const resetAiStream = useCallback((): void => {
+    const stream = aiStreamRef.current
+    if (stream.timer !== null) window.clearTimeout(stream.timer)
+    // Follow-up asks continue after the previous answer, not over it.
+    const lastStreamed = stream.blockIds[stream.blockIds.length - 1]
+    if (lastStreamed && editor.getBlock(lastStreamed)) aiBlockIdRef.current = lastStreamed
+    aiStreamRef.current = { blockIds: [], latestMd: '', writtenMd: '', timer: null, writing: false }
+  }, [editor])
+
+  const flushAiStream = useCallback((): void => {
+    const stream = aiStreamRef.current
+    if (stream.writing || stream.latestMd === stream.writtenMd) return
+    stream.writing = true
+    const md = stream.latestMd
+    void (async () => {
+      try {
+        // Citation tokens are dead text outside the chat surface.
+        const cleaned = md
+          .replace(/\s*\[(?:N|E|F|P|T|M)\d+(?:,\s*(?:N|E|F|P|T|M)\d+)*\]/g, '')
+          .trim()
+        if (!cleaned) return
+        onAiInserted?.(cleaned)
+        const blocks = (await editor.tryParseMarkdownToBlocks(cleaned)) as NotepadBlock[]
+        if (blocks.length === 0) return
+        const existing = stream.blockIds.filter((id) => editor.getBlock(id))
+        if (existing.length > 0) {
+          const replaced = editor.replaceBlocks(existing, blocks)
+          stream.blockIds = replaced.insertedBlocks.map((block) => block.id)
+        } else {
+          const anchorId = aiBlockIdRef.current
+          const anchorBlock = anchorId ? editor.getBlock(anchorId) : undefined
+          const reference = anchorBlock ?? editor.document[editor.document.length - 1]
+          const inserted = reference
+            ? editor.insertBlocks(blocks, reference, 'after')
+            : editor.replaceBlocks(editor.document, blocks).insertedBlocks
+          stream.blockIds = inserted.map((block) => block.id)
+        }
+        stream.writtenMd = md
+      } finally {
+        stream.writing = false
+        // A newer delta (or the authoritative final content) arrived while
+        // this write was in flight — flush again so nothing is dropped.
+        if (stream.latestMd !== stream.writtenMd && stream.timer === null) {
+          flushAiStream()
+        }
+      }
+    })()
+  }, [editor, onAiInserted])
+
+  const handleAiAnswer = useCallback(
+    (md: string, done: boolean): void => {
+      const stream = aiStreamRef.current
+      stream.latestMd = md
+      if (done) {
+        if (stream.timer !== null) {
+          window.clearTimeout(stream.timer)
+          stream.timer = null
+        }
+        flushAiStream()
+        return
+      }
+      if (stream.timer !== null) return
+      stream.timer = window.setTimeout(() => {
+        stream.timer = null
+        flushAiStream()
+      }, 300)
+    },
+    [flushAiStream]
+  )
+
   const openAskAi = useCallback((): void => {
+    resetAiStream()
     const container = containerRef.current
     let anchor: AiAnchor = { top: 48, left: 0, width: container?.clientWidth ?? 540 }
     try {
@@ -231,28 +315,7 @@ export function NotepadEditor({
     setAiSelection(selected.trim())
     setAiAnchor(anchor)
     setAiOpen(true)
-  }, [editor])
-
-  const insertAiAnswer = useCallback(
-    (md: string): void => {
-      // Citation tokens are dead text outside the chat surface.
-      const cleaned = md.replace(/\s*\[(?:N|E|F|P|T|M)\d+(?:,\s*(?:N|E|F|P|T|M)\d+)*\]/g, '')
-      onAiInserted?.(cleaned)
-      void (async () => {
-        const blocks = (await editor.tryParseMarkdownToBlocks(cleaned)) as NotepadBlock[]
-        const anchorId = aiBlockIdRef.current
-        const anchorBlock = anchorId ? editor.getBlock(anchorId) : undefined
-        if (anchorBlock) {
-          editor.insertBlocks(blocks, anchorBlock, 'after')
-        } else {
-          const last = editor.document[editor.document.length - 1]
-          if (last) editor.insertBlocks(blocks, last, 'after')
-          else editor.replaceBlocks(editor.document, blocks)
-        }
-      })()
-    },
-    [editor, onAiInserted]
-  )
+  }, [editor, resetAiStream])
 
   // One capture handler covers links in both note content and suggestion
   // blocks: note://<id> opens the note on the map, everything else goes to
@@ -328,8 +391,8 @@ export function NotepadEditor({
           selection={aiSelection}
           onClose={() => setAiOpen(false)}
           onNotesEdit={onChatNotesEdit ?? (() => undefined)}
-          onOpenNote={onOpenNoteInMap ?? (() => undefined)}
-          onInsert={insertAiAnswer}
+          onAnswer={handleAiAnswer}
+          onAskStarted={resetAiStream}
         />
       ) : null}
     </div>
