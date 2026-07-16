@@ -146,3 +146,13 @@ LLM_REASONING_BY_MODEL["google/gemini-3.5-flash"] = low/minimal   # latency-sens
 - **Auto-sync after each meeting** costs a rebuild pass; acceptable (caches make it incremental), and it's queued not forced.
 - **Plate integration surface** (Slate model, markdown round-trip lossiness on exotic structures) — notes are simple prose/bullets; acceptable.
 - **Summary model swap** changes live-summary tone/costs for all sessions ($1.50/M in, $9/M out); fallback path unchanged if Gemini errors.
+
+## 8. Rev 2 — pilot feedback rework (2026-07-16, implemented directly by orchestrator)
+
+Neil's first-pilot feedback replaced several v1 decisions:
+- **Editor: BlockNote (MPL-2.0), not Plate.** Plate lacked working markdown input shortcuts; BlockNote has them natively (`* `, `# `, code blocks) plus a Notion-grade feel. Suggestions are a custom `suggestion` block type rendered INLINE in the document at their anchors (hover accept ✓ / deny ✕, rationale tooltip), always excluded from serialization until accepted.
+- **Final summary lands in the notepad** as one large pending suggestion appended below the user's notes (server appends it to `suggested_edits`; rides suggestions persistence). No separate final-summary card; the card is a slim live-only rolling summary strip.
+- **Granola-faithful layout:** meetings home list ↔ note page (serif title, chip row, centered 680px column), floating pill bottom bar (waveform transcript toggle + stop, "Ask anything", "What did I miss"), transcript and chat as floating overlay sheets. Transcript = compact chat bubbles (mic right, system audio left), search, copy, Insights toggle; stays mounted so scroll position survives open/close (fixes forced bottom-scroll).
+- **Call notification is an OS-level always-on-top panel window** (frameless, bottom-right of the screen, all Spaces, shown without focus steal) — visible when Taurine is hidden/minimized. Suppression state machine moved to the main process.
+- **Models:** `LIVE_SUMMARY_MODEL = deepseek/deepseek-v4-flash` (gemini rolling summaries were garbled), `FINAL_SUMMARY_MODEL = z-ai/glm-5.2`.
+- **Note links:** chat/summary/insights citation chips center the note on the map (never external/localhost); the notepad supports `note://<id>` deep links to the map.
