@@ -50,6 +50,7 @@ class SummarizerLike(Protocol):
         transcript_evidence: str,
         update: GroundingUpdate,
         open_actionables: list[Actionable],
+        notepad_md: str = "",
     ) -> Any: ...
 
 
@@ -90,6 +91,7 @@ class LiveSession:
         self.last_grounding: GroundingUpdate | None = None
         self._summary: MeetingSummary | None = None
         self._actionables: list[Actionable] = []
+        self._notepad_md = ""
         self._summary_task: asyncio.Task[None] | None = None
         self._topic_start_seq: int | None = None
         # User-set actionable statuses always win over summarizer snapshots
@@ -158,6 +160,9 @@ class LiveSession:
             if self._summary is not None
             else MeetingSummary()
         )
+
+    def set_notepad(self, text_md: str) -> None:
+        self._notepad_md = text_md
 
     async def set_actionable_status(self, actionable_id: str, status: str) -> None:
         if status not in {"confirmed", "dismissed"}:
@@ -247,7 +252,13 @@ class LiveSession:
             row for row in self._actionables if row.status != "dismissed"
         ]
         self._summary_task = asyncio.create_task(
-            self._run_summary(update, snapshot, transcript_evidence, open_actionables)
+            self._run_summary(
+                update,
+                snapshot,
+                transcript_evidence,
+                open_actionables,
+                self._notepad_md,
+            )
         )
         self._summary_task.add_done_callback(self._clear_summary_task)
 
@@ -257,6 +268,7 @@ class LiveSession:
         snapshot: SummaryLedgerSnapshot,
         transcript_evidence: str,
         open_actionables: list[Actionable],
+        notepad_md: str,
     ) -> None:
         # Any exit that neither accepts nor rejects the checkpoint —
         # including task cancellation — must release it, or the ledger stays
@@ -277,6 +289,7 @@ class LiveSession:
                     transcript_evidence,
                     update,
                     open_actionables,
+                    notepad_md,
                 )
             except Exception as exc:
                 reject(str(exc))

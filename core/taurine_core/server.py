@@ -86,6 +86,7 @@ from taurine_core.schemas import (
     MeetingUpdateRequest,
     NeighborRef,
     NotePreview,
+    NotepadMsg,
     OpenNoteMsg,
     ProfileGenerationStatus,
     StartMsg,
@@ -116,6 +117,9 @@ class LiveSessionLike(Protocol):
         ...
 
     async def set_actionable_status(self, actionable_id: str, status: str) -> None:
+        ...
+
+    def set_notepad(self, text_md: str) -> None:
         ...
 
     def current_summary(self) -> MeetingSummary:
@@ -1757,6 +1761,17 @@ async def _handle_control(
         live = ctx_holder[0].live
         if live is not None:
             await live.set_actionable_status(message.id, message.status)
+    elif isinstance(message, NotepadMsg):
+        context = ctx_holder[0]
+        if message.text_md is None:
+            return session_started
+        if message.meeting_id != context.meeting_id:
+            logging.getLogger("taurine.session").debug(
+                "ignoring notepad update for unbound meeting %s",
+                message.meeting_id,
+            )
+        elif context.live is not None:
+            context.live.set_notepad(message.text_md)
     elif isinstance(message, OpenNoteMsg):
         try:
             await asyncio.to_thread(runtime.open_note, message.note_id)
@@ -1765,7 +1780,9 @@ async def _handle_control(
     return session_started
 
 
-def _parse_control(raw: str) -> StartMsg | StopMsg | ActionableStatusMsg | OpenNoteMsg:
+def _parse_control(
+    raw: str,
+) -> StartMsg | StopMsg | NotepadMsg | ActionableStatusMsg | OpenNoteMsg:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("control message must be a JSON object")
@@ -1776,6 +1793,8 @@ def _parse_control(raw: str) -> StartMsg | StopMsg | ActionableStatusMsg | OpenN
         return StopMsg.model_validate(payload)
     if message_type == "actionable_status":
         return ActionableStatusMsg.model_validate(payload)
+    if message_type == "notepad":
+        return NotepadMsg.model_validate(payload)
     if message_type == "open_note":
         return OpenNoteMsg.model_validate(payload)
     raise ValueError(f"unsupported control type: {message_type}")

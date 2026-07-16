@@ -43,14 +43,29 @@ class OpenRouterClient:
         timeout_s: float | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if schema is None:
+            response_format: dict[str, Any] = {"type": "json_object"}
+        else:
+            schema_name = schema.get("title")
+            if not isinstance(schema_name, str) or not schema_name:
+                schema_name = "response"
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
         payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "response_format": {"type": "json_object"},
+            "response_format": response_format,
             # only route to providers that honor response_format
             "provider": {"require_parameters": True},
             **_reasoning_for(model),
@@ -275,9 +290,14 @@ def _parse_json_content(content: str) -> Any:
     """Parse model output that may wrap JSON in markdown fences or prose."""
     try:
         return json.loads(content)
-    except json.JSONDecodeError:
-        start = content.find("{")
-        end = content.rfind("}")
-        if start == -1 or end <= start:
-            raise
-        return json.loads(content[start : end + 1])
+    except json.JSONDecodeError as original_error:
+        decoder = json.JSONDecoder()
+        for start, character in enumerate(content):
+            if character != "{":
+                continue
+            try:
+                parsed, _end = decoder.raw_decode(content, start)
+            except json.JSONDecodeError:
+                continue
+            return parsed
+        raise original_error

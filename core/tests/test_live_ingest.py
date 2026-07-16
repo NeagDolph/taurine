@@ -67,7 +67,7 @@ class Trigger:
 class SummaryStub:
     results: list[SummaryResult | None]
     wait_on: asyncio.Event | None = None
-    calls: list[tuple[str, GroundingUpdate]] = field(default_factory=list)
+    calls: list[tuple[str, GroundingUpdate, str]] = field(default_factory=list)
     started: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def summarize(
@@ -76,9 +76,10 @@ class SummaryStub:
         transcript_evidence: str,
         update: GroundingUpdate,
         open_actionables: list[object],
+        notepad_md: str = "",
     ) -> SummaryResult | None:
         del state, open_actionables
-        self.calls.append((transcript_evidence, update))
+        self.calls.append((transcript_evidence, update, notepad_md))
         self.started.set()
         if self.wait_on is not None:
             await self.wait_on.wait()
@@ -140,6 +141,23 @@ async def test_accepted_summary_advances_only_snapshotted_sequence() -> None:
     assert session.ledger.last_accepted_summary_seq == 1
     assert [row.seq for row in session.ledger.pending()] == [2]
     assert any(row.type == "summary" and row.rev == 1 for row in events)
+
+
+async def test_notepad_is_snapshotted_into_summary_call() -> None:
+    registry = EvidenceRegistry()
+    summary = SummaryStub([SummaryResult(summary=None, no_update=True)])
+    session, _ = _session(
+        registry,
+        ambient=SequenceAmbient([_pack(registry)]),
+        trigger=Trigger([(True, "jaccard")]),
+        summarizer=summary,
+    )
+    session.set_notepad("# Decisions\nShip Friday")
+
+    await session.on_chunk(Chunk(channel=0, text="Ship Friday", ts=1.0))
+    await _drain(session)
+
+    assert summary.calls[0][2] == "# Decisions\nShip Friday"
 
 
 async def test_no_update_and_rejection_leave_transcript_checkpoint_pending() -> None:
@@ -358,9 +376,14 @@ async def test_rolling_summary_two_pass_real_summarizer_advances_checkpoint() ->
             self.responses = list(responses)
 
         async def complete_json(
-            self, model: str, system: str, user: str, timeout_s: float | None = None
+            self,
+            model: str,
+            system: str,
+            user: str,
+            timeout_s: float | None = None,
+            schema: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
-            del model, system, user, timeout_s
+            del model, system, user, timeout_s, schema
             return self.responses.pop(0)
 
     class Entails:

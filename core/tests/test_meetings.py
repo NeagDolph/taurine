@@ -257,6 +257,56 @@ def test_parse_start_control_accepts_optional_meeting_id() -> None:
     assert bound.meeting_id == "abc123"
 
 
+def test_parse_notepad_control_accepts_text_and_tolerates_missing_text() -> None:
+    populated = _parse_control(
+        json.dumps(
+            {"type": "notepad", "meeting_id": "abc123", "text_md": "# Notes"}
+        )
+    )
+    missing = _parse_control(
+        json.dumps({"type": "notepad", "meeting_id": "abc123"})
+    )
+
+    assert populated.meeting_id == "abc123"
+    assert populated.text_md == "# Notes"
+    assert missing.text_md is None
+
+
+def test_notepad_control_updates_only_the_bound_meeting(index: Index) -> None:
+    meeting = index.meeting_create("Bound")
+    live_sessions: list[FakeLiveSession] = []
+    runtime = _runtime(index, live_sessions)
+
+    with TestClient(create_app(runtime)) as client:
+        with client.websocket_connect("/session") as ws:
+            assert ws.receive_json()["type"] == "status"
+            ws.send_json(
+                {
+                    "type": "start",
+                    "channels": [{"id": 0, "label": "mic"}],
+                    "meeting_id": meeting["meeting_id"],
+                }
+            )
+            ws.send_json(
+                {
+                    "type": "notepad",
+                    "meeting_id": meeting["meeting_id"],
+                    "text_md": "# Priority",
+                }
+            )
+            ws.send_json(
+                {
+                    "type": "notepad",
+                    "meeting_id": "different-meeting",
+                    "text_md": "must be ignored",
+                }
+            )
+            ws.send_json({"type": "notepad", "meeting_id": meeting["meeting_id"]})
+            ws.send_json({"type": "stop"})
+
+    assert live_sessions[0].notepads == ["# Priority"]
+
+
 async def test_live_session_final_chunk_hook_uses_assigned_sequence() -> None:
     class NoopAmbient:
         async def on_window(self, *args: Any, **kwargs: Any) -> None:
@@ -340,6 +390,7 @@ def test_rest_patch_suggestions_only_changes_statuses(index: Index) -> None:
 class FakeLiveSession:
     on_final_chunk: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
     chunks: list[Chunk] = field(default_factory=list)
+    notepads: list[str] = field(default_factory=list)
     closed: bool = False
 
     async def on_chunk(self, chunk: Chunk) -> None:
@@ -358,6 +409,9 @@ class FakeLiveSession:
 
     async def set_actionable_status(self, actionable_id: str, status: str) -> None:
         del actionable_id, status
+
+    def set_notepad(self, text_md: str) -> None:
+        self.notepads.append(text_md)
 
     def current_summary(self) -> MeetingSummary:
         return MeetingSummary(summary_md=" | ".join(chunk.text for chunk in self.chunks))

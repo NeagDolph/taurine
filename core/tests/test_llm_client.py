@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from taurine_core import config
-from taurine_core.llm import OpenRouterClient
+from taurine_core.llm import OpenRouterClient, _parse_json_content
 from taurine_core.ports import LLMError
 
 
@@ -40,6 +40,49 @@ async def test_complete_json_posts_openrouter_json_object_request() -> None:
         {"role": "system", "content": "system text"},
         {"role": "user", "content": "user text"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_complete_json_posts_strict_json_schema_when_supplied() -> None:
+    requests: list[httpx.Request] = []
+    schema = {
+        "title": "live_summary",
+        "type": "object",
+        "properties": {"no_update": {"type": "boolean"}},
+        "required": ["no_update"],
+        "additionalProperties": False,
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"no_update": true}'}}]},
+        )
+
+    client = OpenRouterClient("secret-key", transport=httpx.MockTransport(handler))
+
+    result = await client.complete_json(
+        "model-a", "system text", "user text", schema=schema
+    )
+
+    assert result == {"no_update": True}
+    body = json.loads(requests[0].content)
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "live_summary",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+    assert body["provider"] == {"require_parameters": True}
+
+
+def test_parse_json_content_takes_first_object_before_gemini_trailing_garbage() -> None:
+    content = '{"ok": true}\n"gemini-2.5"}\n.5-pro-…'
+
+    assert _parse_json_content(content) == {"ok": True}
 
 
 @pytest.mark.asyncio
@@ -118,10 +161,12 @@ async def test_reasoning_parameter_is_per_model() -> None:
     await client.complete_json("z-ai/glm-5.2", "system", "user")
     await client.complete_json("deepseek/deepseek-v4-flash", "system", "user")
     await client.complete_json("deepseek/deepseek-chat", "system", "user")
+    await client.complete_json("google/gemini-3.5-flash", "system", "user")
 
     assert bodies[0]["reasoning"] == {"enabled": False}
     assert bodies[1]["reasoning"] == {"enabled": False}
     assert "reasoning" not in bodies[2]  # deepseek providers reject the parameter
+    assert bodies[3]["reasoning"] == {"effort": "low"}
 
 
 @pytest.mark.asyncio

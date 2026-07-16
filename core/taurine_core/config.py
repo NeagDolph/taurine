@@ -63,6 +63,7 @@ LLM_REASONING_BY_MODEL = {
     "z-ai/glm-5.2": {"enabled": False},
     "deepseek/deepseek-v4-pro": {"enabled": False},
     "deepseek/deepseek-v4-flash": {"enabled": False},
+    "google/gemini-3.5-flash": {"effort": "low"},
     # Grounded edge adjudication is a bounded verify/label task, not open
     # reasoning: gpt-oss defaults to medium effort (thousands of think-tokens
     # per call → ~100s latency and runaway malformed JSON). Low effort is the
@@ -242,6 +243,7 @@ FUZZY_SNAP_LABELS = ("person", "organization", "project")  # spans eligible for 
 
 # ── summarizer (spec 2026-07-08: one pass, change-triggered) ───────────
 SUMMARY_MODEL = "deepseek/deepseek-v4-flash"
+LIVE_SUMMARY_MODEL = "google/gemini-3.5-flash"
 SUMMARY_FALLBACK_MODEL = "deepseek/deepseek-chat"
 IDEA_SEARCH_MODEL = SUMMARY_MODEL        # idea-lens per-note alignment adjudication
 CONTEXT_ENRICH_MODEL = SUMMARY_MODEL     # situating prefixes for episodic passages (empty on failure)
@@ -251,6 +253,7 @@ CONTEXT_LLM_MIN_PASSAGES = 3             # hybrid: multi-passage threads receive
 CONTEXT_ENRICH_BATCH = 10                # passages per enrichment call, grouped by note
 CONTEXT_ENRICH_CONCURRENCY = 6           # bounded parallel enrichment calls
 SUMMARY_TIMEOUT_S = 20.0
+MEETING_NOTES_PROMPT_MAX_CHARS = 8000
 SUMMARY_MIN_INTERVAL_S = 25.0            # hard floor between summarizer passes
 SUMMARY_MAX_STALENESS_S = 240.0          # force a pass if new speech and this much elapsed
 SUMMARY_MIN_NEW_CHARS = 200              # don't resummarize silence

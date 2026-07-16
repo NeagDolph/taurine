@@ -63,9 +63,16 @@ class ConnectorError(Exception):
 
 class LLMPort(Protocol):
     async def complete_json(
-        self, model: str, system: str, user: str, timeout_s: float | None = None
+        self,
+        model: str,
+        system: str,
+        user: str,
+        timeout_s: float | None = None,
+        schema: dict | None = None,
     ) -> dict:
-        """One chat completion via OpenRouter, response_format json_object.
+        """One JSON chat completion via OpenRouter.
+
+        schema selects a strict json_schema response_format when supplied.
         timeout_s overrides config.LLM_TIMEOUT_S (long offline calls).
         Raises LLMError on HTTP/parse failure."""
         ...

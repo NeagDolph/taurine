@@ -32,6 +32,7 @@ class Call:
     system: str
     user: str
     timeout_s: float | None
+    schema: dict[str, Any] | None
 
 
 class FakeLLM:
@@ -45,8 +46,9 @@ class FakeLLM:
         system: str,
         user: str,
         timeout_s: float | None = None,
+        schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        self.calls.append(Call(model, system, user, timeout_s))
+        self.calls.append(Call(model, system, user, timeout_s, schema))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -89,6 +91,67 @@ async def test_prompt_supplies_exact_t_e_f_p_n_and_uncitable_profile(
     assert "[E1] (2026-07-14) Maya owns the launch." in prompt
     assert f"observed={timestamp_date(2.0)}" in prompt
     assert "not evidence" in llm.calls[0].system
+
+
+async def test_user_notes_precede_transcript_and_use_live_model_schema() -> None:
+    registry, update = _evidence()
+    llm = FakeLLM([{"no_update": True}])
+
+    result = await _summarizer(llm, registry, Entails()).summarize(
+        None,
+        '[T1] You: "Maya owns the launch."',
+        update,
+        [],
+        notepad_md="# Launch\nMaya owns the launch.",
+    )
+
+    assert result is not None and result.no_update
+    call = llm.calls[0]
+    assert call.model == config.LIVE_SUMMARY_MODEL
+    assert call.schema is not None
+    assert call.schema["title"] == "live_summary"
+    assert call.user.index("<user_notes>") < call.user.index("<transcript_evidence>")
+    assert (
+        "User notes signal what the user considers important — weight related "
+        "transcript content higher; do not restate the notes back."
+        in call.user
+    )
+    assert "# Launch\nMaya owns the launch." in call.user
+
+
+async def test_user_notes_block_is_omitted_for_whitespace() -> None:
+    registry, update = _evidence()
+    llm = FakeLLM([{"no_update": True}])
+
+    await _summarizer(llm, registry, Entails()).summarize(
+        None, '[T1] You: "hello"', update, [], notepad_md=" \n\t "
+    )
+
+    assert "<user_notes>" not in llm.calls[0].user
+
+
+async def test_user_notes_truncation_uses_exact_head_marker_tail_math() -> None:
+    registry, update = _evidence()
+    llm = FakeLLM([{"no_update": True}])
+    notes = "H" * 5_800 + "discarded" * 100 + "T" * 2_000
+    marker = "\n…[notes truncated]…\n"
+
+    await _summarizer(llm, registry, Entails()).summarize(
+        None, '[T1] You: "hello"', update, [], notepad_md=notes
+    )
+
+    block = llm.calls[0].user.split("<user_notes>\n", 1)[1].split(
+        "\n</user_notes>", 1
+    )[0]
+    rendered_notes = block.split("\n", 1)[1]
+    assert rendered_notes == notes[:5_800] + marker + notes[-2_000:]
+    assert len(rendered_notes) <= config.MEETING_NOTES_PROMPT_MAX_CHARS
+
+
+def test_summary_model_aliases_remain_on_deepseek() -> None:
+    assert config.SUMMARY_MODEL == "deepseek/deepseek-v4-flash"
+    assert config.IDEA_SEARCH_MODEL == config.SUMMARY_MODEL
+    assert config.CONTEXT_ENRICH_MODEL == config.SUMMARY_MODEL
 
 
 async def test_live_summary_prompt_datetime_is_request_scoped_and_reused_for_fallback(

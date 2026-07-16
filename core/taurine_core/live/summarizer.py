@@ -59,6 +59,65 @@ or
    "confidence": 0.9}]}
 """
 
+LIVE_SUMMARY_SCHEMA: dict[str, Any] = {
+    "title": "live_summary",
+    "type": "object",
+    "properties": {
+        "no_update": {"type": "boolean"},
+        "summary_md": {"type": "string"},
+        "highlights": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "fact_id": {"type": "string"},
+                    "why": {"type": "string"},
+                },
+                "required": ["fact_id", "why"],
+                "additionalProperties": False,
+            },
+        },
+        "actionables": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "quote": {"type": "string"},
+                    "assignee": {"type": "string"},
+                    "due": {"type": "string"},
+                    "grounding": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "why_new": {"type": "string"},
+                    "confidence": {"type": "number"},
+                },
+                "required": [
+                    "title",
+                    "quote",
+                    "assignee",
+                    "due",
+                    "grounding",
+                    "why_new",
+                    "confidence",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["no_update"],
+    "additionalProperties": False,
+}
+
+_USER_NOTES_INSTRUCTION = (
+    "User notes signal what the user considers important — weight related "
+    "transcript content higher; do not restate the notes back."
+)
+_USER_NOTES_HEAD_CHARS = 5_800
+_USER_NOTES_TAIL_CHARS = 2_000
+_USER_NOTES_TRUNCATION_MARKER = "\n…[notes truncated]…\n"
+
 
 @dataclass
 class SummaryResult:
@@ -97,6 +156,7 @@ class Summarizer:
         transcript_evidence: str,
         update: GroundingUpdate,
         open_actionables: list[Actionable],
+        notepad_md: str = "",
     ) -> SummaryResult | None:
         """Generate once (plus model fallback) and accept only validated output."""
 
@@ -107,17 +167,19 @@ class Summarizer:
             transcript,
             update,
             open_actionables,
+            notepad_md,
             profile_block=user_profile_block(self.index),
         )
         system_prompt = current_datetime_line(time.time()) + "\n" + SYSTEM_PROMPT
         try:
             raw = await self.llm.complete_json(
-                config.SUMMARY_MODEL,
+                config.LIVE_SUMMARY_MODEL,
                 system_prompt,
                 prompt,
                 timeout_s=config.SUMMARY_TIMEOUT_S,
+                schema=LIVE_SUMMARY_SCHEMA,
             )
-            model = config.SUMMARY_MODEL
+            model = config.LIVE_SUMMARY_MODEL
         except LLMError:
             try:
                 raw = await self.llm.complete_json(
@@ -125,6 +187,7 @@ class Summarizer:
                     system_prompt,
                     prompt,
                     timeout_s=config.SUMMARY_TIMEOUT_S,
+                    schema=LIVE_SUMMARY_SCHEMA,
                 )
                 model = config.SUMMARY_FALLBACK_MODEL
             except LLMError:
@@ -283,20 +346,39 @@ def _build_user_prompt(
     transcript: str,
     update: GroundingUpdate,
     open_actionables: list[Actionable],
+    notepad_md: str = "",
     *,
     profile_block: str = "",
 ) -> str:
     previous = "none" if state is None else json.dumps(state.model_dump(mode="json"))
-    sections = (
-        f"<previous_summary>\n{previous}\n</previous_summary>",
-        f"<transcript_evidence>\n{transcript or 'none'}\n</transcript_evidence>",
-        f"<knowledge_evidence>\n{_grounding_block(update)}\n</knowledge_evidence>",
-        "<open_actionables>\n"
-        f"{_open_actionables_block(open_actionables)}\n"
-        "</open_actionables>",
+    sections = [f"<previous_summary>\n{previous}\n</previous_summary>"]
+    notes_block = _user_notes_block(notepad_md)
+    if notes_block:
+        sections.append(notes_block)
+    sections.extend(
+        [
+            f"<transcript_evidence>\n{transcript or 'none'}\n</transcript_evidence>",
+            f"<knowledge_evidence>\n{_grounding_block(update)}\n</knowledge_evidence>",
+            "<open_actionables>\n"
+            f"{_open_actionables_block(open_actionables)}\n"
+            "</open_actionables>",
+        ]
     )
     body = "\n\n".join(sections)
     return f"{profile_block}\n\n{body}" if profile_block else body
+
+
+def _user_notes_block(notepad_md: str) -> str:
+    if not notepad_md.strip():
+        return ""
+    rendered = notepad_md
+    if len(rendered) > config.MEETING_NOTES_PROMPT_MAX_CHARS:
+        rendered = (
+            rendered[:_USER_NOTES_HEAD_CHARS]
+            + _USER_NOTES_TRUNCATION_MARKER
+            + rendered[-_USER_NOTES_TAIL_CHARS:]
+        )
+    return f"<user_notes>\n{_USER_NOTES_INSTRUCTION}\n{rendered}\n</user_notes>"
 
 
 def _grounding_block(update: GroundingUpdate) -> str:

@@ -683,6 +683,12 @@ class StopMsg(BaseModel):
     type: Literal["stop"]
 
 
+class NotepadMsg(BaseModel):
+    type: Literal["notepad"]
+    meeting_id: str
+    text_md: Optional[str] = None
+
+
 class OpenNoteMsg(BaseModel):
     type: Literal["open_note"]
     note_id: str
