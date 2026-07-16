@@ -10,6 +10,8 @@ export function sourceLabel(source: string): string {
       return 'Claude'
     case 'codex_mem':
       return 'Codex'
+    case 'taurine':
+      return 'Taurine'
     default:
       return source
   }

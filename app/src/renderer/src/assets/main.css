@@ -290,6 +290,10 @@
     @apply bg-[#58c98d]/15 text-[#58c98d];
   }
 
+  .source-taurine {
+    @apply bg-[#ffd75e]/15 text-[#ffd75e];
+  }
+
   .source-claude_mem,
   .source-codex_mem {
     @apply bg-white/[0.07] text-fg/65;

@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ListeningState } from '../../components/SessionControls'
-import { getMeeting, type Meeting, type MeetingListRow } from '../../lib/meetings'
+import { getMeeting, patchMeeting, type Meeting, type MeetingListRow } from '../../lib/meetings'
 import { appendSummaryToNotes, flushCurrentNotepad } from '../../lib/notepad-sync'
+import { applySuggestion, revalidatePendingSuggestions } from '../../lib/suggestions'
 import type {
   Actionable,
+  FinalSummaryEvent,
+  FinalSummaryStatusEvent,
   LiveGroundingEvent,
   SummaryEvent,
   TranscriptEvent
@@ -19,6 +22,8 @@ export interface MeetingsCoordinator {
   liveMeetingId: string | null
   listeningState: ListeningState
   micError: string | null
+  finalSummaryStatus: FinalSummaryStatusEvent | null
+  latestFinalSummary: FinalSummaryEvent | null
   live: {
     chunks: TranscriptEvent[]
     interims: Record<number, TranscriptEvent>
@@ -96,6 +101,15 @@ export function MeetingsView({
 
   useEffect(() => registerNotesFlush(flushNotes), [flushNotes, registerNotesFlush])
 
+  const applyLoadedMeeting = useCallback((next: Meeting): void => {
+    setMeeting(next)
+    setNotesMd(next.notesMd)
+    setTitle(next.title)
+    currentNotesRef.current = next.notesMd
+    savedNotesRef.current = next.notesMd
+    loadedMeetingIdRef.current = next.meetingId
+  }, [])
+
   useEffect(() => {
     const controller = new AbortController()
     currentMeetingIdRef.current = selectedMeetingId
@@ -105,12 +119,7 @@ export function MeetingsView({
       void getMeeting(selectedMeetingId, { signal: controller.signal })
         .then((next) => {
           if (controller.signal.aborted) return
-          setMeeting(next)
-          setNotesMd(next.notesMd)
-          setTitle(next.title)
-          currentNotesRef.current = next.notesMd
-          savedNotesRef.current = next.notesMd
-          loadedMeetingIdRef.current = next.meetingId
+          applyLoadedMeeting(next)
         })
         .catch((loadError: unknown) => {
           if (!controller.signal.aborted) {
@@ -126,7 +135,31 @@ export function MeetingsView({
       controller.abort()
       void flushNotes().catch(() => undefined)
     }
-  }, [flushNotes, selectedMeetingId])
+  }, [applyLoadedMeeting, flushNotes, selectedMeetingId])
+
+  useEffect(() => {
+    const event = coordinator.latestFinalSummary
+    if (!event || event.meetingId !== selectedMeetingId) return
+
+    let cancelled = false
+    const refetchAuthoritativeMeeting = async (): Promise<void> => {
+      try {
+        await flushNotes()
+        const next = await getMeeting(event.meetingId)
+        if (!cancelled) applyLoadedMeeting(next)
+      } catch (loadError) {
+        if (!cancelled) {
+          setError(
+            loadError instanceof Error ? loadError.message : 'Final summary could not be loaded'
+          )
+        }
+      }
+    }
+    void refetchAuthoritativeMeeting()
+    return () => {
+      cancelled = true
+    }
+  }, [applyLoadedMeeting, coordinator.latestFinalSummary, flushNotes, selectedMeetingId])
 
   const handleNotesChange = useCallback(
     (markdown: string): void => {
@@ -150,6 +183,50 @@ export function MeetingsView({
       handleNotesChange(appendSummaryToNotes(currentNotesRef.current, summaryMd))
     },
     [handleNotesChange]
+  )
+
+  const handleResolveSuggestion = useCallback(
+    (id: string, accept: boolean): void => {
+      if (!meeting) return
+      const edit = meeting.suggestions.find(
+        (suggestion) => suggestion.id === id && suggestion.status === 'pending'
+      )
+      if (!edit) return
+
+      const status = accept ? ('accepted' as const) : ('rejected' as const)
+      const nextSuggestions = meeting.suggestions.map((suggestion) =>
+        suggestion.id === id ? { ...suggestion, status } : suggestion
+      )
+      setMeeting((current) =>
+        current?.meetingId === meeting.meetingId
+          ? { ...current, suggestions: nextSuggestions }
+          : current
+      )
+      if (accept) {
+        handleNotesChange(applySuggestion(currentNotesRef.current, edit))
+      }
+
+      void patchMeeting(meeting.meetingId, { suggestions: nextSuggestions }).catch(
+        (patchError: unknown) => {
+          setMeeting((current) =>
+            current?.meetingId === meeting.meetingId
+              ? {
+                  ...current,
+                  suggestions: current.suggestions.map((suggestion) =>
+                    suggestion.id === id ? { ...suggestion, status: 'pending' } : suggestion
+                  )
+                }
+              : current
+          )
+          setError(
+            patchError instanceof Error
+              ? patchError.message
+              : 'Suggestion status could not be saved'
+          )
+        }
+      )
+    },
+    [handleNotesChange, meeting]
   )
 
   const handleSelect = useCallback(
@@ -201,6 +278,20 @@ export function MeetingsView({
   const isLiveSelection = meeting?.meetingId === coordinator.liveMeetingId
   const selectedSummary = isLiveSelection ? coordinator.live.summary : null
   const selectedActionables = isLiveSelection ? coordinator.live.actionables : []
+  const suggestions =
+    meeting && meeting.suggestionsBaseRev < meeting.notesRev
+      ? revalidatePendingSuggestions(notesMd, meeting.suggestions)
+      : (meeting?.suggestions ?? [])
+  const finalSummaryStatus =
+    coordinator.finalSummaryStatus ??
+    (meeting?.status === 'summarizing'
+      ? {
+          type: 'final_summary_status' as const,
+          meetingId: meeting.meetingId,
+          state: 'running' as const,
+          detail: ''
+        }
+      : null)
 
   return (
     <div className="grid h-full min-h-0 grid-cols-[220px_minmax(0,1fr)] overflow-hidden rounded-[10px] border border-white/[0.08] bg-surface-1/60">
@@ -276,6 +367,7 @@ export function MeetingsView({
               summary={selectedSummary}
               actionables={selectedActionables}
               finalSummaryMd={meeting.finalSummaryMd}
+              finalSummaryStatus={finalSummaryStatus}
               listeningState={isLiveSelection ? coordinator.listeningState : 'idle'}
               onActionableStatus={coordinator.setActionableStatus}
               onAddToNotes={handleAddToNotes}
@@ -286,8 +378,8 @@ export function MeetingsView({
                 key={meeting.meetingId}
                 valueMd={notesMd}
                 onChangeMd={handleNotesChange}
-                suggestions={meeting.suggestions}
-                onResolveSuggestion={ignoreSuggestion}
+                suggestions={suggestions}
+                onResolveSuggestion={handleResolveSuggestion}
                 readOnly={isLiveSelection && coordinator.listeningState === 'stopping'}
               />
             </div>
@@ -325,8 +417,4 @@ export function MeetingsView({
       ) : null}
     </div>
   )
-}
-
-function ignoreSuggestion(): void {
-  // Suggestion projection and resolution arrive in Task 4.3.
 }

@@ -1,5 +1,4 @@
 /* eslint-disable react-refresh/only-export-components -- Task 1.2 requires these helpers from this module. */
-import { BaseSuggestionPlugin } from '@platejs/suggestion'
 import {
   BasicBlocksPlugin,
   BasicMarksPlugin,
@@ -11,16 +10,10 @@ import { ListStyleType, toggleList } from '@platejs/list'
 import { ListPlugin } from '@platejs/list/react'
 import { MarkdownPlugin, deserializeMd, serializeMd } from '@platejs/markdown'
 import type { Descendant, RenderElementProps, RenderLeafProps, TElement, Value } from 'platejs'
-import {
-  Plate,
-  PlateContent,
-  createPlateEditor,
-  toPlatePlugin,
-  useEditorRef,
-  usePlateEditor
-} from 'platejs/react'
+import { Plate, PlateContent, createPlateEditor, useEditorRef, usePlateEditor } from 'platejs/react'
 import { useEffect, useRef } from 'react'
 import type { SuggestedEdit } from '../../lib/meetings'
+import { projectPendingSuggestions, type SuggestionProjection } from '../../lib/suggestions'
 
 export interface NotepadEditorProps {
   valueMd: string
@@ -30,13 +23,7 @@ export interface NotepadEditorProps {
   readOnly?: boolean
 }
 
-const NOTEPAD_PLUGINS = [
-  BasicBlocksPlugin,
-  BasicMarksPlugin,
-  ListPlugin,
-  MarkdownPlugin,
-  toPlatePlugin(BaseSuggestionPlugin)
-]
+const NOTEPAD_PLUGINS = [BasicBlocksPlugin, BasicMarksPlugin, ListPlugin, MarkdownPlugin]
 
 export function deserializeMarkdown(markdown: string): Value {
   const editor = createPlateEditor({ plugins: NOTEPAD_PLUGINS })
@@ -52,6 +39,8 @@ export function serializeMarkdown(value: Value): string {
 export function NotepadEditor({
   valueMd,
   onChangeMd,
+  suggestions,
+  onResolveSuggestion,
   readOnly = false
 }: NotepadEditorProps): React.JSX.Element {
   const editor = usePlateEditor({
@@ -77,6 +66,11 @@ export function NotepadEditor({
       }}
     >
       <NotepadToolbar readOnly={readOnly} />
+      <SuggestionDecorations
+        projections={projectPendingSuggestions(valueMd, suggestions)}
+        onResolveSuggestion={onResolveSuggestion}
+        readOnly={readOnly}
+      />
       <PlateContent
         className="min-h-full px-5 py-4 text-[14px] leading-7 text-fg outline-none"
         placeholder="Take notes…"
@@ -86,6 +80,83 @@ export function NotepadEditor({
       />
     </Plate>
   )
+}
+
+export function SuggestionDecorations({
+  projections,
+  onResolveSuggestion,
+  readOnly
+}: {
+  projections: SuggestionProjection[]
+  onResolveSuggestion(id: string, accept: boolean): void
+  readOnly: boolean
+}): React.JSX.Element | null {
+  if (projections.length === 0) return null
+
+  return (
+    <aside
+      className="grid gap-2 border-b border-accent/20 bg-accent/[0.035] px-4 py-3"
+      aria-label="Suggested note edits"
+    >
+      {projections
+        .slice()
+        .sort((left, right) => left.location - right.location)
+        .map(({ edit, appendMode }) => (
+          <article
+            className="rounded-lg border border-accent/25 bg-surface-2/90 px-3 py-2 shadow-sm"
+            key={edit.id}
+            title={edit.rationale || undefined}
+          >
+            <div className="flex items-start gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="mb-1 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-accent-hi">
+                  <span>
+                    {appendMode ? 'Append to notes' : `After “${anchorLabel(edit.anchor)}”`}
+                  </span>
+                  {edit.rationale ? (
+                    <span
+                      className="cursor-help text-fg/35"
+                      aria-label={`Rationale: ${edit.rationale}`}
+                      title={edit.rationale}
+                    >
+                      ⓘ
+                    </span>
+                  ) : null}
+                </div>
+                <div className="whitespace-pre-wrap text-[12px] leading-5 text-fg/80">
+                  {edit.insertMd.trim()}
+                </div>
+              </div>
+              <div className="flex flex-none items-center gap-1">
+                <button
+                  className="primary-button compact"
+                  type="button"
+                  aria-label="Accept suggestion"
+                  disabled={readOnly}
+                  onClick={() => onResolveSuggestion(edit.id, true)}
+                >
+                  Accept
+                </button>
+                <button
+                  className="icon-button"
+                  type="button"
+                  aria-label="Dismiss suggestion"
+                  disabled={readOnly}
+                  onClick={() => onResolveSuggestion(edit.id, false)}
+                >
+                  &times;
+                </button>
+              </div>
+            </div>
+          </article>
+        ))}
+    </aside>
+  )
+}
+
+function anchorLabel(anchor: string): string {
+  const compact = anchor.replace(/\s+/g, ' ').trim()
+  return compact.length > 48 ? `${compact.slice(0, 47)}…` : compact
 }
 
 function filterPendingSuggestions(value: Value): Value {

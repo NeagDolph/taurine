@@ -1,7 +1,14 @@
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { parseMeeting } from './meetings'
-import { deserializeMarkdown, serializeMarkdown } from '../views/meetings/NotepadEditor'
+import {
+  deserializeMarkdown,
+  serializeMarkdown,
+  SuggestionDecorations
+} from '../views/meetings/NotepadEditor'
 import { parseUpdateEvent } from './updates'
+import { projectPendingSuggestions } from './suggestions'
 
 describe('parseMeeting', () => {
   it('maps a complete meeting payload from snake case to camel case', () => {
@@ -17,11 +24,12 @@ describe('parseMeeting', () => {
         notes_md: '# Notes',
         notes_rev: 7,
         final_summary_md: '## Summary',
+        suggestions_base_rev: 6,
         suggestions: [
           {
             id: 'suggestion-1',
             anchor: 'Notes',
-            occurrence: 0,
+            occurrence: 1,
             insert_md: '\nMore detail',
             rationale: 'Adds context',
             status: 'pending'
@@ -41,11 +49,12 @@ describe('parseMeeting', () => {
       notesMd: '# Notes',
       notesRev: 7,
       finalSummaryMd: '## Summary',
+      suggestionsBaseRev: 6,
       suggestions: [
         {
           id: 'suggestion-1',
           anchor: 'Notes',
-          occurrence: 0,
+          occurrence: 1,
           insertMd: '\nMore detail',
           rationale: 'Adds context',
           status: 'pending'
@@ -68,6 +77,7 @@ describe('parseMeeting', () => {
       notes_md: '',
       notes_rev: 0,
       final_summary_md: '',
+      suggestions_base_rev: 0,
       suggestions: { not: 'an array' },
       transcript: [],
       chat_id: null
@@ -93,6 +103,29 @@ describe('NotepadEditor markdown serialization', () => {
     paragraph.children.push({ text: ' pending insertion', suggestion: true })
 
     expect(serializeMarkdown(value)).toBe('Keep this')
+  })
+
+  it('renders pending insertions as controls outside the editor value', () => {
+    const suggestion = {
+      id: 'suggestion-1',
+      anchor: 'Keep this',
+      occurrence: 1,
+      insertMd: '\n\nSuggested detail.',
+      rationale: 'Adds useful context',
+      status: 'pending' as const
+    }
+    const markup = renderToStaticMarkup(
+      createElement(SuggestionDecorations, {
+        projections: projectPendingSuggestions('Keep this', [suggestion]),
+        onResolveSuggestion: () => undefined,
+        readOnly: false
+      })
+    )
+
+    expect(markup).toContain('Suggested detail.')
+    expect(markup).toContain('Accept suggestion')
+    expect(markup).toContain('Dismiss suggestion')
+    expect(serializeMarkdown(deserializeMarkdown('Keep this'))).toBe('Keep this')
   })
 })
 

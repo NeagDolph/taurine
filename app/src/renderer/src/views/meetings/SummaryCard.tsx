@@ -2,12 +2,13 @@ import ReactMarkdown from 'react-markdown'
 import { ActionableRail } from '../../components/ActionableRail'
 import type { ListeningState } from '../../components/SessionControls'
 import { SummaryPanel } from '../../components/SummaryPanel'
-import type { Actionable, SummaryEvent } from '../../lib/sidecar'
+import type { Actionable, FinalSummaryStatusEvent, SummaryEvent } from '../../lib/sidecar'
 
 interface SummaryCardProps {
   summary: SummaryEvent | null
   actionables: Actionable[]
   finalSummaryMd: string
+  finalSummaryStatus: FinalSummaryStatusEvent | null
   listeningState: ListeningState
   onActionableStatus(id: string, status: 'confirmed' | 'dismissed'): void
   onAddToNotes(summaryMd: string): void
@@ -17,6 +18,7 @@ export function SummaryCard({
   summary,
   actionables,
   finalSummaryMd,
+  finalSummaryStatus,
   listeningState,
   onActionableStatus,
   onAddToNotes
@@ -25,7 +27,14 @@ export function SummaryCard({
   const visibleActionables = actionables.filter((item) => item.status !== 'dismissed')
   const active = listeningState !== 'idle' && listeningState !== 'error'
   const noteChangesDisabled = listeningState === 'stopping'
-  if (!active && !markdown && visibleActionables.length === 0) return null
+  const finalRunning = finalSummaryStatus?.state === 'running'
+  const finalError =
+    finalSummaryStatus?.state === 'error'
+      ? finalSummaryStatus.detail || 'Final summary could not be generated.'
+      : ''
+  if (!active && !markdown && visibleActionables.length === 0 && !finalRunning && !finalError) {
+    return null
+  }
 
   if (summary) {
     return (
@@ -56,7 +65,9 @@ export function SummaryCard({
   return (
     <section className="grid max-h-[34vh] flex-none gap-3 overflow-y-auto border-b border-white/[0.08] bg-surface-2/50 px-5 py-3">
       <div className="flex items-center justify-between gap-3">
-        <span className="section-label">Meeting summary</span>
+        <span className={`section-label ${finalRunning ? 'animate-pulse' : ''}`}>
+          {finalRunning ? 'Summarizing…' : finalSummaryMd ? 'Final summary' : 'Meeting summary'}
+        </span>
         {markdown ? (
           <button
             className="secondary-button compact"
@@ -72,11 +83,19 @@ export function SummaryCard({
         <div className="markdown-body text-[13px] leading-normal text-fg">
           <ReactMarkdown>{markdown}</ReactMarkdown>
         </div>
+      ) : finalRunning ? (
+        <div className="grid gap-2" aria-label="Summarizing meeting">
+          <div className="h-2.5 w-4/5 animate-pulse rounded-full bg-white/[0.08]" />
+          <div className="h-2.5 w-2/3 animate-pulse rounded-full bg-white/[0.06]" />
+        </div>
+      ) : finalError ? (
+        <p className="m-0 text-xs text-bad">{finalError}</p>
       ) : (
         <p className="m-0 text-xs text-fg/45">
           A live summary will appear as the meeting develops.
         </p>
       )}
+      {markdown && finalError ? <p className="m-0 text-xs text-bad">{finalError}</p> : null}
       {visibleActionables.length > 0 ? (
         <div className="flex flex-wrap gap-2 border-t border-white/[0.08] pt-2.5">
           {visibleActionables.map((item) => (

@@ -1,3 +1,5 @@
+import type { SuggestedEdit, SuggestedEditStatus } from './meetings'
+
 // dev override: VITE_SIDECAR_PORT lets a preview/dev instance target a scratch sidecar
 export const SIDECAR_PORT: string = import.meta.env.VITE_SIDECAR_PORT ?? '8930'
 export const SIDECAR_WS_URL = `ws://127.0.0.1:${SIDECAR_PORT}/session`
@@ -201,6 +203,22 @@ export interface SummaryEvent {
   updated_at: number
 }
 
+export interface FinalSummaryStatusEvent {
+  type: 'final_summary_status'
+  meetingId: string
+  state: 'running' | 'done' | 'error'
+  detail: string
+}
+
+export interface FinalSummaryEvent {
+  type: 'final_summary'
+  meetingId: string
+  title: string
+  finalSummaryMd: string
+  baseRev: number
+  suggestedEdits: SuggestedEdit[]
+}
+
 export interface ActionableEvent {
   type: 'actionable'
   op: ActionableOp
@@ -318,6 +336,8 @@ export type SidecarEvent =
   | TranscriptEvent
   | LiveGroundingEvent
   | SummaryEvent
+  | FinalSummaryStatusEvent
+  | FinalSummaryEvent
   | ActionableEvent
   | RetrievalEvent
   | TriggerEvent
@@ -363,6 +383,8 @@ export class SidecarClient {
   private readonly transcriptCallbacks = new Set<Callback<TranscriptEvent>>()
   private readonly groundingCallbacks = new Set<Callback<LiveGroundingEvent>>()
   private readonly summaryCallbacks = new Set<Callback<SummaryEvent>>()
+  private readonly finalSummaryStatusCallbacks = new Set<Callback<FinalSummaryStatusEvent>>()
+  private readonly finalSummaryCallbacks = new Set<Callback<FinalSummaryEvent>>()
   private readonly actionableCallbacks = new Set<Callback<ActionableEvent>>()
   private readonly retrievalCallbacks = new Set<Callback<RetrievalEvent>>()
   private readonly triggerCallbacks = new Set<Callback<TriggerEvent>>()
@@ -470,6 +492,14 @@ export class SidecarClient {
 
   onSummary(callback: Callback<SummaryEvent>): Unsubscribe {
     return this.addCallback(this.summaryCallbacks, callback)
+  }
+
+  onFinalSummaryStatus(callback: Callback<FinalSummaryStatusEvent>): Unsubscribe {
+    return this.addCallback(this.finalSummaryStatusCallbacks, callback)
+  }
+
+  onFinalSummary(callback: Callback<FinalSummaryEvent>): Unsubscribe {
+    return this.addCallback(this.finalSummaryCallbacks, callback)
   }
 
   onActionable(callback: Callback<ActionableEvent>): Unsubscribe {
@@ -580,6 +610,12 @@ export class SidecarClient {
         break
       case 'summary':
         this.emit(this.summaryCallbacks, event)
+        break
+      case 'final_summary_status':
+        this.emit(this.finalSummaryStatusCallbacks, event)
+        break
+      case 'final_summary':
+        this.emit(this.finalSummaryCallbacks, event)
         break
       case 'actionable':
         this.emit(this.actionableCallbacks, event)
@@ -768,6 +804,10 @@ function parseSidecarEvent(raw: string): SidecarEvent | null {
       return parseLiveGrounding(record)
     case 'summary':
       return parseSummary(record)
+    case 'final_summary_status':
+      return parseFinalSummaryStatus(record)
+    case 'final_summary':
+      return parseFinalSummary(record)
     case 'actionable':
       return parseActionable(record)
     case 'retrieval':
@@ -778,6 +818,69 @@ function parseSidecarEvent(raw: string): SidecarEvent | null {
       return parseStatus(record)
     default:
       return null
+  }
+}
+
+function parseFinalSummaryStatus(record: Record<string, unknown>): FinalSummaryStatusEvent | null {
+  if (
+    typeof record.meeting_id !== 'string' ||
+    (record.state !== 'running' && record.state !== 'done' && record.state !== 'error')
+  ) {
+    return null
+  }
+  return {
+    type: 'final_summary_status',
+    meetingId: record.meeting_id,
+    state: record.state,
+    detail: typeof record.detail === 'string' ? record.detail : ''
+  }
+}
+
+function parseFinalSummary(record: Record<string, unknown>): FinalSummaryEvent | null {
+  if (
+    typeof record.meeting_id !== 'string' ||
+    typeof record.title !== 'string' ||
+    typeof record.final_summary_md !== 'string' ||
+    typeof record.base_rev !== 'number'
+  ) {
+    return null
+  }
+
+  const suggestedEdits = Array.isArray(record.suggested_edits)
+    ? record.suggested_edits.map(parseSuggestedEdit).filter(isNotNull)
+    : []
+  return {
+    type: 'final_summary',
+    meetingId: record.meeting_id,
+    title: record.title,
+    finalSummaryMd: record.final_summary_md,
+    baseRev: record.base_rev,
+    suggestedEdits
+  }
+}
+
+function parseSuggestedEdit(value: unknown): SuggestedEdit | null {
+  const record = asRecord(value)
+  if (
+    !record ||
+    typeof record.id !== 'string' ||
+    typeof record.anchor !== 'string' ||
+    !Number.isInteger(record.occurrence) ||
+    (record.occurrence as number) < 1 ||
+    typeof record.insert_md !== 'string' ||
+    typeof record.rationale !== 'string'
+  ) {
+    return null
+  }
+  const status: SuggestedEditStatus =
+    record.status === 'accepted' || record.status === 'rejected' ? record.status : 'pending'
+  return {
+    id: record.id,
+    anchor: record.anchor,
+    occurrence: record.occurrence as number,
+    insertMd: record.insert_md,
+    rationale: record.rationale,
+    status
   }
 }
 

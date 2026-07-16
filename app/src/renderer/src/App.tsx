@@ -17,6 +17,8 @@ import {
   type Actionable,
   type AsrState,
   type ConnectorInfo,
+  type FinalSummaryEvent,
+  type FinalSummaryStatusEvent,
   type IndexStatus,
   type ProfileState,
   type RetrievalEvent,
@@ -75,6 +77,10 @@ function App(): React.JSX.Element {
   const [interimsByChannel, setInterimsByChannel] = useState<Record<number, TranscriptEvent>>({})
   const [liveGrounding, setLiveGrounding] = useState<LiveGroundingEvent | null>(null)
   const [summary, setSummary] = useState<SummaryEvent | null>(null)
+  const [finalSummaryStatuses, setFinalSummaryStatuses] = useState<
+    Record<string, FinalSummaryStatusEvent>
+  >({})
+  const [latestFinalSummary, setLatestFinalSummary] = useState<FinalSummaryEvent | null>(null)
   const [actionables, setActionables] = useState<Actionable[]>([])
   const [groundedNoteIds, setGroundedNoteIds] = useState<string[]>([])
   const [lastRetrieval, setLastRetrieval] = useState<RetrievalEvent | null>(null)
@@ -144,6 +150,19 @@ function App(): React.JSX.Element {
           event.evidence?.notes.forEach((item) => next.add(item.note_id))
           return next.size === current.length ? current : [...next]
         })
+      }),
+      client.onFinalSummaryStatus((event) => {
+        setFinalSummaryStatuses((current) => ({ ...current, [event.meetingId]: event }))
+      }),
+      client.onFinalSummary((event) => {
+        setLatestFinalSummary(event)
+        setMeetingsIndex((current) =>
+          current.map((meeting) =>
+            meeting.meetingId === event.meetingId
+              ? { ...meeting, title: event.title, status: 'done' }
+              : meeting
+          )
+        )
       }),
       client.onActionable((event) => {
         if (!liveMeetingIdRef.current) return
@@ -344,6 +363,13 @@ function App(): React.JSX.Element {
       setActionables([])
       setGroundedNoteIds([])
       setLastRetrieval(null)
+      setFinalSummaryStatuses((current) => {
+        if (!(meetingId in current)) return current
+        const next = { ...current }
+        delete next[meetingId]
+        return next
+      })
+      setLatestFinalSummary((current) => (current?.meetingId === meetingId ? null : current))
       notepadPushRef.current?.cancel()
 
       let systemAudioAvailable = false
@@ -510,6 +536,10 @@ function App(): React.JSX.Element {
       meetings: meetingsIndex,
       selectedMeetingId,
       liveMeetingId,
+      finalSummaryStatus: selectedMeetingId
+        ? (finalSummaryStatuses[selectedMeetingId] ?? null)
+        : null,
+      latestFinalSummary,
       listeningState,
       micError: micError || null,
       live: {
@@ -541,6 +571,8 @@ function App(): React.JSX.Element {
       listeningState,
       liveGrounding,
       liveMeetingId,
+      finalSummaryStatuses,
+      latestFinalSummary,
       meetingsIndex,
       micError,
       flushNotepadPush,

@@ -831,7 +831,8 @@ const SOURCE_COLORS: Record<string, string> = {
   gmail: '#ffffff',
   imessage: '#5fd18d',
   local_folders: '#f0a35e',
-  obsidian: '#b98cff'
+  obsidian: '#b98cff',
+  taurine: '#ffd75e'
 }
 
 const SOURCE_LABELS: Record<string, string> = {
@@ -840,7 +841,8 @@ const SOURCE_LABELS: Record<string, string> = {
   codex_mem: 'Codex',
   imessage: 'iMessage',
   local_folders: 'Folders',
-  obsidian: 'Obsidian'
+  obsidian: 'Obsidian',
+  taurine: 'Taurine'
 }
 
 const SOURCE_PALETTE = ['#8ab4ff', '#8edfd2', '#c99cff', '#ff99ad', '#79d7a2', '#9cc7d8']

@@ -33,6 +33,7 @@ export interface Meeting extends MeetingListRow {
   notesMd: string
   notesRev: number
   finalSummaryMd: string
+  suggestionsBaseRev: number
   suggestions: SuggestedEdit[]
   transcript: TranscriptChunk[]
   chatId: string | null
@@ -164,6 +165,8 @@ export function parseMeeting(value: unknown): Meeting {
     notesMd: record.notes_md,
     notesRev: record.notes_rev,
     finalSummaryMd: record.final_summary_md,
+    suggestionsBaseRev:
+      typeof record.suggestions_base_rev === 'number' ? record.suggestions_base_rev : 0,
     suggestions: parseSuggestions(record.suggestions),
     transcript: parseTranscript(record.transcript),
     chatId: record.chat_id
@@ -178,7 +181,8 @@ function parseSuggestions(value: unknown): SuggestedEdit[] {
       !record ||
       typeof record.id !== 'string' ||
       typeof record.anchor !== 'string' ||
-      typeof record.occurrence !== 'number' ||
+      !Number.isInteger(record.occurrence) ||
+      (record.occurrence as number) < 1 ||
       typeof record.insert_md !== 'string' ||
       typeof record.rationale !== 'string' ||
       !isSuggestedEditStatus(record.status)
@@ -189,7 +193,7 @@ function parseSuggestions(value: unknown): SuggestedEdit[] {
       {
         id: record.id,
         anchor: record.anchor,
-        occurrence: record.occurrence,
+        occurrence: record.occurrence as number,
         insertMd: record.insert_md,
         rationale: record.rationale,
         status: record.status
