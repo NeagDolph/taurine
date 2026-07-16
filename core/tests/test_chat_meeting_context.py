@@ -355,3 +355,36 @@ def test_meeting_engine_seeds_indexed_taurine_note(store: Any) -> None:
     assert callable(seed_helper), "meeting retrieval seed helper is not implemented"
 
     assert seed_helper(store, meeting["meeting_id"]) == (note_id,)
+
+
+def test_meeting_only_turn_skips_fact_support_when_pack_is_none(store: Any) -> None:
+    """Regression: meeting evidence with no retrieval pack must not call
+    expose_fact_support(None) (crashed live with AttributeError on .passages)."""
+    from taurine_core.chat.engine import _MeetingEvidence
+
+    store.create_chat("chat-m-only", now=1.0)
+    user_id = store.add_chat_message(
+        ChatMessage(chat_id="chat-m-only", role="user", content="q", created=2.0)
+    )
+    assistant_id = store.add_chat_message(
+        ChatMessage(chat_id="chat-m-only", role="assistant", content="", created=3.0)
+    )
+    engine = ChatEngine(store, None, None)
+
+    class ExplodingRetriever:
+        def expose_fact_support(self, pack: Any) -> dict:
+            return {"boom": pack.passages}  # AttributeError on None
+
+    messages = engine._build_messages(
+        "chat-m-only",
+        "What did we decide?",
+        None,
+        retriever=ExplodingRetriever(),
+        current_user_id=user_id,
+        assistant_id=assistant_id,
+        meeting_evidence=_MeetingEvidence(
+            block='[M1] (2026-07-16, meeting) notes', ids=("M1",)
+        ),
+    )
+
+    assert any("MEETING CONTEXT" in m["content"] for m in messages)

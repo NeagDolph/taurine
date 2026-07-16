@@ -1061,7 +1061,11 @@ class ChatEngine:
             # M6: expose bounded non-selected fact-support passages — they
             # become read/citable and render as compact quotes under facts.
             expose = getattr(retriever, "expose_fact_support", None)
-            support = expose(context_pack) if callable(expose) else {}
+            support = (
+                expose(context_pack)
+                if callable(expose) and context_pack is not None
+                else {}
+            )
             evidence = _combined_evidence_block(
                 context_pack,
                 meeting_evidence,
