@@ -2,6 +2,7 @@ import { app, shell, BrowserWindow, dialog, ipcMain } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { registerSystemAudioIpc } from './sysaudio'
 
 if (is.dev) {
   // dev-only: lets tooling attach to the real renderer for debugging
@@ -75,6 +76,7 @@ app.whenReady().then(() => {
       : await dialog.showOpenDialog(options)
     return result.canceled ? null : (result.filePaths[0] ?? null)
   })
+  registerSystemAudioIpc()
   createWindow()
 
   app.on('activate', function () {
