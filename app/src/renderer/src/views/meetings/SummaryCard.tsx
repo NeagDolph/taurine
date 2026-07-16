@@ -1,139 +1,106 @@
-import ReactMarkdown from 'react-markdown'
-import { ActionableRail } from '../../components/ActionableRail'
-import type { ListeningState } from '../../components/SessionControls'
 import { SummaryPanel } from '../../components/SummaryPanel'
+import type { ListeningState } from '../../components/SessionControls'
 import type { Actionable, FinalSummaryStatusEvent, SummaryEvent } from '../../lib/sidecar'
 
 interface SummaryCardProps {
   summary: SummaryEvent | null
   actionables: Actionable[]
-  finalSummaryMd: string
   finalSummaryStatus: FinalSummaryStatusEvent | null
   listeningState: ListeningState
   onActionableStatus(id: string, status: 'confirmed' | 'dismissed'): void
   onAddToNotes(summaryMd: string): void
+  onOpenNote(noteId: string): void
 }
 
+/**
+ * Slim rolling-summary card shown while a meeting is live. The final summary
+ * never renders here — it arrives in the notepad as a pending suggestion.
+ */
 export function SummaryCard({
   summary,
   actionables,
-  finalSummaryMd,
   finalSummaryStatus,
   listeningState,
   onActionableStatus,
-  onAddToNotes
+  onAddToNotes,
+  onOpenNote
 }: SummaryCardProps): React.JSX.Element | null {
-  const markdown = summary?.summary_md || finalSummaryMd
-  const visibleActionables = actionables.filter((item) => item.status !== 'dismissed')
-  const active = listeningState !== 'idle' && listeningState !== 'error'
-  const noteChangesDisabled = listeningState === 'stopping'
+  const live = listeningState === 'listening' || listeningState === 'starting'
   const finalRunning = finalSummaryStatus?.state === 'running'
   const finalError =
     finalSummaryStatus?.state === 'error'
       ? finalSummaryStatus.detail || 'Final summary could not be generated.'
       : ''
-  if (!active && !markdown && visibleActionables.length === 0 && !finalRunning && !finalError) {
-    return null
-  }
 
-  if (summary) {
+  if (finalRunning) {
     return (
-      <section className="grid max-h-[34vh] flex-none grid-cols-[minmax(0,3fr)_minmax(240px,2fr)] gap-3 overflow-y-auto border-b border-white/[0.08] bg-surface-2/30 p-3">
-        <div className="min-w-0">
-          <div className="mb-2 flex justify-end">
-            <button
-              className="secondary-button compact"
-              type="button"
-              disabled={noteChangesDisabled}
-              onClick={() => onAddToNotes(markdown)}
-            >
-              Add to notes
-            </button>
-          </div>
-          <SummaryPanel summary={summary} onOpenNote={ignoreNote} />
-        </div>
-        <ActionableRail
-          actionables={actionables}
-          evidence={summary.evidence ?? null}
-          onStatus={onActionableStatus}
-          onOpenNote={ignoreNote}
-        />
-      </section>
+      <div
+        className="mb-4 flex items-center gap-2.5 rounded-xl border border-white/[0.08] bg-white/[0.03] px-3.5 py-2.5"
+        aria-label="Summarizing meeting"
+      >
+        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
+        <span className="text-xs text-fg/60">Writing your meeting summary…</span>
+      </div>
     )
   }
+  if (finalError) {
+    return (
+      <div className="mb-4 rounded-xl border border-bad/25 bg-bad/[0.06] px-3.5 py-2.5 text-xs text-bad">
+        {finalError}
+      </div>
+    )
+  }
+  if (!live || !summary?.summary_md) return null
+
+  const visibleActionables = actionables.filter((item) => item.status !== 'dismissed')
 
   return (
-    <section className="grid max-h-[34vh] flex-none gap-3 overflow-y-auto border-b border-white/[0.08] bg-surface-2/50 px-5 py-3">
-      <div className="flex items-center justify-between gap-3">
-        <span className={`section-label ${finalRunning ? 'animate-pulse' : ''}`}>
-          {finalRunning ? 'Summarizing…' : finalSummaryMd ? 'Final summary' : 'Meeting summary'}
-        </span>
-        {markdown ? (
-          <button
-            className="secondary-button compact"
-            type="button"
-            disabled={noteChangesDisabled}
-            onClick={() => onAddToNotes(markdown)}
-          >
-            Add to notes
-          </button>
-        ) : null}
+    <section className="mb-4 max-h-[32vh] overflow-y-auto">
+      <div className="relative">
+        <SummaryPanel summary={summary} onOpenNote={onOpenNote} onShowInMap={onOpenNote} />
+        <button
+          className="secondary-button compact absolute right-3 top-2.5"
+          type="button"
+          onClick={() => onAddToNotes(summary.summary_md)}
+        >
+          Add to notes
+        </button>
       </div>
-      {markdown ? (
-        <div className="markdown-body text-[13px] leading-normal text-fg">
-          <ReactMarkdown>{markdown}</ReactMarkdown>
-        </div>
-      ) : finalRunning ? (
-        <div className="grid gap-2" aria-label="Summarizing meeting">
-          <div className="h-2.5 w-4/5 animate-pulse rounded-full bg-white/[0.08]" />
-          <div className="h-2.5 w-2/3 animate-pulse rounded-full bg-white/[0.06]" />
-        </div>
-      ) : finalError ? (
-        <p className="m-0 text-xs text-bad">{finalError}</p>
-      ) : (
-        <p className="m-0 text-xs text-fg/45">
-          A live summary will appear as the meeting develops.
-        </p>
-      )}
-      {markdown && finalError ? <p className="m-0 text-xs text-bad">{finalError}</p> : null}
       {visibleActionables.length > 0 ? (
-        <div className="flex flex-wrap gap-2 border-t border-white/[0.08] pt-2.5">
+        <div className="mt-2.5 flex flex-wrap gap-1.5 border-t border-white/[0.07] pt-2.5">
           {visibleActionables.map((item) => (
-            <article
-              className="flex min-w-[220px] flex-1 items-start justify-between gap-2 rounded-lg border border-white/[0.08] bg-white/[0.03] p-2.5"
+            <span
+              className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] ${
+                item.status === 'confirmed'
+                  ? 'border-ok/40 bg-ok/[0.08] text-fg/85'
+                  : 'border-white/[0.1] bg-white/[0.03] text-fg/70'
+              }`}
               key={item.id}
+              title={item.quote}
             >
-              <div className="min-w-0">
-                <h3 className="text-xs font-semibold text-fg">{item.title}</h3>
-                <p className="mt-1 line-clamp-2 text-[11px] text-fg/55">{item.quote}</p>
-              </div>
-              <div className="flex flex-none gap-1">
-                {item.status !== 'confirmed' ? (
-                  <button
-                    className="secondary-button compact"
-                    type="button"
-                    onClick={() => onActionableStatus(item.id, 'confirmed')}
-                  >
-                    Confirm
-                  </button>
-                ) : null}
+              {item.title}
+              {item.status !== 'confirmed' ? (
                 <button
-                  className="icon-button"
+                  className="text-ok/80 hover:text-ok"
                   type="button"
-                  aria-label={`Dismiss ${item.title}`}
-                  onClick={() => onActionableStatus(item.id, 'dismissed')}
+                  aria-label={`Confirm ${item.title}`}
+                  onClick={() => onActionableStatus(item.id, 'confirmed')}
                 >
-                  &times;
+                  ✓
                 </button>
-              </div>
-            </article>
+              ) : null}
+              <button
+                className="text-fg/35 hover:text-fg/70"
+                type="button"
+                aria-label={`Dismiss ${item.title}`}
+                onClick={() => onActionableStatus(item.id, 'dismissed')}
+              >
+                ✕
+              </button>
+            </span>
           ))}
         </div>
       ) : null}
     </section>
   )
-}
-
-function ignoreNote(): void {
-  // Meeting-local citation navigation can be added without expanding the coordinator contract.
 }

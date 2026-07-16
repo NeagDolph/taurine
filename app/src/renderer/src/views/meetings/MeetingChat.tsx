@@ -23,13 +23,27 @@ const EMPTY_STREAM: Omit<StreamingTurn, 'messageId'> = {
   error: ''
 }
 
+export interface AskRequest {
+  text: string
+  nonce: number
+}
+
 interface MeetingChatProps {
   meeting: Meeting
+  open: boolean
+  askRequest: AskRequest | null
+  onClose: () => void
   onOpenNote: (noteId: string) => void
 }
 
-export function MeetingChat({ meeting, onOpenNote }: MeetingChatProps): React.JSX.Element {
-  const [expanded, setExpanded] = useState(false)
+export function MeetingChat({
+  meeting,
+  open,
+  askRequest,
+  onClose,
+  onOpenNote
+}: MeetingChatProps): React.JSX.Element | null {
+  const expanded = open
   const [everExpanded, setEverExpanded] = useState(false)
   const [chatId, setChatId] = useState<string | null>(meeting.chatId)
   const [messages, setMessages] = useState<ChatMessage[]>([])
@@ -87,11 +101,11 @@ export function MeetingChat({ meeting, onOpenNote }: MeetingChatProps): React.JS
   useEffect(() => {
     if (!expanded) return undefined
     const collapse = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setExpanded(false)
+      if (event.key === 'Escape') onClose()
     }
     window.addEventListener('keydown', collapse)
     return () => window.removeEventListener('keydown', collapse)
-  }, [expanded])
+  }, [expanded, onClose])
 
   useEffect(() => {
     const node = threadRef.current
@@ -124,25 +138,35 @@ export function MeetingChat({ meeting, onOpenNote }: MeetingChatProps): React.JS
     if (chatId && !streaming) clientRef.current?.regenerate(chatId)
   }, [chatId, streaming])
 
-  if (!expanded) {
-    return (
-      <div className="border-t border-white/[0.08] p-3">
-        <button
-          className="flex h-9 w-full items-center rounded-lg border border-white/[0.08] bg-white/[0.025] px-3 text-left text-xs text-fg/45 transition-colors hover:border-white/[0.14] hover:text-fg/70"
-          type="button"
-          aria-expanded="false"
-          onClick={() => setExpanded(true)}
-        >
-          Ask about this meeting…
-        </button>
-      </div>
-    )
-  }
+  // "Ask anything" / "What did I miss" from the bottom bar: queue until the
+  // socket is up, then send exactly once per nonce.
+  const queuedAskRef = useRef<AskRequest | null>(null)
+  const sentNonceRef = useRef(0)
+  useEffect(() => {
+    if (!askRequest || askRequest.nonce === sentNonceRef.current) return
+    queuedAskRef.current = askRequest
+    setEverExpanded(true)
+  }, [askRequest])
+  useEffect(() => {
+    if (connection !== 'connected') return
+    const queued = queuedAskRef.current
+    if (!queued || queued.nonce === sentNonceRef.current) return
+    sentNonceRef.current = queued.nonce
+    queuedAskRef.current = null
+    send(queued.text)
+  }, [connection, send, askRequest, streaming])
+
+  if (!expanded && !everExpanded) return null
 
   const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant')
 
   return (
-    <section className="grid h-[min(42vh,380px)] min-h-[220px] grid-rows-[auto_minmax(0,1fr)_auto] border-t border-white/[0.08] bg-surface-1/95">
+    <section
+      className={`absolute bottom-[84px] left-1/2 z-30 grid h-[min(56vh,540px)] w-[min(660px,94%)] -translate-x-1/2 grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-2xl border border-white/[0.1] bg-surface-2/95 shadow-2xl backdrop-blur-xl transition-all duration-150 ${
+        expanded ? 'visible translate-y-0 opacity-100' : 'invisible translate-y-2 opacity-0'
+      }`}
+      aria-hidden={!expanded}
+    >
       <header className="flex h-9 items-center justify-between border-b border-white/[0.07] px-4">
         <div className="flex items-center gap-2 text-xs font-medium text-fg/70">
           <span>Ask about this meeting</span>
@@ -152,9 +176,9 @@ export function MeetingChat({ meeting, onOpenNote }: MeetingChatProps): React.JS
           className="border-0 bg-transparent text-sm text-fg/45 hover:text-fg"
           type="button"
           aria-label="Collapse meeting chat"
-          onClick={() => setExpanded(false)}
+          onClick={onClose}
         >
-          ⌄
+          −
         </button>
       </header>
 

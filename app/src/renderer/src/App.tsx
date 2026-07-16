@@ -628,9 +628,11 @@ function App(): React.JSX.Element {
       registerNotesFlush,
       queueNotepadPush,
       flushNotepadPush,
-      setActionableStatus: actionableStatus
+      setActionableStatus: actionableStatus,
+      openNoteInMap: showInMap
     }),
     [
+      showInMap,
       actionables,
       actionableStatus,
       chunks,

@@ -1,14 +1,13 @@
-import { createElement } from 'react'
-import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { parseMeeting } from './meetings'
 import {
-  deserializeMarkdown,
-  serializeMarkdown,
-  SuggestionDecorations
-} from '../views/meetings/NotepadEditor'
+  anchorTail,
+  blockPlainText,
+  findAnchorBlockId,
+  stripSuggestionBlocks,
+  type BlockLike
+} from './suggestion-blocks'
 import { parseUpdateEvent } from './updates'
-import { projectPendingSuggestions } from './suggestions'
 
 describe('parseMeeting', () => {
   it('maps a complete meeting payload from snake case to camel case', () => {
@@ -87,45 +86,71 @@ describe('parseMeeting', () => {
   })
 })
 
-describe('NotepadEditor markdown serialization', () => {
-  it('round-trips headings, bold text, and lists', () => {
-    const markdown = '# Planning\n\nA **bold** decision.\n\n- First\n- Second'
-    const value = deserializeMarkdown(markdown)
-
-    const serialized = serializeMarkdown(value)
-    expect(serialized).toBe('# Planning\n\nA **bold** decision.\n\n* First\n* Second')
-    expect(serializeMarkdown(deserializeMarkdown(serialized))).toBe(serialized)
+describe('suggestion block projection', () => {
+  const block = (id: string, text: string, children: BlockLike[] = []): BlockLike => ({
+    id,
+    type: 'paragraph',
+    content: [{ type: 'text', text }],
+    children
   })
 
-  it('does not leak suggestion-marked text into markdown', () => {
-    const value = deserializeMarkdown('Keep this')
-    const paragraph = value[0] as { children: Array<Record<string, unknown>> }
-    paragraph.children.push({ text: ' pending insertion', suggestion: true })
-
-    expect(serializeMarkdown(value)).toBe('Keep this')
+  it('extracts plain text from inline content', () => {
+    expect(blockPlainText(block('a', 'Maya owns the rollout.'))).toBe('Maya owns the rollout.')
+    expect(blockPlainText({ id: 'x', type: 'suggestion' })).toBe('')
   })
 
-  it('renders pending insertions as controls outside the editor value', () => {
-    const suggestion = {
-      id: 'suggestion-1',
-      anchor: 'Keep this',
+  it('strips list and heading markers from anchor tails', () => {
+    expect(anchorTail('- Maya owns the rollout.')).toBe('Maya owns the rollout.')
+    expect(anchorTail('## Agenda\n1. **Budget** review')).toBe('Budget review')
+    expect(anchorTail('')).toBe('')
+  })
+
+  it('finds the anchored block by occurrence and skips suggestion blocks', () => {
+    const blocks = [
+      block('b1', 'Same line'),
+      { id: 's1', type: 'suggestion' as const },
+      block('b2', 'Same line'),
+      block('b3', 'Other')
+    ]
+    const edit = (
+      occurrence: number,
+      anchor = '- Same line'
+    ): Parameters<typeof findAnchorBlockId>[1] => ({
+      id: 'e1',
+      anchor,
+      occurrence,
+      insertMd: 'x',
+      rationale: '',
+      status: 'pending' as const
+    })
+    expect(findAnchorBlockId(blocks, edit(1))).toBe('b1')
+    expect(findAnchorBlockId(blocks, edit(2))).toBe('b2')
+    expect(findAnchorBlockId(blocks, edit(9))).toBe('b2')
+    expect(findAnchorBlockId(blocks, edit(1, ''))).toBeNull()
+    expect(findAnchorBlockId(blocks, edit(1, '- Missing'))).toBeNull()
+  })
+
+  it('finds anchors inside nested children', () => {
+    const blocks = [block('top', 'Top', [block('child', 'Nested target')])]
+    const edit = {
+      id: 'e2',
+      anchor: '- Nested target',
       occurrence: 1,
-      insertMd: '\n\nSuggested detail.',
-      rationale: 'Adds useful context',
+      insertMd: 'x',
+      rationale: '',
       status: 'pending' as const
     }
-    const markup = renderToStaticMarkup(
-      createElement(SuggestionDecorations, {
-        projections: projectPendingSuggestions('Keep this', [suggestion]),
-        onResolveSuggestion: () => undefined,
-        readOnly: false
-      })
-    )
+    expect(findAnchorBlockId(blocks, edit)).toBe('child')
+  })
 
-    expect(markup).toContain('Suggested detail.')
-    expect(markup).toContain('Accept suggestion')
-    expect(markup).toContain('Dismiss suggestion')
-    expect(serializeMarkdown(deserializeMarkdown('Keep this'))).toBe('Keep this')
+  it('strips suggestion blocks recursively before serialization', () => {
+    const blocks: BlockLike[] = [
+      block('keep', 'Keep this', [{ id: 'nested-s', type: 'suggestion' }]),
+      { id: 's', type: 'suggestion' }
+    ]
+    const stripped = stripSuggestionBlocks(blocks)
+    expect(stripped).toHaveLength(1)
+    expect(stripped[0].children).toHaveLength(0)
   })
 })
 
