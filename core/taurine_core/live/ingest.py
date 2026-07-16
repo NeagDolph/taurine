@@ -27,6 +27,7 @@ from taurine_core.schemas import (
 
 Event = TranscriptEvent | LiveGroundingEvent | SummaryEvent | ActionableEvent
 EventSink = Callable[[Event], Awaitable[None] | None]
+FinalChunkSink = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 class TriggerLike(Protocol):
@@ -72,6 +73,7 @@ class LiveSession:
         summarizer: SummarizerLike,
         emit: EventSink,
         logger: LoggerLike | None = None,
+        on_final_chunk: FinalChunkSink | None = None,
     ) -> None:
         if grounding.registry is not registry:
             raise ValueError("live retrieval, grounding, and transcript must share a registry")
@@ -83,6 +85,7 @@ class LiveSession:
         self._summarizer = summarizer
         self._emit = emit
         self._logger = logger or _NullLogger()
+        self._on_final_chunk = on_final_chunk
         self._partials: dict[int, str] = {}
         self.last_grounding: GroundingUpdate | None = None
         self._summary: MeetingSummary | None = None
@@ -127,6 +130,17 @@ class LiveSession:
             ts=emitted.ts,
             final=emitted.final,
         )
+        if emitted.final and self._on_final_chunk is not None:
+            result = self._on_final_chunk(
+                {
+                    "channel": emitted.channel,
+                    "text": emitted.text,
+                    "ts": emitted.ts,
+                    "seq": emitted.seq,
+                }
+            )
+            if isawaitable(result):
+                await result
         await self._emit_event(
             TranscriptEvent(
                 channel=emitted.channel,

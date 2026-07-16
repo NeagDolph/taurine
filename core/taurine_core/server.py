@@ -82,6 +82,8 @@ from taurine_core.schemas import (
     IndexStatus,
     LocalGraphResponse,
     MeetingSummary,
+    MeetingCreateRequest,
+    MeetingUpdateRequest,
     NeighborRef,
     NotePreview,
     OpenNoteMsg,
@@ -131,7 +133,7 @@ class UpdateBus:
     payloads when it drains its queue, so bursts coalesce naturally.
     """
 
-    KINDS = ("connectors", "sync", "graph", "profile", "chats")
+    KINDS = ("connectors", "sync", "graph", "profile", "chats", "meetings")
 
     def __init__(self) -> None:
         self._subscribers: set[asyncio.Queue[str]] = set()
@@ -168,11 +170,19 @@ class UpdateBus:
 
 
 @dataclass
+class SessionContext:
+    generation: int
+    meeting_id: str | None
+    live: LiveSession | None = None
+    asr: ASRClient | None = None
+
+
+@dataclass
 class Runtime:
     index: Any
     sync_once: Callable[[], SyncReport]
     open_note: Callable[[str], None]
-    make_live_session: Callable[[EventSink, Any], LiveSessionLike] | None
+    make_live_session: Callable[..., LiveSessionLike] | None
     make_asr_client: Callable[
         [ChunkCallback, StatusCallback, IndexStatusProvider],
         ASRClientLike,
@@ -194,7 +204,17 @@ class Runtime:
     status_sinks: set[Callable[[], Awaitable[None]]] = field(default_factory=set)
     updates: UpdateBus = field(default_factory=UpdateBus)
     graph_version: int = 0
-    active_live_session: LiveSessionLike | None = None
+    active_sessions: dict[str, SessionContext] = field(default_factory=dict)
+    meeting_epochs: dict[str, int] = field(default_factory=dict)
+    meeting_finalizers: dict[
+        str, asyncio.TimerHandle | asyncio.Task[Any]
+    ] = field(default_factory=dict)
+    active_unbound_sessions: dict[int, SessionContext] = field(default_factory=dict)
+    context_epochs: dict[int, int] = field(default_factory=dict)
+    context_transcript_buffers: dict[int, Any] = field(default_factory=dict)
+    pending_live_sessions: dict[
+        int, Callable[[], LiveSessionLike | None]
+    ] = field(default_factory=dict)
     make_chat_engine: Callable[[], Any] | None = None
     chat_engine: Any = None
     make_profile_generator: Callable[[], Any] | None = None
@@ -205,6 +225,20 @@ class Runtime:
     profile_generation_task: asyncio.Task[Any] | None = None
     knowledge_runtime: Any = None
     regenerate_knowledge: Callable[..., Any] | None = None
+
+    def current_live_session(self) -> LiveSessionLike | None:
+        contexts = [
+            *self.active_sessions.values(),
+            *self.active_unbound_sessions.values(),
+        ]
+        for context in reversed(contexts):
+            if context.live is not None:
+                return context.live
+        for initialize in reversed(self.pending_live_sessions.values()):
+            live = initialize()
+            if live is not None:
+                return live
+        return None
 
 
 class EdgeReasonRequest(BaseModel):
@@ -320,6 +354,16 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             # waiting for it. A partial build only leaves a temporary
             # *.build-*.db file that the next build reuses or replaces.
             if active_runtime is not None:
+                finalizer_tasks = [
+                    finalizer
+                    for finalizer in active_runtime.meeting_finalizers.values()
+                    if isinstance(finalizer, asyncio.Task)
+                ]
+                for finalizer in active_runtime.meeting_finalizers.values():
+                    finalizer.cancel()
+                active_runtime.meeting_finalizers.clear()
+                if finalizer_tasks:
+                    await asyncio.gather(*finalizer_tasks, return_exceptions=True)
                 if active_runtime.sync_task is not None:
                     active_runtime.sync_task.cancel()
                     await asyncio.gather(active_runtime.sync_task, return_exceptions=True)
@@ -662,7 +706,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         active_runtime = _ready_runtime(app)
         if active_runtime.make_live_session is None:
             raise HTTPException(status_code=404, detail="live session unavailable")
-        live = active_runtime.active_live_session
+        live = active_runtime.current_live_session()
         if live is None:
             return MeetingSummary()
         return live.current_summary()
@@ -714,6 +758,63 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="chat not found")
         active_runtime.index.delete_chat(chat_id)
         active_runtime.updates.publish("chats")
+        return {"ok": True}
+
+    @app.get("/meetings")
+    async def meetings() -> dict[str, list[dict[str, Any]]]:
+        active_runtime = _ready_runtime(app)
+        return {"meetings": active_runtime.index.meetings_list()}
+
+    @app.post("/meetings")
+    async def create_meeting(
+        payload: MeetingCreateRequest | None = Body(None),
+    ) -> dict[str, Any]:
+        active_runtime = _ready_runtime(app)
+        meeting = active_runtime.index.meeting_create(payload.title if payload else "")
+        active_runtime.updates.publish("meetings")
+        return meeting
+
+    @app.get("/meetings/{meeting_id}")
+    async def meeting_detail(meeting_id: str) -> dict[str, Any]:
+        active_runtime = _ready_runtime(app)
+        meeting = active_runtime.index.meeting_get(meeting_id)
+        if meeting is None:
+            raise HTTPException(status_code=404, detail="meeting not found")
+        return meeting
+
+    @app.patch("/meetings/{meeting_id}")
+    async def update_meeting(
+        meeting_id: str, payload: MeetingUpdateRequest = Body(...)
+    ) -> dict[str, Any]:
+        active_runtime = _ready_runtime(app)
+        previous = active_runtime.index.meeting_get(meeting_id)
+        if previous is None:
+            raise HTTPException(status_code=404, detail="meeting not found")
+        suggestions = payload.suggestions
+        if suggestions is not None:
+            suggestions = _suggestion_status_patch(
+                previous["suggestions"], suggestions
+            )
+        meeting = active_runtime.index.meeting_update(
+            meeting_id,
+            title=payload.title,
+            notes_md=payload.notes_md,
+            suggestions=suggestions,
+        )
+        if payload.title is not None and meeting["title"] != previous["title"]:
+            active_runtime.updates.publish("meetings")
+        return meeting
+
+    @app.delete("/meetings/{meeting_id}")
+    async def delete_meeting(meeting_id: str) -> dict[str, bool]:
+        active_runtime = _ready_runtime(app)
+        if active_runtime.index.meeting_get(meeting_id) is None:
+            raise HTTPException(status_code=404, detail="meeting not found")
+        finalizer = active_runtime.meeting_finalizers.pop(meeting_id, None)
+        if finalizer is not None:
+            finalizer.cancel()
+        active_runtime.index.meeting_delete(meeting_id)
+        active_runtime.updates.publish("meetings")
         return {"ok": True}
 
     @app.put("/profile")
@@ -803,13 +904,28 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             await websocket.close(code=1011)
             logger.close()
             return
-        live = active_runtime.make_live_session(emit, logger)
-        active_runtime.active_live_session = live
-        asr = active_runtime.make_asr_client(
-            live.on_chunk,
-            emit,
-            lambda: _index_status(active_runtime),
-        )
+        ctx_holder = [SessionContext(generation=0, meeting_id=None)]
+        transcript_buffer: list[_MeetingTranscriptBuffer | None] = [None]
+
+        async def on_final_chunk(chunk: dict[str, Any]) -> None:
+            buffer = transcript_buffer[0]
+            if buffer is not None:
+                await buffer.append(chunk)
+
+        pending_key = id(ctx_holder)
+
+        def initialize_pending_live() -> LiveSessionLike | None:
+            context = ctx_holder[0]
+            if context.generation != 0:
+                return context.live
+            if context.live is None:
+                context.live = _make_live_session(
+                    active_runtime, emit, logger, on_final_chunk
+                )  # type: ignore[assignment]
+            return context.live
+
+        active_runtime.pending_live_sessions[pending_key] = initialize_pending_live
+
         sender = asyncio.create_task(_send_events(websocket, events))
         await emit(
             StatusEvent(asr="disconnected", index=_index_status(active_runtime))
@@ -823,8 +939,9 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 if message.get("text") is not None:
                     session_started = await _handle_control(
                         message["text"],
-                        asr=asr,
-                        live=live,
+                        ctx_holder=ctx_holder,
+                        transcript_buffer=transcript_buffer,
+                        on_final_chunk=on_final_chunk,
                         runtime=active_runtime,
                         emit=emit,
                         logger=logger,
@@ -836,21 +953,31 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                     except ValueError as exc:
                         await emit(_status_error(active_runtime, str(exc)))
                         continue
+                    asr = ctx_holder[0].asr
+                    if asr is None:
+                        await emit(_status_error(active_runtime, "session has not started"))
+                        continue
                     await asr.send_pcm_s16(channel, pcm)
         except WebSocketDisconnect:
             pass
         finally:
-            if active_runtime.active_live_session is live:
-                active_runtime.active_live_session = None
+            active_runtime.pending_live_sessions.pop(pending_key, None)
             active_runtime.status_sinks.discard(emit_index_status)
             if not session_started:
                 logger.log("session_start", channels=[])
-            # Cancel and drain any in-flight summary before closing the
-            # logger so the task cannot log into a closed sink (M8).
-            live_close = getattr(live, "aclose", None)
-            if live_close is not None:
-                await live_close()
-            await asr.stop()
+            context = ctx_holder[0]
+            if context.meeting_id is not None:
+                snapshot = await _capture_finalization_snapshot(
+                    active_runtime, context, transcript_buffer[0]
+                )
+                if snapshot is not None:
+                    _schedule_meeting_finalization(active_runtime, snapshot)
+            await _teardown_session_context(context)
+            if context.meeting_id is not None and snapshot is not None:
+                await _refresh_snapshot_transcript(
+                    active_runtime, snapshot, transcript_buffer[0]
+                )
+            _remove_active_context(active_runtime, context)
             sender.cancel()
             await asyncio.gather(sender, return_exceptions=True)
             logger.close()
@@ -1043,7 +1170,11 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
         knowledge_runtime.activate_from_disk()
         return build_report
 
-    def make_live_session(emit: EventSink, logger: SessionLogger) -> LiveSession:
+    def make_live_session(
+        emit: EventSink,
+        logger: SessionLogger,
+        on_final_chunk: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
+    ) -> LiveSession:
         clock = _MonotonicClock()
         registry = EvidenceRegistry()
         grounding = GroundingEngine(registry)
@@ -1065,6 +1196,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
             ),
             emit=emit,
             logger=logger,
+            on_final_chunk=on_final_chunk,
         )
 
     def make_asr_client(
@@ -1331,6 +1463,178 @@ def _knowledge_note_preview(
         store.close()
 
 
+@dataclass(frozen=True)
+class _MeetingFinalizationSnapshot:
+    meeting_id: str
+    epoch: int
+    notes_md: str
+    transcript: list[dict[str, Any]]
+
+
+class _MeetingTranscriptBuffer:
+    FLUSH_CHUNKS = 20
+    FLUSH_INTERVAL_S = 10.0
+
+    def __init__(self, index: Any, meeting_id: str) -> None:
+        self._index = index
+        self._meeting_id = meeting_id
+        self._chunks: list[dict[str, Any]] = []
+        self._timer: asyncio.TimerHandle | None = None
+        self._lock = asyncio.Lock()
+
+    async def append(self, chunk: dict[str, Any]) -> None:
+        async with self._lock:
+            self._chunks.append(dict(chunk))
+            if self._timer is None:
+                self._timer = asyncio.get_running_loop().call_later(
+                    self.FLUSH_INTERVAL_S, self._flush_from_timer
+                )
+            should_flush = len(self._chunks) >= self.FLUSH_CHUNKS
+        if should_flush:
+            await self.flush()
+
+    def _flush_from_timer(self) -> None:
+        self._timer = None
+        asyncio.create_task(self.flush())
+
+    async def flush(self) -> None:
+        async with self._lock:
+            timer = self._timer
+            self._timer = None
+            chunks = self._chunks
+            self._chunks = []
+        if timer is not None:
+            timer.cancel()
+        if not chunks:
+            return
+        try:
+            self._index.meeting_append_transcript(self._meeting_id, chunks)
+        except KeyError:
+            return
+
+
+def _make_live_session(
+    runtime: Runtime,
+    emit: EventSink,
+    logger: Any,
+    on_final_chunk: Callable[[dict[str, Any]], Awaitable[None] | None],
+) -> LiveSessionLike:
+    factory = runtime.make_live_session
+    if factory is None:  # pragma: no cover - guarded by websocket setup
+        raise RuntimeError("live session unavailable")
+    parameters = inspect.signature(factory).parameters.values()
+    supports_keyword = any(
+        parameter.name == "on_final_chunk"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if supports_keyword:
+        return factory(emit, logger, on_final_chunk=on_final_chunk)  # type: ignore[call-arg]
+    positional = sum(
+        parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        for parameter in parameters
+    )
+    if positional >= 3:
+        return factory(emit, logger, on_final_chunk)  # type: ignore[call-arg]
+    return factory(emit, logger)
+
+
+async def _teardown_session_context(context: SessionContext) -> None:
+    live_close = getattr(context.live, "aclose", None)
+    if live_close is not None:
+        await live_close()
+    if context.asr is not None:
+        await context.asr.stop()
+
+
+def _remove_active_context(runtime: Runtime, context: SessionContext) -> None:
+    if context.meeting_id is not None:
+        if runtime.active_sessions.get(context.meeting_id) is context:
+            runtime.active_sessions.pop(context.meeting_id, None)
+    else:
+        runtime.active_unbound_sessions.pop(id(context), None)
+    runtime.context_epochs.pop(id(context), None)
+    runtime.context_transcript_buffers.pop(id(context), None)
+
+
+async def _capture_finalization_snapshot(
+    runtime: Runtime,
+    context: SessionContext,
+    transcript_buffer: _MeetingTranscriptBuffer | None,
+) -> _MeetingFinalizationSnapshot | None:
+    meeting_id = context.meeting_id
+    if meeting_id is None:
+        return None
+    if transcript_buffer is not None:
+        await transcript_buffer.flush()
+    meeting = runtime.index.meeting_get(meeting_id)
+    if meeting is None or meeting["status"] != "live":
+        return None
+    return _MeetingFinalizationSnapshot(
+        meeting_id=meeting_id,
+        epoch=runtime.context_epochs.get(id(context), -1),
+        notes_md=meeting["notes_md"],
+        transcript=list(meeting["transcript"]),
+    )
+
+
+async def _refresh_snapshot_transcript(
+    runtime: Runtime,
+    snapshot: _MeetingFinalizationSnapshot,
+    transcript_buffer: _MeetingTranscriptBuffer | None,
+) -> None:
+    if transcript_buffer is not None:
+        await transcript_buffer.flush()
+    meeting = runtime.index.meeting_get(snapshot.meeting_id)
+    if meeting is not None:
+        snapshot.transcript[:] = meeting["transcript"]
+
+
+def _finalize_meeting_snapshot(
+    runtime: Runtime, snapshot: _MeetingFinalizationSnapshot
+) -> bool:
+    if runtime.meeting_epochs.get(snapshot.meeting_id) != snapshot.epoch:
+        return False
+    if snapshot.meeting_id in runtime.active_sessions:
+        return False
+    meeting = runtime.index.meeting_get(snapshot.meeting_id)
+    if meeting is None or meeting["status"] == "done":
+        return False
+    runtime.index.meeting_set_status(
+        snapshot.meeting_id, "done", ended_at=time.time()
+    )
+    runtime.updates.publish("meetings")
+    return True
+
+
+def _cancel_meeting_finalizer(runtime: Runtime, meeting_id: str) -> None:
+    finalizer = runtime.meeting_finalizers.pop(meeting_id, None)
+    if finalizer is not None:
+        finalizer.cancel()
+
+
+def _schedule_meeting_finalization(
+    runtime: Runtime, snapshot: _MeetingFinalizationSnapshot
+) -> None:
+    if runtime.meeting_epochs.get(snapshot.meeting_id) != snapshot.epoch:
+        return
+    _cancel_meeting_finalizer(runtime, snapshot.meeting_id)
+    handle: asyncio.TimerHandle | None = None
+
+    def expire() -> None:
+        current = runtime.meeting_finalizers.get(snapshot.meeting_id)
+        if current is not handle:
+            return
+        runtime.meeting_finalizers.pop(snapshot.meeting_id, None)
+        _finalize_meeting_snapshot(runtime, snapshot)
+
+    handle = asyncio.get_running_loop().call_later(
+        config.MEETING_FINALIZE_GRACE_S, expire
+    )
+    runtime.meeting_finalizers[snapshot.meeting_id] = handle
+
+
 def split_audio_frame(frame: bytes) -> tuple[int, bytes]:
     if not frame:
         raise ValueError("audio frame missing channel byte")
@@ -1340,8 +1644,9 @@ def split_audio_frame(frame: bytes) -> tuple[int, bytes]:
 async def _handle_control(
     raw: str,
     *,
-    asr: ASRClientLike,
-    live: LiveSessionLike,
+    ctx_holder: list[SessionContext],
+    transcript_buffer: list[_MeetingTranscriptBuffer | None],
+    on_final_chunk: Callable[[dict[str, Any]], Awaitable[None] | None],
     runtime: Runtime,
     emit: EventSink,
     logger: Any,
@@ -1356,15 +1661,102 @@ async def _handle_control(
     logger.log("control", message=message.model_dump())
 
     if isinstance(message, StartMsg):
+        runtime.pending_live_sessions.pop(id(ctx_holder), None)
+        if message.meeting_id is not None:
+            meeting = runtime.index.meeting_get(message.meeting_id)
+            if meeting is None:
+                await emit(_status_error(runtime, "meeting not found"))
+                return session_started
+
+        previous = ctx_holder[0]
+        if previous.generation > 0:
+            snapshot = None
+            if previous.meeting_id is not None:
+                snapshot = await _capture_finalization_snapshot(
+                    runtime, previous, transcript_buffer[0]
+                )
+                if snapshot is not None:
+                    _schedule_meeting_finalization(runtime, snapshot)
+            await _teardown_session_context(previous)
+            if snapshot is not None:
+                await _refresh_snapshot_transcript(
+                    runtime, snapshot, transcript_buffer[0]
+                )
+            _remove_active_context(runtime, previous)
+        elif previous.live is not None or previous.asr is not None:
+            await _teardown_session_context(previous)
+
+        context = SessionContext(
+            generation=previous.generation + 1,
+            meeting_id=message.meeting_id,
+        )
+        ctx_holder[0] = context
+        transcript_buffer[0] = (
+            _MeetingTranscriptBuffer(runtime.index, message.meeting_id)
+            if message.meeting_id is not None
+            else None
+        )
+        context.live = _make_live_session(runtime, emit, logger, on_final_chunk)
+        context.asr = runtime.make_asr_client(
+            context.live.on_chunk,
+            emit,
+            lambda: _index_status(runtime),
+        )
+
+        if message.meeting_id is not None:
+            meeting_id = message.meeting_id
+            _cancel_meeting_finalizer(runtime, meeting_id)
+            replaced = runtime.active_sessions.get(meeting_id)
+            if replaced is not None and replaced is not context:
+                replaced_buffer = runtime.context_transcript_buffers.get(id(replaced))
+                await _teardown_session_context(replaced)
+                if replaced_buffer is not None:
+                    await replaced_buffer.flush()
+                _remove_active_context(runtime, replaced)
+            epoch = runtime.meeting_epochs.get(meeting_id, 0) + 1
+            runtime.meeting_epochs[meeting_id] = epoch
+            runtime.context_epochs[id(context)] = epoch
+            if transcript_buffer[0] is not None:
+                runtime.context_transcript_buffers[id(context)] = transcript_buffer[0]
+            runtime.active_sessions.pop(meeting_id, None)
+            runtime.active_sessions[meeting_id] = context
+            meeting = runtime.index.meeting_get(meeting_id)
+            if meeting is not None and meeting["status"] != "live":
+                runtime.index.meeting_set_status(
+                    meeting_id,
+                    "live",
+                    started_at=time.time() if meeting["started_at"] is None else None,
+                )
+                runtime.updates.publish("meetings")
+        else:
+            runtime.active_unbound_sessions[id(context)] = context
+
         if not session_started:
             logger.log("session_start", channels=message.channels)
             session_started = True
         channel_ids = [int(channel["id"]) for channel in message.channels if "id" in channel]
-        await asr.start(channel_ids)
+        await context.asr.start(channel_ids)
     elif isinstance(message, StopMsg):
-        await asr.stop()
+        context = ctx_holder[0]
+        if context.asr is not None:
+            await context.asr.stop()
+        if context.meeting_id is not None:
+            context_epoch = runtime.context_epochs.get(id(context), -1)
+            live_close = getattr(context.live, "aclose", None)
+            if live_close is not None:
+                await live_close()
+            snapshot = await _capture_finalization_snapshot(
+                runtime, context, transcript_buffer[0]
+            )
+            _remove_active_context(runtime, context)
+            if runtime.meeting_epochs.get(context.meeting_id) == context_epoch:
+                _cancel_meeting_finalizer(runtime, context.meeting_id)
+                if snapshot is not None:
+                    _finalize_meeting_snapshot(runtime, snapshot)
     elif isinstance(message, ActionableStatusMsg):
-        await live.set_actionable_status(message.id, message.status)
+        live = ctx_holder[0].live
+        if live is not None:
+            await live.set_actionable_status(message.id, message.status)
     elif isinstance(message, OpenNoteMsg):
         try:
             await asyncio.to_thread(runtime.open_note, message.note_id)
@@ -1401,6 +1793,37 @@ def _parse_chat_control(raw: str) -> ChatSendMsg | ChatCancelMsg | ChatRegenerat
     if message_type == "chat_regenerate":
         return ChatRegenerateMsg.model_validate(payload)
     raise ValueError(f"unsupported chat control type: {message_type}")
+
+
+def _suggestion_status_patch(
+    stored: list[dict[str, Any]], incoming: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    if len(stored) != len(incoming):
+        raise HTTPException(
+            status_code=422, detail="suggestions patch may only change statuses"
+        )
+    for previous, row in zip(stored, incoming, strict=True):
+        if (
+            not isinstance(previous, dict)
+            or not isinstance(row, dict)
+            or not isinstance(previous.get("id"), str)
+            or row.get("id") != previous["id"]
+            or row.get("status") not in {
+                "pending",
+                "accepted",
+                "rejected",
+            }
+        ):
+            raise HTTPException(
+                status_code=422, detail="suggestions patch may only change statuses"
+            )
+        if {key: value for key, value in row.items() if key != "status"} != {
+            key: value for key, value in previous.items() if key != "status"
+        }:
+            raise HTTPException(
+                status_code=422, detail="suggestions patch may only change statuses"
+            )
+    return incoming
 
 
 async def _send_events(
@@ -1701,6 +2124,11 @@ async def _send_updates(
                     ],
                 }
             )
+        )
+    if "meetings" in kinds:
+        meetings = getattr(runtime.index, "meetings_list", lambda: [])()
+        await websocket.send_text(
+            json.dumps({"type": "meetings", "meetings": meetings})
         )
 
 

@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
+from uuid import uuid4
 
 import numpy as np
 
@@ -344,6 +345,233 @@ class Index:
             "SELECT note_id, ingest_salience FROM notes"
         ).fetchall()
         return {row["note_id"]: float(row["ingest_salience"]) for row in rows}
+
+    # ── meetings persistence (spec 2026-07-16-meetings-overhaul §2.1) ─
+    @staticmethod
+    def _meeting_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        suggestions_value = json.loads(row["suggestions_json"])
+        if isinstance(suggestions_value, dict):
+            suggestions = suggestions_value.get("edits", [])
+            suggestions_base_rev = suggestions_value.get("base_rev", 0)
+        else:  # defensive compatibility with pre-contract development rows
+            suggestions = suggestions_value if isinstance(suggestions_value, list) else []
+            suggestions_base_rev = 0
+        transcript = json.loads(row["transcript_json"])
+        return {
+            "meeting_id": row["meeting_id"],
+            "title": row["title"],
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+            "started_at": (
+                float(row["started_at"]) if row["started_at"] is not None else None
+            ),
+            "ended_at": float(row["ended_at"]) if row["ended_at"] is not None else None,
+            "notes_md": row["notes_md"],
+            "notes_rev": int(row["notes_rev"]),
+            "final_summary_md": row["final_summary_md"],
+            "suggestions": suggestions if isinstance(suggestions, list) else [],
+            "suggestions_base_rev": int(suggestions_base_rev),
+            "transcript": transcript if isinstance(transcript, list) else [],
+            "chat_id": row["chat_id"],
+            "status": row["status"],
+        }
+
+    def meeting_create(self, title: str = "") -> dict[str, Any]:
+        meeting_id = uuid4().hex
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO meetings(meeting_id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (meeting_id, title, now, now),
+            )
+        meeting = self.meeting_get(meeting_id)
+        if meeting is None:  # pragma: no cover - insertion invariant
+            raise RuntimeError("meeting insert did not persist")
+        return meeting
+
+    def meeting_get(self, meeting_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM meetings WHERE meeting_id = ?", (meeting_id,)
+        ).fetchone()
+        return self._meeting_from_row(row) if row is not None else None
+
+    def meetings_list(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT meeting_id, title, created_at, updated_at, started_at, ended_at, status
+            FROM meetings
+            ORDER BY created_at DESC, rowid DESC
+            """
+        ).fetchall()
+        return [
+            {
+                "meeting_id": row["meeting_id"],
+                "title": row["title"],
+                "created_at": float(row["created_at"]),
+                "updated_at": float(row["updated_at"]),
+                "started_at": (
+                    float(row["started_at"]) if row["started_at"] is not None else None
+                ),
+                "ended_at": (
+                    float(row["ended_at"]) if row["ended_at"] is not None else None
+                ),
+                "status": row["status"],
+            }
+            for row in rows
+        ]
+
+    def meeting_update(
+        self,
+        meeting_id: str,
+        *,
+        title: str | None = None,
+        notes_md: str | None = None,
+        suggestions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM meetings WHERE meeting_id = ?", (meeting_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(meeting_id)
+            updates: list[str] = []
+            values: list[Any] = []
+            content_changed = False
+            if title is not None and title != row["title"]:
+                updates.append("title = ?")
+                values.append(title)
+                content_changed = True
+            if notes_md is not None and notes_md != row["notes_md"]:
+                updates.extend(("notes_md = ?", "notes_rev = notes_rev + 1"))
+                values.append(notes_md)
+                content_changed = True
+            if suggestions is not None:
+                stored = json.loads(row["suggestions_json"])
+                base_rev = stored.get("base_rev", 0) if isinstance(stored, dict) else 0
+                next_value = {"base_rev": int(base_rev), "edits": suggestions}
+                updates.append("suggestions_json = ?")
+                values.append(json.dumps(next_value, separators=(",", ":")))
+            if content_changed:
+                updates.append("updated_at = ?")
+                values.append(time.time())
+            if updates:
+                values.append(meeting_id)
+                self._conn.execute(
+                    f"UPDATE meetings SET {', '.join(updates)} WHERE meeting_id = ?",
+                    values,
+                )
+        meeting = self.meeting_get(meeting_id)
+        if meeting is None:  # pragma: no cover - row held by transaction
+            raise KeyError(meeting_id)
+        return meeting
+
+    def meeting_delete(self, meeting_id: str) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM meetings WHERE meeting_id = ?", (meeting_id,))
+
+    def meeting_append_transcript(
+        self, meeting_id: str, chunks: list[dict[str, Any]]
+    ) -> None:
+        if not chunks:
+            return
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT transcript_json FROM meetings WHERE meeting_id = ?", (meeting_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(meeting_id)
+            transcript = json.loads(row["transcript_json"])
+            if not isinstance(transcript, list):
+                transcript = []
+            transcript.extend(chunks)
+            self._conn.execute(
+                "UPDATE meetings SET transcript_json = ? WHERE meeting_id = ?",
+                (json.dumps(transcript, separators=(",", ":")), meeting_id),
+            )
+
+    def meeting_set_status(
+        self,
+        meeting_id: str,
+        status: str,
+        *,
+        started_at: float | None = None,
+        ended_at: float | None = None,
+    ) -> None:
+        if status not in {"draft", "live", "summarizing", "done"}:
+            raise ValueError(f"invalid meeting status: {status}")
+        assignments = ["status = ?", "updated_at = ?"]
+        values: list[Any] = [status, time.time()]
+        if started_at is not None:
+            assignments.append("started_at = ?")
+            values.append(started_at)
+        if ended_at is not None:
+            assignments.append("ended_at = ?")
+            values.append(ended_at)
+        values.append(meeting_id)
+        with self._conn:
+            cursor = self._conn.execute(
+                f"UPDATE meetings SET {', '.join(assignments)} WHERE meeting_id = ?",
+                values,
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(meeting_id)
+
+    def meeting_set_chat(self, meeting_id: str, chat_id: str) -> None:
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE meetings SET chat_id = ? WHERE meeting_id = ?",
+                (chat_id, meeting_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(meeting_id)
+
+    def meeting_for_chat(self, chat_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM meetings WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return self._meeting_from_row(row) if row is not None else None
+
+    def meeting_set_final(
+        self,
+        meeting_id: str,
+        *,
+        final_summary_md: str,
+        suggestions: list[dict[str, Any]],
+        base_rev: int,
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        suggestions_json = json.dumps(
+            {"base_rev": int(base_rev), "edits": suggestions}, separators=(",", ":")
+        )
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT title FROM meetings WHERE meeting_id = ?", (meeting_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(meeting_id)
+            next_title = title if title is not None and not row["title"] else row["title"]
+            self._conn.execute(
+                """
+                UPDATE meetings
+                SET final_summary_md = ?, suggestions_json = ?, title = ?, updated_at = ?
+                WHERE meeting_id = ?
+                """,
+                (final_summary_md, suggestions_json, next_title, now, meeting_id),
+            )
+        meeting = self.meeting_get(meeting_id)
+        if meeting is None:  # pragma: no cover - row held by transaction
+            raise KeyError(meeting_id)
+        return meeting
+
+    def meetings_done(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM meetings WHERE status = 'done' ORDER BY updated_at DESC"
+        ).fetchall()
+        return [self._meeting_from_row(row) for row in rows]
 
     # ── chat persistence (spec 2026-07-08-chat-knowledge-base §1.5) ────
     def create_chat(self, chat_id: str, *, now: float) -> ChatMeta:
@@ -784,6 +1012,22 @@ class Index:
                     created REAL NOT NULL,
                     updated REAL NOT NULL,
                     registry_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS meetings (
+                    meeting_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    started_at REAL,
+                    ended_at REAL,
+                    notes_md TEXT NOT NULL DEFAULT '',
+                    notes_rev INTEGER NOT NULL DEFAULT 0,
+                    final_summary_md TEXT NOT NULL DEFAULT '',
+                    suggestions_json TEXT NOT NULL DEFAULT '{"base_rev":0,"edits":[]}',
+                    transcript_json TEXT NOT NULL DEFAULT '[]',
+                    chat_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'draft'
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_messages (

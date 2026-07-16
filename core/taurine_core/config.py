@@ -229,6 +229,7 @@ LIVE_ACCUM_EPSILON = 0.02                # accumulated entries below this are pr
 LIVE_TOPIC_SHIFT_SIM = 0.35              # window-vs-EMA cosine below this on an accepted pass → pivot
 LIVE_SPANS_BUDGET_S = 0.3                # soft budget for GLiNER query spans; timeout → no spans
 LIVE_LEDGER_MAX_CHUNKS = 2000            # hard safety cap on retained transcript chunks
+MEETING_FINALIZE_GRACE_S = 60            # disconnect grace before finalization
 RRF_K = 60
 HEAD_TOP_K = 20
 C2_TOP_K = 8                             # match the search-lane quota (was 5: entity notes

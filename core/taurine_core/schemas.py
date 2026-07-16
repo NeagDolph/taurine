@@ -666,6 +666,17 @@ class StatusEvent(BaseModel):
 class StartMsg(BaseModel):
     type: Literal["start"]
     channels: list[dict]           # [{"id": 0, "label": "mic"}]
+    meeting_id: Optional[str] = None
+
+
+class MeetingCreateRequest(BaseModel):
+    title: str = ""
+
+
+class MeetingUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    notes_md: Optional[str] = None
+    suggestions: Optional[list[dict[str, Any]]] = None
 
 
 class StopMsg(BaseModel):

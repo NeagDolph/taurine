@@ -321,7 +321,7 @@ def test_chat_rest_crud_and_update_bus_publish(store: Any) -> None:
 
     with TestClient(create_app(runtime)) as client:
         with client.websocket_connect("/updates") as updates:
-            snapshot_types = {updates.receive_json()["type"] for _ in range(4)}
+            snapshot_types = {updates.receive_json()["type"] for _ in range(5)}
             assert "chats" in snapshot_types
             created = client.post("/chats").json()
             assert created["chat_id"].startswith("chat-")
