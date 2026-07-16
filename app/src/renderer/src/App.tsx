@@ -1,7 +1,21 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type CSSProperties
+} from 'react'
+import { CallNotification } from './components/CallNotification'
 import { SessionControls, type ListeningState } from './components/SessionControls'
 import { StatusBar } from './components/StatusBar'
 import { PcmAudioCapture } from './lib/audio'
+import {
+  callDetectionReducer,
+  INITIAL_CALL_DETECTION_STATE,
+  shouldShowCallNotification
+} from './lib/call-detection'
 import { SystemAudioCapture } from './lib/sysaudio'
 import {
   createMeeting as createMeetingRecord,
@@ -46,6 +60,9 @@ const MAIN_TABS: Array<{ id: MainTab; label: string }> = [
   { id: 'connectors', label: 'Connectors' }
 ]
 
+const CALL_NOTIFICATION_SECONDS = 10
+const MIC_IDLE_REARM_MS = 5000
+
 function App(): React.JSX.Element {
   const clientRef = useRef<SidecarClient | null>(null)
   const audioRef = useRef<PcmAudioCapture | null>(null)
@@ -55,6 +72,8 @@ function App(): React.JSX.Element {
   const notesFlushRef = useRef<(() => Promise<void>) | null>(null)
   const notesSavesRef = useRef<Map<string, Promise<void>>>(new Map())
   const notepadPushRef = useRef<DebouncedNotepadPush | null>(null)
+  const micWatchListeningStateRef = useRef<ListeningState>('idle')
+  const micRearmTimerRef = useRef<number | null>(null)
 
   const [activeTab, setActiveTab] = useState<MainTab>('meetings')
   const [meetingsIndex, setMeetingsIndex] = useState<MeetingListRow[]>([])
@@ -86,6 +105,46 @@ function App(): React.JSX.Element {
   const [lastRetrieval, setLastRetrieval] = useState<RetrievalEvent | null>(null)
   const [mapFocus, setMapFocus] = useState<MapFocusRequest | null>(null)
   const [chatSeed, setChatSeed] = useState<ChatSeedRequest | null>(null)
+  const [callDetection, dispatchCallDetection] = useReducer(
+    callDetectionReducer,
+    INITIAL_CALL_DETECTION_STATE
+  )
+
+  const clearMicRearmTimer = useCallback((): void => {
+    if (micRearmTimerRef.current === null) return
+    window.clearTimeout(micRearmTimerRef.current)
+    micRearmTimerRef.current = null
+  }, [])
+
+  useEffect(() => {
+    const unsubscribe = window.api.micWatch.onActive((active) => {
+      const currentListeningState = micWatchListeningStateRef.current
+      if (currentListeningState !== 'idle') return
+
+      clearMicRearmTimer()
+      dispatchCallDetection({
+        type: 'mic',
+        active,
+        listeningState: currentListeningState
+      })
+      if (!active) {
+        micRearmTimerRef.current = window.setTimeout(() => {
+          micRearmTimerRef.current = null
+          dispatchCallDetection({ type: 'rearm' })
+        }, MIC_IDLE_REARM_MS)
+      }
+    })
+    return () => {
+      unsubscribe()
+      clearMicRearmTimer()
+    }
+  }, [clearMicRearmTimer])
+
+  useEffect(() => {
+    micWatchListeningStateRef.current = listeningState
+    dispatchCallDetection({ type: 'listening', listeningState })
+    if (listeningState !== 'idle') clearMicRearmTimer()
+  }, [clearMicRearmTimer, listeningState])
 
   useEffect(() => {
     let disposed = false
@@ -471,6 +530,16 @@ function App(): React.JSX.Element {
     setListeningState('idle')
   }, [listeningState])
 
+  const startDetectedCall = useCallback((): void => {
+    dispatchCallDetection({ type: 'suppress' })
+    setActiveTab('meetings')
+    void startMeeting()
+  }, [startMeeting])
+
+  const dismissDetectedCall = useCallback((): void => {
+    dispatchCallDetection({ type: 'suppress' })
+  }, [])
+
   const actionableStatus = useCallback((id: string, status: 'confirmed' | 'dismissed') => {
     clientRef.current?.actionableStatus(id, status)
     setActionables((current) =>
@@ -589,6 +658,7 @@ function App(): React.JSX.Element {
   )
 
   const showDisconnectedBanner = connection !== 'connected'
+  const showCallNotification = shouldShowCallNotification(callDetection, listeningState)
 
   return (
     <div className="relative flex h-screen flex-col gap-2.5 p-3">
@@ -704,6 +774,14 @@ function App(): React.JSX.Element {
         syncError={syncError}
         onSync={syncIndex}
       />
+
+      {showCallNotification ? (
+        <CallNotification
+          seconds={CALL_NOTIFICATION_SECONDS}
+          onStart={startDetectedCall}
+          onDismiss={dismissDetectedCall}
+        />
+      ) : null}
     </div>
   )
 }
