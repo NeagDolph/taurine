@@ -251,8 +251,11 @@ FUZZY_SNAP_LABELS = ("person", "organization", "project")  # spans eligible for 
 
 # ── summarizer (spec 2026-07-08: one pass, change-triggered) ───────────
 SUMMARY_MODEL = "deepseek/deepseek-v4-flash"
-LIVE_SUMMARY_MODEL = "google/gemini-3.5-flash"
-FINAL_SUMMARY_MODEL = "google/gemini-3.5-flash"
+# Neil 2026-07-16 after first pilot: gemini rolling summaries came out garbled —
+# deepseek flash for the latency-sensitive rolling lane, GLM-5.2 (the chat
+# model, strongest JSON+tools we run) for the one-shot final summary.
+LIVE_SUMMARY_MODEL = "deepseek/deepseek-v4-flash"
+FINAL_SUMMARY_MODEL = "z-ai/glm-5.2"
 FINAL_SUMMARY_MAX_TOOL_CALLS = 6
 FINAL_SUMMARY_TIMEOUT_S = 120
 FINAL_SUMMARY_MAX_TOKENS = 8192          # final strict-JSON turn generation ceiling
