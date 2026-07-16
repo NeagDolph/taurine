@@ -1,70 +1,106 @@
-# Meetings Overhaul Implementation Plan
+# Meetings Overhaul Implementation Plan (rev 2 — post codex review)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Granola-style Meetings section: persistent meeting notepads (WYSIWYG markdown + suggestions), system-audio second Deepgram stream with You/Them labeling, user notes feeding the live summarizer, Gemini 3.5 Flash end-of-call summary with graph access + suggested edits, meetings indexed as an implicit `taurine` source, and a call-detection notification with countdown auto-start.
 
-**Spec:** `docs/superpowers/specs/2026-07-16-meetings-overhaul-design.md` — read it first; it is authoritative on behavior.
+**Spec:** `docs/superpowers/specs/2026-07-16-meetings-overhaul-design.md` — read it first; authoritative on behavior. This rev 2 incorporates the 2026-07-16 codex review (16 findings): corrected store location, session lifecycle state machine, runtime-owned finalization, hidden-connector sync path, `llm_agent` tool-loop API, citable `[M#]` meeting evidence, suggestion-serialization safety, native packaging/cleanup, and an E2E harness task.
 
-**Architecture:** Core (Python sidecar) gains a meetings store + REST, notepad/final-summary lanes on the existing `/session` WS, and a `taurine` note source. App (Electron 39 + React 19 + Tailwind 4) gains a Meetings tab (Plate editor), a main-process system-audio tap (audiotee/CATap) feeding channel 1 of the existing PCM protocol, and a micwatch Swift helper driving a global notification.
+**Architecture:** Core (Python sidecar) gains meetings tables on the existing `Index` store, a per-start live-session lifecycle on `/session`, a runtime-owned finalization pipeline, and a hidden `taurine` connector. App (Electron 39 + React 19 + Tailwind 4) gains a Meetings tab (Plate editor) coordinated from App.tsx, a main-process system-audio tap (audiotee/CATap) feeding channel 1 of the existing PCM protocol, and a micwatch Swift helper driving a global notification.
 
-**Tech Stack:** FastAPI sidecar (`core/taurine_core`), Electron 39/React 19, Plate (`platejs`, `@platejs/markdown`, `@platejs/suggestion` — MIT packages only, never `xl-*`/paid), `audiotee` npm, Deepgram nova-3, OpenRouter `google/gemini-3.5-flash`.
+**Tech Stack:** FastAPI sidecar (`core/taurine_core`), Electron 39/React 19, Plate (`platejs` + markdown + suggestion packages — MIT only, never `xl-*`/paid/GPL), `audiotee` npm, Deepgram nova-3, OpenRouter `google/gemini-3.5-flash`, vitest (new, renderer unit tests).
 
 ## Global Constraints
 
-- Everything lands on `main` in /Users/neil/taurine; each phase leaves the repo green (core: `cd /Users/neil/taurine/core && .venv/bin/python -m pytest -q`; app: `cd /Users/neil/taurine/app && npx tsc --noEmit -p tsconfig.web.json && npm run lint && npm run build` — use `npx electron-vite build` if `npm run build` is absent).
-- Python: match existing style (type hints, pydantic models in `schemas.py`, config constants in `config.py`). TS: match existing idioms (plain useState/props, hand-rolled tolerant parsers in `sidecar.ts`, Tailwind utilities + `@layer components` classes).
+- Everything lands on `main` in /Users/neil/taurine; each phase leaves the repo green (core: `cd /Users/neil/taurine/core && .venv/bin/python -m pytest -q`; app: `cd /Users/neil/taurine/app && npx tsc --noEmit -p tsconfig.web.json && npm run lint && npx electron-vite build && npx vitest run`).
+- Python: match existing style (type hints, pydantic models in `schemas.py`, config constants in `config.py`). TS: match existing idioms (plain useState/props, hand-rolled tolerant parsers in `sidecar.ts`, Tailwind utilities + `@layer components` classes). React runs under StrictMode — every effect/subscription must be cleanup-correct and double-invoke-safe.
 - Live retrieval/abstention/calibration code is OFF-LIMITS except where a task names a file. Do not touch `retrieval/`, calibration artifacts, or chat routing defaults.
-- Wire contracts (message/table/REST shapes) in this plan are exact; do not rename fields.
+- Wire contracts (message/table/REST shapes) in this plan are exact; do not rename fields. Wire = snake_case; renderer types = camelCase mapped in lib parsers.
 - Commits: conventional prefix, trailer `Co-Authored-By: Codex GPT-5.6 <noreply@openai.com>`.
 - macOS-only features (audiotee, micwatch) must degrade gracefully: feature-detect, never crash on unsupported platforms.
+- Chats persist via `Index` in `core/taurine_core/indexer/store.py` (NOT a top-level store.py). All meetings persistence lives there too, same connection + `CREATE TABLE IF NOT EXISTS` in the existing schema-init path.
 
 ---
 
 ## Phase 1 — Meetings foundation
 
-### Task 1.1 (core): meetings store + REST + session binding
+### Task 1.1 (core): meetings store + REST + per-start session lifecycle
 
 **Files:**
-- Create: `core/taurine_core/meetings.py` (store class)
-- Modify: `core/taurine_core/store.py` (only if the chats tables live there — mirror wherever `GET /chats` persistence lives), `core/taurine_core/server.py` (routes ~line 660 area, `/session` handler ~773-856, `_parse_control` ~1376, UpdateBus KINDS ~134), `core/taurine_core/schemas.py` (control msgs ~666, events), `core/taurine_core/live/ingest.py` (transcript append hook)
+- Modify: `core/taurine_core/indexer/store.py` (meetings tables + CRUD on `Index`), `core/taurine_core/server.py` (routes near the chats block ~:670; `/session` handler :773-856; `_parse_control` :1376; UpdateBus KINDS :134), `core/taurine_core/schemas.py` (StartMsg ~:666, Meeting models), `core/taurine_core/live/ingest.py` (final-chunk hook), `core/taurine_core/config.py` (`MEETING_FINALIZE_GRACE_S = 60`)
 - Test: `core/tests/test_meetings.py`
 
-**Interfaces (produced — later tasks and the app rely on these exactly):**
-- Table: `meetings(meeting_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, started_at REAL, ended_at REAL, notes_md TEXT NOT NULL DEFAULT '', final_summary_md TEXT NOT NULL DEFAULT '', suggestions_json TEXT NOT NULL DEFAULT '[]', transcript_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft')`; `status ∈ {'draft','live','summarizing','done'}`; `meeting_id = uuid4().hex`.
-- `MeetingStore` methods: `create(title='') -> Meeting`, `get(meeting_id) -> Meeting | None`, `list_summaries() -> list[MeetingSummaryRow]` (no bodies, newest-first by created_at), `update(meeting_id, *, title=None, notes_md=None, suggestions=None) -> Meeting`, `delete(meeting_id)`, `append_transcript(meeting_id, chunk: dict)` (chunk = `{"channel":int,"text":str,"ts":float,"seq":int}`), `set_status(meeting_id, status, *, started_at=None, ended_at=None)`.
-- REST: `GET /meetings` → `{"meetings":[{"meeting_id","title","created_at","started_at","ended_at","status"}]}`; `POST /meetings` body `{"title"?: str}` → full meeting JSON (all columns, `suggestions` as parsed list, `transcript` as parsed list); `GET /meetings/{id}` → full meeting JSON (404 if missing); `PATCH /meetings/{id}` body any of `{"title","notes_md","suggestions"}` → full meeting JSON; `DELETE /meetings/{id}` → `{"ok": true}`.
-- Control message: `StartMsg` gains `meeting_id: str | None = None`. When a session starts with a meeting_id: `set_status(id,'live',started_at=now)`; every **final** transcript chunk also goes to `append_transcript`; on `stop` control **or socket disconnect while live**: `set_status(id,'done', ended_at=now)` (phase 4 changes 'done' to the summarizing pipeline).
-- `/updates` bus: new kind `"meetings"` pushed after any meeting mutation, payload `{"type":"meetings"}` (list invalidation only).
+**Interfaces (produced — exact):**
+- Tables (in `Index` schema init):
+  ```sql
+  CREATE TABLE IF NOT EXISTS meetings (
+    meeting_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL, updated_at REAL NOT NULL,
+    started_at REAL, ended_at REAL,
+    notes_md TEXT NOT NULL DEFAULT '', notes_rev INTEGER NOT NULL DEFAULT 0,
+    final_summary_md TEXT NOT NULL DEFAULT '',
+    suggestions_json TEXT NOT NULL DEFAULT '[]',
+    transcript_json TEXT NOT NULL DEFAULT '[]',
+    chat_id TEXT, status TEXT NOT NULL DEFAULT 'draft')
+  ```
+  `status ∈ {'draft','live','summarizing','done'}`; `meeting_id = uuid4().hex`.
+- `Index` methods: `meeting_create(title='') -> dict`, `meeting_get(meeting_id) -> dict | None`, `meetings_list() -> list[dict]` (no notes/transcript/suggestions bodies; newest-first), `meeting_update(meeting_id, *, title=None, notes_md=None, suggestions=None) -> dict` (any notes_md change bumps `notes_rev` and `updated_at`; title change bumps `updated_at`), `meeting_delete(meeting_id)`, `meeting_append_transcript(meeting_id, chunks: list[dict])` (batched — chunk = `{"channel":int,"text":str,"ts":float,"seq":int}`; appends to the JSON array in one read-modify-write, single writer: the live session), `meeting_set_status(meeting_id, status, *, started_at=None, ended_at=None)`, `meeting_set_chat(meeting_id, chat_id)`, `meetings_done() -> list[dict]` (full rows for source extraction).
+- REST (mirror the chats handlers' style): `GET /meetings` → `{"meetings":[{meeting_id,title,created_at,updated_at,started_at,ended_at,status}]}`; `POST /meetings` body `{"title"?}` → full meeting JSON (`suggestions` and `transcript` as parsed lists); `GET /meetings/{id}` (404 if missing); `PATCH /meetings/{id}` body any of `{"title","notes_md","suggestions"}`; `DELETE /meetings/{id}` → `{"ok":true}`. Full meeting JSON always includes `notes_rev`.
+- `/updates`: new kind `"meetings"` in `UpdateBus.KINDS` + snapshot sender (`server.py:1692` area) sending `{"type":"meetings","meetings":[…list rows…]}`; published on create/delete/title/status change ONLY (never per transcript batch).
+- Control: `StartMsg` gains `meeting_id: str | None = None`. Old messages parse unchanged.
+- **Per-start lifecycle (inside the `/session` handler):** `start` with a meeting_id while a previous meeting on this socket is still live → finalize the previous one first (phase 1: just `meeting_set_status(...,'done', ended_at=now)`; phase 4 swaps in the pipeline). Each `start` creates a FRESH `LiveSession` + ASR client (tear down the old pair exactly like the socket-close path does) so ledger/summary/actionable state never leaks across meetings. `stop` → flush transcript buffer + finalize the bound meeting. **Disconnect while live:** do NOT finalize inline; schedule a grace timer (`MEETING_FINALIZE_GRACE_S`) on the runtime; a new socket's `start` for the same meeting_id cancels it (meeting stays `live`, transcript keeps appending); expiry finalizes. Timer + "already finalized" guard are runtime-owned and idempotent.
+- **Transcript buffering:** `LiveSession` receives an `on_final_chunk(chunk_dict)` callback (injected via `make_live_session`); the server-side buffer flushes to `meeting_append_transcript` every 20 finals or 10 s (whichever first) and always on stop/disconnect.
 
 **Steps:**
-- [ ] Write failing tests in `core/tests/test_meetings.py`: store CRUD round-trip (create → update notes_md → get returns it; list_summaries excludes `notes_md`); `append_transcript` accumulates ordered chunks; status transitions (`draft→live` sets `started_at`, `→done` sets `ended_at`); REST endpoints via the existing FastAPI test-client pattern (find it in `core/tests/test_server*.py` and mirror fixtures) including 404 and PATCH partial-update; `_parse_control` accepts `{"type":"start","channels":[{"id":0,"label":"mic"}],"meeting_id":"abc"}` and old messages without `meeting_id` still parse.
-- [ ] Run: `cd /Users/neil/taurine/core && .venv/bin/python -m pytest tests/test_meetings.py -q` → FAIL (module missing).
-- [ ] Implement `meetings.py` + wiring. Persistence in the same SQLite DB the chats endpoints use (find via the `GET /chats` handler at `server.py:670`); `CREATE TABLE IF NOT EXISTS` on init. Live-session binding in the `/session` websocket handler: hold `meeting_id` per connection; transcript hook where finals reach the ledger in `ingest.py:111-139` (callback injected via `make_live_session`, keep `LiveSession` decoupled — pass an `on_final_chunk` callable).
-- [ ] Run tests + full suite → PASS, no regressions.
-- [ ] Commit: `feat(core): meetings store, REST, live-session binding`.
+- [ ] Failing tests in `core/tests/test_meetings.py` (mirror existing FastAPI test-client fixtures from the server tests): store CRUD + `notes_rev` bump semantics; list excludes bodies; batched transcript append preserves order; status transitions set timestamps; REST 404/PATCH-partial/DELETE; `_parse_control` accepts start with and without `meeting_id`; fresh-LiveSession-per-start (two starts on one socket → second meeting's ledger does not contain first meeting's chunks — assert via the session objects the factory produced); disconnect-grace (simulate: bind meeting, drop socket, assert status still `live`, fire the timer callback, assert `done`); double-finalize is a no-op.
+- [ ] Run: `cd /Users/neil/taurine/core && .venv/bin/python -m pytest tests/test_meetings.py -q` → FAIL.
+- [ ] Implement. Keep the grace timer on the runtime object (e.g. `runtime.meeting_finalizers: dict[str, asyncio.TimerHandle|Task]`).
+- [ ] Full suite green.
+- [ ] Commit: `feat(core): meetings store, REST, per-start live-session lifecycle`.
 
-### Task 1.2 (app): Meetings tab shell with Plate notepad
+### Task 1.2 (app): Meetings tab shell, App-level coordinator, Plate notepad
 
 **Files:**
-- Create: `app/src/renderer/src/lib/meetings.ts`, `app/src/renderer/src/views/meetings/MeetingsView.tsx`, `app/src/renderer/src/views/meetings/MeetingSidebar.tsx`, `app/src/renderer/src/views/meetings/NotepadEditor.tsx`, `app/src/renderer/src/views/meetings/TranscriptPanel.tsx`, `app/src/renderer/src/views/meetings/SummaryCard.tsx`
-- Modify: `app/src/renderer/src/App.tsx` (tab rename `'live'`→`'meetings'` at :32-40; replace the live 2×2 grid at :362-391 with `<MeetingsView …/>`; session start gains meeting binding), `app/src/renderer/src/lib/sidecar.ts` (StartMsg meeting_id; `meetings` update kind in `updates.ts`), `app/package.json` (Plate deps)
-- Delete from layout (files stay, imported by new components): direct grid usage of `SummaryPanel`/`ActionableRail`/`FeedView`/`AmbientList` in App.tsx.
+- Create: `app/src/renderer/src/lib/meetings.ts`, `app/src/renderer/src/lib/meetings.test.ts`, `app/src/renderer/src/views/meetings/MeetingsView.tsx`, `MeetingSidebar.tsx`, `NotepadEditor.tsx`, `TranscriptPanel.tsx`, `SummaryCard.tsx` (same dir), `app/vitest.config.ts`
+- Modify: `app/src/renderer/src/App.tsx` (tab rename :32-40; live grid :362-391 → `<MeetingsView/>`; coordinator state), `app/src/renderer/src/lib/sidecar.ts` (StartMsg meeting_id + **reconnect replays the full last StartMsg** — today :485 replays a hard-coded mic-only start; store the last start payload and resend it verbatim), `app/src/renderer/src/lib/updates.ts` (`meetings` kind), `app/package.json` (Plate deps + vitest)
 
 **Interfaces:**
-- Consumes: Task 1.1 REST + `meetings` update kind + `start.meeting_id`.
-- Produces: `lib/meetings.ts` exports `interface Meeting {meetingId, title, createdAt, startedAt, endedAt, notesMd, finalSummaryMd, suggestions: SuggestedEdit[], transcript: TranscriptChunk[], status}`, `interface SuggestedEdit {id: string; anchor: string; insertMd: string; rationale: string; status: 'pending'|'accepted'|'rejected'}`, functions `listMeetings()`, `createMeeting()`, `getMeeting(id)`, `patchMeeting(id, patch)`, `deleteMeeting(id)` (snake_case↔camelCase mapping, tolerant parsing like `graph.ts`).
-- `NotepadEditor` props: `{ valueMd: string; onChangeMd: (md: string) => void; suggestions: SuggestedEdit[]; onResolveSuggestion: (id: string, accept: boolean) => void; readOnly?: boolean }`. Internally Plate; markdown (de)serialization at the boundary via `@platejs/markdown`; suggestion marks rendered from `suggestions` with inline accept/deny controls (suggestion UI may be minimal in this task — full behavior lands in Task 4.3, but the props contract is fixed now).
-- `MeetingsView` props (from App): `{ live: { listeningState, chunks, interims, summary, actionables, liveGrounding, micError }, callbacks: { startListening(meetingId), stopListening(), setActionableStatus(), inspectGrounding() } }` — exact prop names may follow existing App.tsx conventions, but MeetingsView owns ALL meetings UI state (selected meeting, editor content, autosave, panel toggles).
+- Consumes: Task 1.1 REST/updates/StartMsg.
+- **App.tsx is the coordinator and owns:** `selectedMeetingId`, `liveMeetingId`, `meetingsIndex` (list rows from the `meetings` updates kind + refetch), the existing clients, and the header start/stop. It passes ONE props object down:
+  ```ts
+  interface MeetingsCoordinator {
+    meetings: MeetingListRow[]
+    selectedMeetingId: string | null
+    liveMeetingId: string | null
+    listeningState: ListeningState
+    micError: string | null
+    live: { chunks: TranscriptEvent[]; interims: Record<number, TranscriptEvent>;
+            summary: SummaryEvent | null; actionables: Actionable[];
+            liveGrounding: LiveGroundingEvent | null }
+    selectMeeting(id: string | null): void
+    createMeeting(): Promise<string>            // returns new id, selects it
+    deleteMeeting(id: string): Promise<void>
+    renameMeeting(id: string, title: string): Promise<void>
+    startMeeting(id?: string): Promise<void>    // creates+selects if id omitted; binds session
+    stopMeeting(): Promise<void>
+    saveNotes(id: string, notesMd: string): Promise<void>   // PATCH; App tracks in-flight for flush
+    setActionableStatus(id: string, status: 'confirmed'|'dismissed'): void
+  }
+  ```
+  Header SessionControls calls `startMeeting()`/`stopMeeting()`. Live event state (`chunks` etc.) is **cleared on every `startMeeting`** and belongs to `liveMeetingId` only.
+- `lib/meetings.ts`: `interface MeetingListRow {meetingId,title,createdAt,updatedAt,startedAt,endedAt,status}`, `interface Meeting extends MeetingListRow {notesMd; notesRev: number; finalSummaryMd; suggestions: SuggestedEdit[]; transcript: TranscriptChunk[]; chatId: string | null}`, `interface SuggestedEdit {id; anchor; occurrence: number; insertMd; rationale; status: 'pending'|'accepted'|'rejected'}`, `interface TranscriptChunk {channel; text; ts; seq}`; functions `listMeetings/createMeeting/getMeeting/patchMeeting/deleteMeeting` with tolerant snake→camel parsing (style of `graph.ts`).
+- `NotepadEditor` props: `{ valueMd: string; onChangeMd(md: string): void; suggestions: SuggestedEdit[]; onResolveSuggestion(id: string, accept: boolean): void; readOnly?: boolean }`. Plate internally; markdown at the boundary. **Serialization invariant: output markdown NEVER contains pending-suggestion content** (suggestion projection arrives in Task 4.3; the invariant + a unit test for "no suggestion leakage with empty suggestions" is established now).
+- MeetingsView renders: sidebar (list rows, status dot, New note), center title input + editor (autosave: debounce 800 ms → `saveNotes`; flush on meeting switch/unmount via effect cleanup), top SummaryCard (live summary + actionables; hidden when empty and idle), right hideable TranscriptPanel (**live meeting:** `live.chunks`/`interims` via FeedView; **non-live selection:** `meeting.transcript` rendered statically with the same You/Them labels; AmbientList + TriggerInspector behind an "inspect" toggle), bottom disabled composer placeholder "Ask about this meeting" (enabled in Task 4.4).
 
 **Steps:**
-- [ ] Install Plate: resolve the current MIT package set for a markdown WYSIWYG with suggestions from https://platejs.org/docs (core `platejs` packages + markdown + suggestion; NO `xl-`/paid/GPL packages). Pin exact versions in package.json.
-- [ ] Build `lib/meetings.ts` + `NotepadEditor` + view components. Layout per spec §2.2: left sidebar (meetings list + New note), center title input + editor, top `SummaryCard` (wraps SummaryPanel content + actionables; hidden when no summary and not listening), right hideable `TranscriptPanel` (FeedView + AmbientList/TriggerInspector behind an "inspect" toggle), bottom chat bar placeholder (non-functional this phase — a disabled composer with "Ask about this meeting" placeholder). Autosave: debounce 800 ms after editor change → `patchMeeting`; flush on meeting switch/unmount.
-- [ ] Wire App.tsx: tab rename (label **Meetings**), pass live state down, `startListening` creates/binds a meeting (`createMeeting()` if none selected) and sends `meeting_id` in start; keep all other tabs untouched.
-- [ ] Verify: `npx tsc --noEmit -p tsconfig.web.json`, `npm run lint`, `npx electron-vite build` all clean. Launch dev app; create/rename/edit/delete meetings; markdown round-trips (type heading/bold/list, switch meetings, come back).
-- [ ] Commit: `feat(app): Meetings tab with Plate notepad and meeting persistence`.
+- [ ] Add vitest (`vitest` + config; `npx vitest run` green on a trivial test) — renderer-lib tests only, no DOM.
+- [ ] Install Plate: resolve current MIT package set for markdown WYSIWYG + suggestions from https://platejs.org/docs; pin versions.
+- [ ] Failing vitest: meetings.ts parses a full meeting payload (snake→camel, malformed suggestions tolerated → []), and NotepadEditor's serialize helper round-trips heading/bold/list markdown (export the md<->value helpers from NotepadEditor's module so they're unit-testable).
+- [ ] Implement lib + components + App coordinator + sidecar.ts reconnect fix.
+- [ ] Verify: tsc, lint, `npx electron-vite build`, `npx vitest run`; dev smoke — create/rename/edit/delete meetings; autosave persists across app restart; start binds meeting (sidecar log shows meeting_id), transcript lands in `transcript_json`, reselecting a done meeting shows its stored transcript.
+- [ ] Commit: `feat(app): Meetings tab with Plate notepad, App-level meeting coordinator`.
 
-**Phase 1 gate (orchestrator):** core suite green; app builds; manual smoke — start listening binds a meeting, transcript lands in `transcript_json`, notes autosave.
+**Phase 1 gate (orchestrator):** core suite green; app checks green; manual smoke of the full create→listen→stop→reload cycle.
 
 ---
 
@@ -74,148 +110,192 @@
 
 **Files:**
 - Create: `app/src/main/sysaudio.ts`
-- Modify: `app/src/main/index.ts`, `app/src/preload/index.ts`, `app/src/preload/index.d.ts`, `app/electron-builder.yml` (extendInfo), `app/package.json` (dep `audiotee`)
+- Modify: `app/src/main/index.ts`, `app/src/preload/index.ts`, `app/src/preload/index.d.ts`, `app/electron-builder.yml` (extendInfo + asarUnpack), `app/package.json` (dep `audiotee`)
 
 **Interfaces (produced):**
-- Preload `window.api` gains: `sysAudio: { available(): Promise<boolean>; start(): Promise<void>; stop(): Promise<void>; onChunk(cb: (chunk: ArrayBuffer) => void): () => void }`. `available()` = darwin && macOS ≥ 14.2 && binary present. Chunks are raw PCM s16le mono 48 kHz as produced by audiotee.
-- `electron-builder.yml` mac.extendInfo gains `NSAudioCaptureUsageDescription: Taurine records system audio to transcribe the other side of your meetings.`
+- Preload `window.api.sysAudio`:
+  ```ts
+  { available(): Promise<boolean>;          // darwin && macOS >= 14.2 && helper present
+    start(): Promise<void>; stop(): Promise<void>;
+    onChunk(cb: (chunk: ArrayBuffer) => void): () => void;   // returns unsubscribe
+    onError(cb: (message: string) => void): () => void }
+  ```
+  Preload NORMALIZES ipc payloads: copy the incoming Buffer/typed array into a fresh `ArrayBuffer` before invoking callbacks. All `on*` return unsubscribe fns (StrictMode-safe).
+- Main `sysaudio.ts`: lazy AudioTee `{ sampleRate: 48000 }` (mono s16le); `data` → `webContents.send('sysaudio:chunk', chunk.data)`; error/exit → `sysaudio:error` + auto-stop; `ipcMain.handle('sysaudio:available'|'sysaudio:start'|'sysaudio:stop')`; stop the tap when the owning webContents is destroyed or reloaded (`'destroyed'`/`'did-start-navigation'`), and on `app.will-quit`. Start/stop idempotent.
+- `electron-builder.yml`: mac.extendInfo gains `NSAudioCaptureUsageDescription: Taurine records system audio to transcribe the other side of your meetings.`; `asarUnpack` gains `node_modules/audiotee/**` (the helper binary must exist unpacked at runtime).
 
 **Steps:**
-- [ ] `npm install audiotee` (main-process usage). Implement `sysaudio.ts`: lazy AudioTee instance `{ sampleRate: 48000 }`, start/stop idempotent, `data` events → `webContents.send('sysaudio:chunk', chunk.data)`, errors → `webContents.send('sysaudio:error', message)` and auto-stop. `ipcMain.handle('sysaudio:available'|'sysaudio:start'|'sysaudio:stop')`. macOS version gate via `process.getSystemVersion()`.
-- [ ] Preload bridge with `ipcRenderer.on('sysaudio:chunk')` subscription returning an unsubscribe fn; extend `TaurineApi` types.
-- [ ] Verify: typecheck+lint+build; on this Mac run dev app and confirm `await window.api.sysAudio.available()` is true and start() triggers the one-time "System Audio Recording Only" TCC prompt, then chunks flow (log byteLength in devtools). If TCC misattributes in dev, document the observed behavior in the commit body — do not block the task on it.
+- [ ] `npm install audiotee` (check its README for the exact chunk event shape and supported rates — it captures at 48 kHz mono 16-bit; if it supports direct 16 kHz output, still emit 48 kHz here — the renderer owns decimation and the contract stays fixed).
+- [ ] Implement main + preload + builder config.
+- [ ] Verify: tsc/lint/build; dev smoke on this Mac — `await window.api.sysAudio.available()` true; `start()` triggers the one-time "System Audio Recording Only" TCC prompt; while playing audio, chunks arrive with NON-ZERO energy (log RMS of a few chunks in devtools — silent zero-filled chunks = TCC misattribution = **BLOCKER: stop and report**, do not proceed to 2.2).
 - [ ] Commit: `feat(app): system-audio tap via CoreAudio process tap (audiotee)`.
 
 ### Task 2.2 (app renderer): channel-1 capture + You/Them labels
 
 **Files:**
-- Create: `app/src/renderer/src/lib/sysaudio.ts` (`SystemAudioCapture`)
-- Modify: `app/src/renderer/src/App.tsx` (start/stop lifecycle), `app/src/renderer/src/views/FeedView.tsx` (`channelLabel` :322-324)
+- Create: `app/src/renderer/src/lib/sysaudio.ts` (`SystemAudioCapture`), `app/src/renderer/src/lib/sysaudio.test.ts`
+- Modify: `app/src/renderer/src/lib/audio.ts` (export `prefixChannel`), `app/src/renderer/src/App.tsx` (start/stop lifecycle), `app/src/renderer/src/views/FeedView.tsx` (`channelLabel` :322-324)
 
 **Interfaces:**
-- Consumes: `window.api.sysAudio`, `SidecarClient.sendAudioFrame`, `client.start(channels)` (already accepts arrays).
-- Produces: `class SystemAudioCapture { constructor(onFrame: (frame: ArrayBuffer) => void); async start(): Promise<void>; stop(): void }` — decimates 48 kHz→16 kHz by averaging each 3 samples, buffers into 4000-sample (250 ms) frames, prefixes channel byte `1` (reuse/export `prefixChannel` from `lib/audio.ts`).
+- `class SystemAudioCapture { constructor(onFrame: (frame: ArrayBuffer) => void, onError: (msg: string) => void); async start(): Promise<void>; stop(): void }` — subscribes `window.api.sysAudio.onChunk/onError`, decimates 48 kHz→16 kHz by averaging each 3 s16 samples (carry remainder samples across chunks), packs 4000-sample (250 ms) frames, prefixes channel byte `1`. `stop()` unsubscribes everything and calls `sysAudio.stop()`.
+- `startMeeting`: if `await window.api.sysAudio.available()` → start SystemAudioCapture and declare `channels: [{id:0,label:'mic'},{id:1,label:'system'}]`; else mic-only exactly as today. `sysaudio` errors surface on the existing micError strip (distinct copy: "System audio stopped — mic still live") and stop only the system capture; mic keeps running. `stopMeeting` and every error path stop both captures.
+- FeedView: `channelLabel` → `0:'You'`, `1:'Them'`, else `Ch ${n}`.
 
 **Steps:**
-- [ ] Implement `SystemAudioCapture` (pure TS; the 3:1 decimation and framing logic mirrors `pcm-worklet.js` but runs on IPC chunks). Handle non-multiple-of-3 chunk tails by carrying remainder samples.
-- [ ] `startListening`: when `await window.api.sysAudio.available()`, start it and declare `channels: [{id:0,label:'mic'},{id:1,label:'system'}]`; otherwise mic-only exactly as today. `stopListening`/error paths stop both captures. `sysaudio:error` shows the existing micError surface with a distinct message but does NOT kill the mic channel.
-- [ ] FeedView: `channelLabel` → `0: 'You'`, `1: 'Them'`, else `Ch ${n}`.
-- [ ] Verify: typecheck+lint+build; dev smoke — play a YouTube video during a session, confirm channel-1 transcripts appear labeled **Them** while mic lines show **You**.
+- [ ] Failing vitest for the decimator: 48 kHz sine input chunks of awkward lengths (e.g. 1000, 1001, 999 samples) → output frame boundaries exact, 3:1 ratio, remainder carried, channel byte = 1.
+- [ ] Implement; wire App lifecycle.
+- [ ] Verify: tsc/lint/build/vitest; dev smoke — play a YouTube video during a session: channel-1 lines labeled **Them**, mic lines **You**; kill system audio mid-session → mic unaffected.
 - [ ] Commit: `feat(app): stream system audio as channel 1 with You/Them labels`.
 
 ### Task 2.3 (core): speaker labels in ledger + summarizer awareness
 
 **Files:**
-- Modify: `core/taurine_core/live/ledger.py` (transcript evidence rendering ~:174), `core/taurine_core/live/summarizer.py` (SYSTEM_PROMPT :38-59)
-- Test: extend `core/tests/test_ledger*.py` / summarizer tests (find existing files by `grep -rl "ledger" core/tests`)
+- Modify: `core/taurine_core/live/ledger.py` (rendering ~:169-174), `core/taurine_core/live/summarizer.py` (SYSTEM_PROMPT :38-59)
+- Test: extend the existing ledger/summarizer test files (locate via `grep -rl "TranscriptLedger" core/tests`)
 
-**Interfaces:** transcript evidence lines render `You: <text>` (channel 0), `Them: <text>` (channel 1), `Ch{n}: <text>` (other). SYSTEM_PROMPT gains one sentence: `Transcript lines are labeled You (the user's own mic) and Them (other call participants); attribute statements accordingly.`
+**Interfaces:** transcript evidence rendering becomes `[T#] You: "text"` (channel 0) / `[T#] Them: "text"` (channel 1) / `[T#] Ch{n}: "text"` (other). **`[T#]` tokens are load-bearing** — the summarizer's citation validator parses them (`summarizer.py:351`); only the `[channel N]` segment changes. SYSTEM_PROMPT gains: `Transcript lines are labeled You (the user's own mic) and Them (other call participants); attribute statements accordingly.`
 
 **Steps:**
-- [ ] Failing tests: ledger window rendering shows `You:`/`Them:` prefixes for channels 0/1; existing citation/offset behavior unchanged.
-- [ ] Implement; run full core suite → green.
+- [ ] Failing tests: rendering for channels 0/1/2; existing `[T#]` citation validation still passes on a summarizer round-trip fixture.
+- [ ] Implement; full suite green.
 - [ ] Commit: `feat(core): speaker-side labels in live transcript evidence`.
 
-**Phase 2 gate (orchestrator):** dev-app smoke with real system audio; core suite green.
+**Phase 2 gate (orchestrator):** dev-app smoke with real system audio (both channels transcribing, labels correct); core suite green; packaged-build check deferred to Neil's next packaging cycle (documented).
 
 ---
 
 ## Phase 3 — Notes ↔ live summary (Gemini)
 
-### Task 3.1 (core): notepad block + Gemini summary model
+### Task 3.1 (core): notepad block + LIVE_SUMMARY_MODEL
 
 **Files:**
-- Modify: `core/taurine_core/schemas.py` (new control msg), `core/taurine_core/server.py` (`_parse_control`/`_handle_control`), `core/taurine_core/live/ingest.py` (hold notepad text), `core/taurine_core/live/summarizer.py` (`_build_user_prompt` :280-298), `core/taurine_core/config.py` (SUMMARY_MODEL swap + `MEETING_NOTES_PROMPT_MAX_CHARS = 8000`)
+- Modify: `core/taurine_core/schemas.py` (NotepadMsg), `core/taurine_core/server.py` (`_parse_control`/`_handle_control`), `core/taurine_core/live/ingest.py` (`set_notepad`, threading into summarize), `core/taurine_core/live/summarizer.py` (`summarize(..., notepad_md: str = "")` → `_build_user_prompt(..., notepad_md)`), `core/taurine_core/config.py`
 - Test: summarizer prompt tests + control parse tests
 
 **Interfaces:**
-- Control: `{"type":"notepad","meeting_id": str,"text_md": str}` → `LiveSession.set_notepad(text_md)` (stored, no event reply).
-- Prompt: `_build_user_prompt` emits, before `<transcript_evidence>`, a `<user_notes>` block containing the notepad capped at `MEETING_NOTES_PROMPT_MAX_CHARS` (keep head 6000 + tail 2000 with `…[truncated]…` marker when over), plus instruction text per spec §2.3 (notes signal importance; don't restate them).
-- Config: `SUMMARY_MODEL = "google/gemini-3.5-flash"`; `SUMMARY_FALLBACK_MODEL` unchanged.
+- Control: `{"type":"notepad","meeting_id": str,"text_md": str}` → `LiveSession.set_notepad(text_md)` (ignored with a debug log if meeting_id ≠ the bound meeting; no reply event).
+- Config: `LIVE_SUMMARY_MODEL = "google/gemini-3.5-flash"` — **used ONLY at the summarizer's model-selection site** (`summarizer.py:113-130`). `SUMMARY_MODEL` stays `deepseek/deepseek-v4-flash` (`IDEA_SEARCH_MODEL`/`CONTEXT_ENRICH_MODEL`/chat utilities alias it — verify with `grep -rn "SUMMARY_MODEL" core/taurine_core` that only the live summarizer call sites change). `SUMMARY_FALLBACK_MODEL` unchanged. `LLM_REASONING_BY_MODEL["google/gemini-3.5-flash"] = {"effort": "low"}` (or the minimal supported variant — check `_reasoning_for` in llm.py and OpenRouter's reasoning param for Gemini; live latency matters). `MEETING_NOTES_PROMPT_MAX_CHARS = 8000`.
+- Prompt: `_build_user_prompt` emits, before `<transcript_evidence>`, a `<user_notes>` block: instruction line per spec §2.3 + the notepad text. Truncation when over cap: `head + "\n…[notes truncated]…\n" + tail` where head=5,800 chars, tail=2,000 chars, and **total including the marker ≤ 8,000**. Block omitted entirely when the notepad is empty/whitespace.
 
 **Steps:**
-- [ ] Failing tests: control message parses (and rejects missing text_md tolerantly); prompt contains `<user_notes>` when set and omits the block entirely when empty; truncation boundaries exact; existing summarizer JSON validation untouched.
-- [ ] Implement. Then verify Gemini structured output ONCE for real: `cd /Users/neil/taurine/core && OPENROUTER smoke — .venv/bin/python -c` script calling `OpenRouterClient.complete_json(model="google/gemini-3.5-flash", system="Return JSON {\"ok\":true}", user="go")` — if `require_parameters` rejects `response_format` for this model, add a per-model relaxation in `llm.py` (documented in code) rather than dropping validation. Requires OPEN_ROUTER_API_KEY from core/.env; if the key is unavailable in your sandbox, STOP and report — the orchestrator runs the smoke.
-- [ ] Full suite green.
-- [ ] Commit: `feat(core): user-notes block in live summary; Gemini 3.5 Flash summarizer`.
+- [ ] Failing tests: control parse (valid; missing text_md tolerated as no-op); prompt contains `<user_notes>` when set, absent when empty; truncation total-length assertion; summarizer JSON/citation validation fixtures unchanged; grep-test that no non-live consumer of `SUMMARY_MODEL` changed (assert `config.SUMMARY_MODEL == "deepseek/deepseek-v4-flash"`).
+- [ ] Implement.
+- [ ] Gemini smoke (needs `OPEN_ROUTER_API_KEY` from core/.env — if unavailable in sandbox, STOP and report; the orchestrator runs it): one `complete_json(model="google/gemini-3.5-flash", …)` call and one `stream_chat` with a dummy tool. If `require_parameters` + `response_format` fails for this model, add a per-model relaxation in `llm.py` (narrow, commented) rather than dropping validation.
+- [ ] Full suite green. Commit: `feat(core): user-notes block in live summary; Gemini 3.5 Flash live summarizer`.
 
-### Task 3.2 (app): notepad push + Add-to-notes
+### Task 3.2 (app): notepad push + flush-before-stop + Add-to-notes
 
 **Files:**
-- Modify: `app/src/renderer/src/views/meetings/MeetingsView.tsx`, `app/src/renderer/src/views/meetings/SummaryCard.tsx`, `app/src/renderer/src/lib/sidecar.ts` (send `notepad` control)
+- Modify: `app/src/renderer/src/lib/sidecar.ts` (`sendNotepad(meetingId, textMd)` control), `app/src/renderer/src/App.tsx` (coordinator), `app/src/renderer/src/views/meetings/MeetingsView.tsx`, `SummaryCard.tsx`
 
-**Interfaces:** `SidecarClient.sendNotepad(meetingId: string, textMd: string)`. SummaryCard gains `onAddToNotes(summaryMd: string)` → MeetingsView appends `\n\n${summaryMd}\n` to the editor content as regular text (through the same path as user edits → autosave).
+**Interfaces:**
+- `SidecarClient.sendNotepad(meetingId: string, textMd: string)` sends the notepad control message (no-op when socket down).
+- Coordinator behavior: while `listeningState==='listening'` and the edited meeting is `liveMeetingId`, notepad edits ALSO send `sendNotepad` debounced 2 s (independent of the 800 ms REST autosave). **`stopMeeting()` order:** flush pending REST autosave (`await saveNotes`) → `sendNotepad` with the final text → send `stop`. WS ordering on one socket guarantees the sidecar sees the final notepad before the stop control.
+- SummaryCard `onAddToNotes(summaryMd)`: MeetingsView appends `\n\n${summaryMd}\n` through the normal editor-change path (so autosave + notepad push both fire).
 
 **Steps:**
-- [ ] Implement debounced (2 s) `sendNotepad` while `listeningState==='listening'` and the edited meeting is the live one. Add-to-notes button on SummaryCard.
-- [ ] Verify: typecheck+lint+build; dev smoke — jot notes during a session, confirm next summary references them (sidecar logs show `<user_notes>`); Add-to-notes appends and persists.
+- [ ] Implement; tsc/lint/build/vitest.
+- [ ] Dev smoke: jot notes mid-session → sidecar session log shows `<user_notes>` in the next summary prompt; Add-to-notes appends + persists; type-then-immediately-stop → final text present on the meeting row.
 - [ ] Commit: `feat(app): notepad feeds live summary; insert summary into notes`.
 
-**Phase 3 gate (orchestrator):** live session E2E on this machine; battery live controls re-run (`battery-v5.py`) — abstention must hold (summarizer model change does not touch retrieval, but verify).
+**Phase 3 gate (orchestrator):** live E2E on this machine; orchestrator re-runs its retrieval battery (live abstention controls) — retrieval untouched but verify; summary latency spot-check with Gemini (target: comparable to deepseek path).
 
 ---
 
 ## Phase 4 — Final summary, suggestions, taurine source, meeting chat
 
-### Task 4.1 (core): final-summary agent + events
+### Task 4.1 (core): tool-agent helper + final-summary pipeline
 
 **Files:**
-- Create: `core/taurine_core/live/final_summary.py`
-- Modify: `core/taurine_core/server.py` (trigger on stop/disconnect-while-live; event sender), `core/taurine_core/schemas.py` (events), `core/taurine_core/config.py` (`FINAL_SUMMARY_MODEL = "google/gemini-3.5-flash"`, `FINAL_SUMMARY_MAX_TOOL_CALLS = 6`, `FINAL_SUMMARY_TIMEOUT_S = 120`), `core/taurine_core/meetings.py` (persist results)
-- Test: `core/tests/test_final_summary.py` (fake LLM client — mirror how summarizer tests fake `stream_chat`/`complete_json`)
+- Create: `core/taurine_core/llm_agent.py`, `core/taurine_core/live/final_summary.py`
+- Modify: `core/taurine_core/llm.py` (`complete_json_messages`), `core/taurine_core/server.py` (stop path + runtime-owned task registry + grace-timer finalization calls into the same pipeline), `core/taurine_core/schemas.py` (events), `core/taurine_core/config.py` (`FINAL_SUMMARY_MODEL="google/gemini-3.5-flash"`, `FINAL_SUMMARY_MAX_TOOL_CALLS=6`, `FINAL_SUMMARY_TIMEOUT_S=120`)
+- Test: `core/tests/test_llm_agent.py`, `core/tests/test_final_summary.py` (fake LLM — mirror existing summarizer fakes)
 
 **Interfaces:**
-- `async def run_final_summary(meeting, llm, engine_factory, store, profile_block, emit) -> FinalSummaryResult` where `emit(event)` sends `/session` events; uses `stream_chat` with the chat tool definitions (`chat/tools.py`) for KB access, then a final strict-JSON turn (or tool-forced JSON) validated fail-closed.
-- Events: `{"type":"final_summary_status","meeting_id":str,"state":"running"|"done"|"error","detail":str}` and `{"type":"final_summary","meeting_id":str,"title":str,"final_summary_md":str,"suggested_edits":[{"id":str,"anchor":str,"insert_md":str,"rationale":str,"status":"pending"}]}`.
-- Output JSON schema from the model: `{"title": str, "final_summary_md": str, "suggested_edits": [{"anchor": str, "insert_md": str, "rationale": str}]}` — validation rules: ≤10 edits; every non-empty `anchor` MUST be an exact substring of the meeting's `notes_md` (drop violators, keep the rest); `insert_md` non-empty; ids assigned server-side (`uuid4().hex[:8]`). Empty/invalid overall JSON → status `error`, meeting still marked `done`, title/notes untouched.
-- Meeting flow: `stop` → status `summarizing` + `final_summary_status running` → on completion persist `final_summary_md`, `suggestions_json`, auto-title if meeting title empty → status `done` + events. Timeout/exception → `error` event, status `done`.
+- `OpenRouterClient.complete_json_messages(model, messages: list[dict], *, timeout_s, temperature=0.2, max_tokens=None) -> dict` — same as `complete_json` but takes a full message list (system/user/assistant/tool roles preserved).
+- `llm_agent.run_tool_agent(llm, *, model, system: str, user: str, tools: list[dict], execute_tool: Callable[[str, dict], Awaitable[str]], max_tool_calls: int, timeout_s: float) -> dict`:
+  non-streaming loop — `complete_tools`-style call (with per-call timeout derived from the remaining budget, NOT the global 15 s default) → append assistant tool_calls + tool results to messages → repeat until no tool call or budget exhausted → final `complete_json_messages` turn appending `{"role":"user","content":"Now return the final JSON result exactly as instructed."}`. Raises `TimeoutError` past `timeout_s`.
+- Tool executor for final summary: build the SAME executor the chat engine uses. Extract chat's private tool-execution into a small public seam — e.g. a `ChatEngine.tool_executor()` method or a module-level `make_tool_executor(retriever, index)` in `chat/engine.py` — reusing the existing implementations of `search_evidence`/`read_note`/`expand_evidence` with a `mode="tool"` retriever from `knowledge_runtime.make_engine`. Do NOT reimplement the tools.
+- `final_summary.run_final_summary(meeting: dict, llm, execute_tool, profile_block: str, emit: Callable[[Event], Awaitable[None]], index) -> None` — assembles inputs (labeled transcript rendered `You:`/`Them:` lines, notes_md + notes_rev, last live summary text, actionable statuses, profile block; prompt per spec §2.4 incl. the You/Them convention and additive-edits rule), runs `run_tool_agent`, validates, persists, emits.
+- Validation (fail-closed): ≤10 edits kept; each non-empty `anchor` must occur in the snapshotted notes and `occurrence` (1-based) must exist — violators dropped, rest kept; `insert_md` non-empty; server assigns `id = uuid4().hex[:8]`, `status="pending"`. Garbage/timeout ⇒ emit `error` status, meeting still → `done`, nothing persisted except status.
+- Events: `{"type":"final_summary_status","meeting_id","state":"running"|"done"|"error","detail":""}` and `{"type":"final_summary","meeting_id","title","final_summary_md","base_rev":int,"suggested_edits":[{"id","anchor","occurrence","insert_md","rationale","status":"pending"}]}`.
+- **Stop path (exact order in `_handle_control`/socket-close):** `await asr.stop()` → settle in-flight rolling summary (existing `aclose` machinery) → flush transcript buffer → snapshot meeting (freshest notes = WS notepad state if newer than row) → mark `summarizing`, publish `meetings` kind → spawn ONE runtime-tracked task (`runtime.finalization_tasks[meeting_id]`, idempotent guard) → task persists results (`final_summary_md`, `suggestions_json` incl. `base_rev`, auto-title only if title empty) → `done` + `meetings` publish + best-effort events (emit wrapper no-ops once the socket is gone). Grace-timer expiry runs the same pipeline (emit = no-op).
 
 **Steps:**
-- [ ] Failing tests: happy path persists + emits (fake LLM returns canned tool call then JSON); anchor-violation edits dropped; >10 edits truncated; LLM garbage → error event, status done; timeout path; untitled meeting gets auto-title, titled meeting keeps its title.
-- [ ] Implement (inputs per spec §2.4: labeled transcript, notes_md, last live summary + actionable statuses, profile block; prompt states the You/Them convention and that edits must be additive enhancements anchored to exact note text).
-- [ ] Full suite green. Commit: `feat(core): end-of-call final summary agent with KB tool access`.
+- [ ] Failing tests — llm_agent: tool loop executes N calls then returns final JSON (fake llm); budget exhaustion; timeout. final_summary: happy path persists + emits + auto-titles untitled meeting; titled meeting keeps title; anchor/occurrence violations dropped; >10 edits truncated; garbage → error event + status done; duplicate finalization no-op; disconnect-before-done → results persisted, no emit crash.
+- [ ] Implement; full suite green.
+- [ ] Commit: `feat(core): end-of-call final summary agent with KB tool access`.
 
-### Task 4.2 (core): implicit `taurine` source
+### Task 4.2 (core): hidden `taurine` connector + coalesced sync
 
 **Files:**
-- Create: `core/taurine_core/indexer/taurine_source.py` (builds `NoteRecord`s from meetings)
-- Modify: `core/taurine_core/server.py` (upsert + queue sync after final summary; also on PATCH of a `done` meeting's notes), `core/taurine_core/config.py` (`TAURINE_SOURCE_ID="taurine"`, `SOURCE_RANK["taurine"]=0.95`, `RECENCY_HALF_LIFE_DAYS["taurine"]=60`), `/connectors` listing (exclude `taurine` — it must never appear)
+- Create: `core/taurine_core/connectors/taurine_meetings.py`
+- Modify: `core/taurine_core/connectors/catalog.py` (register), `core/taurine_core/server.py` (`/connectors` listing excludes it :527; enable/disable/delete endpoints 404 it; coalesced post-finalize sync), `core/taurine_core/config.py` (`TAURINE_SOURCE_ID="taurine"`, `SOURCE_RANK["taurine"]=0.95`, `RECENCY_HALF_LIFE_DAYS["taurine"]=60`, `MEETING_SYNC_DELAY_S=60`)
 - Test: `core/tests/test_taurine_source.py`
 
 **Interfaces:**
-- `def meeting_note_records(meetings: Iterable[Meeting]) -> list[NoteRecord]`: one record per `done` meeting with non-empty content; `note_id=f"taurine:{meeting_id}"`, `source="taurine"`, `title=meeting title or 'Meeting YYYY-MM-DD'`, `text = notes_md + ("\n\n## Meeting summary\n" + final_summary_md if final_summary_md else "")`, `modified/created` from meeting timestamps.
-- After final summary (and after PATCH to a done meeting): `index.replace_source_records("taurine", meeting_note_records(store.all_done()))` then queue the existing global sync IF none running (reuse `_run_global_sync` machinery; a simple "sync pending" debounce flag is fine).
+- `TaurineMeetingsConnector(ConnectorPort)`: `connector_id="taurine"`, `kind="local"`, plus a class attr `hidden = True`. `extract(config)` reads `index.meetings_done()` and yields one `NoteRecord` per done meeting with non-empty content: `note_id=f"taurine:{meeting_id}"`, `source="taurine"`, `title = meeting title or f"Meeting {date(created_at):%Y-%m-%d}"`, `text = notes_md + ("\n\n## Meeting summary\n" + final_summary_md if final_summary_md else "")`, `modified=updated_at`, `created=created_at`, `content_hash = <the same stable hash helper other connectors use — find it in connectors/base.py>`. Deleted meetings disappear via replace semantics on the next extract.
+- Registry: registered like any connector but **always enabled** (seed the enabled ledger on registration or special-case `hidden` in `sync_all_enabled_collecting` — pick whichever is smaller against `registry.py:198-218`), so every global sync includes taurine records in the build extraction. `/connectors` REST filters `hidden` connectors; enable/disable/config/delete-data endpoints return 404 for them.
+- Post-finalize sync: after a meeting reaches `done` with a final summary, schedule the existing global-sync entrypoint (`_run_global_sync` path used by `POST /index/sync`) after `MEETING_SYNC_DELAY_S`, coalesced (a pending timer is not duplicated; skipped when a sync is already running). PATCH edits to done meetings do NOT schedule syncs.
 
 **Steps:**
-- [ ] Failing tests: record shape/id/source; empty meetings skipped; `/connectors` response never contains `taurine`; replace-records called after a (faked) final summary completes.
-- [ ] Implement; full suite green. Commit: `feat(core): index meetings as implicit taurine source`.
+- [ ] Failing tests: extract shape/id/hash/timestamps; empty meetings skipped; `/connectors` response never contains `taurine`; enable endpoint 404s; global sync's collected extraction includes taurine records (fake two done meetings); finalize schedules exactly one coalesced sync.
+- [ ] Implement; full suite green.
+- [ ] Commit: `feat(core): index meetings as implicit taurine source`.
 
 ### Task 4.3 (app): suggestions UX + final card + source branding
 
 **Files:**
-- Modify: `app/src/renderer/src/views/meetings/NotepadEditor.tsx` (real suggestion marks), `MeetingsView.tsx`, `SummaryCard.tsx` (final summary card variant), `app/src/renderer/src/lib/sidecar.ts` (parse the two new events), `app/src/renderer/src/lib/graph.ts` (`SOURCE_COLORS["taurine"]="#ffd75e"`, `SOURCE_LABELS["taurine"]="Taurine"`), `app/src/renderer/src/lib/labels.ts` (case `taurine` → `'Taurine'`), `app/src/renderer/src/assets/main.css` (`.source-taurine` chip)
+- Modify: `app/src/renderer/src/views/meetings/NotepadEditor.tsx`, `MeetingsView.tsx`, `SummaryCard.tsx`, `app/src/renderer/src/lib/sidecar.ts` (parse both events), `app/src/renderer/src/lib/suggestions.ts` (new — pure anchor/apply logic), `app/src/renderer/src/lib/suggestions.test.ts`, `app/src/renderer/src/lib/graph.ts` (`SOURCE_COLORS["taurine"]="#ffd75e"`, `SOURCE_LABELS["taurine"]="Taurine"`), `app/src/renderer/src/lib/labels.ts` (`taurine`→`'Taurine'`), `app/src/renderer/src/assets/main.css` (`.source-taurine` chip)
 
-**Interfaces:** consumes Task 4.1 events + Task 1.2 `SuggestedEdit`/`onResolveSuggestion`. Behavior: on `final_summary` event for the open meeting, show final card + map each pending edit to a Plate suggestion (anchor exact-match; no match → append a suggestion block at document end). Accept = apply `insert_md` after the anchor (or at end) as normal text; deny = discard. Both update the meeting via `patchMeeting(id, {suggestions})` with the new status, and accepted content flows through autosave. `final_summary_status` renders a small progress state on the card ("Summarizing…").
+**Interfaces:**
+- `lib/suggestions.ts` (pure, unit-tested): `locateAnchor(notesMd, anchor, occurrence) -> number | null` (char index after the occurrence; `""` anchor → end) and `applySuggestion(notesMd, edit) -> string` (insert `insertMd` at the located point with sensible newline handling; null location → append `\n\n${insertMd}`).
+- Event handling (App coordinator): `final_summary_status` → progress state on SummaryCard ("Summarizing…" shimmer / error note). `final_summary` → refetch meeting (authoritative), show final card. If `base_rev < meeting.notesRev`, re-validate every pending anchor client-side via `locateAnchor`; misses degrade to append-mode suggestions.
+- Editor: pending suggestions project as suggestion-marked insertions at their anchor points (Plate suggestion plugin), each with inline accept (accent) / deny (subtle) controls + rationale on hover. **Autosave serialization filters all pending-suggestion content** (serialize from a value with suggestion nodes stripped — add a vitest asserting md-out excludes pending text). Projection is idempotent: re-projecting the same `suggestions_json` after reload yields the same editor state. Accept → `applySuggestion` result becomes canonical content (normal change path), edit status `accepted`; deny → status `rejected`; both `patchMeeting(id, {suggestions})`.
+- If the Plate suggestion plugin fights the filtered-serialization invariant, fall back to widget-decoration rendering (suggestion cards anchored inline but NOT part of the document tree) — the invariant wins over the mechanism.
 
 **Steps:**
-- [ ] Implement event parsing (tolerant, like the rest of `parseSidecarEvent`), suggestion rendering with accept/deny controls styled like the app (accent for accept, subtle for deny, rationale on hover/expand).
-- [ ] Verify: typecheck+lint+build; dev smoke with a scripted short meeting (orchestrator provides E2E script) — suggestions appear, accept inserts text, deny removes, state survives app reload (suggestions_json).
+- [ ] Failing vitest for `suggestions.ts`: occurrence disambiguation (3× same anchor), empty anchor append, missing anchor → null, apply idempotence, unicode safety.
+- [ ] Implement events + projection + branding entries.
+- [ ] Verify: tsc/lint/build/vitest; dev smoke with the Task 4.5 harness — suggestions appear as they arrive, accept inserts + persists, deny removes, pending suggestions survive app reload and never leak into saved markdown (inspect `notes_md` via `GET /meetings/{id}` while suggestions pending).
 - [ ] Commit: `feat(app): AI suggested edits with accept/deny; taurine source branding`.
 
-### Task 4.4 (core+app): meeting-scoped chat
+### Task 4.4 (core+app): meeting-scoped chat with citable [M#] evidence
 
 **Files:**
-- Modify: `core/taurine_core/schemas.py` (`ChatSendMsg.meeting_id: str | None = None`), `core/taurine_core/chat/engine.py` (`_build_messages` injects `<meeting_context>`), `core/taurine_core/server.py` (pass meeting store into chat path), `core/taurine_core/config.py` (`MEETING_CONTEXT_MAX_CHARS = 12000`); app: `app/src/renderer/src/lib/chat.ts` (send meeting_id), `app/src/renderer/src/views/meetings/MeetingChat.tsx` (new — bottom drawer reusing Composer/AssistantTurn), `MeetingsView.tsx`
+- Modify: `core/taurine_core/schemas.py` (`ChatSendMsg.meeting_id: str | None = None`), `core/taurine_core/chat/engine.py` (meeting evidence registration + `_build_messages`), `core/taurine_core/server.py` (chat path gets meeting lookup; regenerate resolves via `meetings.chat_id`; first meeting send links + titles the chat), `core/taurine_core/config.py` (`MEETING_CONTEXT_MAX_CHARS=12000`); app: `app/src/renderer/src/lib/chat.ts` (send `meeting_id`), `app/src/renderer/src/views/meetings/MeetingChat.tsx` (new), `MeetingsView.tsx`
 - Test: `core/tests/test_chat_meeting_context.py`
 
-**Interfaces:** when `meeting_id` set and meeting exists: a non-citable `<meeting_context>` block (notepad md + last 60 transcript lines labeled You/Them + current final/live summary, total capped at `MEETING_CONTEXT_MAX_CHARS`) is inserted next to the profile block; `seed_note_ids` gains `taurine:{meeting_id}`. Without `meeting_id`: byte-identical messages to today (test this). App: each meeting lazily creates one chat via existing `POST /chats` (store the chat_id in renderer state keyed by meeting; title `Meeting: {title}`), drawer streams via existing ChatClient.
+**Interfaces:**
+- **Citable meeting evidence:** when `meeting_id` resolves, the engine registers meeting-local items in the turn's evidence registry as `[M#]` refs: `[M1]` = notepad (as one item), `[M2..]` = transcript windows (chunk consecutive same-channel lines into ~800-char windows, newest ~60 lines) and the live/final summary, all capped to `MEETING_CONTEXT_MAX_CHARS` total (drop oldest transcript windows first). They render in the evidence block like other evidence (`[M3] (2026-07-16, meeting) You: …`), the system prompt names them as citable meeting context, and the citation validator accepts registered `M` ids exactly like other registered kinds (follow how `[T#]` transcript refs are registered/validated in live — reuse that kind or add an `M` kind to the registry + validator + renderer chips). Renderer `MessageMarkdown.tsx` citation regex already matches `[T\d+]`-style patterns — extend the regex + chip kind for `M`.
+- Live summary access: while live, the engine reads the bound `LiveSession`'s current summary via `runtime.active_live_session`; after finalize, uses `final_summary_md` from the row.
+- **Durable link:** first `chat_send` with `meeting_id` and empty `chat_id` → create chat, then set its title `Meeting: {title or date}` through the existing rename path, then `meeting_set_chat(meeting_id, chat_id)`. `chat_regenerate` (no meeting_id on the wire) resolves the meeting by reverse lookup (`Index` method `meeting_for_chat(chat_id)`) so regenerated turns keep context. Without `meeting_id` and no linked chat: byte-identical behavior to today (test asserts message list equality).
+- Retrieval seeds `taurine:{meeting_id}` when that note exists in the index.
+- App: `MeetingChat` bottom drawer (collapsed bar "Ask about this meeting…" → expands; Esc collapses) reusing Composer/AssistantTurn/ChatClient; chat id restored from `meeting.chatId` on load.
 
 **Steps:**
-- [ ] Failing tests: block present/capped/absent; non-meeting chat unchanged; unknown meeting_id ignored gracefully.
-- [ ] Implement core, then app drawer (collapsed bar “Ask about this meeting…” → expands to thread; Esc collapses).
-- [ ] Full core suite + app build green. Commit: `feat: meeting-scoped chat with notepad and transcript context`.
+- [ ] Failing tests: `[M#]` items registered + capped + oldest-dropped; citations to `M` ids survive validation; no meeting_id → byte-identical messages; regenerate re-injects context via reverse lookup; first send links chat + titles it; unknown meeting_id ignored gracefully.
+- [ ] Implement core, then app drawer.
+- [ ] Full core suite + app checks green. Commit: `feat: meeting-scoped chat with citable meeting evidence`.
 
-**Phase 4 gate (orchestrator):** scripted E2E (fake transcript session → stop → final summary with ≥1 suggestion → note under `taurine` source after sync → map legend shows Taurine); battery re-run; chat latency spot-check.
+### Task 4.5 (core): deterministic meeting E2E harness
+
+**Files:**
+- Create: `core/scripts/e2e_meeting_flow.py`
+- Modify: `core/taurine_core/server.py` (`_parse_control`/`_handle_control`: dev-only `inject_transcript`), `core/taurine_core/config.py` (`TEST_CONTROLS_ENABLED = os.environ.get("TAURINE_TEST_CONTROLS") == "1"`)
+- Test: `core/tests/test_inject_transcript.py`
+
+**Interfaces:**
+- Control (only when `TEST_CONTROLS_ENABLED`, otherwise rejected+logged): `{"type":"inject_transcript","chunks":[{"channel":0,"text":"…"},…]}` — each chunk runs through the exact `on_chunk` path as ASR finals (`final=True`, ts=now, seq assigned normally).
+- `e2e_meeting_flow.py` (run against a live sidecar: `TAURINE_TEST_CONTROLS=1 .venv/bin/python scripts/e2e_meeting_flow.py`): POST /meetings → WS /session start(meeting, channels 0+1) → inject a scripted 2-speaker transcript → send notepad → stop → await `final_summary` event (timeout 180 s) → assert: meeting row `done`, `final_summary_md` non-empty, ≥0 suggestions with valid anchors, transcript persisted; print a PASS/FAIL summary. Exit non-zero on failure.
+- Purpose: phase-4 gate + regression tool; uses the real Gemini path (cheap) — NOT part of pytest.
+
+**Steps:**
+- [ ] Failing test: inject control rejected when flag off; accepted + flows to ledger when on.
+- [ ] Implement control + script; run the script end-to-end against a local sidecar.
+- [ ] Commit: `feat(core): deterministic meeting E2E harness`.
+
+**Phase 4 gate (orchestrator):** `e2e_meeting_flow.py` PASS; note appears under source `taurine` after the coalesced sync (map legend shows Taurine); orchestrator retrieval battery re-run; suggestions accept/deny + reload smoke in the dev app.
 
 ---
 
@@ -224,18 +304,18 @@
 ### Task 5.1 (app main): micwatch helper + watcher
 
 **Files:**
-- Create: `app/resources/native/micwatch.swift`, `app/scripts/build-native.mjs` (swiftc build; skipped gracefully if swiftc missing), `app/src/main/micwatch.ts`
-- Modify: `app/src/main/index.ts` (spawn on ready), `app/package.json` (`build:native` script + `postinstall` hook if binary absent), `app/src/preload/index.ts` + `index.d.ts`
+- Create: `app/resources/native/micwatch.swift`, `app/scripts/build-native.mjs`, `app/src/main/micwatch.ts`
+- Modify: `app/src/main/index.ts` (spawn on ready), `app/package.json` (`build:native` script; `postinstall` builds if binary missing AND swiftc present), `app/src/preload/index.ts` + `index.d.ts`
 
 **Interfaces:**
-- Swift helper: subscribes `kAudioDevicePropertyDeviceIsRunningSomewhere` on the default input device AND `kAudioHardwarePropertyDefaultInputDevice` (re-subscribe on device change); prints one JSON line `{"active":true|false}` on every state edge (plus the initial state on launch); exits cleanly on SIGTERM. ~60-90 lines, no deps.
-- `micwatch.ts`: spawn `resources/native/micwatch` (path via `app.isPackaged` branch), parse lines, debounce activations <1.5 s, forward via `webContents.send('micwatch:active', bool)`. Missing binary/non-darwin → silently inactive.
-- Preload: `window.api.micWatch: { onActive(cb: (active: boolean) => void): () => void }`.
-- Commit BOTH the source and the built binary (`app/resources/native/micwatch`, arm64) so dev works without a build step; `build:native` re-produces it.
+- Swift helper: subscribes `kAudioDevicePropertyDeviceIsRunningSomewhere` on the default input device AND `kAudioHardwarePropertyDefaultInputDevice` (re-subscribe on device change); prints one JSON line `{"active":true|false}` per state edge plus the initial state; exits on SIGTERM. No deps, ~60-90 lines.
+- Build: `swiftc -O micwatch.swift -o micwatch` — build a **universal binary** (`-target arm64-apple-macos14 ` + `-target x86_64-apple-macos14` slices, `lipo -create`). Commit BOTH source and the universal binary at `app/resources/native/micwatch` (dev works with no toolchain; `resources/**` is already asarUnpack'd so packaging works).
+- `micwatch.ts`: spawn (path branches on `app.isPackaged`), parse lines tolerantly, debounce activations <1.5 s, forward edges via `webContents.send('micwatch:active', bool)`; respawn with backoff (max 3) on crash; disabled silently on non-darwin/missing binary; kill on quit.
+- Preload: `window.api.micWatch: { onActive(cb: (active: boolean) => void): () => void }` (unsubscribe fn, StrictMode-safe).
 
 **Steps:**
-- [ ] Write the Swift helper + build script; build it (`npm run build:native`); test standalone: run binary, start a Voice Memo recording → `{"active":true}` line; stop → false.
-- [ ] Wire main/preload; typecheck+lint+build.
+- [ ] Write helper + build script; `npm run build:native`; standalone test: run binary, start a Voice Memos recording → `{"active":true}`; stop → `{"active":false}`.
+- [ ] Wire main/preload; tsc/lint/build.
 - [ ] Commit: `feat(app): mic-activity watcher (CoreAudio) for call detection`.
 
 ### Task 5.2 (app renderer): notification card + auto-start
@@ -244,25 +324,21 @@
 - Create: `app/src/renderer/src/components/CallNotification.tsx`
 - Modify: `app/src/renderer/src/App.tsx`
 
-**Interfaces:** `CallNotification` props `{ onStart(): void; onDismiss(): void; seconds: number }` — fixed bottom-right card (z-50, above all view layers), top edge hosts a full-width 3px countdown bar animating `scaleX 1→0` over `seconds` (10), buttons **Start notes** (primary) / **Dismiss** (secondary); reaching zero calls `onStart`.
-
-**App wiring (state machine in App.tsx):**
-- Show card when `micwatch:active=true` AND `listeningState==='idle'` AND not suppressed.
-- `onStart` / countdown-zero: create meeting (or reuse today's live draft), switch `activeTab='meetings'`, run the exact `startListening` path (mic + system audio), hide card.
-- `onDismiss`: hide; suppress until `micwatch:active=false` has been observed continuously ≥5 s (re-arm), so one prompt per call.
-- While Taurine itself is listening, micwatch events are ignored entirely.
+**Interfaces:**
+- `CallNotification` props `{ seconds: number; onStart(): void; onDismiss(): void }` — fixed bottom-right (z above all view layers), top edge = full-width 3 px countdown bar animating `scaleX 1→0` linearly over `seconds` (CSS transition started on mount; do NOT re-trigger on re-render), body "Call detected — start meeting notes?", buttons **Start notes** (primary) / **Dismiss** (secondary). One `setTimeout(seconds)` fires `onStart`; cleanup on unmount (StrictMode-safe: timer set in effect with cleanup).
+- App wiring: show when `micwatch:active === true` AND `listeningState === 'idle'` AND not suppressed. `onStart`/timeout → `startMeeting()` (the coordinator creates/binds a meeting, switches `activeTab='meetings'`, starts mic + system audio) → hide. `onDismiss` → hide + suppress until `micwatch:active === false` has held continuously ≥5 s (re-arm). While Taurine is listening, micwatch events are ignored. Countdown default 10 s.
 
 **Steps:**
-- [ ] Implement card + wiring; countdown driven by a single `setTimeout` + CSS transition (pause not required).
-- [ ] Verify: typecheck+lint+build; dev smoke — start a Voice Memo recording → card appears; let it expire once (auto-start fires), dismiss once (no re-prompt until mic idle 5 s).
+- [ ] Implement card + wiring.
+- [ ] Verify: tsc/lint/build/vitest; dev smoke — Voice Memos recording → card appears; let it expire once (auto-start fires, Meetings tab opens listening); trigger again and Dismiss (no re-prompt until idle 5 s).
 - [ ] Commit: `feat(app): call-detected notification with countdown auto-start`.
 
-**Phase 5 gate (orchestrator):** full manual scenario — incoming "call" (any app using mic) → notification → auto-start → meeting with both channels → notes → stop → final summary → suggestions → indexed note visible in map after sync.
+**Phase 5 gate (orchestrator):** full scenario — external app grabs mic → notification → auto-start → both channels live → notes → stop → final summary + suggestions → indexed under `taurine` in map after sync.
 
 ---
 
-## Self-review record
+## Self-review record (rev 2)
 
-- Spec coverage: §1→Tasks 2.1-2.3; §2.1→1.1; §2.2→1.2; §2.3→3.1-3.2; §2.4→4.1+4.3; §2.5→4.2+4.3; §2.6→4.4; §3→5.1-5.2; §4 constants distributed to their owning tasks; §6 testing embedded per-task + phase gates; §7 risks → Task 2.1 (TCC note), 3.1 (Gemini smoke), 4.1 (anchor validation), 4.2 (sync queue guard).
-- Contracts consistent: `SuggestedEdit` field names match between core events (snake_case on wire) and `lib/meetings.ts` (camelCase mapped); `meeting_id` spelled identically in StartMsg/notepad/ChatSendMsg; channel byte 1 + label `system` everywhere.
-- No placeholder steps; every task names exact files, shapes, and commands.
+- All 16 codex-review findings addressed: B1→Task 1.2 coordinator contract; B2→Task 1.1 per-start lifecycle + grace + sidecar.ts replay fix; B3→Task 4.1 stop-path ordering + runtime-owned tasks + best-effort emit; B4→Task 4.2 hidden registered connector; B5→Task 4.1 `llm_agent`/`complete_json_messages`; B6→Task 4.4 `[M#]` citable evidence; M7→store location corrected everywhere; M8→content_hash/updated_at/delete handling; M9→`LIVE_SUMMARY_MODEL` + reasoning pin + alias grep-test; M10→`meetings.chat_id` + reverse lookup + regenerate; M11→`[T#]`-preserving label format; M12→flush-before-stop + freshest-notes snapshot + truncation math; M13→live-state keying + stored-transcript rendering + batched appends + update-kind rules; M14→onError/Buffer-normalization/asarUnpack/destroyed-cleanup/universal binary/TCC-as-blocker; M15→canonical-content invariant + occurrence + base_rev + filtered serialization + fallback mechanism; M16→vitest setup, Task 4.5 harness, battery referenced as orchestrator-owned.
+- Type consistency pass: `SuggestedEdit {id, anchor, occurrence, insertMd, rationale, status}` matches wire `suggested_edits` + `suggestions_json`; `meeting_id` identical across StartMsg/NotepadMsg/ChatSendMsg/events; `notes_rev`/`base_rev` int end-to-end; channel byte 1 + label `system` everywhere.
+- No placeholder steps; every task names exact files, shapes, commands, and failure modes.

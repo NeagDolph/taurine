@@ -26,7 +26,7 @@ Rationale: the tap path needs only the soft "System Audio Recording Only" TCC pr
 
 **Labeling (UI + agents):** channel 0 = **You**, channel 1 = **Them**.
 - Renderer: `FeedView.channelLabel` maps 0→"You", 1→"Them"; per-channel interims already exist.
-- Ledger: transcript evidence rendering ([ledger.py:174](core/taurine_core/live/ledger.py)) emits `You:`/`Them:` prefixes instead of `[channel N]`.
+- Ledger: transcript evidence rendering ([ledger.py:174](core/taurine_core/live/ledger.py)) becomes `[T#] You: "text"` / `[T#] Them: "text"` / `[T#] Ch{n}: "text"` — the `[T#]` tokens are load-bearing (the summarizer's citation validator parses them) and must be preserved exactly.
 - Summarizer + final-summary prompts state the convention: "Transcript lines are labeled You (the user's mic) and Them (other call participants)." Attribution in summaries/actionables follows from that.
 
 **Permissions/build:** add `NSAudioCaptureUsageDescription` to `electron-builder.yml` `extendInfo`. Known risk: TCC attribution for the helper binary in `electron-vite dev` (unsigned dev parent) — verified by an early spike task; fallback is running the tap binary with explicit responsibility or documenting a one-time grant.
@@ -39,10 +39,10 @@ Rationale: the tap path needs only the soft "System Audio Recording Only" TCC pr
 
 New `meetings` store (same SQLite state DB as chats), REST + events:
 
-- Table `meetings(meeting_id TEXT PK, title TEXT, created_at REAL, started_at REAL, ended_at REAL, notes_md TEXT, final_summary_md TEXT, suggestions_json TEXT, transcript_json TEXT, status TEXT)` — `status ∈ {draft, live, summarizing, done}`. `transcript_json` holds the final labeled transcript (list of `{channel,text,ts,seq}`) for reload/final-summary input; it is not indexed in v1.
-- REST: `GET /meetings` (list, newest first), `POST /meetings` (create draft), `GET /meetings/{id}`, `PATCH /meetings/{id}` (title, notes_md — debounced autosave target), `DELETE /meetings/{id}`.
-- `/updates` bus gains kind `meetings` (list invalidation).
-- The `start` control message gains `meeting_id`; a live session is always bound to a meeting (the renderer creates one first if needed). Transcript finals append to the meeting row; `stop` (or socket close while live) sets `ended_at` and triggers the end-of-call pipeline (§2.4).
+- Table `meetings(meeting_id TEXT PK, title TEXT, created_at REAL, updated_at REAL, started_at REAL, ended_at REAL, notes_md TEXT, notes_rev INTEGER, final_summary_md TEXT, suggestions_json TEXT, transcript_json TEXT, chat_id TEXT, status TEXT)` — `status ∈ {draft, live, summarizing, done}`, stored on the existing `Index` store (`indexer/store.py`, same connection/DDL-init as chats). `transcript_json` holds the labeled transcript (list of `{channel,text,ts,seq}`) for reload/final-summary input; it is not indexed in v1 and is written in batches (every ~20 finals or 10 s, and on stop), not per chunk.
+- REST: `GET /meetings` (list, newest first), `POST /meetings` (create draft), `GET /meetings/{id}`, `PATCH /meetings/{id}` (title, notes_md — debounced autosave target; bumps `notes_rev`/`updated_at`), `DELETE /meetings/{id}`.
+- `/updates` bus gains kind `meetings` (list invalidation; published on meeting create/delete/title/status change — not per transcript chunk).
+- The `start` control message gains `meeting_id`; a live session is always bound to a meeting (the renderer creates one first if needed). Each `start` gets a fresh live-session state (a `stop`→`start` sequence on one socket must not leak ledger/summary state between meetings). `stop` triggers the end-of-call pipeline (§2.4). **Disconnect grace:** socket loss while live starts a 60 s grace timer instead of finalizing; the client's reconnect replays its full last start message (meeting_id + channels), cancelling the timer and resuming the same meeting; timer expiry finalizes. The client reconnect replay must carry the real last `StartMsg`, not a hard-coded mic-only start.
 
 ### 2.2 Renderer: the Meetings tab (rename from Live)
 
@@ -52,6 +52,8 @@ New `meetings` store (same SQLite state DB as chats), REST + events:
 - **Center: the notepad.** Editable title + **Plate** WYSIWYG markdown editor.
   - Why Plate: the only MIT-licensed option where WYSIWYG editing, markdown in/out (`@platejs/markdown`), and first-class Google-Docs-style suggestions (`@platejs/suggestion` marks with accept/reject) ship open-source. Tiptap's equivalent is paywalled; BlockNote's is GPL; Milkdown/Lexical would need custom suggestion machinery.
   - Notes persist as markdown (`notes_md`): deserialize on open, serialize + `PATCH` on debounced autosave (800 ms idle). Minimal hand-rolled toolbar; no shadcn dependency.
+  - **Canonical content = accepted content only.** Pending AI suggestions live as suggestion-marked nodes/decorations that are ALWAYS excluded from the serialized markdown; autosave can never persist un-accepted suggestion text. Suggestion projection into the editor is idempotent (re-running it after reload produces the same state from `suggestions_json`).
+  - **Stop flushes notes first:** stopping a session flushes the pending autosave PATCH and the final notepad control message before sending `stop`, so the final summary never sees stale notes.
 - **Top: live summary card** (visible when a session is live or a summary exists): rolling `summary_md` with citation chips (reuse SummaryPanel internals), action items inline (absorbing ActionableRail), and a **"Add to notes"** button that inserts the current summary markdown at the end of the notepad as regular user-owned content.
 - **Bottom: "Ask anything" chat bar** expanding into a drawer. Reuses Composer/AssistantTurn/ChatClient. Each meeting lazily creates one chat thread; `chat_send` carries a new optional `meeting_id`.
 - **Right (hideable): transcript panel** — FeedView with You/Them labels, toggled by a waveform button; the grounding/evidence view (AmbientList + TriggerInspector) moves behind an "inspect" toggle inside this panel.
@@ -61,30 +63,34 @@ New `meetings` store (same SQLite state DB as chats), REST + events:
 
 - Renderer sends `{"type":"notepad","meeting_id":…,"text_md":…}` on the `/session` socket, debounced 2 s after edits during a live session.
 - `LiveSession` keeps the latest notepad text; `Summarizer._build_user_prompt` gains a `<user_notes>` block (capped `MEETING_NOTES_PROMPT_MAX_CHARS = 8000`, head+tail truncation) with instructions: user notes signal what the user considers important — weight related transcript content higher; do not restate the notes back.
-- **Live summary model switches to `SUMMARY_MODEL = "google/gemini-3.5-flash"`** (Neil: Gemini 3.5 Flash is the main summary and note-edit LLM). Existing JSON + citation validation unchanged; `SUMMARY_FALLBACK_MODEL` stays deepseek. Verified on OpenRouter: streaming, tools, structured outputs supported.
+- **Live summary model becomes a new `LIVE_SUMMARY_MODEL = "google/gemini-3.5-flash"`** (Neil: Gemini 3.5 Flash is the main summary and note-edit LLM), used ONLY by the live summarizer. `SUMMARY_MODEL` keeps its current value because `IDEA_SEARCH_MODEL`/`CONTEXT_ENRICH_MODEL` and chat utility calls alias it — those paths must not change model or cost. Gemini reasoning is pinned low/minimal for the latency-sensitive live lane via `LLM_REASONING_BY_MODEL`. Existing JSON + citation validation unchanged; `SUMMARY_FALLBACK_MODEL` stays deepseek. Verified on OpenRouter: streaming, tools, structured outputs supported.
 
 ### 2.4 End-of-call final summary + suggested edits (Gemini 3.5 Flash, graph access)
 
 New module `core/taurine_core/live/final_summary.py`, triggered on `stop`:
 
-- **Inputs:** full labeled transcript, final `notes_md`, last live summary + confirmed/dismissed actionables, `user_profile_block`.
-- **Tools:** the existing chat tool set (`search_evidence`, `read_note`, `expand_evidence` — [chat/tools.py](core/taurine_core/chat/tools.py)) over `stream_chat`, so the agent can traverse other notes and the graph for context (people, projects, prior meetings). Model `FINAL_SUMMARY_MODEL = "google/gemini-3.5-flash"`, bounded by `FINAL_SUMMARY_MAX_TOOL_CALLS = 6` and `FINAL_SUMMARY_TIMEOUT_S = 120`.
+- **Lifecycle (exact order):** stop control → `await asr.stop()` (flush finals) → settle/cancel the in-flight rolling summary → snapshot meeting state (transcript flush + freshest notes: latest of the WS notepad state and the meeting row) → launch a **runtime-owned, idempotent** finalization task keyed by meeting_id (double-finalize impossible; survives socket teardown). Event emission is best-effort to whatever `/session` socket is alive; persistence + a `meetings` update-kind push are the source of truth, so the UI recovers missed events by refetching.
+- **Inputs:** full labeled transcript, freshest `notes_md` (+ its `notes_rev`), last live summary + confirmed/dismissed actionables, `user_profile_block`.
+- **Tools:** the existing chat tool set (`search_evidence`, `read_note`, `expand_evidence` — [chat/tools.py](core/taurine_core/chat/tools.py)) via a new small public tool-agent helper (`llm_agent.run_tool_agent`: non-streaming tool loop that carries full message history, then a final strict-JSON turn with `response_format` over the same history — the existing `complete_json` only takes system+user and cannot carry tool results). Model `FINAL_SUMMARY_MODEL = "google/gemini-3.5-flash"`, bounded by `FINAL_SUMMARY_MAX_TOOL_CALLS = 6` and `FINAL_SUMMARY_TIMEOUT_S = 120`.
 - **Output (strict JSON, validated fail-closed like the live summarizer):**
   - `title` — auto-title for untitled meetings;
   - `final_summary_md` — the polished summary;
-  - `suggested_edits[]` — `{anchor, insert_md, rationale}` where `anchor` is an exact substring of the user's notes (`""` = append at end). Edits are additive insertions/expansions of the user's own notes (Granola's "enhanced notes" behavior), not rewrites.
+  - `suggested_edits[]` — `{anchor, occurrence, insert_md, rationale}` where `anchor` is an exact substring of the user's notes (`""` = append at end) and `occurrence` disambiguates repeated anchors (validated server-side against the snapshotted notes; violators dropped). The result carries `base_rev` = the `notes_rev` it was computed against, so the client re-validates anchors if the user kept typing. Edits are additive insertions/expansions of the user's own notes (Granola's "enhanced notes" behavior), not rewrites.
 - **Event flow over `/session`:** `final_summary_status` (`running`/`done`/`error`) → `final_summary` (payload). Status also lands on the meeting row (`summarizing` → `done`) so a reload can re-fetch; suggestions persist in `suggestions_json` until resolved.
 - **Renderer:** `final_summary_md` renders as a distinct card (insertable like the live summary); each `suggested_edit` becomes a Plate suggestion mark at the anchor match (fallback: appended suggestion block when the anchor no longer matches), shown Google-Docs-style with rationale tooltip and accept/deny controls as they arrive. Accept applies the insertion as normal text; deny discards; both update `suggestions_json` via PATCH.
 
 ### 2.5 Taurine notes as an implicit source
 
-- New source id **`taurine`** — NOT a connector: it never appears in `/connectors` or the Connectors view, cannot be disabled, and has no sync toggle. After the final summary completes (and again whenever a meeting's notes change later), the sidecar upserts `NoteRecord(note_id=f"taurine:{meeting_id}", source="taurine", title, text = notes_md + "\n\n## Meeting summary\n" + final_summary_md, modified=now)` for all meetings via `replace_source_records("taurine", …)`, then queues the existing global sync (skipped if one is already running) so the note enters the graph like any other.
+- New source id **`taurine`** — implicit: it never appears in `/connectors` responses or the Connectors view, cannot be disabled, and has no sync toggle. **Mechanism:** it IS registered in the connector registry (a hidden, always-enabled connector whose `extract()` builds `NoteRecord`s from `done` meetings) so the existing sync/build pipeline includes it without special-casing — global sync only extracts registered connectors, so an unregistered source would silently never reach the graph. The `/connectors` REST listing and UI filter it out.
+- Records: `NoteRecord(note_id=f"taurine:{meeting_id}", source="taurine", title (or "Meeting YYYY-MM-DD"), text = notes_md + "\n\n## Meeting summary\n" + final_summary_md, modified=meeting.updated_at, created=meeting.created_at, content_hash=<stable hash of title+text>)`. Deleted meetings drop their record on the next extract (replace semantics).
+- **Sync trigger:** one coalesced global sync is queued ~60 s after a meeting finalizes (skipped if a sync is already running) — finishing a meeting is user intent. Post-hoc note edits do NOT auto-trigger syncs; they ride the next manual/scheduled sync.
 - Priors: `SOURCE_RANK["taurine"] = 0.95` (first-party authored), `RECENCY_HALF_LIFE_DAYS["taurine"] = 60`.
 - UI registries: `SOURCE_COLORS["taurine"] = "#ffd75e"` + `SOURCE_LABELS["taurine"] = "Taurine"` (graph.ts), `labels.ts` case, `.source-taurine` chip (main.css). Map legend/coloring then picks it up automatically.
 
 ### 2.6 Meeting-scoped chat
 
-- `ChatSendMsg` gains optional `meeting_id`. When set, `_build_messages` injects a non-citable `<meeting_context>` block (notepad markdown + last ~60 transcript lines + current summary, capped) beside the profile block, and seeds retrieval with `taurine:{meeting_id}` once indexed. Everything else (retrieval, tools, streaming) is the normal chat path — dense_facts routing keeps working unchanged for non-meeting chats.
+- `ChatSendMsg` gains optional `meeting_id`. When set, the meeting's context enters the turn as **citable meeting-local evidence `[M#]`** — the notepad (one item) plus recent transcript windows and the current live/final summary — registered in the turn's evidence registry so the chat citation validator accepts answers grounded in the meeting (a non-citable XML block would be stripped by validation, which requires every factual sentence to cite supplied evidence). Retrieval also seeds `taurine:{meeting_id}` once indexed. Total meeting context capped at `MEETING_CONTEXT_MAX_CHARS`.
+- **Durable binding:** the meeting↔chat link persists server-side (`meetings.chat_id`, set when the meeting's first chat message creates a chat; the chat is titled `Meeting: {title}` via the existing rename path). `chat_regenerate` resolves the meeting through this link so regenerated turns keep their context. Non-meeting chats are byte-identical to today.
 
 ## 3. Call detection + auto-enable notification
 
@@ -101,15 +107,19 @@ New module `core/taurine_core/live/final_summary.py`, triggered on `stop`:
 ## 4. Config additions (core)
 
 ```
-SUMMARY_MODEL = "google/gemini-3.5-flash"        # was deepseek/deepseek-v4-flash
+LIVE_SUMMARY_MODEL = "google/gemini-3.5-flash"   # live summarizer only; SUMMARY_MODEL untouched
+                                                 # (IDEA_SEARCH/CONTEXT_ENRICH/chat utilities alias it)
 FINAL_SUMMARY_MODEL = "google/gemini-3.5-flash"
 FINAL_SUMMARY_MAX_TOOL_CALLS = 6
 FINAL_SUMMARY_TIMEOUT_S = 120
-MEETING_NOTES_PROMPT_MAX_CHARS = 8000
-MEETING_CONTEXT_MAX_CHARS = 12000                # meeting-scoped chat block
+MEETING_NOTES_PROMPT_MAX_CHARS = 8000            # cap includes the truncation marker
+MEETING_CONTEXT_MAX_CHARS = 12000                # meeting-scoped chat evidence
+MEETING_FINALIZE_GRACE_S = 60                    # disconnect-while-live grace before finalizing
+MEETING_SYNC_DELAY_S = 60                        # coalesced auto-sync after finalization
 TAURINE_SOURCE_ID = "taurine"
 SOURCE_RANK["taurine"] = 0.95
 RECENCY_HALF_LIFE_DAYS["taurine"] = 60
+LLM_REASONING_BY_MODEL["google/gemini-3.5-flash"] = low/minimal   # latency-sensitive live lane
 ```
 
 ## 5. Rollout phases (each lands green on main)
