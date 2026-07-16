@@ -2,6 +2,9 @@ import { ElectronAPI } from '@electron-toolkit/preload'
 
 export interface TaurineApi {
   chooseDirectory: () => Promise<string | null>
+  micWatch: {
+    onActive: (callback: (active: boolean) => void) => () => void
+  }
   sysAudio: {
     available: () => Promise<boolean>
     start: () => Promise<void>

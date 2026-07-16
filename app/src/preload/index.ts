@@ -4,6 +4,15 @@ import { electronAPI } from '@electron-toolkit/preload'
 // Custom APIs for renderer
 const api = {
   chooseDirectory: (): Promise<string | null> => ipcRenderer.invoke('dialog:choose-directory'),
+  micWatch: {
+    onActive: (callback: (active: boolean) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, active: unknown): void => {
+        if (typeof active === 'boolean') callback(active)
+      }
+      ipcRenderer.on('micwatch:active', listener)
+      return () => ipcRenderer.removeListener('micwatch:active', listener)
+    }
+  },
   sysAudio: {
     available: (): Promise<boolean> => ipcRenderer.invoke('sysaudio:available'),
     start: (): Promise<void> => ipcRenderer.invoke('sysaudio:start'),

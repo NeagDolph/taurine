@@ -2,6 +2,7 @@ import { app, shell, BrowserWindow, dialog, ipcMain } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { startMicWatch } from './micwatch'
 import { registerSystemAudioIpc } from './sysaudio'
 
 if (is.dev) {
@@ -77,6 +78,8 @@ app.whenReady().then(() => {
     return result.canceled ? null : (result.filePaths[0] ?? null)
   })
   registerSystemAudioIpc()
+  const stopMicWatch = startMicWatch()
+  app.once('will-quit', stopMicWatch)
   createWindow()
 
   app.on('activate', function () {
