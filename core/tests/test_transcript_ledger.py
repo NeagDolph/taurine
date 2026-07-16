@@ -51,13 +51,20 @@ def test_pruning_render_history_cannot_delete_unsummarized_speech() -> None:
     assert [row.seq for row in ledger.pending()] == [4, 5]
 
 
-def test_transcript_registry_ids_are_stable_and_render_citeable_text() -> None:
+@pytest.mark.parametrize(
+    ("channel", "speaker"),
+    [(0, "You"), (1, "Them"), (2, "Ch2")],
+)
+def test_transcript_registry_ids_are_stable_and_render_citeable_speaker_text(
+    channel: int,
+    speaker: str,
+) -> None:
     registry = EvidenceRegistry()
     ledger = TranscriptLedger(registry)
-    row = ledger.append(_chunk("Maya moved the review.", 10.0, channel=1))
+    row = ledger.append(_chunk("Maya moved the review.", 10.0, channel=channel))
 
     assert row.transcript_ref == "T1"
-    assert ledger.render((row,)) == '[T1] [channel 1] "Maya moved the review."'
+    assert ledger.render((row,)) == f'[T1] {speaker}: "Maya moved the review."'
     record = registry.resolve("T1")
     assert record is not None
     assert record.payload["text"] == "Maya moved the review."

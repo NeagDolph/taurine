@@ -41,6 +41,7 @@ Update the prior summary using only the supplied transcript and knowledge-base
 evidence. Every factual sentence must cite its support. Use [T#] for transcript
 claims and [E#] or [F#] for knowledge-base claims. [N#] is navigation metadata
 and [P#] explains a path; neither supports a factual sentence by itself.
+Transcript lines are labeled You (the user's own mic) and Them (other call participants); attribute statements accordingly.
 
 The optional <user_profile> is uncitable background for resolving names only.
 It is not evidence. Never cite it. Preserve temporal qualifiers and conflicts. If there

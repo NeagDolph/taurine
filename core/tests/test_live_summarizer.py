@@ -136,6 +136,26 @@ async def test_accepts_sentence_level_validated_summary_and_evidence_snapshot() 
     assert registry.refs("cited") == ("F1",)
 
 
+async def test_labeled_transcript_round_trip_preserves_t_citation_validation() -> None:
+    registry, update = _evidence()
+    llm = FakeLLM(
+        [{"summary_md": "Maya owns the launch. [T1]", "actionables": []}]
+    )
+
+    result = await _summarizer(llm, registry, Entails()).summarize(
+        None, '[T1] You: "Maya owns the launch."', update, []
+    )
+
+    assert result is not None and not result.rejected
+    assert result.summary is not None
+    assert result.summary.summary_md == "Maya owns the launch. [T1]"
+    assert (
+        "Transcript lines are labeled You (the user's own mic) and Them (other call "
+        "participants); attribute statements accordingly."
+        in llm.calls[0].system
+    )
+
+
 async def test_abstained_pass_cannot_reuse_accumulated_session_evidence() -> None:
     registry, accepted = _evidence()
     abstained = replace(

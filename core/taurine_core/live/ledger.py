@@ -170,9 +170,12 @@ class TranscriptLedger:
         lines: list[str] = []
         for row in chunks:
             self.registry.mark_read(row.transcript_ref)
-            lines.append(
-                f'[{row.transcript_ref}] [channel {row.channel}] "{row.text}"'
+            speaker = (
+                "You"
+                if row.channel == 0
+                else "Them" if row.channel == 1 else f"Ch{row.channel}"
             )
+            lines.append(f'[{row.transcript_ref}] {speaker}: "{row.text}"')
         return "\n".join(lines)
 
     def query_window(

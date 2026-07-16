@@ -136,7 +136,7 @@ async def test_accepted_summary_advances_only_snapshotted_sequence() -> None:
     release.set()
     await _drain(session)
 
-    assert summary.calls[0][0].startswith('[T1] [channel 0] "first final"')
+    assert summary.calls[0][0].startswith('[T1] You: "first final"')
     assert session.ledger.last_accepted_summary_seq == 1
     assert [row.seq for row in session.ledger.pending()] == [2]
     assert any(row.type == "summary" and row.rev == 1 for row in events)
