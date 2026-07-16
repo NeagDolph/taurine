@@ -3,10 +3,12 @@ import '@blocknote/mantine/style.css'
 import { BlockNoteSchema, defaultBlockSpecs, type Block } from '@blocknote/core'
 import { BlockNoteView } from '@blocknote/mantine'
 import { createReactBlockSpec, useCreateBlockNote } from '@blocknote/react'
-import { useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type { SuggestedEdit } from '../../lib/meetings'
+import { normalizeLine } from '../../lib/provenance'
 import {
+  blockPlainText,
   findAnchorBlockId,
   stripSuggestionBlocks,
   type BlockLike
@@ -18,6 +20,7 @@ export interface NotepadEditorProps {
   suggestions: SuggestedEdit[]
   onResolveSuggestion(id: string, accept: boolean): void
   onOpenNoteInMap?(noteId: string): void
+  aiLines?: string[]
   readOnly?: boolean
 }
 
@@ -113,9 +116,11 @@ export function NotepadEditor({
   suggestions,
   onResolveSuggestion,
   onOpenNoteInMap,
+  aiLines = [],
   readOnly = false
 }: NotepadEditorProps): React.JSX.Element {
   const editor = useCreateBlockNote({ schema })
+  const containerRef = useRef<HTMLDivElement | null>(null)
   const lastExternalMd = useRef<string | null>(null)
   const pending = useMemo(
     () => suggestions.filter((edit) => edit.status === 'pending'),
@@ -131,6 +136,31 @@ export function NotepadEditor({
     suggestionResolvers.set(editor as object, onResolveSuggestion)
   }, [editor, onResolveSuggestion])
 
+  // Per-line AI provenance: blocks whose normalized text matches an
+  // agent-authored line render gray; the moment the user edits one, its
+  // text diverges and it flips back to the default color.
+  const paintProvenance = useCallback((): void => {
+    const container = containerRef.current
+    if (!container) return
+    const aiSet = new Set(aiLines)
+    const walk = (blocks: BlockLike[]): void => {
+      for (const block of blocks) {
+        const element = container.querySelector(`[data-id="${block.id}"]`)
+        if (element && block.type !== 'suggestion') {
+          const text = normalizeLine(blockPlainText(block))
+          element.classList.toggle('ai-authored', text.length > 0 && aiSet.has(text))
+        }
+        if (block.children?.length) walk(block.children)
+      }
+    }
+    walk(editor.document as unknown as BlockLike[])
+  }, [aiLines, editor])
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(paintProvenance)
+    return () => cancelAnimationFrame(frame)
+  }, [paintProvenance, valueMd, suggestions])
+
   // Rebuild the document whenever canonical markdown or the pending
   // suggestion set changes externally. User keystrokes round-trip through
   // onChange → parent → identical valueMd, so they never trigger a rebuild.
@@ -143,11 +173,12 @@ export function NotepadEditor({
       const blocks = (await editor.tryParseMarkdownToBlocks(valueMd)) as NotepadBlock[]
       if (cancelled) return
       editor.replaceBlocks(editor.document, injectSuggestions(blocks, pending))
+      requestAnimationFrame(paintProvenance)
     })()
     return () => {
       cancelled = true
     }
-  }, [editor, pending, pendingKey, valueMd])
+  }, [editor, paintProvenance, pending, pendingKey, valueMd])
 
   // One capture handler covers links in both note content and suggestion
   // blocks: note://<id> opens the note on the map, everything else goes to
@@ -166,7 +197,7 @@ export function NotepadEditor({
   }
 
   return (
-    <div onClickCapture={handleLinkClicks}>
+    <div ref={containerRef} onClickCapture={handleLinkClicks}>
       <BlockNoteView
       editor={editor}
       editable={!readOnly}
@@ -175,6 +206,7 @@ export function NotepadEditor({
       data-color-scheme="dark"
       sideMenu={false}
       onChange={() => {
+        requestAnimationFrame(paintProvenance)
         void (async () => {
           const canonical = stripSuggestionBlocks(
             editor.document as unknown as BlockLike[]

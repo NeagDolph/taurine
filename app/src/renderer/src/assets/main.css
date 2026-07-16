@@ -552,3 +552,8 @@
 .waveform-live span:nth-child(4) {
   animation-delay: 0.45s;
 }
+
+/* Per-line AI provenance: purely agent-authored lines render gray. */
+.notepad-editor .ai-authored .bn-inline-content {
+  color: color-mix(in srgb, var(--fg) 48%, transparent);
+}

@@ -60,6 +60,7 @@ describe('parseMeeting', () => {
         }
       ],
       transcript: [{ channel: 1, text: 'Hello', ts: 5, seq: 6 }],
+      aiLines: [],
       chatId: 'chat-1'
     })
   })

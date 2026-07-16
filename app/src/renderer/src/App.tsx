@@ -300,12 +300,12 @@ function App(): React.JSX.Element {
     setMeetingsIndex((current) => upsertMeetingRow(current, meeting))
   }, [])
 
-  const saveNotes = useCallback((id: string, notesMd: string): Promise<void> => {
+  const saveNotes = useCallback((id: string, notesMd: string, aiLines: string[]): Promise<void> => {
     const prior = notesSavesRef.current.get(id) ?? Promise.resolve()
     const task = prior
       .catch(() => undefined)
       .then(async () => {
-        const meeting = await patchMeeting(id, { notesMd })
+        const meeting = await patchMeeting(id, { notesMd, aiLines })
         setMeetingsIndex((current) => upsertMeetingRow(current, meeting))
       })
     notesSavesRef.current.set(id, task)

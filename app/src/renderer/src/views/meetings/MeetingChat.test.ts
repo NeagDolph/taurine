@@ -18,6 +18,7 @@ const MEETING: Meeting = {
   suggestionsBaseRev: 0,
   suggestions: [],
   transcript: [],
+  aiLines: [],
   chatId: 'chat-1'
 }
 
@@ -29,7 +30,8 @@ describe('MeetingChat', () => {
         open: false,
         askRequest: null,
         onClose: () => undefined,
-        onOpenNote: () => undefined
+        onOpenNote: () => undefined,
+        onNotesEdit: () => undefined
       })
     )
     expect(markup).toBe('')
@@ -42,7 +44,8 @@ describe('MeetingChat', () => {
         open: true,
         askRequest: null,
         onClose: () => undefined,
-        onOpenNote: () => undefined
+        onOpenNote: () => undefined,
+        onNotesEdit: () => undefined
       })
     )
     expect(markup).toContain('Ask about this meeting')

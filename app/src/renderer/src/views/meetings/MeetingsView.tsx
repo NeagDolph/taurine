@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ListeningState } from '../../components/SessionControls'
 import { getMeeting, patchMeeting, type Meeting, type MeetingListRow } from '../../lib/meetings'
 import { appendSummaryToNotes, flushCurrentNotepad } from '../../lib/notepad-sync'
+import { addAiLines, pruneAiLines } from '../../lib/provenance'
 import { applySuggestion, revalidatePendingSuggestions } from '../../lib/suggestions'
 import type {
   Actionable,
@@ -11,7 +12,7 @@ import type {
   SummaryEvent,
   TranscriptEvent
 } from '../../lib/sidecar'
-import { MeetingChat, type AskRequest } from './MeetingChat'
+import { MeetingChat, type AskRequest, type ChatNotesEdit } from './MeetingChat'
 import { NotepadEditor } from './NotepadEditor'
 import { SummaryCard } from './SummaryCard'
 import { TranscriptOverlay } from './TranscriptOverlay'
@@ -37,7 +38,7 @@ export interface MeetingsCoordinator {
   renameMeeting(id: string, title: string): Promise<void>
   startMeeting(id?: string): Promise<void>
   stopMeeting(): Promise<void>
-  saveNotes(id: string, notesMd: string): Promise<void>
+  saveNotes(id: string, notesMd: string, aiLines: string[]): Promise<void>
   registerNotesFlush(flush: () => Promise<void>): () => void
   queueNotepadPush(id: string, notesMd: string): void
   flushNotepadPush(id: string, notesMd: string): void
@@ -76,6 +77,12 @@ export function MeetingsView({
   const loadedMeetingIdRef = useRef<string | null>(null)
   const currentNotesRef = useRef('')
   const savedNotesRef = useRef('')
+  const [aiLines, setAiLinesState] = useState<string[]>([])
+  const aiLinesRef = useRef<string[]>([])
+  const setAiLines = useCallback((lines: string[]): void => {
+    aiLinesRef.current = lines
+    setAiLinesState(lines)
+  }, [])
 
   const savePendingNotes = useCallback(async (): Promise<void> => {
     if (timerRef.current !== null) {
@@ -85,9 +92,10 @@ export function MeetingsView({
     const id = currentMeetingIdRef.current
     const markdown = currentNotesRef.current
     if (!id || markdown === savedNotesRef.current) return
-    await saveNotes(id, markdown)
+    setAiLines(pruneAiLines(aiLinesRef.current, markdown))
+    await saveNotes(id, markdown, aiLinesRef.current)
     savedNotesRef.current = markdown
-  }, [saveNotes])
+  }, [saveNotes, setAiLines])
 
   const flushNotes = useCallback(async (): Promise<void> => {
     if (timerRef.current !== null) {
@@ -99,10 +107,13 @@ export function MeetingsView({
       meetingId: loadedMeetingIdRef.current === id ? id : null,
       currentTextMd: currentNotesRef.current,
       savedTextMd: savedNotesRef.current,
-      save: saveNotes,
+      save: (id, markdown) => {
+        setAiLines(pruneAiLines(aiLinesRef.current, markdown))
+        return saveNotes(id, markdown, aiLinesRef.current)
+      },
       push: flushNotepadPush
     })
-  }, [flushNotepadPush, saveNotes])
+  }, [flushNotepadPush, saveNotes, setAiLines])
 
   useEffect(() => registerNotesFlush(flushNotes), [flushNotes, registerNotesFlush])
 
@@ -112,8 +123,9 @@ export function MeetingsView({
     setTitle(next.title)
     currentNotesRef.current = next.notesMd
     savedNotesRef.current = next.notesMd
+    setAiLines(next.aiLines)
     loadedMeetingIdRef.current = next.meetingId
-  }, [])
+  }, [setAiLines])
 
   // Reset per-meeting overlay state during render when the selection moves.
   const [overlaysFor, setOverlaysFor] = useState(selectedMeetingId)
@@ -196,9 +208,29 @@ export function MeetingsView({
 
   const handleAddToNotes = useCallback(
     (summaryMd: string): void => {
+      setAiLines(addAiLines(aiLinesRef.current, summaryMd))
       handleNotesChange(appendSummaryToNotes(currentNotesRef.current, summaryMd))
     },
-    [handleNotesChange]
+    [handleNotesChange, setAiLines]
+  )
+
+  // The meeting chat's edit_notes tool: apply here (single writer beside the
+  // user's keystrokes) and mark inserted lines as AI-authored (gray).
+  const handleChatNotesEdit = useCallback(
+    (edit: ChatNotesEdit): void => {
+      setAiLines(addAiLines(aiLinesRef.current, edit.insertMd))
+      handleNotesChange(
+        applySuggestion(currentNotesRef.current, {
+          id: edit.editId,
+          anchor: edit.anchor,
+          occurrence: edit.occurrence,
+          insertMd: edit.insertMd,
+          rationale: '',
+          status: 'pending'
+        })
+      )
+    },
+    [handleNotesChange, setAiLines]
   )
 
   const handleResolveSuggestion = useCallback(
@@ -219,6 +251,7 @@ export function MeetingsView({
           : current
       )
       if (accept) {
+        setAiLines(addAiLines(aiLinesRef.current, edit.insertMd))
         handleNotesChange(applySuggestion(currentNotesRef.current, edit))
       }
 
@@ -242,7 +275,7 @@ export function MeetingsView({
         }
       )
     },
-    [handleNotesChange, meeting]
+    [handleNotesChange, meeting, setAiLines]
   )
 
   const handleSelect = useCallback(
@@ -409,6 +442,7 @@ export function MeetingsView({
                 suggestions={suggestions}
                 onResolveSuggestion={handleResolveSuggestion}
                 onOpenNoteInMap={openNoteInMap}
+                aiLines={aiLines}
                 readOnly={isLiveSelection && coordinator.listeningState === 'stopping'}
               />
             </div>
@@ -430,6 +464,7 @@ export function MeetingsView({
             askRequest={askRequest}
             onClose={() => setChatOpen(false)}
             onOpenNote={openNoteInMap}
+            onNotesEdit={handleChatNotesEdit}
           />
 
           <div className="absolute bottom-5 left-1/2 z-40 flex w-[min(680px,92%)] -translate-x-1/2 items-center gap-2 rounded-full border border-white/[0.1] bg-surface-2/90 py-1.5 pl-2 pr-2 shadow-2xl backdrop-blur-xl">

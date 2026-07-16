@@ -28,12 +28,20 @@ export interface AskRequest {
   nonce: number
 }
 
+export interface ChatNotesEdit {
+  editId: string
+  anchor: string
+  occurrence: number
+  insertMd: string
+}
+
 interface MeetingChatProps {
   meeting: Meeting
   open: boolean
   askRequest: AskRequest | null
   onClose: () => void
   onOpenNote: (noteId: string) => void
+  onNotesEdit: (edit: ChatNotesEdit) => void
 }
 
 export function MeetingChat({
@@ -41,7 +49,8 @@ export function MeetingChat({
   open,
   askRequest,
   onClose,
-  onOpenNote
+  onOpenNote,
+  onNotesEdit
 }: MeetingChatProps): React.JSX.Element | null {
   const expanded = open
   const [everExpanded, setEverExpanded] = useState(false)
@@ -51,6 +60,10 @@ export function MeetingChat({
   const [connection, setConnection] = useState<ChatConnectionState>('disconnected')
   const [error, setError] = useState('')
   const clientRef = useRef<ChatClient | null>(null)
+  const onNotesEditRef = useRef(onNotesEdit)
+  useEffect(() => {
+    onNotesEditRef.current = onNotesEdit
+  }, [onNotesEdit])
   const pendingTextRef = useRef<string | null>(null)
   const loadedChatRef = useRef<string | null>(null)
   const threadRef = useRef<HTMLDivElement | null>(null)
@@ -68,7 +81,9 @@ export function MeetingChat({
         setChatId,
         setMessages,
         setStreaming,
-        setError
+        setError,
+        meetingId: meeting.meetingId,
+        onNotesEdit: (edit) => onNotesEditRef.current(edit)
       })
     })
     const unsubscribeConnection = client.onConnection(setConnection)
@@ -238,6 +253,8 @@ interface EventState {
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>
   setStreaming: React.Dispatch<React.SetStateAction<StreamingTurn | null>>
   setError: React.Dispatch<React.SetStateAction<string>>
+  meetingId: string
+  onNotesEdit: (edit: ChatNotesEdit) => void
 }
 
 function applyEvent(event: ChatEvent, state: EventState): void {
@@ -299,6 +316,16 @@ function applyEvent(event: ChatEvent, state: EventState): void {
         event.message
       ])
       state.setStreaming(null)
+      return
+    case 'chat_notes_edit':
+      if (event.meetingId === state.meetingId) {
+        state.onNotesEdit({
+          editId: event.editId,
+          anchor: event.anchor,
+          occurrence: event.occurrence,
+          insertMd: event.insertMd
+        })
+      }
       return
     case 'chat_error':
       if (event.code === 'busy') {

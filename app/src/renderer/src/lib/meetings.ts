@@ -36,6 +36,7 @@ export interface Meeting extends MeetingListRow {
   suggestionsBaseRev: number
   suggestions: SuggestedEdit[]
   transcript: TranscriptChunk[]
+  aiLines: string[]
   chatId: string | null
 }
 
@@ -43,6 +44,7 @@ export interface MeetingPatch {
   title?: string
   notesMd?: string
   suggestions?: SuggestedEdit[]
+  aiLines?: string[]
 }
 
 interface MeetingsRequestOptions {
@@ -101,6 +103,7 @@ export async function patchMeeting(
   if (patch.suggestions !== undefined) {
     body.suggestions = patch.suggestions.map(suggestedEditToWire)
   }
+  if (patch.aiLines !== undefined) body.ai_lines = patch.aiLines
 
   const payload = await requestMeetingsJson(
     `/meetings/${encodeURIComponent(meetingId)}`,
@@ -169,6 +172,9 @@ export function parseMeeting(value: unknown): Meeting {
       typeof record.suggestions_base_rev === 'number' ? record.suggestions_base_rev : 0,
     suggestions: parseSuggestions(record.suggestions),
     transcript: parseTranscript(record.transcript),
+    aiLines: Array.isArray(record.ai_lines)
+      ? record.ai_lines.filter((line): line is string => typeof line === 'string')
+      : [],
     chatId: record.chat_id
   }
 }

@@ -11,7 +11,7 @@ export interface ChatMeta {
   message_count: number
 }
 
-export type ChatActivityKind = 'search' | 'read' | 'expand'
+export type ChatActivityKind = 'search' | 'read' | 'expand' | 'edit'
 
 export interface ChatActivityStep {
   kind: ChatActivityKind
@@ -103,6 +103,17 @@ export interface ChatMetaEvent {
   chat: ChatMeta
 }
 
+export interface ChatNotesEditEvent {
+  type: 'chat_notes_edit'
+  chat_id: string
+  message_id: number
+  meetingId: string
+  editId: string
+  anchor: string
+  occurrence: number
+  insertMd: string
+}
+
 export type ChatEvent =
   | ChatAckEvent
   | ChatRetrievalEvent
@@ -112,6 +123,7 @@ export type ChatEvent =
   | ChatDoneEvent
   | ChatErrorEvent
   | ChatMetaEvent
+  | ChatNotesEditEvent
 
 export type ChatConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
 
@@ -407,6 +419,31 @@ export function parseChatEvent(raw: string): ChatEvent | null {
       const chat = parseChatMeta(record.chat)
       return chat ? { type: 'chat_meta', chat } : null
     }
+    case 'chat_notes_edit': {
+      if (
+        typeof record.chat_id !== 'string' ||
+        typeof record.message_id !== 'number' ||
+        typeof record.meeting_id !== 'string' ||
+        typeof record.anchor !== 'string' ||
+        typeof record.insert_md !== 'string' ||
+        !record.insert_md
+      ) {
+        return null
+      }
+      return {
+        type: 'chat_notes_edit',
+        chat_id: record.chat_id,
+        message_id: record.message_id,
+        meetingId: record.meeting_id,
+        editId: typeof record.edit_id === 'string' ? record.edit_id : '',
+        anchor: record.anchor,
+        occurrence:
+          typeof record.occurrence === 'number' && record.occurrence >= 1
+            ? Math.floor(record.occurrence)
+            : 1,
+        insertMd: record.insert_md
+      }
+    }
     default:
       return null
   }
@@ -492,7 +529,10 @@ function parseActivityStep(value: unknown): ChatActivityStep | null {
   const record = asRecord(value)
   if (
     !record ||
-    (record.kind !== 'search' && record.kind !== 'read' && record.kind !== 'expand') ||
+    (record.kind !== 'search' &&
+      record.kind !== 'read' &&
+      record.kind !== 'expand' &&
+      record.kind !== 'edit') ||
     typeof record.label !== 'string'
   ) {
     return null
