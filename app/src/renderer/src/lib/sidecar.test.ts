@@ -78,4 +78,31 @@ describe('SidecarClient reconnect', () => {
       })
     ])
   })
+
+  it('sends the current notepad markdown with its meeting id', () => {
+    const client = new SidecarClient('ws://127.0.0.1:8930/session')
+    client.connect()
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+
+    client.sendNotepad('meeting-42', '# Decisions\n\nShip it.')
+
+    expect(socket.sent).toEqual([
+      JSON.stringify({
+        type: 'notepad',
+        meeting_id: 'meeting-42',
+        text_md: '# Decisions\n\nShip it.'
+      })
+    ])
+  })
+
+  it('drops notepad updates while the socket is down', () => {
+    const client = new SidecarClient('ws://127.0.0.1:8930/session')
+    client.connect()
+    const socket = FakeWebSocket.instances[0]
+
+    client.sendNotepad('meeting-42', 'offline edit')
+
+    expect(socket.sent).toEqual([])
+  })
 })

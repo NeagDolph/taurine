@@ -10,6 +10,7 @@ interface SummaryCardProps {
   finalSummaryMd: string
   listeningState: ListeningState
   onActionableStatus(id: string, status: 'confirmed' | 'dismissed'): void
+  onAddToNotes(summaryMd: string): void
 }
 
 export function SummaryCard({
@@ -17,17 +18,31 @@ export function SummaryCard({
   actionables,
   finalSummaryMd,
   listeningState,
-  onActionableStatus
+  onActionableStatus,
+  onAddToNotes
 }: SummaryCardProps): React.JSX.Element | null {
   const markdown = summary?.summary_md || finalSummaryMd
   const visibleActionables = actionables.filter((item) => item.status !== 'dismissed')
   const active = listeningState !== 'idle' && listeningState !== 'error'
+  const noteChangesDisabled = listeningState === 'stopping'
   if (!active && !markdown && visibleActionables.length === 0) return null
 
   if (summary) {
     return (
       <section className="grid max-h-[34vh] flex-none grid-cols-[minmax(0,3fr)_minmax(240px,2fr)] gap-3 overflow-y-auto border-b border-white/[0.08] bg-surface-2/30 p-3">
-        <SummaryPanel summary={summary} onOpenNote={ignoreNote} />
+        <div className="min-w-0">
+          <div className="mb-2 flex justify-end">
+            <button
+              className="secondary-button compact"
+              type="button"
+              disabled={noteChangesDisabled}
+              onClick={() => onAddToNotes(markdown)}
+            >
+              Add to notes
+            </button>
+          </div>
+          <SummaryPanel summary={summary} onOpenNote={ignoreNote} />
+        </div>
         <ActionableRail
           actionables={actionables}
           evidence={summary.evidence ?? null}
@@ -42,6 +57,16 @@ export function SummaryCard({
     <section className="grid max-h-[34vh] flex-none gap-3 overflow-y-auto border-b border-white/[0.08] bg-surface-2/50 px-5 py-3">
       <div className="flex items-center justify-between gap-3">
         <span className="section-label">Meeting summary</span>
+        {markdown ? (
+          <button
+            className="secondary-button compact"
+            type="button"
+            disabled={noteChangesDisabled}
+            onClick={() => onAddToNotes(markdown)}
+          >
+            Add to notes
+          </button>
+        ) : null}
       </div>
       {markdown ? (
         <div className="markdown-body text-[13px] leading-normal text-fg">

@@ -344,6 +344,7 @@ export interface StartMsg {
 type JsonControlMessage =
   | StartMsg
   | { type: 'stop' }
+  | { type: 'notepad'; meeting_id: string; text_md: string }
   | { type: 'actionable_status'; id: string; status: 'confirmed' | 'dismissed' }
   | { type: 'open_note'; note_id: string }
 
@@ -408,6 +409,10 @@ export class SidecarClient {
     this.sessionActive = false
     this.lastStartMessage = null
     this.sendJson({ type: 'stop' })
+  }
+
+  sendNotepad(meetingId: string, textMd: string): void {
+    this.sendJson({ type: 'notepad', meeting_id: meetingId, text_md: textMd })
   }
 
   actionableStatus(id: string, status: 'confirmed' | 'dismissed'): void {

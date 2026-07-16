@@ -10,6 +10,7 @@ import {
   patchMeeting,
   type MeetingListRow
 } from './lib/meetings'
+import { DebouncedNotepadPush } from './lib/notepad-sync'
 import {
   SidecarClient,
   fetchStartupStatus,
@@ -51,6 +52,7 @@ function App(): React.JSX.Element {
   const liveMeetingIdRef = useRef<string | null>(null)
   const notesFlushRef = useRef<(() => Promise<void>) | null>(null)
   const notesSavesRef = useRef<Map<string, Promise<void>>>(new Map())
+  const notepadPushRef = useRef<DebouncedNotepadPush | null>(null)
 
   const [activeTab, setActiveTab] = useState<MainTab>('meetings')
   const [meetingsIndex, setMeetingsIndex] = useState<MeetingListRow[]>([])
@@ -83,6 +85,10 @@ function App(): React.JSX.Element {
     let disposed = false
     const client = new SidecarClient()
     clientRef.current = client
+    const notepadPush = new DebouncedNotepadPush((meetingId, textMd) => {
+      client.sendNotepad(meetingId, textMd)
+    })
+    notepadPushRef.current = notepadPush
 
     const refreshMeetings = async (): Promise<void> => {
       try {
@@ -194,6 +200,8 @@ function App(): React.JSX.Element {
       systemAudioRef.current = null
       audioRef.current?.stop()
       audioRef.current = null
+      notepadPush.cancel()
+      if (notepadPushRef.current === notepadPush) notepadPushRef.current = null
       client.stop()
       unsubscribe.forEach((remove) => remove())
       client.disconnect()
@@ -292,6 +300,19 @@ function App(): React.JSX.Element {
     }
   }, [])
 
+  const queueNotepadPush = useCallback(
+    (id: string, textMd: string): void => {
+      if (listeningState !== 'listening' || id !== liveMeetingId) return
+      notepadPushRef.current?.schedule(id, textMd)
+    },
+    [listeningState, liveMeetingId]
+  )
+
+  const flushNotepadPush = useCallback((id: string, textMd: string): void => {
+    if (id !== liveMeetingIdRef.current) return
+    notepadPushRef.current?.flush(id, textMd)
+  }, [])
+
   const startMeeting = useCallback(
     async (id?: string): Promise<void> => {
       const client = clientRef.current
@@ -323,6 +344,7 @@ function App(): React.JSX.Element {
       setActionables([])
       setGroundedNoteIds([])
       setLastRetrieval(null)
+      notepadPushRef.current?.cancel()
 
       let systemAudioAvailable = false
       try {
@@ -371,6 +393,7 @@ function App(): React.JSX.Element {
         capture.stop()
         audioRef.current = null
         client.stop()
+        notepadPushRef.current?.cancel()
         liveMeetingIdRef.current = null
         setLiveMeetingId(null)
         setMicError(error instanceof Error ? error.message : 'Microphone capture failed')
@@ -401,6 +424,7 @@ function App(): React.JSX.Element {
     try {
       await notesFlushRef.current?.()
       await Promise.all([...notesSavesRef.current.values()])
+      notepadPushRef.current?.flushPending()
     } catch (error) {
       setMicError(
         error instanceof Error
@@ -415,6 +439,7 @@ function App(): React.JSX.Element {
     audioRef.current?.stop()
     audioRef.current = null
     clientRef.current?.stop()
+    notepadPushRef.current?.cancel()
     liveMeetingIdRef.current = null
     setLiveMeetingId(null)
     setListeningState('idle')
@@ -502,6 +527,8 @@ function App(): React.JSX.Element {
       stopMeeting,
       saveNotes,
       registerNotesFlush,
+      queueNotepadPush,
+      flushNotepadPush,
       setActionableStatus: actionableStatus
     }),
     [
@@ -516,6 +543,8 @@ function App(): React.JSX.Element {
       liveMeetingId,
       meetingsIndex,
       micError,
+      flushNotepadPush,
+      queueNotepadPush,
       registerNotesFlush,
       renameMeeting,
       saveNotes,

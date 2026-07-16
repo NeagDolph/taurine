@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ListeningState } from '../../components/SessionControls'
 import { getMeeting, type Meeting, type MeetingListRow } from '../../lib/meetings'
+import { appendSummaryToNotes, flushCurrentNotepad } from '../../lib/notepad-sync'
 import type {
   Actionable,
   LiveGroundingEvent,
@@ -33,6 +34,8 @@ export interface MeetingsCoordinator {
   stopMeeting(): Promise<void>
   saveNotes(id: string, notesMd: string): Promise<void>
   registerNotesFlush(flush: () => Promise<void>): () => void
+  queueNotepadPush(id: string, notesMd: string): void
+  flushNotepadPush(id: string, notesMd: string): void
   setActionableStatus(id: string, status: 'confirmed' | 'dismissed'): void
 }
 
@@ -45,6 +48,8 @@ export function MeetingsView({
     selectedMeetingId,
     saveNotes,
     registerNotesFlush,
+    queueNotepadPush,
+    flushNotepadPush,
     selectMeeting,
     createMeeting,
     deleteMeeting,
@@ -58,10 +63,11 @@ export function MeetingsView({
   const [transcriptOpen, setTranscriptOpen] = useState(true)
   const timerRef = useRef<number | null>(null)
   const currentMeetingIdRef = useRef<string | null>(null)
+  const loadedMeetingIdRef = useRef<string | null>(null)
   const currentNotesRef = useRef('')
   const savedNotesRef = useRef('')
 
-  const flushNotes = useCallback(async (): Promise<void> => {
+  const savePendingNotes = useCallback(async (): Promise<void> => {
     if (timerRef.current !== null) {
       window.clearTimeout(timerRef.current)
       timerRef.current = null
@@ -73,11 +79,27 @@ export function MeetingsView({
     savedNotesRef.current = markdown
   }, [saveNotes])
 
+  const flushNotes = useCallback(async (): Promise<void> => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current)
+      timerRef.current = null
+    }
+    const id = currentMeetingIdRef.current
+    savedNotesRef.current = await flushCurrentNotepad({
+      meetingId: loadedMeetingIdRef.current === id ? id : null,
+      currentTextMd: currentNotesRef.current,
+      savedTextMd: savedNotesRef.current,
+      save: saveNotes,
+      push: flushNotepadPush
+    })
+  }, [flushNotepadPush, saveNotes])
+
   useEffect(() => registerNotesFlush(flushNotes), [flushNotes, registerNotesFlush])
 
   useEffect(() => {
     const controller = new AbortController()
     currentMeetingIdRef.current = selectedMeetingId
+    loadedMeetingIdRef.current = null
 
     if (selectedMeetingId) {
       void getMeeting(selectedMeetingId, { signal: controller.signal })
@@ -88,6 +110,7 @@ export function MeetingsView({
           setTitle(next.title)
           currentNotesRef.current = next.notesMd
           savedNotesRef.current = next.notesMd
+          loadedMeetingIdRef.current = next.meetingId
         })
         .catch((loadError: unknown) => {
           if (!controller.signal.aborted) {
@@ -109,16 +132,24 @@ export function MeetingsView({
     (markdown: string): void => {
       setNotesMd(markdown)
       currentNotesRef.current = markdown
+      queueNotepadPush(currentMeetingIdRef.current ?? '', markdown)
       if (markdown === savedNotesRef.current) return
       if (timerRef.current !== null) window.clearTimeout(timerRef.current)
       timerRef.current = window.setTimeout(() => {
         timerRef.current = null
-        void flushNotes().catch((saveError: unknown) => {
+        void savePendingNotes().catch((saveError: unknown) => {
           setError(saveError instanceof Error ? saveError.message : 'Notes could not be saved')
         })
       }, 800)
     },
-    [flushNotes]
+    [queueNotepadPush, savePendingNotes]
+  )
+
+  const handleAddToNotes = useCallback(
+    (summaryMd: string): void => {
+      handleNotesChange(appendSummaryToNotes(currentNotesRef.current, summaryMd))
+    },
+    [handleNotesChange]
   )
 
   const handleSelect = useCallback(
@@ -247,6 +278,7 @@ export function MeetingsView({
               finalSummaryMd={meeting.finalSummaryMd}
               listeningState={isLiveSelection ? coordinator.listeningState : 'idle'}
               onActionableStatus={coordinator.setActionableStatus}
+              onAddToNotes={handleAddToNotes}
             />
 
             <div className="min-h-0 overflow-y-auto bg-surface-0/20">
