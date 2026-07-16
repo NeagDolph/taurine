@@ -234,6 +234,8 @@ LIVE_TOPIC_SHIFT_SIM = 0.35              # window-vs-EMA cosine below this on an
 LIVE_SPANS_BUDGET_S = 0.3                # soft budget for GLiNER query spans; timeout → no spans
 LIVE_LEDGER_MAX_CHUNKS = 2000            # hard safety cap on retained transcript chunks
 MEETING_FINALIZE_GRACE_S = 60            # disconnect grace before finalization
+MEETING_SYNC_DELAY_S = 60                # coalesced global sync after finalization
+TAURINE_SOURCE_ID = "taurine"
 RRF_K = 60
 HEAD_TOP_K = 20
 C2_TOP_K = 8                             # match the search-lane quota (was 5: entity notes
@@ -464,6 +466,7 @@ SOURCE_RANK = {
     "google_docs": 1.00,                 # authored documents: written notes tier
     "claude_mem": 0.70,                  # agent memories: a bit lower still
     "codex_mem": 0.70,
+    "taurine": 0.95,
 }
 SOURCE_RANK_DEFAULT = 0.85               # future connectors until explicitly ranked
 
@@ -486,6 +489,7 @@ RECENCY_HALF_LIFE_DAYS = {
     "apple_notes": 90.0,
     "obsidian": 120.0,                   # evergreen notes barely decay
     "local_folders": 120.0,              # attached documents: evergreen tier
+    "taurine": 60.0,
 }
 RECENCY_HALF_LIFE_DEFAULT_DAYS = 90.0
 RECENCY_FLOOR = 0.15                     # decay is a downweight, never an exclusion

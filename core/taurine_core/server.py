@@ -205,6 +205,7 @@ class Runtime:
     connector_sync_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
     sync_status: SyncStatus = field(default_factory=SyncStatus)
     sync_task: asyncio.Task[Any] | None = None
+    meeting_sync_task: asyncio.Task[Any] | None = None
     sync_cancel: threading.Event | None = None
     sync_last_emit_s: float = 0.0
     # True when the graph no longer matches the enabled sources (a source was
@@ -368,6 +369,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             # *.build-*.db file that the next build reuses or replaces.
             if active_runtime is not None:
                 await _shutdown_meeting_finalizations(active_runtime)
+                if active_runtime.meeting_sync_task is not None:
+                    active_runtime.meeting_sync_task.cancel()
+                    await asyncio.gather(
+                        active_runtime.meeting_sync_task, return_exceptions=True
+                    )
                 if active_runtime.sync_task is not None:
                     active_runtime.sync_task.cancel()
                     await asyncio.gather(active_runtime.sync_task, return_exceptions=True)
@@ -540,19 +546,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.post("/index/sync", status_code=202)
     async def index_sync() -> SyncStatus:
         active_runtime = _ready_runtime(app)
-        if (
-            active_runtime.sync_status.running
-            or active_runtime.sync_task is not None
-            and not active_runtime.sync_task.done()
-        ):
+        if not _start_global_sync(active_runtime):
             raise HTTPException(status_code=409, detail="sync already running")
-        active_runtime.sync_cancel = threading.Event()
-        _set_sync_status(
-            active_runtime,
-            SyncStatus(running=True, phase="syncing"),
-            force_emit=True,
-        )
-        active_runtime.sync_task = asyncio.create_task(_run_global_sync(active_runtime))
         return _sync_status_payload(active_runtime)
 
     @app.get("/index/sync")
@@ -576,7 +571,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     async def connectors() -> list[ConnectorInfo]:
         active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
-        return registry.list_info(active_runtime.index)
+        return _visible_connector_infos(registry, active_runtime.index)
 
     @app.post("/connectors/{connector_id}/enable")
     async def connector_enable(connector_id: str) -> ConnectorInfo:
@@ -584,6 +579,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         # read or indexed until the user presses sync.
         active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
+        _connector_info(active_runtime, connector_id)
         try:
             registry.set_enabled(active_runtime.index, connector_id, True)
         except KeyError:
@@ -599,6 +595,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         # stay as-built until the next sync rebuilds cleanly.
         active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
+        _connector_info(active_runtime, connector_id)
         try:
             registry.set_enabled(active_runtime.index, connector_id, False)
         except KeyError:
@@ -612,6 +609,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     async def connector_delete_data(connector_id: str) -> ConnectorInfo:
         active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
+        _connector_info(active_runtime, connector_id)
         if connector_id in registry.syncing:
             raise HTTPException(status_code=409, detail="connector sync running — wait for it to finish")
         if (
@@ -658,6 +656,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     ) -> ConnectorInfo:
         active_runtime = _ready_runtime(app)
         registry = _connector_registry(active_runtime)
+        _connector_info(active_runtime, connector_id)
         config_payload = _flat_config(payload)
         try:
             registry.set_config(active_runtime.index, connector_id, config_payload)
@@ -1074,8 +1073,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
     llm = OpenRouterClient(secrets["OPEN_ROUTER_API_KEY"])
     report("loading_models", "span extraction model")
     span_extractor = Gliner2SpanExtractor()
-    connector_registry = ConnectorRegistry()
-    connector_registry.reconcile_ledger(index)
+    connector_registry = ConnectorRegistry.for_index(index)
 
     complete_relations = relation_completer_for(llm)
 
@@ -1719,6 +1717,13 @@ async def _run_meeting_finalization(
             emit_after_update,
             runtime.index,
         )
+        finalized = runtime.index.meeting_get(snapshot.meeting_id)
+        if (
+            finalized is not None
+            and finalized["status"] == "done"
+            and str(finalized.get("final_summary_md") or "").strip()
+        ):
+            _schedule_meeting_sync(runtime)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -2167,6 +2172,49 @@ async def _run_global_sync(runtime: Runtime) -> None:
         await _emit_index_status(runtime)
 
 
+def _global_sync_running(runtime: Runtime) -> bool:
+    return bool(
+        runtime.sync_status.running
+        or runtime.sync_task is not None
+        and not runtime.sync_task.done()
+    )
+
+
+def _start_global_sync(runtime: Runtime) -> bool:
+    if _global_sync_running(runtime):
+        return False
+    runtime.sync_cancel = threading.Event()
+    _set_sync_status(
+        runtime,
+        SyncStatus(running=True, phase="syncing"),
+        force_emit=True,
+    )
+    runtime.sync_task = asyncio.create_task(_run_global_sync(runtime))
+    return True
+
+
+def _schedule_meeting_sync(runtime: Runtime) -> bool:
+    if _global_sync_running(runtime):
+        return False
+    pending = runtime.meeting_sync_task
+    if pending is not None and not pending.done():
+        return False
+
+    async def delayed_sync() -> None:
+        await asyncio.sleep(config.MEETING_SYNC_DELAY_S)
+        _start_global_sync(runtime)
+
+    task = asyncio.create_task(delayed_sync())
+    runtime.meeting_sync_task = task
+
+    def finished(done: asyncio.Task[Any]) -> None:
+        if runtime.meeting_sync_task is done:
+            runtime.meeting_sync_task = None
+
+    task.add_done_callback(finished)
+    return True
+
+
 async def _run_profile_generation(runtime: Runtime) -> None:
     generator = runtime.profile_generator
     assert generator is not None
@@ -2303,7 +2351,7 @@ async def _send_updates(
     time so coalesced bursts reflect the latest state."""
     if "connectors" in kinds and runtime.connector_registry is not None:
         infos = await asyncio.to_thread(
-            runtime.connector_registry.list_info, runtime.index
+            _visible_connector_infos, runtime.connector_registry, runtime.index
         )
         await websocket.send_text(
             json.dumps(
@@ -2397,10 +2445,28 @@ def _connector_registry(runtime: Runtime) -> Any:
 
 def _connector_info(runtime: Runtime, connector_id: str) -> ConnectorInfo:
     registry = _connector_registry(runtime)
-    for info in registry.list_info(runtime.index):
+    for info in _visible_connector_infos(registry, runtime.index):
         if info.connector_id == connector_id:
             return info
     raise HTTPException(status_code=404, detail="connector not found")
+
+
+def _visible_connector_infos(registry: Any, index: Any) -> list[ConnectorInfo]:
+    return [
+        info
+        for info in registry.list_info(index)
+        if not _connector_is_hidden(registry, info.connector_id)
+    ]
+
+
+def _connector_is_hidden(registry: Any, connector_id: str) -> bool:
+    is_hidden = getattr(registry, "is_hidden", None)
+    if not callable(is_hidden):
+        return False
+    try:
+        return bool(is_hidden(connector_id))
+    except KeyError:
+        return False
 
 
 def _chat_engine(runtime: Runtime) -> Any:

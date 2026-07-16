@@ -9,6 +9,7 @@ from .imessage import IMessageConnector
 from .local_folders import LocalFoldersConnector
 from .obsidian import ObsidianConnector
 from .outlook import OutlookConnector
+from .taurine_meetings import TaurineMeetingsConnector
 
 
 CONNECTORS: list = [
@@ -22,6 +23,11 @@ CONNECTORS: list = [
     GoogleDocsConnector(),
     OutlookConnector(),
 ]
+
+# These connectors require runtime-owned handles and are materialized only
+# after those handles exist. They are still registry members, not sync
+# special-cases.
+RUNTIME_CONNECTOR_FACTORIES: tuple[type, ...] = (TaurineMeetingsConnector,)
 
 try:
     from .apple_notes import AppleNotesConnector

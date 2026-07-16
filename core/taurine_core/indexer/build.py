@@ -1378,7 +1378,7 @@ def main(
         from taurine_core.indexer.store import Index
 
         source_index = Index(Path("taurine.db"))
-        connector_registry = ConnectorRegistry()
+        connector_registry = ConnectorRegistry.for_index(source_index)
 
         def connector_loader() -> Sequence[NoteRecord]:
             return connector_registry.extract_all_enabled(source_index).records

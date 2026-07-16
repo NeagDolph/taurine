@@ -32,7 +32,7 @@ class SourceExtraction:
     reports: tuple[ConnectorSyncReport, ...] = ()
 
 
-def build_connectors() -> list[ConnectorPort]:
+def build_connectors(*, index: object | None = None) -> list[ConnectorPort]:
     try:
         module = importlib.import_module("taurine_core.connectors.catalog")
     except ModuleNotFoundError as exc:
@@ -41,8 +41,13 @@ def build_connectors() -> list[ConnectorPort]:
         ):
             raise
         return [AppleNotesConnector()]
-    connectors = getattr(module, "CONNECTORS")
-    return [_materialize(connector) for connector in connectors]
+    connectors = [_materialize(connector) for connector in getattr(module, "CONNECTORS")]
+    if index is not None:
+        connectors.extend(
+            factory(index)
+            for factory in getattr(module, "RUNTIME_CONNECTOR_FACTORIES", ())
+        )
+    return connectors
 
 
 class ConnectorRegistry:
@@ -55,6 +60,12 @@ class ConnectorRegistry:
         # sync progress changes so the /updates websocket can broadcast
         self.on_change: Callable[[], None] | None = None
 
+    @classmethod
+    def for_index(cls, index: object) -> ConnectorRegistry:
+        registry = cls(build_connectors(index=index))
+        registry.reconcile_ledger(index)
+        return registry
+
     def list_info(self, index: object) -> list[ConnectorInfo]:
         counts = index.note_count_by_source()  # type: ignore[attr-defined]
         return [
@@ -65,13 +76,15 @@ class ConnectorRegistry:
     def set_enabled(self, index: object, connector_id: str, enabled: bool) -> None:
         """Enable/disable the connector. Data is always kept: the index ledger
         just deactivates the source. purge_data() is the explicit delete."""
-        self._connector(connector_id)
+        connector = self._connector(connector_id)
         state = self._state(index, connector_id)
         state["enabled"] = bool(enabled)
+        effective_enabled = self.is_effectively_enabled(connector, state)
+        state["enabled"] = effective_enabled
         self._save_state(index, connector_id, state)
         set_source_enabled = getattr(index, "set_source_enabled", None)
         if callable(set_source_enabled):
-            set_source_enabled(connector_id, bool(enabled))
+            set_source_enabled(connector_id, effective_enabled)
         self._notify()
 
     def purge_data(self, index: object, connector_id: str) -> int:
@@ -92,7 +105,7 @@ class ConnectorRegistry:
             state = self._state(index, connector.connector_id)
             set_source_enabled(
                 connector.connector_id,
-                self._enabled(connector.connector_id, state),
+                self.is_effectively_enabled(connector, state),
             )
 
     def set_config(self, index: object, connector_id: str, config: dict) -> None:
@@ -206,7 +219,9 @@ class ConnectorRegistry:
         unavailable: list[str] = []
         for connector in self._connectors:
             connector_id = connector.connector_id
-            if not self._enabled(connector_id, self._state(index, connector_id)):
+            if not self.is_effectively_enabled(
+                connector, self._state(index, connector_id)
+            ):
                 continue
             report, extracted = self._sync_connector(connector_id, index, llm)
             reports.append(report)
@@ -237,7 +252,7 @@ class ConnectorRegistry:
         unavailable: list[str] = []
         for connector in self._connectors:
             state = self._state(index, connector.connector_id)
-            if not self._enabled(connector.connector_id, state):
+            if not self.is_effectively_enabled(connector, state):
                 continue
             # progress stays OUTSIDE the guard: cooperative cancellation is
             # raised through it and must abort the read, not mark a connector
@@ -300,7 +315,7 @@ class ConnectorRegistry:
             connector_id=connector.connector_id,
             label=connector.label,
             kind=connector.kind,  # type: ignore[arg-type]
-            enabled=self._enabled(connector.connector_id, state),
+            enabled=self.is_effectively_enabled(connector, state),
             available=available,
             detail=detail,
             docs=docs,
@@ -327,9 +342,16 @@ class ConnectorRegistry:
         index.set_connector_state(connector_id, state)  # type: ignore[attr-defined]
 
     @staticmethod
-    def _enabled(connector_id: str, state: dict) -> bool:
-        default = connector_id == "apple_notes"
+    def is_effectively_enabled(connector: ConnectorPort, state: dict) -> bool:
+        """Hidden registry members are implicit and cannot be disabled."""
+
+        if bool(getattr(connector, "hidden", False)):
+            return True
+        default = connector.connector_id == "apple_notes"
         return bool(state.get("enabled", default))
+
+    def is_hidden(self, connector_id: str) -> bool:
+        return bool(getattr(self._connector(connector_id), "hidden", False))
 
     @staticmethod
     def _config(connector: ConnectorPort, state: dict) -> dict:
