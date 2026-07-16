@@ -4,13 +4,30 @@ import { electronAPI } from '@electron-toolkit/preload'
 // Custom APIs for renderer
 const api = {
   chooseDirectory: (): Promise<string | null> => ipcRenderer.invoke('dialog:choose-directory'),
-  micWatch: {
-    onActive: (callback: (active: boolean) => void): (() => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, active: unknown): void => {
-        if (typeof active === 'boolean') callback(active)
+  callNotif: {
+    // Main window: the OS-level panel (or its countdown) chose "Start notes".
+    onStart: (callback: () => void): (() => void) => {
+      const listener = (): void => callback()
+      ipcRenderer.on('callnotif:start', listener)
+      return () => ipcRenderer.removeListener('callnotif:start', listener)
+    }
+  },
+  callNotifPanel: {
+    // Notification panel window only.
+    action: (action: 'start' | 'dismiss'): void => {
+      ipcRenderer.send('callnotif:panel-action', action)
+    },
+    onShow: (callback: (seconds: number) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, seconds: unknown): void => {
+        callback(typeof seconds === 'number' && seconds > 0 ? seconds : 10)
       }
-      ipcRenderer.on('micwatch:active', listener)
-      return () => ipcRenderer.removeListener('micwatch:active', listener)
+      ipcRenderer.on('callnotif:show', listener)
+      return () => ipcRenderer.removeListener('callnotif:show', listener)
+    }
+  },
+  session: {
+    reportListening: (listening: boolean): void => {
+      ipcRenderer.send('session:listening', listening)
     }
   },
   sysAudio: {

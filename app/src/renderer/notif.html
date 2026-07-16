@@ -1,0 +1,121 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Call detected</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        background: transparent;
+        overflow: hidden;
+        font-family:
+          -apple-system,
+          BlinkMacSystemFont,
+          'Segoe UI',
+          sans-serif;
+        user-select: none;
+      }
+      .card {
+        position: relative;
+        margin: 6px;
+        height: 96px;
+        border-radius: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(28, 28, 31, 0.94);
+        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+        overflow: hidden;
+        color: #ecebe6;
+        -webkit-app-region: no-drag;
+      }
+      .countdown {
+        position: absolute;
+        top: 0;
+        left: 0;
+        height: 3px;
+        width: 100%;
+        background: #f5c518;
+        transform-origin: left;
+      }
+      .countdown.running {
+        transition-property: transform;
+        transition-timing-function: linear;
+        transform: scaleX(0);
+      }
+      .body {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 16px 14px 12px;
+      }
+      .title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #57d98a;
+        animation: pulse 1.4s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.35;
+        }
+      }
+      .buttons {
+        display: flex;
+        gap: 8px;
+      }
+      button {
+        flex: 1;
+        height: 30px;
+        border-radius: 8px;
+        border: 1px solid transparent;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .start {
+        background: #f5c518;
+        color: #17140a;
+      }
+      .start:hover {
+        background: #ffd75e;
+      }
+      .dismiss {
+        background: rgba(255, 255, 255, 0.06);
+        border-color: rgba(255, 255, 255, 0.12);
+        color: #ecebe6;
+      }
+      .dismiss:hover {
+        background: rgba(255, 255, 255, 0.12);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="countdown" id="countdown"></div>
+      <div class="body">
+        <div class="title"><span class="dot"></span> Call detected — take notes?</div>
+        <div class="buttons">
+          <button class="start" id="start" type="button">Start notes</button>
+          <button class="dismiss" id="dismiss" type="button">Dismiss</button>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="./src/notif-main.ts"></script>
+  </body>
+</html>

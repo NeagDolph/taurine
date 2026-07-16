@@ -3,7 +3,10 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { startMicWatch } from './micwatch'
+import { CallNotifier } from './notifier'
 import { registerSystemAudioIpc } from './sysaudio'
+
+let mainWindow: BrowserWindow | null = null
 
 if (is.dev) {
   // dev-only: lets tooling attach to the real renderer for debugging
@@ -12,7 +15,7 @@ if (is.dev) {
 
 function createWindow(): void {
   // Create the browser window.
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1500,
     height: 950,
     minWidth: 1180,
@@ -26,16 +29,20 @@ function createWindow(): void {
     }
   })
 
-  mainWindow.on('ready-to-show', () => {
-    mainWindow.show()
+  const window = mainWindow
+  window.on('ready-to-show', () => {
+    window.show()
+  })
+  window.on('closed', () => {
+    if (mainWindow === window) mainWindow = null
   })
 
-  mainWindow.webContents.setWindowOpenHandler((details) => {
+  window.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }
   })
 
-  loadRenderer(mainWindow)
+  loadRenderer(window)
 }
 
 function loadRenderer(window: BrowserWindow): void {
@@ -78,8 +85,12 @@ app.whenReady().then(() => {
     return result.canceled ? null : (result.filePaths[0] ?? null)
   })
   registerSystemAudioIpc()
-  const stopMicWatch = startMicWatch()
-  app.once('will-quit', stopMicWatch)
+  const notifier = new CallNotifier(() => mainWindow)
+  const stopMicWatch = startMicWatch((active) => notifier.onMicActive(active))
+  app.once('will-quit', () => {
+    stopMicWatch()
+    notifier.dispose()
+  })
   createWindow()
 
   app.on('activate', function () {

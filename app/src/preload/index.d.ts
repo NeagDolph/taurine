@@ -2,8 +2,15 @@ import { ElectronAPI } from '@electron-toolkit/preload'
 
 export interface TaurineApi {
   chooseDirectory: () => Promise<string | null>
-  micWatch: {
-    onActive: (callback: (active: boolean) => void) => () => void
+  callNotif: {
+    onStart: (callback: () => void) => () => void
+  }
+  callNotifPanel: {
+    action: (action: 'start' | 'dismiss') => void
+    onShow: (callback: (seconds: number) => void) => () => void
+  }
+  session: {
+    reportListening: (listening: boolean) => void
   }
   sysAudio: {
     available: () => Promise<boolean>

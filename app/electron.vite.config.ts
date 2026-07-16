@@ -12,6 +12,14 @@ export default defineConfig({
         '@renderer': resolve('src/renderer/src')
       }
     },
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve('src/renderer/index.html'),
+          notif: resolve('src/renderer/notif.html')
+        }
+      }
+    },
     plugins: [react(), tailwindcss()],
     server: {
       port: Number(process.env.PORT) || 5174,

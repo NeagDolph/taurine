@@ -70,6 +70,8 @@ class MicWatchProcess {
   private stopping = false
   private lastActive: boolean | null = null
   private readonly debouncer = new MicActivityDebouncer((active) => this.broadcast(active))
+
+  constructor(private readonly onActive?: (active: boolean) => void) {}
   private readonly windowLoaded = (window: BrowserWindow): void => {
     window.webContents.once('did-finish-load', () => {
       if (this.lastActive !== null && !window.webContents.isDestroyed()) {
@@ -141,6 +143,7 @@ class MicWatchProcess {
 
   private broadcast(active: boolean): void {
     this.lastActive = active
+    this.onActive?.(active)
     BrowserWindow.getAllWindows().forEach((window) => {
       if (!window.webContents.isDestroyed()) {
         window.webContents.send('micwatch:active', active)
@@ -149,8 +152,8 @@ class MicWatchProcess {
   }
 }
 
-export function startMicWatch(): () => void {
-  const watcher = new MicWatchProcess()
+export function startMicWatch(onActive?: (active: boolean) => void): () => void {
+  const watcher = new MicWatchProcess(onActive)
   watcher.start()
   return () => watcher.stop()
 }
