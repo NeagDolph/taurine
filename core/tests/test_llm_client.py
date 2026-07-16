@@ -166,7 +166,7 @@ async def test_reasoning_parameter_is_per_model() -> None:
     assert bodies[0]["reasoning"] == {"enabled": False}
     assert bodies[1]["reasoning"] == {"enabled": False}
     assert "reasoning" not in bodies[2]  # deepseek providers reject the parameter
-    assert bodies[3]["reasoning"] == {"effort": "low"}
+    assert bodies[3]["reasoning"] == {"effort": "medium"}
 
 
 @pytest.mark.asyncio

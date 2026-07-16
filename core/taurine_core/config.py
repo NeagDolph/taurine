@@ -63,7 +63,10 @@ LLM_REASONING_BY_MODEL = {
     "z-ai/glm-5.2": {"enabled": False},
     "deepseek/deepseek-v4-pro": {"enabled": False},
     "deepseek/deepseek-v4-flash": {"enabled": False},
-    "google/gemini-3.5-flash": {"effort": "low"},
+    # Measured 2026-07-16: low effort makes gemini-3.5-flash degenerate under
+    # strict json_schema (runaway/unterminated strings, CoT leaked into
+    # summary_md); medium is clean and ~4x cheaper in completion tokens.
+    "google/gemini-3.5-flash": {"effort": "medium"},
     # Grounded edge adjudication is a bounded verify/label task, not open
     # reasoning: gpt-oss defaults to medium effort (thousands of think-tokens
     # per call → ~100s latency and runaway malformed JSON). Low effort is the
