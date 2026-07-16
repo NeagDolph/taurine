@@ -6,6 +6,7 @@ import logging
 import math
 from collections import OrderedDict
 from dataclasses import dataclass, replace
+from datetime import datetime
 from time import monotonic
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -404,6 +405,75 @@ class SharedRetrievalEngine:
             triple = TripleRecognitionResult(
                 (), (), {}, False, "triple_recognizer_disabled"
             )
+
+        passage_rows: tuple[PassageContext, ...] | None = None
+        passage_by_id: dict[str, PassageContext] | None = None
+        fact_rows: tuple[Any, ...] | None = None
+        eligible_passage_ids: frozenset[str] | None = None
+        if query.mode == "live" and int(config.LIVE_RECENCY_WINDOW_DAYS) > 0:
+            all_passage_rows = self.store.passage_contexts(
+                self.snapshot.passage_ids
+            )
+            eligible_passage_ids = frozenset(
+                row.passage_id
+                for row in all_passage_rows
+                if _live_passage_is_recent(row, query)
+            )
+            passage_rows = tuple(
+                row
+                for row in all_passage_rows
+                if row.passage_id in eligible_passage_ids
+            )
+            passage_by_id = {row.passage_id: row for row in passage_rows}
+            all_fact_rows = self.store.fact_contexts()
+            fact_rows = tuple(
+                row
+                for row in all_fact_rows
+                if str(row.source_passage_id) in eligible_passage_ids
+            )
+            eligible_fact_ids = {str(row.fact_id) for row in fact_rows}
+            eligible_entity_ids = _live_eligible_entity_ids(
+                self.snapshot,
+                self.store,
+                (*exact.all_hits, *entity.all_hits),
+                eligible_passage_ids,
+                build_id=self.snapshot.build_id,
+            )
+            dense = _filter_head_result_for_live_recency(
+                dense,
+                eligible_passage_ids=eligible_passage_ids,
+                eligible_fact_ids=eligible_fact_ids,
+                eligible_entity_ids=eligible_entity_ids,
+            )
+            bm25 = _filter_head_result_for_live_recency(
+                bm25,
+                eligible_passage_ids=eligible_passage_ids,
+                eligible_fact_ids=eligible_fact_ids,
+                eligible_entity_ids=eligible_entity_ids,
+            )
+            exact = _filter_head_result_for_live_recency(
+                exact,
+                eligible_passage_ids=eligible_passage_ids,
+                eligible_fact_ids=eligible_fact_ids,
+                eligible_entity_ids=eligible_entity_ids,
+            )
+            entity = _filter_head_result_for_live_recency(
+                entity,
+                eligible_passage_ids=eligible_passage_ids,
+                eligible_fact_ids=eligible_fact_ids,
+                eligible_entity_ids=eligible_entity_ids,
+            )
+            resolved_entity_ids = {
+                hit.target_id
+                for hit in (*exact.accepted, *entity.accepted)
+                if hit.target_kind == "entity"
+            }
+            required_entity_ids &= resolved_entity_ids
+            triple = _filter_triple_result_for_live_recency(
+                triple,
+                eligible_passage_ids=eligible_passage_ids,
+                eligible_fact_ids=eligible_fact_ids,
+            )
         triple_hits = _triple_head_hits(triple)
         accepted_hits = (
             *dense.accepted,
@@ -552,14 +622,20 @@ class SharedRetrievalEngine:
         # query_entity_reset; mirroring it into passage_reset double-counted
         # entity evidence and let weak entities inherit the strongest weight.
 
-        passage_rows = self.store.passage_contexts(self.snapshot.passage_ids)
-        passage_by_id = {row.passage_id: row for row in passage_rows}
-        fact_rows = self.store.fact_contexts()
+        if passage_rows is None:
+            passage_rows = self.store.passage_contexts(self.snapshot.passage_ids)
+        if passage_by_id is None:
+            passage_by_id = {row.passage_id: row for row in passage_rows}
+        if fact_rows is None:
+            fact_rows = self.store.fact_contexts()
         hub_ids = self._hub_entity_ids()
         activated_hubs = tuple(sorted(hub_ids & resolved_entity_ids))
         hub_activation = self._hub_activation(activated_hubs, passage_by_id)
         retrieval_graph, traversable_fact_ids = self._retrieval_graph(
-            query, fact_rows, hub_activation
+            query,
+            fact_rows,
+            hub_activation,
+            eligible_passage_ids=eligible_passage_ids,
         )
         ppr_started = monotonic()
         ppr = TypedPPR(retrieval_graph).run(
@@ -1370,6 +1446,8 @@ class SharedRetrievalEngine:
         query: RetrievalQuery,
         fact_rows: Sequence[Any],
         hub_activation: Mapping[str, tuple[str, ...]],
+        *,
+        eligible_passage_ids: frozenset[str] | None = None,
     ) -> tuple[Any, set[str]]:
         """L29: LRU-cache the materialized temporal graph per intent/activation.
 
@@ -1393,14 +1471,31 @@ class SharedRetrievalEngine:
             kind,
             time_key,
             tuple(sorted(hub_activation.items())),
+            (
+                None
+                if eligible_passage_ids is None
+                else tuple(sorted(eligible_passage_ids))
+            ),
         )
         cached = self._graph_cache.get(key)
         if cached is not None:
             self._graph_cache.move_to_end(key)
             return cached
-        result = _temporal_retrieval_graph(
-            self.snapshot, fact_rows, query, hub_activation=hub_activation
-        )
+        if eligible_passage_ids is None:
+            result = _temporal_retrieval_graph(
+                self.snapshot,
+                fact_rows,
+                query,
+                hub_activation=hub_activation,
+            )
+        else:
+            result = _temporal_retrieval_graph(
+                self.snapshot,
+                fact_rows,
+                query,
+                hub_activation=hub_activation,
+                eligible_passage_ids=eligible_passage_ids,
+            )
         self._graph_cache[key] = result
         while len(self._graph_cache) > _GRAPH_CACHE_SIZE:
             self._graph_cache.popitem(last=False)
@@ -1570,6 +1665,167 @@ class SharedRetrievalEngine:
 
 
 _GRAPH_CACHE_SIZE = 8
+
+
+def _live_passage_is_recent(
+    passage: PassageContext,
+    query: RetrievalQuery,
+) -> bool:
+    window_days = int(config.LIVE_RECENCY_WINDOW_DAYS)
+    if window_days <= 0:
+        return True
+    cutoff = float(query.now) - window_days * 24 * 60 * 60
+    passage_date = str(passage.passage_date or "").strip()
+    if passage_date:
+        try:
+            effective = datetime.strptime(passage_date, "%Y-%m-%d").astimezone().timestamp()
+        except ValueError:
+            return False
+        return effective >= cutoff
+    for value in (passage.modified, passage.created):
+        try:
+            effective = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(effective) and effective > 0.0:
+            return effective >= cutoff
+    return False
+
+
+def _live_eligible_entity_ids(
+    snapshot: IndexSnapshot,
+    store: EvidenceStore,
+    hits: Sequence[HeadHit],
+    eligible_passage_ids: frozenset[str],
+    *,
+    build_id: str,
+) -> set[str]:
+    lookup = getattr(store, "passage_ids_for_entities", None)
+    entity_ids = {
+        hit.target_id for hit in hits if hit.target_kind == "entity"
+    }
+    node_kind = dict(
+        zip(
+            snapshot.base_graph.node_ids,
+            snapshot.base_graph.node_kinds,
+            strict=True,
+        )
+    )
+    graph_sources: dict[str, set[str]] = {}
+    for edge in snapshot.base_graph.edges:
+        if edge.kind != "contains":
+            continue
+        if node_kind.get(edge.src_id) == "entity" and node_kind.get(edge.dst_id) == "passage":
+            graph_sources.setdefault(edge.src_id, set()).add(edge.dst_id)
+        elif node_kind.get(edge.dst_id) == "entity" and node_kind.get(edge.src_id) == "passage":
+            graph_sources.setdefault(edge.dst_id, set()).add(edge.src_id)
+    return {
+        entity_id
+        for entity_id in entity_ids
+        if eligible_passage_ids.intersection(
+            graph_sources.get(entity_id, set())
+            | set(
+                lookup((entity_id,), build_id=build_id)
+                if callable(lookup)
+                else ()
+            )
+        )
+    }
+
+
+def _filter_head_result_for_live_recency(
+    result: HeadResult,
+    *,
+    eligible_passage_ids: frozenset[str],
+    eligible_fact_ids: set[str],
+    eligible_entity_ids: set[str],
+) -> HeadResult:
+    def eligible(hit: HeadHit) -> bool:
+        if hit.target_kind == "passage":
+            return hit.target_id in eligible_passage_ids
+        if hit.target_kind == "fact":
+            return any(
+                fact_id in eligible_fact_ids
+                for fact_id in hit.target_id.split("|")
+            )
+        if hit.target_kind == "entity":
+            return hit.target_id in eligible_entity_ids
+        return False
+
+    accepted = tuple(hit for hit in result.accepted if eligible(hit))
+    rejected = tuple(hit for hit in result.rejected if eligible(hit))
+    return HeadResult(
+        tuple(replace(hit, rank=rank) for rank, hit in enumerate(accepted, 1)),
+        tuple(
+            replace(hit, rank=rank)
+            for rank, hit in enumerate(rejected, len(accepted) + 1)
+        ),
+        status=result.status,
+        reason=result.reason,
+    )
+
+
+def _filter_triple_result_for_live_recency(
+    result: TripleRecognitionResult,
+    *,
+    eligible_passage_ids: frozenset[str],
+    eligible_fact_ids: set[str],
+) -> TripleRecognitionResult:
+    triples = []
+    for row in result.triples:
+        contexts = tuple(
+            context
+            for context in row.contexts
+            if str(context.source_passage_id) in eligible_passage_ids
+            and str(context.fact_id) in eligible_fact_ids
+        )
+        fact_ids = tuple(
+            fact_id for fact_id in row.fact_ids if fact_id in eligible_fact_ids
+        )
+        source_passage_ids = tuple(
+            passage_id
+            for passage_id in row.source_passage_ids
+            if passage_id in eligible_passage_ids
+        )
+        if not contexts or not fact_ids or not source_passage_ids:
+            continue
+        source_note_ids = tuple(
+            dict.fromkeys(str(context.source_note_id) for context in contexts)
+        )
+        triples.append(
+            replace(
+                row,
+                fact_ids=fact_ids,
+                source_passage_ids=source_passage_ids,
+                source_note_ids=source_note_ids,
+                contexts=contexts,
+            )
+        )
+    decisions = tuple(
+        replace(
+            row,
+            fact_ids=tuple(
+                fact_id for fact_id in row.fact_ids if fact_id in eligible_fact_ids
+            ),
+        )
+        for row in result.decisions
+        if any(fact_id in eligible_fact_ids for fact_id in row.fact_ids)
+    )
+    seeded_entities = {
+        entity_id
+        for row in triples
+        for entity_id in (row.subject_entity_id, row.object_entity_id)
+    }
+    return replace(
+        result,
+        triples=tuple(triples),
+        decisions=decisions,
+        entity_seed_weights={
+            entity_id: weight
+            for entity_id, weight in result.entity_seed_weights.items()
+            if entity_id in seeded_entities
+        },
+    )
 
 
 def _sanitized_error(exc: BaseException) -> str:
@@ -2304,6 +2560,7 @@ def _temporal_retrieval_graph(
     query: RetrievalQuery,
     *,
     hub_activation: Mapping[str, tuple[str, ...]] | None = None,
+    eligible_passage_ids: frozenset[str] | None = None,
 ) -> tuple[Any, set[str]]:
     """Materialize the query's fact overlay using the one shared temporal
     predicate (M2), plus synthesized contains links for explicitly
@@ -2343,11 +2600,26 @@ def _temporal_retrieval_graph(
         )
         for fact, weight in selected
     )
+    node_rows = tuple(
+        (node_id, node_kind)
+        for node_id, node_kind in zip(
+            snapshot.base_graph.node_ids,
+            snapshot.base_graph.node_kinds,
+            strict=True,
+        )
+        if eligible_passage_ids is None
+        or node_kind != "passage"
+        or node_id in eligible_passage_ids
+    )
+    known_nodes = {node_id for node_id, _node_kind in node_rows}
     non_fact_edges = tuple(
-        edge for edge in snapshot.base_graph.edges if edge.kind != "fact"
+        edge
+        for edge in snapshot.base_graph.edges
+        if edge.kind != "fact"
+        and edge.src_id in known_nodes
+        and edge.dst_id in known_nodes
     )
     overlay_edges = grouped_fact_edges(fact_inputs)
-    known_nodes = set(snapshot.base_graph.node_ids)
     hub_edges: list[BaseEdge] = []
     hub_weight = float(config.HUB_ACTIVATION_EDGE_WEIGHT)
     for entity_id in sorted(hub_activation or {}):
@@ -2360,8 +2632,8 @@ def _temporal_retrieval_graph(
             hub_edges.append(BaseEdge(entity_id, passage_id, "contains", hub_weight))
     graph = materialize_base_graph(
         build_id=snapshot.build_id,
-        node_ids=snapshot.base_graph.node_ids,
-        node_kinds=snapshot.base_graph.node_kinds,
+        node_ids=tuple(node_id for node_id, _node_kind in node_rows),
+        node_kinds=tuple(node_kind for _node_id, node_kind in node_rows),
         edges=(*non_fact_edges, *overlay_edges, *hub_edges),
     )
     return graph, {str(fact.fact_id) for fact, _weight in selected}

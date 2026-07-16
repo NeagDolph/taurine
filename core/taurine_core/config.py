@@ -385,6 +385,8 @@ RERANK_API_FLOOR_OVERRIDES_BY_MODEL = {
 # Live remains byte-for-byte strict while chat calibrates the Cohere scale.
 LIVE_RERANK_API_FLOOR_OVERRIDES = {"accept": 0.5, "fallback": 0.15}
 LIVE_RERANK_CANDIDATES = 30
+# Meetings reference current material; 0 disables the window.
+LIVE_RECENCY_WINDOW_DAYS = 14
 # Live retrieval deadline. 0.75s was calibrated for all-local inference;
 # with query embedding and reranking now cloud round-trips, one retrieval
 # spends ~0.3-0.7s per call before local work. The 8s ambient throttle

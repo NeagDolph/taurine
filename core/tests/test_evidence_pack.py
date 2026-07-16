@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Sequence
@@ -56,6 +58,7 @@ class PassageRow:
     char_end: int
     created: float
     modified: float
+    passage_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1045,6 +1048,255 @@ def test_live_high_precision_head_does_not_fill_from_below_floor_rerank_rows(
     assert pack.decision.accepted is True
     assert len(pack.passages) == 1
     assert pack.passages[0].low_confidence is False
+
+
+def _recency_engine(
+    tmp_path: Path,
+    rows: Sequence[PassageRow],
+    *,
+    mode: str,
+) -> SharedRetrievalEngine:
+    passage_ids = tuple(row.passage_id for row in rows)
+    snapshot = IndexSnapshot(
+        build_id="build-1",
+        database_path=tmp_path / "knowledge.db",
+        calibration_hash="calibration-hash",
+        passage_ids=passage_ids,
+        passage_matrix=np.asarray(
+            [(1.0, 0.0) for _row in rows], dtype=np.float32
+        ),
+        fact_ids=(),
+        fact_matrix=np.empty((0, 2), dtype=np.float32),
+        alias_index={},
+        base_graph=materialize_base_graph(
+            build_id="build-1",
+            node_ids=passage_ids,
+            node_kinds=("passage",) * len(rows),
+            edges=(),
+        ),
+        projection=ExplodingProjection(),  # type: ignore[arg-type]
+        quality_ranks={},
+    )
+    calibrator, abstention = _calibrator(mode)
+    return SharedRetrievalEngine(
+        snapshot,
+        FakeStore(
+            rows,
+            bm25=tuple(
+                BM25PassageHit(row.passage_id, 20.0, 1.0) for row in rows
+            ),
+        ),
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0], dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=RecordingReranker(),  # type: ignore[arg-type]
+    )
+
+
+def _recency_rows(now: float) -> tuple[PassageRow, ...]:
+    current = datetime.fromtimestamp(now, timezone.utc)
+
+    def timestamp(days_ago: int) -> float:
+        return (current - timedelta(days=days_ago)).timestamp()
+
+    return (
+        PassageRow(
+            "dated-old", "n1", "Dated old", "imessage", "Fifteen days old.",
+            0, 17, timestamp(1), timestamp(1),
+            (current - timedelta(days=15)).date().isoformat(),
+        ),
+        PassageRow(
+            "dated-recent", "n2", "Dated recent", "imessage", "Thirteen days old.",
+            0, 18, timestamp(30), timestamp(30),
+            (current - timedelta(days=13)).date().isoformat(),
+        ),
+        PassageRow(
+            "modified-old", "n3", "Modified old", "obsidian", "Modified fifteen days ago.",
+            0, 26, timestamp(1), timestamp(15),
+        ),
+        PassageRow(
+            "modified-recent", "n4", "Modified recent", "obsidian", "Modified thirteen days ago.",
+            0, 27, timestamp(30), timestamp(13),
+        ),
+    )
+
+
+def test_live_recency_filters_daily_dates_and_note_timestamp_fallbacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(config, "EVIDENCE_NEAR_DUP_SIM", 1.01)
+    engine = _recency_engine(tmp_path, _recency_rows(now), mode="live")
+
+    pack = engine.retrieve(RetrievalQuery("current material", "live", now=now))
+
+    assert {row.passage_id for row in pack.passages} == {
+        "dated-recent",
+        "modified-recent",
+    }
+
+
+def test_chat_retrieval_is_byte_identical_with_live_recency_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
+    rows = _recency_rows(now)
+    monkeypatch.setattr(evidence_module, "_elapsed_ms", lambda started: 0.0)
+    enabled = _recency_engine(tmp_path / "enabled", rows, mode="chat").retrieve(
+        RetrievalQuery("current material", "chat", now=now)
+    )
+    monkeypatch.setattr(config, "LIVE_RECENCY_WINDOW_DAYS", 0, raising=False)
+    disabled = _recency_engine(tmp_path / "disabled", rows, mode="chat").retrieve(
+        RetrievalQuery("current material", "chat", now=now)
+    )
+
+    serialize = lambda pack: json.dumps(  # noqa: E731 - compact byte comparison
+        asdict(pack), sort_keys=True, separators=(",", ":")
+    ).encode()
+    assert serialize(enabled) == serialize(disabled)
+
+
+def test_zero_live_recency_window_disables_filtering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(config, "EVIDENCE_NEAR_DUP_SIM", 1.01)
+    monkeypatch.setattr(config, "LIVE_RECENCY_WINDOW_DAYS", 0, raising=False)
+    engine = _recency_engine(tmp_path, _recency_rows(now), mode="live")
+
+    pack = engine.retrieve(RetrievalQuery("current material", "live", now=now))
+
+    assert {row.passage_id for row in pack.passages} == {
+        "dated-old",
+        "dated-recent",
+        "modified-old",
+        "modified-recent",
+    }
+
+
+def test_live_recency_applies_to_entity_anchor_source_passages(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
+    old = (datetime.fromtimestamp(now, timezone.utc) - timedelta(days=15)).timestamp()
+    row = PassageRow(
+        "p-old", "n-old", "Old Maya", "obsidian", "Maya owned the launch.",
+        0, 22, old, old,
+    )
+    graph = materialize_base_graph(
+        build_id="build-1",
+        node_ids=("p-old", "e-maya"),
+        node_kinds=("passage", "entity"),
+        edges=(
+            BaseEdge("p-old", "e-maya", "contains", 0.9),
+            BaseEdge("e-maya", "p-old", "contains", 0.9),
+        ),
+    )
+    snapshot = IndexSnapshot(
+        "build-1", tmp_path / "knowledge.db", "calibration-hash",
+        ("p-old",), np.asarray(((1.0, 0.0),), dtype=np.float32),
+        (), np.empty((0, 2), dtype=np.float32),
+        {"maya": ("e-maya",)}, graph, ExplodingProjection(), {},
+        alias_case_index={"Maya": ("e-maya",)},
+        entity_types={"e-maya": "person"},
+    )
+    calibrator, abstention = _calibrator("live")
+    recorder = RecordingReranker()
+    engine = SharedRetrievalEngine(
+        snapshot,
+        FakeStore(
+            (row,),
+            entities=(EntityRow("e-maya", "Maya", "person", True),),
+            entity_passages={"e-maya": ("p-old",)},
+        ),
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.zeros(2, dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=recorder,  # type: ignore[arg-type]
+    )
+
+    pack = engine.retrieve(RetrievalQuery("Maya", "live", now=now))
+
+    assert pack.decision.accepted is False
+    assert pack.passages == ()
+    assert recorder.candidates == ()
+
+
+def test_live_recency_applies_to_fact_anchor_source_passages(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
+    old = (datetime.fromtimestamp(now, timezone.utc) - timedelta(days=15)).timestamp()
+    row = PassageRow(
+        "p-old", "n-old", "Old fact", "obsidian", "Maya owned the launch.",
+        0, 22, old, old,
+    )
+    fact = replace(
+        _fact(), source_passage_id="p-old", source_note_id="n-old", observed_at=old
+    )
+    triple = RecognizedTriple(
+        logical_key=fact.logical_key,
+        fact_ids=(fact.fact_id,),
+        source_passage_ids=(fact.source_passage_id,),
+        source_note_ids=(fact.source_note_id,),
+        subject_entity_id=fact.subject_entity_id,
+        subject=fact.subject,
+        predicate=fact.predicate,
+        predicate_description=fact.predicate_description,
+        object_entity_id=fact.object_entity_id,
+        object=fact.object,
+        score=0.94,
+        contexts=(fact,),
+    )
+    recognized = TripleRecognitionResult(
+        (triple,),
+        (TripleRecognitionDecision(fact.logical_key, (fact.fact_id,), 0.94, 0.94, True, "accepted"),),
+        {fact.subject_entity_id: 0.94, fact.object_entity_id: 0.94},
+        False,
+        "recognized_triples",
+    )
+    graph = materialize_base_graph(
+        build_id="build-1",
+        node_ids=("p-old", fact.subject_entity_id, fact.object_entity_id),
+        node_kinds=("passage", "entity", "entity"),
+        edges=(
+            BaseEdge("p-old", fact.subject_entity_id, "contains", 0.9),
+            BaseEdge(fact.subject_entity_id, "p-old", "contains", 0.9),
+            BaseEdge(
+                fact.subject_entity_id, fact.object_entity_id, "fact", 0.9,
+                "forward", (fact.fact_id,),
+            ),
+        ),
+    )
+    snapshot = IndexSnapshot(
+        "build-1", tmp_path / "knowledge.db", "calibration-hash",
+        ("p-old",), np.asarray(((1.0, 0.0),), dtype=np.float32),
+        (), np.empty((0, 2), dtype=np.float32), {}, graph,
+        ExplodingProjection(), {},
+    )
+    calibrator, abstention = _calibrator("live")
+    recorder = RecordingReranker()
+    engine = SharedRetrievalEngine(
+        snapshot,
+        FakeStore((row,), (fact,)),
+        calibrator,
+        abstention,
+        query_embedder=lambda text: np.array([1.0, 0.0], dtype=np.float32),
+        registry=EvidenceRegistry(),
+        reranker=recorder,  # type: ignore[arg-type]
+        triple_recognizer=FakeTripleRecognizer(recognized),
+    )
+
+    pack = engine.retrieve(RetrievalQuery("Who owned it?", "live", now=now))
+
+    assert pack.decision.accepted is False
+    assert pack.passages == ()
+    assert recorder.candidates == ()
 
 
 def test_degraded_reranker_falls_back_only_to_calibrated_direct_passages(tmp_path: Path) -> None:
