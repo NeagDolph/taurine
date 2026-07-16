@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { SessionControls, type ListeningState } from './components/SessionControls'
 import { StatusBar } from './components/StatusBar'
 import { PcmAudioCapture } from './lib/audio'
+import { SystemAudioCapture } from './lib/sysaudio'
 import {
   createMeeting as createMeetingRecord,
   deleteMeeting as deleteMeetingRecord,
@@ -45,6 +46,7 @@ const MAIN_TABS: Array<{ id: MainTab; label: string }> = [
 function App(): React.JSX.Element {
   const clientRef = useRef<SidecarClient | null>(null)
   const audioRef = useRef<PcmAudioCapture | null>(null)
+  const systemAudioRef = useRef<SystemAudioCapture | null>(null)
   const transcriptIdRef = useRef(0)
   const liveMeetingIdRef = useRef<string | null>(null)
   const notesFlushRef = useRef<(() => Promise<void>) | null>(null)
@@ -188,6 +190,8 @@ function App(): React.JSX.Element {
 
     return () => {
       disposed = true
+      systemAudioRef.current?.stop()
+      systemAudioRef.current = null
       audioRef.current?.stop()
       audioRef.current = null
       client.stop()
@@ -319,17 +323,51 @@ function App(): React.JSX.Element {
       setActionables([])
       setGroundedNoteIds([])
       setLastRetrieval(null)
-      client.start([{ id: 0, label: 'mic' }], meetingId)
+
+      let systemAudioAvailable = false
+      try {
+        systemAudioAvailable = await window.api.sysAudio.available()
+      } catch {
+        // Unsupported platforms and missing helpers retain the existing mic-only path.
+      }
+      client.start(
+        systemAudioAvailable
+          ? [
+              { id: 0, label: 'mic' },
+              { id: 1, label: 'system' }
+            ]
+          : [{ id: 0, label: 'mic' }],
+        meetingId
+      )
 
       const capture = new PcmAudioCapture((frame) => {
         clientRef.current?.sendAudioFrame(frame)
       })
       audioRef.current = capture
 
+      let systemCapture: SystemAudioCapture | null = null
+      if (systemAudioAvailable) {
+        systemCapture = new SystemAudioCapture(
+          (frame) => clientRef.current?.sendAudioFrame(frame),
+          () => {
+            const failedCapture = systemCapture
+            if (!failedCapture || systemAudioRef.current !== failedCapture) return
+            failedCapture.stop()
+            systemAudioRef.current = null
+            if (liveMeetingIdRef.current === meetingId) {
+              setMicError('System audio stopped — mic still live')
+            }
+          }
+        )
+      }
+      systemAudioRef.current = systemCapture
+
       try {
         await capture.start()
         setListeningState('listening')
       } catch (error) {
+        systemCapture?.stop()
+        systemAudioRef.current = null
         capture.stop()
         audioRef.current = null
         client.stop()
@@ -337,6 +375,21 @@ function App(): React.JSX.Element {
         setLiveMeetingId(null)
         setMicError(error instanceof Error ? error.message : 'Microphone capture failed')
         setListeningState('error')
+        return
+      }
+
+      if (systemCapture) {
+        try {
+          await systemCapture.start()
+        } catch {
+          systemCapture.stop()
+          if (systemAudioRef.current === systemCapture) {
+            systemAudioRef.current = null
+          }
+          if (liveMeetingIdRef.current === meetingId) {
+            setMicError('System audio stopped — mic still live')
+          }
+        }
       }
     },
     [createMeeting, listeningState]
@@ -357,6 +410,8 @@ function App(): React.JSX.Element {
       setListeningState('listening')
       return
     }
+    systemAudioRef.current?.stop()
+    systemAudioRef.current = null
     audioRef.current?.stop()
     audioRef.current = null
     clientRef.current?.stop()

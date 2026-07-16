@@ -64,7 +64,7 @@ export class PcmAudioCapture {
   }
 }
 
-function prefixChannel(frame: ArrayBuffer, channelId: number): ArrayBuffer {
+export function prefixChannel(frame: ArrayBuffer, channelId: number): ArrayBuffer {
   const prefixed = new Uint8Array(frame.byteLength + 1)
   prefixed[0] = channelId
   prefixed.set(new Uint8Array(frame), 1)
