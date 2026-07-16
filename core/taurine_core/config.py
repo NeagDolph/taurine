@@ -490,6 +490,12 @@ ALIAS_STOPWORDS = frozenset(
     untitled misc random daily journal draft drafts meeting call chat talk plan plans
     """.split()
 )
+# Query-side entity/alias guards. Unlike ALIAS_STOPWORDS, this does not alter
+# build-time alias storage: these tokens are suppressed only while resolving a
+# retrieval query.
+QUERY_ALIAS_STOPWORDS = frozenset(
+    """the a an um uh okay ok yeah yes no right like so well hmm me i today tomorrow""".split()
+)
 
 # ── C2 GLiNER2 span extraction (schema-based, label descriptions) ─────
 GLINER2_MODEL = "fastino/gliner2-large-v1"

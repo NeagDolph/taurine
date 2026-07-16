@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -90,6 +91,59 @@ def test_exact_alias_uses_word_boundaries_and_credits_each_entity_once(
     assert head.search("A Mayan calendar").accepted == ()
 
 
+def test_short_exact_aliases_are_case_sensitive(
+    calibrator: HeadCalibrator, tmp_path: Path
+) -> None:
+    snapshot = replace(
+        _snapshot(tmp_path),
+        alias_index={"spo": ("e-spo",)},
+        alias_case_index={"SPO": ("e-spo",)},
+    )
+    head = ExactAliasHead(snapshot, calibrator)
+
+    assert [hit.target_id for hit in head.search("What is SPO?").accepted] == [
+        "e-spo"
+    ]
+    assert head.search("What is spo?").accepted == ()
+
+
+def test_query_alias_stopwords_never_reach_exact_or_entity_resolution(
+    calibrator: HeadCalibrator, tmp_path: Path
+) -> None:
+    snapshot = replace(
+        _snapshot(tmp_path),
+        alias_index={
+            "the": ("e-the",),
+            "um": ("e-um",),
+            "okay": ("e-okay",),
+            "yeah": ("e-yeah",),
+            "right": ("e-right",),
+        },
+        alias_case_index={
+            "the": ("e-the",),
+            "UM": ("e-um",),
+            "okay": ("e-okay",),
+            "yeah": ("e-yeah",),
+            "Right": ("e-right",),
+        },
+    )
+    query = "the the um okay yeah right"
+    assert ExactAliasHead(snapshot, calibrator).search(query).all_hits == ()
+
+    calls: list[str] = []
+
+    def resolve(
+        surface: str, etype: str | None, context: str
+    ) -> tuple[RawHeadCandidate, ...]:
+        del etype, context
+        calls.append(surface)
+        return (RawHeadCandidate("entity", f"e-{surface}", 1.0, "alias"),)
+
+    spans = tuple((token, None) for token in query.split())
+    assert QueryEntityHead(resolve, calibrator).search(query, spans).all_hits == ()
+    assert calls == []
+
+
 def test_query_entity_head_accepts_only_unambiguous_resolutions(
     calibrator: HeadCalibrator,
 ) -> None:
@@ -167,6 +221,11 @@ def _snapshot(tmp_path: Path) -> IndexSnapshot:
             "maya": ("e-maya",),
             "maya tung": ("e-maya",),
             "maya labs": ("e-maya-labs",),
+        },
+        alias_case_index={
+            "Maya": ("e-maya",),
+            "Maya Tung": ("e-maya",),
+            "Maya Labs": ("e-maya-labs",),
         },
         base_graph=materialize_base_graph(
             build_id="build-1",

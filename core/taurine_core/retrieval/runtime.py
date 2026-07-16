@@ -28,7 +28,7 @@ from taurine_core.models_local import (
 )
 from taurine_core.retrieval.calibration import AbstentionPolicy, HeadCalibrator
 from taurine_core.retrieval.evidence import SharedRetrievalEngine
-from taurine_core.retrieval.heads import RawHeadCandidate
+from taurine_core.retrieval.heads import RawHeadCandidate, query_alias_allowed
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.retrieval.rerank import (
     LocalPassageReranker,
@@ -443,15 +443,22 @@ class RetrievalRuntime:
         # sequence as ready-made RawHeadCandidates and derives ambiguity from
         # len != 1, which matches this resolver's semantics exactly.
         del query
-        normalized = surface.strip().casefold()
-        ids = tuple(snapshot.alias_index.get(normalized, ()))
+        query_surface = surface.strip()
+        if not query_alias_allowed(query_surface):
+            return ()
+        normalized = query_surface.casefold()
+        if len(query_surface) <= 3:
+            ids = tuple(snapshot.alias_case_index.get(query_surface, ()))
+        else:
+            ids = tuple(snapshot.alias_index.get(normalized, ()))
         exact = bool(ids)
         matched_alias = normalized
         if not ids:
             distances = [
                 (Levenshtein.distance(normalized, alias), alias)
                 for alias in snapshot.alias_index
-                if _fuzzy_alias_allowed(normalized, alias)
+                if query_alias_allowed(query_surface, alias=alias)
+                and _fuzzy_alias_allowed(normalized, alias)
             ]
             if distances:
                 best_distance = min(row[0] for row in distances)
@@ -479,6 +486,7 @@ class RetrievalRuntime:
                 entity_id,
                 1.0 if exact else _fuzzy_score(normalized, matched_alias),
                 contexts[entity_id].canonical,
+                contexts[entity_id].etype,
             )
             for entity_id in ids
             if entity_id in contexts

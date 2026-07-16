@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Literal, Protocol, Sequence
 
 import numpy as np
 
+from taurine_core import config
 from taurine_core.indexer.knowledge_store import BM25PassageHit
 from taurine_core.retrieval.calibration import HeadCalibrator
 from taurine_core.retrieval.snapshot import IndexSnapshot
@@ -21,6 +22,7 @@ class RawHeadCandidate:
     target_id: str
     raw_score: float
     reason: str
+    entity_etype: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,7 +129,28 @@ class ExactAliasHead:
         matches: list[tuple[int, int, str, tuple[str, ...]]] = []
         for alias, target_ids in self.snapshot.alias_index.items():
             surface = alias.strip()
-            if not surface or not target_ids:
+            if not surface or not target_ids or not query_alias_allowed(surface):
+                continue
+            if len(surface) <= 3:
+                raw_variants = tuple(
+                    (raw_surface, raw_target_ids)
+                    for raw_surface, raw_target_ids in self.snapshot.alias_case_index.items()
+                    if raw_surface.strip().casefold() == surface.casefold()
+                ) or ((surface.upper(), target_ids),)
+                for raw_surface, raw_target_ids in raw_variants:
+                    raw_surface = raw_surface.strip()
+                    match = re.search(
+                        rf"(?<!\w){re.escape(raw_surface)}(?!\w)", query
+                    )
+                    if match is not None:
+                        matches.append(
+                            (
+                                match.start(),
+                                -len(raw_surface),
+                                surface.casefold(),
+                                raw_target_ids,
+                            )
+                        )
                 continue
             match = re.search(
                 rf"(?<!\w){re.escape(surface)}(?!\w)",
@@ -169,7 +192,13 @@ class ExactAliasHead:
             rank += 1
             hit, is_accepted = _make_hit(
                 "exact",
-                RawHeadCandidate("entity", target_id, 1.0, surface),
+                RawHeadCandidate(
+                    "entity",
+                    target_id,
+                    1.0,
+                    surface,
+                    self.snapshot.entity_types.get(target_id),
+                ),
                 self.calibrator,
                 rank,
                 accepted_reason="accepted_unambiguous_exact_alias",
@@ -196,6 +225,8 @@ class QueryEntityHead:
         seen: set[str] = set()
         rank = 0
         for surface, etype in spans:
+            if not query_alias_allowed(surface):
+                continue
             resolution = self.resolver(surface, etype, query)
             candidates, ambiguous = _resolution_candidates(resolution)
             for candidate in candidates:
@@ -203,6 +234,8 @@ class QueryEntityHead:
                     continue
                 seen.add(candidate.target_id)
                 rank += 1
+                if candidate.entity_etype is None and etype is not None:
+                    candidate = replace(candidate, entity_etype=etype)
                 hit, is_accepted = _make_hit(
                     "entity",
                     candidate,
@@ -290,9 +323,29 @@ def _make_hit(
             rank=rank,
             head=head,
             reason=reason,
+            entity_etype=candidate.entity_etype,
         ),
         is_accepted,
     )
+
+
+def query_alias_allowed(surface: str, *, alias: str | None = None) -> bool:
+    """Apply query-only alias guards without changing stored alias tables."""
+
+    query_surface = surface.strip()
+    if not query_surface or _is_query_alias_stopword(query_surface):
+        return False
+    if alias is None:
+        return True
+    stored_alias = alias.strip()
+    if not stored_alias or _is_query_alias_stopword(stored_alias):
+        return False
+    return len(stored_alias) > 3 or query_surface == stored_alias
+
+
+def _is_query_alias_stopword(surface: str) -> bool:
+    tokens = re.findall(r"\w+", surface.casefold())
+    return len(tokens) == 1 and tokens[0] in config.QUERY_ALIAS_STOPWORDS
 
 
 def _resolution_candidates(

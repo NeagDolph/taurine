@@ -1079,6 +1079,50 @@ class KnowledgeStore:
                 target_ids.append(entity_id)
         return {surface: tuple(target_ids) for surface, target_ids in grouped.items()}
 
+    def alias_case_index(
+        self, *, build_id: str | None = None
+    ) -> dict[str, tuple[str, ...]]:
+        """Return a query-only alias view that preserves stored surface case."""
+
+        if build_id is None:
+            rows = self._conn.execute(
+                "SELECT surface, entity_id FROM entity_aliases "
+                "ORDER BY surface, entity_id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT a.surface, a.entity_id
+                FROM entity_aliases a
+                JOIN entities e ON e.entity_id = a.entity_id
+                WHERE e.build_id = ?
+                ORDER BY a.surface, a.entity_id
+                """,
+                (build_id,),
+            ).fetchall()
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            target_ids = grouped.setdefault(str(row["surface"]), [])
+            entity_id = str(row["entity_id"])
+            if not target_ids or target_ids[-1] != entity_id:
+                target_ids.append(entity_id)
+        return {surface: tuple(target_ids) for surface, target_ids in grouped.items()}
+
+    def entity_type_index(self, *, build_id: str | None = None) -> dict[str, str]:
+        """Return entity types needed by query-time live precision policy."""
+
+        if build_id is None:
+            rows = self._conn.execute(
+                "SELECT entity_id, etype FROM entities ORDER BY entity_id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT entity_id, etype FROM entities "
+                "WHERE build_id = ? ORDER BY entity_id",
+                (build_id,),
+            ).fetchall()
+        return {str(row["entity_id"]): str(row["etype"]) for row in rows}
+
     def entity_contexts(
         self,
         entity_ids: Sequence[str],

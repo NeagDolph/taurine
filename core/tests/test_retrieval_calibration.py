@@ -141,13 +141,14 @@ def test_post_abstention_requires_evidence_floor_and_allows_exact_override() -> 
 
     floor = artifact.modes["live"].evidence_floor
     low = policy.post_rerank(
-        (_hit("exact", "e1", 1.0, 1, "entity"),), (max(0.0, floor - 0.05),)
+        (_hit("exact", "e1", 1.0, 1, "entity", entity_etype="person"),),
+        (max(0.0, floor - 0.05),),
     )
     assert not low.accepted
     assert low.reason == "no_evidence_above_floor"
 
     high_precision = policy.post_rerank(
-        (_hit("exact", "e1", 1.0, 1, "entity"),),
+        (_hit("exact", "e1", 1.0, 1, "entity", entity_etype="person"),),
         (min(1.0, floor + 0.05),),
     )
     assert high_precision.accepted
@@ -158,7 +159,7 @@ def test_post_abstention_uses_explicit_cloud_evidence_floor_only_when_supplied()
     artifact = load_calibration(_ARTIFACT)
     policy = AbstentionPolicy(artifact, mode="live")
     score = 0.2
-    hits = (_hit("exact", "e1", 1.0, 1, "entity"),)
+    hits = (_hit("exact", "e1", 1.0, 1, "entity", entity_etype="person"),)
 
     artifact_result = policy.post_rerank(hits, (score,))
     cloud_result = policy.post_rerank(
@@ -171,6 +172,61 @@ def test_post_abstention_uses_explicit_cloud_evidence_floor_only_when_supplied()
     assert artifact_result.reason == "no_evidence_above_floor"
     assert cloud_result.accepted is True
     assert cloud_result.reason == "accepted_high_precision_head"
+
+
+@pytest.mark.parametrize("entity_etype", ("concept", "event", "date_or_deadline"))
+def test_live_high_precision_override_rejects_non_strict_entity_types(
+    entity_etype: str,
+) -> None:
+    artifact = load_calibration(_ARTIFACT)
+    score = 0.5
+    hit = _hit(
+        "entity",
+        "e1",
+        1.0,
+        1,
+        "entity",
+        entity_etype=entity_etype,
+    )
+
+    live_policy = AbstentionPolicy(artifact, mode="live")
+    chat_policy = AbstentionPolicy(artifact, mode="chat")
+    live_pre = live_policy.pre_ppr((hit,))
+    chat_pre = chat_policy.pre_ppr((hit,))
+    live = live_policy.post_rerank((hit,), (score,))
+    chat = chat_policy.post_rerank((hit,), (score,))
+
+    assert live_pre.reason == "accepted_recall_head"
+    assert chat_pre.reason == "accepted_high_precision_head"
+    assert live.accepted is False
+    assert live.reason == "single_head_without_override"
+    assert chat.accepted is True
+    assert chat.reason == "accepted_high_precision_head"
+
+
+@pytest.mark.parametrize(
+    "entity_etype", ("person", "organization", "project", "product", "place")
+)
+def test_live_high_precision_override_accepts_strict_entity_types(
+    entity_etype: str,
+) -> None:
+    artifact = load_calibration(_ARTIFACT)
+    hit = _hit(
+        "entity",
+        "e1",
+        1.0,
+        1,
+        "entity",
+        entity_etype=entity_etype,
+    )
+
+    policy = AbstentionPolicy(artifact, mode="live")
+    pre = policy.pre_ppr((hit,))
+    decision = policy.post_rerank((hit,), (0.5,))
+
+    assert pre.reason == "accepted_high_precision_head"
+    assert decision.accepted is True
+    assert decision.reason == "accepted_high_precision_head"
 
 
 def test_post_abstention_requires_independent_heads_to_agree_on_selected_evidence() -> None:
@@ -204,6 +260,8 @@ def _hit(
     score: float,
     rank: int,
     target_kind: str = "passage",
+    *,
+    entity_etype: str | None = None,
 ) -> HeadHit:
     return HeadHit(
         target_kind=target_kind,  # type: ignore[arg-type]
@@ -213,6 +271,7 @@ def _hit(
         rank=rank,
         head=head,
         reason="accepted",
+        entity_etype=entity_etype,
     )
 
 

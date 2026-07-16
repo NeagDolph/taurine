@@ -309,6 +309,83 @@ def test_entity_resolver_output_flows_through_query_entity_head(
         assert [hit.target_id for hit in hits] == [resolution[0].target_id]
 
 
+def test_query_alias_guards_and_live_filler_abstention(
+    tmp_path, monkeypatch
+) -> None:
+    from taurine_core.retrieval.heads import QueryEntityHead
+    from taurine_core.retrieval.types import RetrievalQuery
+    from taurine_core.schemas import ExtractedMention, Extraction
+
+    text = "SPO collaborates with UM on the Right framework."
+
+    def extractor(_notes, *, tokenizer):
+        del tokenizer
+        return {
+            "n1": Extraction(
+                mentions=[
+                    ExtractedMention(
+                        surface=surface,
+                        etype=etype,
+                        confidence=0.95,
+                        char_start=text.index(surface),
+                        char_end=text.index(surface) + len(surface),
+                        extractor="fake",
+                        schema_id="s1",
+                    )
+                    for surface, etype in (
+                        ("SPO", "project"),
+                        ("UM", "organization"),
+                        ("Right", "concept"),
+                    )
+                ],
+                schema_id="s1",
+            )
+        }
+
+    database = tmp_path / "knowledge.db"
+    BuildCoordinator(
+        BuildDependencies(
+            tokenizer=Tokenizer(), embedder=_embed, embedding_dim=16, extractor=extractor
+        )
+    ).build([make_note("n1", "Alias guard", text)], database, replace_derived=True)
+    scorer = PairScorerStub()
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime.local_pair_reranker", lambda: scorer
+    )
+    monkeypatch.setattr(
+        "taurine_core.retrieval.runtime._openrouter_pair_reranker", lambda: scorer
+    )
+
+    runtime = RetrievalRuntime(database)
+    try:
+        engine = runtime.make_engine("live", EvidenceRegistry())
+        assert len(engine.entity_resolver("SPO", "project", "What is SPO?")) == 1
+        assert engine.entity_resolver("spo", "project", "What is spo?") == ()
+        assert engine.entity_resolver("um", None, "um") == ()
+        assert engine.entity_resolver("right", None, "right") == ()
+
+        filler = "the the um okay yeah right"
+        filler_spans = tuple((token, None) for token in filler.split())
+        resolved = QueryEntityHead(engine.entity_resolver, engine.calibrator).search(
+            filler, filler_spans
+        )
+        assert resolved.all_hits == ()
+
+        monkeypatch.setattr(engine.store, "search_passages_bm25", lambda query, k: ())
+        engine.query_embedder = lambda _text: np.zeros(16, dtype=np.float32)
+        for query, spans in (
+            (filler, filler_spans),
+            ("blargle zibble frobnitz", ()),
+        ):
+            pack = engine.retrieve(
+                RetrievalQuery(query, "live", now=10.0), entity_spans=spans
+            )
+            assert pack.decision.accepted is False
+            assert pack.passages == ()
+    finally:
+        runtime.close()
+
+
 def test_tampered_calibration_degrades_to_conservative_floors_without_raising(
     tmp_path, monkeypatch
 ) -> None:

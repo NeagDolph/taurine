@@ -322,6 +322,8 @@ def _snapshot(tmp_path: Path, passages: Sequence[PassageRow]) -> IndexSnapshot:
         fact_ids=(),
         fact_matrix=np.empty((0, 3), dtype=np.float32),
         alias_index={"maya": ("e-maya",)},
+        alias_case_index={"Maya": ("e-maya",)},
+        entity_types={"e-maya": "person", "e-launch": "project"},
         base_graph=materialize_base_graph(
             build_id="build-1", node_ids=node_ids, node_kinds=node_kinds, edges=edges
         ),

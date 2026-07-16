@@ -15,6 +15,9 @@ from taurine_core.retrieval.types import HeadHit, RetrievalDecision, RetrievalMo
 
 
 _SUPPORTED_ARTIFACT_VERSION = "1"
+_LIVE_HIGH_PRECISION_ENTITY_TYPES = frozenset(
+    {"person", "organization", "project", "product", "place"}
+)
 
 
 class CalibrationMismatch(ValueError):
@@ -196,7 +199,7 @@ class AbstentionPolicy:
                 rejected_heads=rejected,
             )
         top = max(_safe_probability(hit.calibrated_score) for hit in qualified)
-        if any(hit.head in {"exact", "entity"} for hit in qualified):
+        if any(self._is_high_precision(hit) for hit in qualified):
             reason = "accepted_high_precision_head"
         elif any(hit.head == "triple" for hit in qualified):
             reason = "accepted_recognized_triple"
@@ -246,7 +249,7 @@ class AbstentionPolicy:
             )
 
         independent_heads = set(heads)
-        high_precision = bool(independent_heads & {"exact", "entity"})
+        high_precision = any(self._is_high_precision(hit) for hit in qualified)
         if evidence_target_ids is None:
             has_agreement = (
                 len(independent_heads) >= self.rules.minimum_independent_heads
@@ -291,6 +294,14 @@ class AbstentionPolicy:
             accepted_heads=heads,
             rejected_heads=rejected,
         )
+
+    def _is_high_precision(self, hit: HeadHit) -> bool:
+        if hit.head not in {"exact", "entity"}:
+            return False
+        if self.mode != "live":
+            return True
+        etype = (hit.entity_etype or "").strip().casefold().replace("-", "_")
+        return etype in _LIVE_HIGH_PRECISION_ENTITY_TYPES
 
     def _qualified(
         self, hits: Sequence[HeadHit]

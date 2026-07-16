@@ -35,6 +35,7 @@ class HeadHit:
     rank: int
     head: str
     reason: str
+    entity_etype: str | None = None
 
 
 @dataclass(frozen=True)

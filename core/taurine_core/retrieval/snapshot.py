@@ -30,6 +30,8 @@ class IndexSnapshot:
     base_graph: BaseGraph
     projection: tuple[Any, ...]
     quality_ranks: Mapping[str, float]
+    alias_case_index: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    entity_types: Mapping[str, str] = field(default_factory=dict)
     model_manifest: Mapping[str, str] = field(default_factory=dict)
     config_manifest: Mapping[str, str] = field(default_factory=dict)
     # Persisted note clusters (or the legacy label-propagation fallback when
@@ -65,6 +67,10 @@ class IndexSnapshot:
         object.__setattr__(self, "fact_matrix", fact_matrix)
         object.__setattr__(self, "base_graph", graph)
         object.__setattr__(self, "alias_index", MappingProxyType(dict(self.alias_index)))
+        object.__setattr__(
+            self, "alias_case_index", MappingProxyType(dict(self.alias_case_index))
+        )
+        object.__setattr__(self, "entity_types", MappingProxyType(dict(self.entity_types)))
         object.__setattr__(self, "quality_ranks", MappingProxyType(dict(self.quality_ranks)))
         object.__setattr__(self, "model_manifest", MappingProxyType(dict(self.model_manifest)))
         object.__setattr__(self, "config_manifest", MappingProxyType(dict(self.config_manifest)))
@@ -162,6 +168,8 @@ def load_index_snapshot(
             fact_ids=fact_ids,
             fact_matrix=fact_matrix,
             alias_index=store.alias_index(build_id=build.build_id),
+            alias_case_index=store.alias_case_index(build_id=build.build_id),
+            entity_types=store.entity_type_index(build_id=build.build_id),
             base_graph=store.base_graph(build.build_id),
             projection=projection,
             quality_ranks=store.quality_ranks(build.build_id),
