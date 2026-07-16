@@ -810,6 +810,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             title=payload.title,
             notes_md=payload.notes_md,
             suggestions=suggestions,
+            ai_lines=payload.ai_lines,
         )
         if payload.title is not None and meeting["title"] != previous["title"]:
             active_runtime.updates.publish("meetings")

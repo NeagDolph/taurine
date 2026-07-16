@@ -388,3 +388,66 @@ def test_meeting_only_turn_skips_fact_support_when_pack_is_none(store: Any) -> N
     )
 
     assert any("MEETING CONTEXT" in m["content"] for m in messages)
+
+
+def test_execute_edit_notes_validates_and_emits(store: Any) -> None:
+    from taurine_core.chat.engine import _execute_edit_notes
+
+    meeting = store.meeting_create("Sync")
+    store.meeting_update(meeting["meeting_id"], notes_md="- Alpha\n- Beta\n- Alpha")
+
+    # anchor not found → failure result, no event
+    result, step, event = _execute_edit_notes(
+        {"anchor": "- Gamma", "insert_md": "\n- Added"},
+        meeting_id=meeting["meeting_id"],
+        index=store,
+        chat_id="chat-1",
+        message_id=7,
+    )
+    assert '"ok": false' in result and event is None and step.kind == "edit"
+
+    # occurrence beyond count → failure
+    result, _step, event = _execute_edit_notes(
+        {"anchor": "- Alpha", "occurrence": 3, "insert_md": "\n- Added"},
+        meeting_id=meeting["meeting_id"],
+        index=store,
+        chat_id="chat-1",
+        message_id=7,
+    )
+    assert '"ok": false' in result and event is None
+
+    # valid anchored edit → ok + renderer event (notes untouched server-side)
+    result, step, event = _execute_edit_notes(
+        {"anchor": "- Beta", "insert_md": "\n- Added detail"},
+        meeting_id=meeting["meeting_id"],
+        index=store,
+        chat_id="chat-1",
+        message_id=7,
+    )
+    assert '"ok": true' in result
+    assert event is not None
+    assert event.type == "chat_notes_edit"
+    assert event.meeting_id == meeting["meeting_id"]
+    assert event.anchor == "- Beta" and event.occurrence == 1
+    assert len(event.edit_id) == 8
+    assert store.meeting_get(meeting["meeting_id"])["notes_md"] == "- Alpha\n- Beta\n- Alpha"
+
+    # append mode with empty anchor is always valid
+    _result, _step, event = _execute_edit_notes(
+        {"anchor": "", "insert_md": "\n## Follow-ups"},
+        meeting_id=meeting["meeting_id"],
+        index=store,
+        chat_id="chat-1",
+        message_id=7,
+    )
+    assert event is not None and event.anchor == ""
+
+    # no meeting bound → failure
+    result, _step, event = _execute_edit_notes(
+        {"anchor": "", "insert_md": "x"},
+        meeting_id=None,
+        index=store,
+        chat_id="chat-1",
+        message_id=7,
+    )
+    assert '"ok": false' in result and event is None

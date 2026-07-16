@@ -702,6 +702,9 @@ class MeetingUpdateRequest(BaseModel):
     title: Optional[str] = None
     notes_md: Optional[str] = None
     suggestions: Optional[list[dict[str, Any]]] = None
+    # Per-line AI provenance (normalized line texts authored by agents);
+    # renderer-maintained, replaces the stored set wholesale.
+    ai_lines: Optional[list[str]] = None
 
 
 class StopMsg(BaseModel):
@@ -745,7 +748,7 @@ class ChatMeta(BaseModel):
 
 
 class ChatActivityStep(BaseModel):
-    kind: Literal["search", "read", "expand"]
+    kind: Literal["search", "read", "expand", "edit"]
     label: str                     # e.g. 'Searched "shopify timeline" → 8 notes'
     status: Literal["running", "done"] = "done"
     note_ids: list[str] = []
@@ -827,6 +830,21 @@ class ChatActivityEvent(BaseModel):
     message_id: int
     step_index: int                # stable index so running→done updates target the step
     step: ChatActivityStep
+
+
+class ChatNotesEditEvent(BaseModel):
+    """Meeting chat's edit_notes tool: the RENDERER applies this to the open
+    notepad (single writer — no race with the user's typing) and persists it
+    through the normal autosave path with AI-line provenance."""
+
+    type: Literal["chat_notes_edit"] = "chat_notes_edit"
+    chat_id: str
+    message_id: int
+    meeting_id: str
+    edit_id: str
+    anchor: str                    # exact substring of the notes; "" = append
+    occurrence: int = 1
+    insert_md: str
 
 
 class ChatDeltaEvent(BaseModel):

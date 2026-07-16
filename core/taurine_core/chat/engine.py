@@ -57,6 +57,7 @@ from ..schemas import (
     ChatMessage,
     ChatMeta,
     ChatMetaEvent,
+    ChatNotesEditEvent,
     ChatRetrievalEvent,
     ChatStrippedClaim,
     ChatThinkingEvent,
@@ -68,7 +69,7 @@ from ..retrieval.registry import EvidenceRegistry
 from ..retrieval.types import EvidencePack, EvidencePassage
 from ..retrieval.validate import EvidenceValidator
 from .retrieval import ChatRetriever
-from .tools import TOOL_DEFINITIONS, execute_tool, render_search_result
+from .tools import EDIT_NOTES_TOOL, TOOL_DEFINITIONS, execute_tool, render_search_result
 
 # async callback the server provides: emits one ws event dict/model to the client
 EmitFn = Callable[[Any], Coroutine[Any, Any, None]]
@@ -671,8 +672,14 @@ class ChatEngine:
             round_index = 0
             tool_count = 0
             budget_notice_sent = False
+            # edit_notes exists only for meeting-scoped turns with a real row.
+            available_tools = (
+                [*TOOL_DEFINITIONS, EDIT_NOTES_TOOL]
+                if meeting_id and self.index.meeting_get(meeting_id) is not None
+                else TOOL_DEFINITIONS
+            )
             while True:
-                tools = TOOL_DEFINITIONS if tool_count < config.CHAT_MAX_TOOL_CALLS else None
+                tools = available_tools if tool_count < config.CHAT_MAX_TOOL_CALLS else None
                 if tools is None and not budget_notice_sent:
                     # GLM keeps trying to call tools in plain text when they
                     # vanish silently (live smoke 2026-07-08) — tell it why
@@ -784,7 +791,17 @@ class ChatEngine:
                                 retriever = speculative_retriever
                                 meeting_evidence = current_meeting_evidence(retriever)
                             context_pack = cached_pack
-                    if cached_pack is not None:
+                    if str(call.get("name") or "") == "edit_notes":
+                        result_json, done_step, notes_edit_event = _execute_edit_notes(
+                            arguments,
+                            meeting_id=meeting_id,
+                            index=self.index,
+                            chat_id=chat_id,
+                            message_id=assistant_id,
+                        )
+                        if notes_edit_event is not None:
+                            await emit(notes_edit_event)
+                    elif cached_pack is not None:
                         result_json, done_step = render_search_result(
                             cached_pack,
                             str(arguments.get("query") or "").strip(),
@@ -1334,7 +1351,10 @@ def _system_prompt(profile_block: str = "", *, meeting_context: bool = False) ->
     if meeting_context:
         prompt += (
             " [M#] entries are citable context from the current meeting and may ground "
-            "factual claims just like supplied passages."
+            "factual claims just like supplied passages. You can modify the user's open "
+            "meeting notes with the edit_notes tool (additive, anchored insertions) — "
+            "use it when the user asks you to add to or update their notes, and tell "
+            "them what you changed."
         )
     if not profile_block:
         return prompt
@@ -1444,7 +1464,72 @@ def _tool_kind(name: str) -> str:
         return "read"
     if name == "expand_evidence":
         return "expand"
+    if name == "edit_notes":
+        return "edit"
     return "search"
+
+
+def _execute_edit_notes(
+    arguments: Mapping[str, Any],
+    *,
+    meeting_id: str | None,
+    index: Any,
+    chat_id: str,
+    message_id: int,
+) -> tuple[str, ChatActivityStep, ChatNotesEditEvent | None]:
+    """Validate an edit_notes call against the meeting's current notes.
+
+    The edit is NOT applied here: the renderer owning the open notepad applies
+    it (single writer, no race with in-flight typing) and persists it with
+    AI-line provenance through the normal autosave path.
+    """
+
+    def failure(reason: str) -> tuple[str, ChatActivityStep, None]:
+        step = ChatActivityStep(
+            kind="edit",
+            label=f"Notes edit failed: {reason}",
+            status="done",
+            tool_name="edit_notes",
+            arguments=dict(arguments),
+        )
+        return json.dumps({"ok": False, "error": reason}), step, None
+
+    meeting = index.meeting_get(meeting_id) if meeting_id else None
+    if meeting is None:
+        return failure("no open meeting is bound to this chat")
+    anchor = arguments.get("anchor")
+    insert_md = arguments.get("insert_md")
+    occurrence = arguments.get("occurrence", 1)
+    if not isinstance(anchor, str) or not isinstance(insert_md, str) or not insert_md.strip():
+        return failure("anchor must be a string and insert_md must be non-empty")
+    if len(insert_md) > 4000:
+        return failure("insert_md is too long (4000 char cap)")
+    if not isinstance(occurrence, int) or isinstance(occurrence, bool) or occurrence < 1:
+        occurrence = 1
+    notes_md = str(meeting.get("notes_md") or "")
+    if anchor and notes_md.count(anchor) < occurrence:
+        return failure(
+            "anchor not found in the current notes — use an exact substring "
+            "of the notes (or '' to append at the end)"
+        )
+
+    event = ChatNotesEditEvent(
+        chat_id=chat_id,
+        message_id=message_id,
+        meeting_id=str(meeting_id),
+        edit_id=uuid4().hex[:8],
+        anchor=anchor,
+        occurrence=occurrence,
+        insert_md=insert_md,
+    )
+    step = ChatActivityStep(
+        kind="edit",
+        label="Edited the meeting notes",
+        status="done",
+        tool_name="edit_notes",
+        arguments=dict(arguments),
+    )
+    return json.dumps({"ok": True, "applied": True}), step, event
 
 
 def _matches_speculative_query(call: Mapping[str, Any], user_text: str) -> bool:

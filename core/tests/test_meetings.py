@@ -49,6 +49,7 @@ def test_meeting_store_crud_and_revision_semantics(
         "suggestions": [],
         "suggestions_base_rev": 0,
         "transcript": [],
+        "ai_lines": [],
         "chat_id": None,
         "status": "draft",
     }

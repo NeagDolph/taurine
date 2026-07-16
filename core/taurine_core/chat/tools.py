@@ -73,6 +73,42 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
 ]
 
+# Meeting-scoped turns only (never in the general chat): additive, anchored
+# edits to the open meeting notepad. Applied by the renderer, which colors
+# agent-authored lines gray until the user edits them.
+EDIT_NOTES_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "edit_notes",
+        "description": (
+            "Insert content into the user's meeting notes. Additive only - "
+            "content is inserted immediately AFTER the anchor text, or "
+            "appended to the end when anchor is empty. Use an exact, unique "
+            "substring of the current notes as the anchor. Only edit when "
+            "the user asks you to change their notes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "anchor": {
+                    "type": "string",
+                    "description": "Exact substring of the notes to insert after; '' appends at the end.",
+                },
+                "occurrence": {
+                    "type": "integer",
+                    "default": 1,
+                    "description": "1-based occurrence of the anchor when it repeats.",
+                },
+                "insert_md": {
+                    "type": "string",
+                    "description": "Markdown to insert (start with a newline to begin a new line).",
+                },
+            },
+            "required": ["anchor", "insert_md"],
+        },
+    },
+}
+
 
 def execute_tool(
     name: str,

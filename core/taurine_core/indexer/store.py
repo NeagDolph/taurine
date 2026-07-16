@@ -372,9 +372,18 @@ class Index:
             "suggestions": suggestions if isinstance(suggestions, list) else [],
             "suggestions_base_rev": int(suggestions_base_rev),
             "transcript": transcript if isinstance(transcript, list) else [],
+            "ai_lines": Index._loaded_ai_lines(row),
             "chat_id": row["chat_id"],
             "status": row["status"],
         }
+
+    @staticmethod
+    def _loaded_ai_lines(row: sqlite3.Row) -> list[str]:
+        try:
+            value = json.loads(row["ai_lines_json"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        return [line for line in value if isinstance(line, str)] if isinstance(value, list) else []
 
     def meeting_create(self, title: str = "") -> dict[str, Any]:
         meeting_id = uuid4().hex
@@ -430,6 +439,7 @@ class Index:
         title: str | None = None,
         notes_md: str | None = None,
         suggestions: list[dict[str, Any]] | None = None,
+        ai_lines: list[str] | None = None,
     ) -> dict[str, Any]:
         with self._conn:
             row = self._conn.execute(
@@ -454,6 +464,16 @@ class Index:
                 next_value = {"base_rev": int(base_rev), "edits": suggestions}
                 updates.append("suggestions_json = ?")
                 values.append(json.dumps(next_value, separators=(",", ":")))
+            if ai_lines is not None:
+                # Per-line AI provenance (renderer-maintained): lines authored
+                # by agents render gray until the user edits them.
+                updates.append("ai_lines_json = ?")
+                values.append(
+                    json.dumps(
+                        [line for line in ai_lines if isinstance(line, str)],
+                        separators=(",", ":"),
+                    )
+                )
             if content_changed:
                 updates.append("updated_at = ?")
                 values.append(time.time())
@@ -1026,6 +1046,7 @@ class Index:
                     final_summary_md TEXT NOT NULL DEFAULT '',
                     suggestions_json TEXT NOT NULL DEFAULT '{"base_rev":0,"edits":[]}',
                     transcript_json TEXT NOT NULL DEFAULT '[]',
+                    ai_lines_json TEXT NOT NULL DEFAULT '[]',
                     chat_id TEXT,
                     status TEXT NOT NULL DEFAULT 'draft'
                 );
@@ -1075,6 +1096,16 @@ class Index:
             self._ensure_notes_quality_rank_column()
             self._ensure_notes_value_columns()
             self._ensure_chat_messages_columns()
+            self._ensure_meetings_columns()
+
+    def _ensure_meetings_columns(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(meetings)").fetchall()
+        }
+        if "ai_lines_json" not in columns:
+            self._conn.execute(
+                "ALTER TABLE meetings ADD COLUMN ai_lines_json TEXT NOT NULL DEFAULT '[]'"
+            )
 
     def _ensure_chat_messages_columns(self) -> None:
         columns = {
