@@ -17,6 +17,7 @@ export interface NotepadEditorProps {
   onChangeMd(md: string): void
   suggestions: SuggestedEdit[]
   onResolveSuggestion(id: string, accept: boolean): void
+  onOpenNoteInMap?(noteId: string): void
   readOnly?: boolean
 }
 
@@ -111,6 +112,7 @@ export function NotepadEditor({
   onChangeMd,
   suggestions,
   onResolveSuggestion,
+  onOpenNoteInMap,
   readOnly = false
 }: NotepadEditorProps): React.JSX.Element {
   const editor = useCreateBlockNote({ schema })
@@ -147,8 +149,25 @@ export function NotepadEditor({
     }
   }, [editor, pending, pendingKey, valueMd])
 
+  // One capture handler covers links in both note content and suggestion
+  // blocks: note://<id> opens the note on the map, everything else goes to
+  // the external browser (never in-app navigation).
+  const handleLinkClicks = (event: React.MouseEvent): void => {
+    const anchor = (event.target as HTMLElement).closest('a')
+    if (!anchor) return
+    event.preventDefault()
+    event.stopPropagation()
+    const href = anchor.getAttribute('href') ?? ''
+    if (href.startsWith('note://')) {
+      onOpenNoteInMap?.(decodeURIComponent(href.slice('note://'.length)))
+    } else if (href && !href.startsWith('#')) {
+      window.open(href)
+    }
+  }
+
   return (
-    <BlockNoteView
+    <div onClickCapture={handleLinkClicks}>
+      <BlockNoteView
       editor={editor}
       editable={!readOnly}
       theme="dark"
@@ -166,7 +185,8 @@ export function NotepadEditor({
           onChangeMd(markdown)
         })()
       }}
-    />
+      />
+    </div>
   )
 }
 

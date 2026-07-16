@@ -676,7 +676,7 @@ function App(): React.JSX.Element {
         <div aria-hidden={activeTab !== 'chat'} style={viewLayerStyle(activeTab === 'chat')}>
           <ChatView
             visible={activeTab === 'chat'}
-            onOpenNote={openNote}
+            onOpenNote={showInMap}
             onShowInMap={showInMap}
             seedRequest={chatSeed}
           />

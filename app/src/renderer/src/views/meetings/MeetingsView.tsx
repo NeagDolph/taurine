@@ -408,6 +408,7 @@ export function MeetingsView({
                 onChangeMd={handleNotesChange}
                 suggestions={suggestions}
                 onResolveSuggestion={handleResolveSuggestion}
+                onOpenNoteInMap={openNoteInMap}
                 readOnly={isLiveSelection && coordinator.listeningState === 'stopping'}
               />
             </div>
