@@ -193,6 +193,18 @@ def _validated_result(
             edits.append(validated)
         if len(edits) == 10:
             break
+    # The summary itself lands in the notepad as one large pending suggestion
+    # (Granola's enhanced-notes flow) instead of a separate card; accepting it
+    # merges it below the user's notes, so it rides suggestions persistence.
+    edits.append(
+        SuggestedEdit(
+            id=f"sum{uuid4().hex[:8]}",
+            anchor="",
+            occurrence=1,
+            insert_md=f"## Summary\n\n{final_summary.strip()}",
+            rationale="Add the meeting summary to your notes",
+        )
+    )
     return title, final_summary.strip(), edits
 
 

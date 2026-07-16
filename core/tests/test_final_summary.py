@@ -142,8 +142,15 @@ async def test_happy_path_persists_emits_and_supplies_all_prompt_inputs(
     assert stored["title"] == "Deck Follow-up"
     assert stored["final_summary_md"] == "## Outcome\nThe deck is due Friday."
     assert stored["suggestions_base_rev"] == meeting["notes_rev"]
-    assert len(stored["suggestions"]) == 2
-    assert all(len(row["id"]) == 8 for row in stored["suggestions"])
+    # model edits + the appended summary-as-suggestion
+    assert len(stored["suggestions"]) == 3
+    summary_edit = stored["suggestions"][-1]
+    assert summary_edit["anchor"] == ""
+    assert summary_edit["id"].startswith("sum")
+    assert summary_edit["insert_md"] == (
+        "## Summary\n\n## Outcome\nThe deck is due Friday."
+    )
+    assert all(len(row["id"]) == 8 for row in stored["suggestions"][:-1])
     assert all(row["status"] == "pending" for row in stored["suggestions"])
     assert [event.type for event in events] == [
         "final_summary_status",
@@ -242,9 +249,10 @@ async def test_invalid_anchors_occurrences_and_edits_are_dropped_then_capped(
     await run_final_summary(meeting, llm, _unused_tool, "", _noop_emit, index)
 
     stored = index.meeting_get(meeting["meeting_id"])
-    assert [row["insert_md"] for row in stored["suggestions"]] == [
+    assert [row["insert_md"] for row in stored["suggestions"][:-1]] == [
         f"valid-{number}" for number in range(10)
     ]
+    assert stored["suggestions"][-1]["insert_md"].startswith("## Summary\n\n")
 
 
 @pytest.mark.parametrize(
