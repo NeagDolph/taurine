@@ -264,6 +264,7 @@ CONTEXT_ENRICH_BATCH = 10                # passages per enrichment call, grouped
 CONTEXT_ENRICH_CONCURRENCY = 6           # bounded parallel enrichment calls
 SUMMARY_TIMEOUT_S = 20.0
 MEETING_NOTES_PROMPT_MAX_CHARS = 8000
+MEETING_CONTEXT_MAX_CHARS = 12000
 SUMMARY_MIN_INTERVAL_S = 25.0            # hard floor between summarizer passes
 SUMMARY_MAX_STALENESS_S = 240.0          # force a pass if new speech and this much elapsed
 SUMMARY_MIN_NEW_CHARS = 200              # don't resummarize silence

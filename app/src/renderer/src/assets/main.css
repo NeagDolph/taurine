@@ -236,12 +236,7 @@
 
   .shimmer {
     animation: shimmer 1.6s linear infinite;
-    background: linear-gradient(
-      90deg,
-      var(--text-2) 0%,
-      var(--text-1) 45%,
-      var(--text-2) 90%
-    );
+    background: linear-gradient(90deg, var(--text-2) 0%, var(--text-1) 45%, var(--text-2) 90%);
     background-clip: text;
     background-size: 200% 100%;
     color: transparent;
@@ -269,7 +264,8 @@
   }
 
   .citation-passage,
-  .citation-transcript {
+  .citation-transcript,
+  .citation-meeting {
     @apply bg-[#5aaaff]/15 text-[#9ecfff];
   }
 

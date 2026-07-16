@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Literal, Mapping
 
 
-EvidenceKind = Literal["note", "passage", "fact", "path", "transcript"]
+EvidenceKind = Literal["note", "passage", "fact", "path", "transcript", "meeting"]
 EvidenceState = Literal["retrieved", "read", "cited"]
 _PREFIX: dict[EvidenceKind, str] = {
     "note": "N",
@@ -17,8 +17,11 @@ _PREFIX: dict[EvidenceKind, str] = {
     "fact": "F",
     "path": "P",
     "transcript": "T",
+    "meeting": "M",
 }
-_PREFIX_ORDER = {prefix: index for index, prefix in enumerate(("N", "E", "F", "P", "T"))}
+_PREFIX_ORDER = {
+    prefix: index for index, prefix in enumerate(("N", "E", "F", "P", "T", "M"))
+}
 
 
 @dataclass(frozen=True)
@@ -187,7 +190,10 @@ class EvidenceRegistry:
             registry._records[ref] = record
             registry._by_identity[(kind, source_id)] = ref
         for prefix in registry._next:
-            value = counters.get(prefix)
+            # Version-1 snapshots written before meeting-local evidence have
+            # no M counter. M1 is safe because those snapshots cannot contain
+            # meeting entries.
+            value = counters.get(prefix, 1 if prefix == "M" else None)
             if not isinstance(value, int) or value < 1:
                 raise ValueError("invalid evidence registry counter")
             highest = max(

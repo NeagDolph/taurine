@@ -18,7 +18,7 @@ from taurine_core.retrieval.registry import EvidenceRecord, EvidenceRegistry
 
 ValidationMode = Literal["live", "chat", "tool"]
 _CITATION_RE = re.compile(r"\[([A-Z])(\d+)\]")
-_COVERAGE_PREFIXES = frozenset({"E", "F", "T"})
+_COVERAGE_PREFIXES = frozenset({"E", "F", "T", "M"})
 _HISTORICAL_QUALIFIERS = re.compile(
     r"\b(?:formerly|previously|historically|used to|at the time|was|were|had|did)\b",
     flags=re.IGNORECASE,
@@ -82,7 +82,7 @@ class EvidenceValidator:
             ref
             for ref, record in records.items()
             if record is not None
-            and record.kind in {"passage", "transcript"}
+            and record.kind in {"passage", "transcript", "meeting"}
             and ref not in available
         }
         invalid.update(unavailable)
@@ -233,7 +233,7 @@ def _ordered_refs(refs: Iterable[str]) -> tuple[str, ...]:
     unique = set(refs)
 
     def key(ref: str) -> tuple[int, int, str]:
-        prefix_order = {prefix: index for index, prefix in enumerate("NEFPT")}
+        prefix_order = {prefix: index for index, prefix in enumerate("NEFPTM")}
         try:
             number = int(ref[1:])
         except ValueError:

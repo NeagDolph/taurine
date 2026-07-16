@@ -28,6 +28,7 @@ from taurine_core.asr import ASRClient, ChunkCallback, IndexStatusProvider, Stat
 from taurine_core.chat.engine import ChatEngine, make_tool_executor
 from taurine_core.chat.retrieval import ChatRetriever
 from taurine_core.connectors.registry import ConnectorRegistry, SourceExtraction
+from taurine_core.dates import timestamp_date
 from taurine_core.indexer.notes import open_note
 from taurine_core.indexer.build import (
     BuildCancelled,
@@ -253,6 +254,10 @@ class Runtime:
             if live is not None:
                 return live
         return None
+
+    def active_live_session(self, meeting_id: str) -> LiveSessionLike | None:
+        context = self.active_sessions.get(meeting_id)
+        return context.live if context is not None else None
 
 
 class EdgeReasonRequest(BaseModel):
@@ -1034,23 +1039,87 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 except (json.JSONDecodeError, ValidationError, ValueError):
                     continue
                 if isinstance(control, ChatSendMsg):
-                    if control.seed_note_ids:
-                        track(
-                            asyncio.create_task(
-                                engine.send(
-                                    control.chat_id,
-                                    control.text,
-                                    emit,
-                                    seed_note_ids=control.seed_note_ids,
+                    meeting = (
+                        active_runtime.index.meeting_get(control.meeting_id)
+                        if control.meeting_id
+                        else None
+                    )
+                    meeting_id = (
+                        str(meeting["meeting_id"]) if meeting is not None else None
+                    )
+                    link_on_create = bool(
+                        meeting is not None
+                        and not control.chat_id
+                        and not meeting.get("chat_id")
+                    )
+                    link_state = {"linked": False}
+
+                    async def scoped_emit(
+                        event: Any,
+                        meeting_row: dict[str, Any] = meeting,
+                        state: dict[str, bool] = link_state,
+                        should_link: bool = link_on_create,
+                    ) -> None:
+                        if should_link and not state["linked"] and isinstance(event, ChatMetaEvent):
+                            title_value = str(meeting_row.get("title") or "").strip()
+                            if not title_value:
+                                title_value = timestamp_date(
+                                    meeting_row.get("started_at")
+                                    or meeting_row.get("created_at"),
+                                    unknown="Untitled",
                                 )
+                            title_value = f"Meeting: {title_value}"[:120].strip()
+                            active_runtime.index.rename_chat(
+                                event.chat.chat_id, title_value, now=time.time()
+                            )
+                            active_runtime.index.meeting_set_chat(
+                                str(meeting_row["meeting_id"]), event.chat.chat_id
+                            )
+                            state["linked"] = True
+                            active_runtime.updates.publish("meetings")
+                            updated = active_runtime.index.chat(event.chat.chat_id)
+                            if updated is not None:
+                                event = ChatMetaEvent(chat=updated)
+                        await emit(event)
+
+                    send_kwargs: dict[str, Any] = {}
+                    if control.seed_note_ids:
+                        send_kwargs["seed_note_ids"] = control.seed_note_ids
+                    if meeting_id is not None:
+                        send_kwargs["meeting_id"] = meeting_id
+                    track(
+                        asyncio.create_task(
+                            engine.send(
+                                control.chat_id,
+                                control.text,
+                                scoped_emit if link_on_create else emit,
+                                **send_kwargs,
                             )
                         )
-                    else:
-                        track(asyncio.create_task(engine.send(control.chat_id, control.text, emit)))
+                    )
                 elif isinstance(control, ChatCancelMsg):
                     await engine.cancel(control.chat_id)
                 elif isinstance(control, ChatRegenerateMsg):
-                    track(asyncio.create_task(engine.regenerate(control.chat_id, emit)))
+                    meeting_for_chat = getattr(
+                        active_runtime.index, "meeting_for_chat", None
+                    )
+                    meeting = (
+                        meeting_for_chat(control.chat_id)
+                        if callable(meeting_for_chat)
+                        else None
+                    )
+                    if meeting is None:
+                        track(asyncio.create_task(engine.regenerate(control.chat_id, emit)))
+                    else:
+                        track(
+                            asyncio.create_task(
+                                engine.regenerate(
+                                    control.chat_id,
+                                    emit,
+                                    meeting_id=str(meeting["meeting_id"]),
+                                )
+                            )
+                        )
         except WebSocketDisconnect:
             pass
         finally:
@@ -1206,7 +1275,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
             index_status=index_status,
         )
 
-    return Runtime(
+    runtime = Runtime(
         index=index,
         sync_once=lambda: connector_registry.sync_all_enabled(index, llm),
         # collecting variant: the global sync hands its extracted records to
@@ -1240,6 +1309,9 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
                 span_extractor=span_extractor,
             ),
             validator_factory=knowledge_runtime.make_validator,
+            live_session_for_meeting=lambda meeting_id: runtime.active_live_session(
+                meeting_id
+            ),
         ),
         final_summary_llm=llm,
         make_final_summary_tool_executor=lambda meeting_id: make_tool_executor(
@@ -1274,6 +1346,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
         regenerate_knowledge=regenerate_knowledge,
         build_cache=build_cache,
     )
+    return runtime
 
 
 def required_secrets(env: Mapping[str, str | None] | None = None) -> dict[str, str]:

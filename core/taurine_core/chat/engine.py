@@ -33,6 +33,7 @@ chat_turn, chat_retrieval.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -61,7 +62,9 @@ from ..schemas import (
     ChatThinkingEvent,
     ChatUsage,
     EvidencePackPayload,
+    MeetingSummary,
 )
+from ..retrieval.registry import EvidenceRegistry
 from ..retrieval.types import EvidencePack, EvidencePassage
 from ..retrieval.validate import EvidenceValidator
 from .retrieval import ChatRetriever
@@ -138,6 +141,21 @@ class _StreamOutcome:
     tool_calls: list[dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class _MeetingEvidence:
+    block: str = ""
+    ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _MeetingItem:
+    identity: str
+    text: str
+    date: str
+    label: str
+    transcript: bool = False
+
+
 class _StreamFailure(Exception):
     def __init__(self, error: LLMError, *, opened: bool) -> None:
         super().__init__(str(error))
@@ -209,6 +227,7 @@ class ChatEngine:
         span_extractor: SpanExtractorPort | None = None,
         retriever_factory: Callable[[str], ChatRetriever] | None = None,
         validator_factory: Callable[[Any], EvidenceValidator] | None = None,
+        live_session_for_meeting: Callable[[str], Any | None] | None = None,
     ) -> None:
         self.index = index
         self.llm = llm
@@ -216,6 +235,7 @@ class ChatEngine:
         self._span_extractor = span_extractor
         self._retriever_factory = retriever_factory
         self._validator_factory = validator_factory
+        self._live_session_for_meeting = live_session_for_meeting
         self._lock = asyncio.Lock()
         self._active: dict[str, asyncio.Task[Any]] = {}
         self._active_count = 0
@@ -227,6 +247,7 @@ class ChatEngine:
         emit: EmitFn,
         *,
         seed_note_ids: Sequence[str] = (),
+        meeting_id: str | None = None,
     ) -> None:
         """Handle chat_send ("" chat_id → create). Runs the full turn;
         busy/limit violations emit chat_error(code="busy") and return."""
@@ -244,6 +265,7 @@ class ChatEngine:
                 created_meta=reservation.created,
                 persist_user=True,
                 seed_note_ids=tuple(seed_note_ids),
+                meeting_id=meeting_id,
             )
         finally:
             await self._release(reservation.chat_id)
@@ -269,7 +291,9 @@ class ChatEngine:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
-    async def regenerate(self, chat_id: str, emit: EmitFn) -> None:
+    async def regenerate(
+        self, chat_id: str, emit: EmitFn, *, meeting_id: str | None = None
+    ) -> None:
         """Delete the last assistant message and re-run the last user one."""
         if self.index.chat(chat_id) is None:
             await emit(ChatErrorEvent(chat_id=chat_id, code="llm", detail="chat not found"))
@@ -295,6 +319,7 @@ class ChatEngine:
                 persist_user=False,
                 user_message_id=last_user.id,
                 restore_pre_turn=True,
+                meeting_id=meeting_id,
             )
         finally:
             await self._release(chat_id)
@@ -338,6 +363,7 @@ class ChatEngine:
         user_message_id: int | None = None,
         restore_pre_turn: bool = False,
         seed_note_ids: Sequence[str] = (),
+        meeting_id: str | None = None,
     ) -> None:
         turn_started = time.monotonic()
         wall_now = time.time()
@@ -353,10 +379,13 @@ class ChatEngine:
                 restore = getattr(value, "restore_pre_turn", None)
                 if callable(restore):
                     restore()
-            if seed_note_ids:
+            turn_seed_ids = tuple(seed_note_ids) + _meeting_seed_note_ids(
+                self.index, meeting_id
+            )
+            if turn_seed_ids:
                 seed = getattr(value, "seed_notes", None)
                 if callable(seed):
-                    seed(seed_note_ids)
+                    seed(tuple(dict.fromkeys(turn_seed_ids)))
             return value
 
         retriever: Any | None = None
@@ -407,6 +436,26 @@ class ChatEngine:
         model = config.CHAT_MODEL
         persisted_message: ChatMessage | None = None
         success_finish_task: asyncio.Task[None] | None = None
+        meeting_evidence = _MeetingEvidence()
+
+        def current_meeting_evidence(current_retriever: Any) -> _MeetingEvidence:
+            if not meeting_id:
+                return _MeetingEvidence()
+            meeting = self.index.meeting_get(meeting_id)
+            if meeting is None:
+                return _MeetingEvidence()
+            live_summary: MeetingSummary | None = None
+            if self._live_session_for_meeting is not None:
+                live = self._live_session_for_meeting(meeting_id)
+                current_summary = getattr(live, "current_summary", None)
+                if callable(current_summary):
+                    live_summary = current_summary()
+            return _build_meeting_evidence(
+                self.index,
+                current_retriever.registry,
+                meeting_id,
+                live_summary=live_summary,
+            )
 
         def _set_ttft(value: float) -> None:
             nonlocal ttft_ms
@@ -445,6 +494,7 @@ class ChatEngine:
                     retriever,
                     self._validator_factory,
                     audit_pack,
+                    meeting_ids=meeting_evidence.ids,
                 )
             retrieved_ids = list(audit_pack.trace.selected_ids) if audit_pack is not None else []
             consulted_ids = list(audit_pack.trace.read_ids) if audit_pack is not None else []
@@ -516,7 +566,12 @@ class ChatEngine:
 
         async def finish_done(*, cancelled: bool) -> None:
             if not cancelled:
-                await self._repair_once(content_parts, retriever, context_pack)
+                await self._repair_once(
+                    content_parts,
+                    retriever,
+                    context_pack,
+                    meeting_evidence=meeting_evidence,
+                )
             message = persist_turn(cancelled=cancelled)
             await emit(ChatDoneEvent(chat_id=chat_id, message_id=assistant_id, message=message))
             if not cancelled:
@@ -602,6 +657,7 @@ class ChatEngine:
                         consulted_ids=list(context_pack.trace.read_ids),
                     )
                 )
+            meeting_evidence = current_meeting_evidence(retriever)
             messages = self._build_messages(
                 chat_id,
                 text,
@@ -610,6 +666,7 @@ class ChatEngine:
                 current_user_id=user_message_id,
                 assistant_id=assistant_id,
                 pre_retrieved=pre_retrieved,
+                meeting_evidence=meeting_evidence,
             )
             round_index = 0
             tool_count = 0
@@ -725,6 +782,7 @@ class ChatEngine:
                             # whose registry owns the cached E#/F# identities.
                             if tool_count == 0:
                                 retriever = speculative_retriever
+                                meeting_evidence = current_meeting_evidence(retriever)
                             context_pack = cached_pack
                     if cached_pack is not None:
                         result_json, done_step = render_search_result(
@@ -833,6 +891,8 @@ class ChatEngine:
         content_parts: list[str],
         retriever: Any,
         context_pack: EvidencePack | None,
+        *,
+        meeting_evidence: _MeetingEvidence = _MeetingEvidence(),
     ) -> None:
         """Run at most one evidence-constrained repair before final persistence."""
 
@@ -845,7 +905,7 @@ class ChatEngine:
         validator = self._validator_factory(registry)
         turn_pack_fn = getattr(retriever, "turn_pack", None)
         pack = turn_pack_fn() if callable(turn_pack_fn) else context_pack
-        supplied_ids = pack.trace.read_ids if pack is not None else ()
+        supplied_ids = _turn_available_ids(pack, meeting_evidence.ids)
         initial = validator.validate(
             draft,
             mode="chat",
@@ -859,9 +919,10 @@ class ChatEngine:
                 config.CHAT_MODEL,
                 (
                     "Return JSON with one key, answer. Repair the draft using only the supplied "
-                    "evidence. Remove unsupported claims. Every factual sentence must cite E# or F#."
+                    "evidence. Remove unsupported claims. Every factual sentence must cite "
+                    + ("E#, F#, or M#." if meeting_evidence.ids else "E# or F#.")
                 ),
-                f"<evidence>\n{_evidence_block(pack) if pack is not None else 'none'}\n</evidence>\n\n<draft>\n{draft}\n</draft>",
+                f"<evidence>\n{_combined_evidence_block(pack, meeting_evidence)}\n</evidence>\n\n<draft>\n{draft}\n</draft>",
                 timeout_s=config.SUMMARY_TIMEOUT_S,
             )
         except Exception:
@@ -974,6 +1035,7 @@ class ChatEngine:
         current_user_id: int,
         assistant_id: int,
         pre_retrieved: bool = False,
+        meeting_evidence: _MeetingEvidence = _MeetingEvidence(),
     ) -> list[dict[str, Any]]:
         history = [
             message
@@ -982,19 +1044,29 @@ class ChatEngine:
         ]
         history = history[-config.CHAT_HISTORY_MAX_TURNS * 2 :]
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _system_prompt(user_profile_block(self.index))}
+            {
+                "role": "system",
+                "content": _system_prompt(
+                    user_profile_block(self.index),
+                    meeting_context=bool(meeting_evidence.ids),
+                ),
+            }
         ]
         for message in history:
             if message.role == "assistant" and not message.content:
                 continue
             messages.append({"role": message.role, "content": message.content})
         content = user_text
-        if context_pack is not None:
+        if context_pack is not None or meeting_evidence.ids:
             # M6: expose bounded non-selected fact-support passages — they
             # become read/citable and render as compact quotes under facts.
             expose = getattr(retriever, "expose_fact_support", None)
             support = expose(context_pack) if callable(expose) else {}
-            evidence = _evidence_block(context_pack, support)
+            evidence = _combined_evidence_block(
+                context_pack,
+                meeting_evidence,
+                support=support,
+            )
             if pre_retrieved:
                 content = (
                     "<pre_retrieved_evidence>\n"
@@ -1039,7 +1111,211 @@ class ChatEngine:
             await emit(ChatMetaEvent(chat=updated))
 
 
-def _system_prompt(profile_block: str = "") -> str:
+def _meeting_seed_note_ids(index: Any, meeting_id: str | None) -> tuple[str, ...]:
+    if not meeting_id:
+        return ()
+    note_id = f"taurine:{meeting_id}"
+    note = getattr(index, "note", None)
+    return (note_id,) if callable(note) and note(note_id) is not None else ()
+
+
+def _build_meeting_evidence(
+    index: Any,
+    registry: EvidenceRegistry,
+    meeting_id: str,
+    *,
+    live_summary: MeetingSummary | None = None,
+) -> _MeetingEvidence:
+    meeting = index.meeting_get(meeting_id)
+    if meeting is None:
+        return _MeetingEvidence()
+
+    meeting_date = timestamp_date(
+        meeting.get("started_at") or meeting.get("created_at"),
+        unknown="unknown-date",
+    )
+    items: list[_MeetingItem] = []
+    notes = str(meeting.get("notes_md") or "").strip()
+    if notes:
+        items.append(
+            _MeetingItem(
+                identity=f"{meeting_id}:notes:{int(meeting.get('notes_rev') or 0)}",
+                text=notes,
+                date=meeting_date,
+                label="Notepad",
+            )
+        )
+
+    items.extend(_meeting_transcript_items(meeting_id, meeting.get("transcript"), meeting_date))
+
+    if live_summary is not None and live_summary.summary_md.strip():
+        summary_text = live_summary.summary_md.strip()
+        summary_version = (
+            f"rev:{live_summary.rev}"
+            if live_summary.rev > 0
+            else f"hash:{_content_hash(summary_text)}"
+        )
+        items.append(
+            _MeetingItem(
+                identity=f"{meeting_id}:summary:{summary_version}",
+                text=summary_text,
+                date=timestamp_date(live_summary.updated_at, unknown=meeting_date),
+                label="Live summary",
+            )
+        )
+    else:
+        summary_text = str(meeting.get("final_summary_md") or "").strip()
+        if summary_text:
+            items.append(
+                _MeetingItem(
+                    identity=f"{meeting_id}:summary:hash:{_content_hash(summary_text)}",
+                    text=summary_text,
+                    date=timestamp_date(meeting.get("ended_at"), unknown=meeting_date),
+                    label="Final summary",
+                )
+            )
+
+    items = _cap_meeting_items(items, max(0, int(config.MEETING_CONTEXT_MAX_CHARS)))
+    rendered: list[str] = []
+    refs: list[str] = []
+    for item in items:
+        ref = registry.register(
+            "meeting",
+            item.identity,
+            {
+                "meeting_id": meeting_id,
+                "section": item.label,
+                "date": item.date,
+                "text": item.text,
+            },
+        )
+        registry.mark_read(ref)
+        refs.append(ref)
+        rendered.append(f"[{ref}] ({item.date}, meeting) {item.label}: {item.text}")
+    block = "\n".join(rendered)
+    if len(block) > config.MEETING_CONTEXT_MAX_CHARS:
+        # Header estimation is conservative, but keep the wire cap absolute.
+        block = block[: config.MEETING_CONTEXT_MAX_CHARS]
+    return _MeetingEvidence(block=block, ids=tuple(refs))
+
+
+def _meeting_transcript_items(
+    meeting_id: str,
+    raw_transcript: object,
+    fallback_date: str,
+) -> list[_MeetingItem]:
+    rows = raw_transcript if isinstance(raw_transcript, list) else []
+    normalized = [row for row in rows[-60:] if isinstance(row, dict) and str(row.get("text") or "").strip()]
+    windows: list[tuple[int, list[str], float | None]] = []
+    channel: int | None = None
+    lines: list[str] = []
+    timestamp: float | None = None
+
+    def flush() -> None:
+        nonlocal channel, lines, timestamp
+        if channel is not None and lines:
+            windows.append((channel, lines, timestamp))
+        channel = None
+        lines = []
+        timestamp = None
+
+    for row in normalized:
+        row_channel = int(row.get("channel") or 0)
+        label = "You" if row_channel == 0 else "Them"
+        line = f"{label}: {str(row.get('text') or '').strip()}"
+        if channel is not None and (row_channel != channel or len("\n".join((*lines, line))) > 800):
+            flush()
+        if channel is None:
+            channel = row_channel
+            try:
+                timestamp = float(row.get("ts"))
+            except (TypeError, ValueError):
+                timestamp = None
+        lines.append(line)
+    flush()
+
+    items: list[_MeetingItem] = []
+    for _channel, window_lines, window_ts in windows:
+        text = "\n".join(window_lines)
+        items.append(
+            _MeetingItem(
+                identity=f"{meeting_id}:window:{_content_hash(text)}",
+                text=text,
+                date=timestamp_date(window_ts, unknown=fallback_date),
+                label="Transcript",
+                transcript=True,
+            )
+        )
+    return items
+
+
+def _cap_meeting_items(items: list[_MeetingItem], limit: int) -> list[_MeetingItem]:
+    if limit <= 0:
+        return []
+    kept = list(items)
+
+    def estimated_size() -> int:
+        return sum(len(item.text) + len(item.label) + len(item.date) + 24 for item in kept)
+
+    while estimated_size() > limit:
+        oldest_transcript = next(
+            (index for index, item in enumerate(kept) if item.transcript), None
+        )
+        if oldest_transcript is None:
+            break
+        if sum(1 for item in kept if item.transcript) == 1:
+            break
+        kept.pop(oldest_transcript)
+
+    overflow = estimated_size() - limit
+    if overflow > 0:
+        transcript_index = next(
+            (index for index, item in enumerate(kept) if item.transcript), None
+        )
+        if transcript_index is not None:
+            item = kept[transcript_index]
+            text = item.text[min(len(item.text), overflow + 1) :].lstrip()
+            if text:
+                kept[transcript_index] = _MeetingItem(
+                    identity=item.identity,
+                    text=text,
+                    date=item.date,
+                    label=item.label,
+                    transcript=True,
+                )
+            else:
+                kept.pop(transcript_index)
+
+    while estimated_size() > limit and kept:
+        index = max(range(len(kept)), key=lambda position: len(kept[position].text))
+        item = kept[index]
+        allowance = max(0, len(item.text) - (estimated_size() - limit))
+        text = item.text[:allowance].rstrip()
+        if not text:
+            kept.pop(index)
+        else:
+            kept[index] = _MeetingItem(
+                identity=item.identity,
+                text=text,
+                date=item.date,
+                label=item.label,
+                transcript=item.transcript,
+            )
+    return kept
+
+
+def _content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _turn_available_ids(
+    pack: EvidencePack | None, meeting_ids: Sequence[str]
+) -> tuple[str, ...]:
+    retrieval_ids = pack.trace.read_ids if pack is not None else ()
+    return tuple(dict.fromkeys((*retrieval_ids, *meeting_ids)))
+
+
+def _system_prompt(profile_block: str = "", *, meeting_context: bool = False) -> str:
     prompt = current_datetime_line(time.time()) + "\n" + (
         "You answer questions over the user's personal knowledge base. Every factual "
         "sentence must cite an exact [E#] passage, a supported [F#] fact, or both. [N#] "
@@ -1051,15 +1327,35 @@ def _system_prompt(profile_block: str = "") -> str:
         "rely on it. When only LOW-CONFIDENCE evidence exists, answer with it and label "
         "the uncertainty rather than refusing. Be direct and write markdown."
     )
+    if meeting_context:
+        prompt += (
+            " [M#] entries are citable context from the current meeting and may ground "
+            "factual claims just like supplied passages."
+        )
     if not profile_block:
         return prompt
     return (
         f"{prompt}\n\n"
         "The user profile below is background context for interpreting names, relationships, "
         "interests, and likely referents. It is not citable evidence. Ground factual answers "
-        "in the supplied [E#] passages and [F#] facts.\n\n"
-        f"{profile_block}"
+        "in the supplied [E#] passages, [F#] facts"
+        + (", and [M#] meeting context.\n\n" if meeting_context else ".\n\n")
+        + profile_block
     )
+
+
+def _combined_evidence_block(
+    pack: EvidencePack | None,
+    meeting: _MeetingEvidence,
+    *,
+    support: Mapping[str, tuple[str, ...]] | None = None,
+) -> str:
+    blocks: list[str] = []
+    if meeting.block:
+        blocks.append("MEETING CONTEXT\n" + meeting.block)
+    if pack is not None:
+        blocks.append(_evidence_block(pack, support))
+    return "\n\n".join(blocks) if blocks else "none"
 
 
 def _evidence_block(
@@ -1184,6 +1480,8 @@ def _finalize_evidence(
     retriever: Any,
     validator_factory: Callable[[Any], EvidenceValidator] | None,
     pack: EvidencePack | None,
+    *,
+    meeting_ids: Sequence[str] = (),
 ) -> tuple[str, tuple[str, ...], tuple[ChatStrippedClaim, ...]]:
     """Validate whole claims; unsupported citations never leave a bare claim.
 
@@ -1196,7 +1494,7 @@ def _finalize_evidence(
         if validator_factory is not None
         else EvidenceValidator(registry)
     )
-    supplied = pack.trace.read_ids if pack is not None else ()
+    supplied = _turn_available_ids(pack, meeting_ids)
     result = validator.validate(
         content,
         mode="chat",
@@ -1239,7 +1537,7 @@ def _remove_unsupported_sentences(content: str, unsupported: tuple[str, ...]) ->
     for rendered in unsupported:
         if rendered in repaired:
             repaired = repaired.replace(rendered, "")
-        elif rendered.startswith(("N", "E", "F", "P")):
+        elif rendered.startswith(("N", "E", "F", "P", "M")):
             # Invalid bare references are removed only as part of their sentence
             # by the validator; never strip a marker and preserve its claim.
             continue

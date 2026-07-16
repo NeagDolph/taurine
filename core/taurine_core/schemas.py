@@ -852,6 +852,7 @@ class ChatSendMsg(BaseModel):
     chat_id: str = ""              # "" → server creates the chat
     text: str
     seed_note_ids: list[str] = []  # graph handoff: bias the first turn toward these notes
+    meeting_id: Optional[str] = None
 
 
 class ChatCancelMsg(BaseModel):

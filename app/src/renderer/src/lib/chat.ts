@@ -153,13 +153,14 @@ export class ChatClient {
     this.emitConnection('disconnected')
   }
 
-  send(chatId: string, text: string, seedNoteIds: string[] = []): boolean {
+  send(chatId: string, text: string, seedNoteIds: string[] = [], meetingId?: string): boolean {
     // seed_note_ids pre-bias the per-chat retriever (map "Ask about this")
     return this.sendJson({
       type: 'chat_send',
       chat_id: chatId,
       text,
-      ...(seedNoteIds.length > 0 ? { seed_note_ids: seedNoteIds } : {})
+      ...(seedNoteIds.length > 0 ? { seed_note_ids: seedNoteIds } : {}),
+      ...(meetingId ? { meeting_id: meetingId } : {})
     })
   }
 

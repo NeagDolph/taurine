@@ -12,6 +12,7 @@ import type {
   TranscriptEvent
 } from '../../lib/sidecar'
 import { MeetingSidebar } from './MeetingSidebar'
+import { MeetingChat } from './MeetingChat'
 import { NotepadEditor } from './NotepadEditor'
 import { SummaryCard } from './SummaryCard'
 import { TranscriptPanel } from './TranscriptPanel'
@@ -384,15 +385,11 @@ export function MeetingsView({
               />
             </div>
 
-            <div className="border-t border-white/[0.08] p-3">
-              <button
-                className="flex h-9 w-full items-center rounded-lg border border-white/[0.08] bg-white/[0.025] px-3 text-left text-xs text-fg/35"
-                type="button"
-                disabled
-              >
-                Ask about this meeting
-              </button>
-            </div>
+            <MeetingChat
+              key={`${meeting.meetingId}:${meeting.chatId ?? 'new'}`}
+              meeting={meeting}
+              onOpenNote={() => undefined}
+            />
           </main>
         ) : (
           <div className="flex items-center justify-center p-6 text-center text-xs text-bad">
