@@ -33,6 +33,7 @@ class FakeLLM:
         tools: list[dict[str, Any]],
         *,
         timeout_s: float | None = None,
+        reasoning: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.tool_calls.append(
             {
@@ -372,3 +373,50 @@ def test_final_summary_schema_is_closed_and_requires_the_wire_contract() -> None
         "insert_md",
         "rationale",
     }
+
+
+async def test_unverified_note_links_degrade_to_plain_text(index: Index) -> None:
+    from taurine_core.schemas import NoteRecord
+
+    real = NoteRecord(
+        note_id="taurine:realnote",
+        title="Klaviyo launch plan",
+        folder="",
+        modified=1.0,
+        created=1.0,
+        content_hash="h1",
+        text="Launch plan body",
+        gist="",
+        source="taurine",
+    )
+    index.replace_source_records("taurine", [real])
+
+    meeting = _snapshot(index)
+    llm = FakeLLM(
+        {
+            "title": "Launch sync",
+            "final_summary_md": (
+                "Discussed the [Klaviyo launch plan](note://taurine:realnote) and "
+                "a [phantom doc](note://made-up-id)."
+            ),
+            "suggested_edits": [
+                {
+                    "anchor": "",
+                    "occurrence": 1,
+                    "insert_md": "\nSee [phantom doc](note://also-fake).",
+                    "rationale": "link",
+                }
+            ],
+        }
+    )
+
+    await run_final_summary(meeting, llm, _unused_tool, "", _noop_emit, index)
+
+    stored = index.meeting_get(meeting["meeting_id"])
+    summary = stored["final_summary_md"]
+    # verified link survives; hallucinated ids degrade to their labels
+    assert "[Klaviyo launch plan](note://taurine:realnote)" in summary
+    assert "note://made-up-id" not in summary and "phantom doc" in summary
+    edit_bodies = [row["insert_md"] for row in stored["suggestions"]]
+    assert all("note://also-fake" not in body for body in edit_bodies)
+    assert any("phantom doc" in body for body in edit_bodies)

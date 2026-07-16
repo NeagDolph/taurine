@@ -256,8 +256,13 @@ SUMMARY_MODEL = "deepseek/deepseek-v4-flash"
 # model, strongest JSON+tools we run) for the one-shot final summary.
 LIVE_SUMMARY_MODEL = "deepseek/deepseek-v4-flash"
 FINAL_SUMMARY_MODEL = "z-ai/glm-5.2"
-FINAL_SUMMARY_MAX_TOOL_CALLS = 6
-FINAL_SUMMARY_TIMEOUT_S = 120
+# Neil 2026-07-16: the final summary is a research agent like profile
+# generation — it searches the corpus, READS results before asserting any
+# association, and links only read-verified notes. Post-call latency is
+# cheap, so the loop gets a real budget and GLM reasoning stays on.
+FINAL_SUMMARY_MAX_TOOL_CALLS = 16
+FINAL_SUMMARY_TIMEOUT_S = 240
+FINAL_SUMMARY_REASONING = {"enabled": True}
 FINAL_SUMMARY_MAX_TOKENS = 8192          # final strict-JSON turn generation ceiling
 FINAL_SUMMARY_MAX_CHARS = 64_000         # reject oversized decoded JSON before persistence
 SUMMARY_FALLBACK_MODEL = "deepseek/deepseek-chat"

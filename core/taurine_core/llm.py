@@ -280,6 +280,7 @@ class OpenRouterClient:
         tools: list[dict[str, Any]],
         *,
         timeout_s: float | None = None,
+        reasoning: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": model,
@@ -290,7 +291,7 @@ class OpenRouterClient:
             "tools": tools,
             # only route to providers that honor tool parameters
             "provider": {"require_parameters": True},
-            **_reasoning_for(model),
+            **({"reasoning": dict(reasoning)} if reasoning is not None else _reasoning_for(model)),
         }
         headers = {"Authorization": f"Bearer {self._api_key}"}
 

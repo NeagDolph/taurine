@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
+from urllib.parse import unquote
 from uuid import uuid4
 
 from taurine_core import config
@@ -43,13 +45,31 @@ FINAL_SUMMARY_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-_SYSTEM_PROMPT = """You produce the polished final record of a meeting.
-Use the knowledge-base tools when they can resolve names, projects, history, or related facts.
+_SYSTEM_PROMPT = """You produce the polished final record of a meeting, and you are a careful \
+research agent over the user's personal knowledge base.
+
+RESEARCH PROTOCOL (follow it strictly):
+1. Search the knowledge base (search_evidence) for the people, organizations, projects, and \
+topics this meeting touched. Run several targeted searches, not one broad one.
+2. Before asserting that ANYTHING in the knowledge base is related to this meeting, READ the \
+evidence (read_note on the specific note) and confirm it refers to the same person, project, \
+or event. A matching name or a similar topic is correlation, not identity — never treat it as \
+confirmation.
+3. Only include HIGH-CONFIDENCE associations: the note you read explicitly asserts the detail \
+you are connecting. If you are not sure two things are the same, OMIT the connection entirely. \
+No hedged references ("possibly related", "may be the same") — silence beats speculation.
+4. When (and only when) you verified a note by reading it and it is genuinely about something \
+discussed in this meeting, link it inline or in a short "Related" section as a markdown link: \
+[note title](note://<note_id>) using the exact note_id from the tool results. Never link a \
+note you did not read this turn, and never fabricate a note_id.
+
 The transcript labels channel 0 as You (the user) and channel 1 as Them (the other side).
 Return a concise title, a polished markdown final summary, and at most 10 suggested note edits.
 Suggested edits are additive insertions or expansions of the user's own notes, never rewrites.
 Each non-empty anchor must be an exact substring from the supplied notes and occurrence is 1-based.
 Use anchor "" to append at the end. Do not invent commitments or overwrite the user's wording.
+Ground the summary in the transcript and notes; verified knowledge-base context may enrich it, \
+unverified context must not appear at all.
 The final response must match the supplied JSON schema exactly."""
 
 
@@ -80,8 +100,9 @@ async def run_final_summary(
             timeout_s=config.FINAL_SUMMARY_TIMEOUT_S,
             schema=FINAL_SUMMARY_SCHEMA,
             max_tokens=config.FINAL_SUMMARY_MAX_TOKENS,
+            reasoning=config.FINAL_SUMMARY_REASONING,
         )
-        title, final_summary_md, edits = _validated_result(meeting, result)
+        title, final_summary_md, edits = _validated_result(meeting, result, index)
         base_rev = int(meeting.get("notes_rev") or 0)
         persisted = index.meeting_set_final(
             meeting_id,
@@ -162,8 +183,29 @@ def _render_transcript(value: Any) -> str:
     return "\n".join(lines)
 
 
+_NOTE_LINK_RE = re.compile(r"\[([^\]]+)\]\(note://([^)\s]+)\)")
+
+
+def _strip_unverified_note_links(markdown: str, index: Any) -> str:
+    """Keep note:// links only when the note actually exists in the corpus.
+
+    The prompt forbids linking unread notes, but hallucinated ids are cheap —
+    a dead link degrades to its plain-text label.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        note_id = unquote(match.group(2))
+        try:
+            exists = index.note(note_id) is not None
+        except Exception:
+            exists = False
+        return match.group(0) if exists else match.group(1)
+
+    return _NOTE_LINK_RE.sub(replace, markdown)
+
+
 def _validated_result(
-    meeting: Mapping[str, Any], result: Any
+    meeting: Mapping[str, Any], result: Any, index: Any
 ) -> tuple[str, str, list[SuggestedEdit]]:
     if not isinstance(result, Mapping):
         raise ValueError("final summary result was not an object")
@@ -185,12 +227,21 @@ def _validated_result(
 
     existing_title = str(meeting.get("title") or "").strip()
     title = existing_title or generated_title.strip()[:120]
+    final_summary = _strip_unverified_note_links(final_summary, index)
     notes_md = str(meeting.get("notes_md") or "")
     edits: list[SuggestedEdit] = []
     for row in raw_edits:
         validated = _validated_edit(row, notes_md)
         if validated is not None:
-            edits.append(validated)
+            edits.append(
+                validated.model_copy(
+                    update={
+                        "insert_md": _strip_unverified_note_links(
+                            validated.insert_md, index
+                        )
+                    }
+                )
+            )
         if len(edits) == 10:
             break
     # The summary itself lands in the notepad as one large pending suggestion

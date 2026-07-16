@@ -35,6 +35,7 @@ class FakeLLM:
         tools: list[dict[str, Any]],
         *,
         timeout_s: float | None = None,
+        reasoning: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.tool_calls.append(
             {

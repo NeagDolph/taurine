@@ -21,6 +21,7 @@ async def run_tool_agent(
     timeout_s: float,
     schema: dict[str, Any] | None = None,
     max_tokens: int | None = None,
+    reasoning: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run bounded tool rounds, then request strict JSON over the full history.
 
@@ -44,6 +45,7 @@ async def run_tool_agent(
                 history[1:],
                 tools,
                 timeout_s=remaining,
+                reasoning=reasoning,
             )
         if not isinstance(assistant, dict):
             raise TypeError("tool completion was not a message object")
