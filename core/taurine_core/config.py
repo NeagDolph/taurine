@@ -1,8 +1,11 @@
 """All tunables. In-code constants by convention — env vars are secrets only."""
 
+import os
+
 # ── sidecar ────────────────────────────────────────────────────────────
 HOST = "127.0.0.1"
 PORT = 8930
+TEST_CONTROLS_ENABLED = os.environ.get("TAURINE_TEST_CONTROLS") == "1"
 
 # ── ASR ────────────────────────────────────────────────────────────────
 # "deepgram" (general speech, prod-proven) | "taurine" (customer-service-tuned)

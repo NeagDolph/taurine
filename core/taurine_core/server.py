@@ -73,6 +73,7 @@ from taurine_core.schemas import (
     ChatMetaEvent,
     ChatRegenerateMsg,
     ChatSendMsg,
+    Chunk,
     ClusterInfo,
     ConnectorInfo,
     FactPayload,
@@ -84,6 +85,7 @@ from taurine_core.schemas import (
     GraphResponse,
     IdeaSearchRequest,
     IdeaSearchResponse,
+    InjectTranscriptMsg,
     IndexStatus,
     LocalGraphResponse,
     MeetingSummary,
@@ -1928,6 +1930,7 @@ async def _handle_control(
     try:
         message = _parse_control(raw)
     except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+        logger.log("control_rejected", detail=str(exc))
         await emit(_status_error(runtime, f"invalid control message: {exc}"))
         return session_started
 
@@ -2046,6 +2049,23 @@ async def _handle_control(
             context.notepad_base_rev = (
                 int(meeting["notes_rev"]) if meeting is not None else None
             )
+    elif isinstance(message, InjectTranscriptMsg):
+        live = ctx_holder[0].live
+        if live is None:
+            await emit(_status_error(runtime, "session has not started"))
+        else:
+            for row in message.chunks:
+                text = row.text.strip()
+                if not text:
+                    continue
+                await live.on_chunk(
+                    Chunk(
+                        channel=row.channel,
+                        text=text,
+                        ts=time.time(),
+                        final=True,
+                    )
+                )
     elif isinstance(message, OpenNoteMsg):
         try:
             await asyncio.to_thread(runtime.open_note, message.note_id)
@@ -2056,7 +2076,14 @@ async def _handle_control(
 
 def _parse_control(
     raw: str,
-) -> StartMsg | StopMsg | NotepadMsg | ActionableStatusMsg | OpenNoteMsg:
+) -> (
+    StartMsg
+    | StopMsg
+    | NotepadMsg
+    | InjectTranscriptMsg
+    | ActionableStatusMsg
+    | OpenNoteMsg
+):
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("control message must be a JSON object")
@@ -2071,6 +2098,10 @@ def _parse_control(
         return NotepadMsg.model_validate(payload)
     if message_type == "open_note":
         return OpenNoteMsg.model_validate(payload)
+    if message_type == "inject_transcript":
+        if not config.TEST_CONTROLS_ENABLED:
+            raise ValueError("test controls are disabled")
+        return InjectTranscriptMsg.model_validate(payload)
     raise ValueError(f"unsupported control type: {message_type}")
 
 

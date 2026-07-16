@@ -714,6 +714,16 @@ class NotepadMsg(BaseModel):
     text_md: Optional[str] = None
 
 
+class InjectTranscriptChunk(BaseModel):
+    channel: int
+    text: str
+
+
+class InjectTranscriptMsg(BaseModel):
+    type: Literal["inject_transcript"]
+    chunks: list[InjectTranscriptChunk]
+
+
 class OpenNoteMsg(BaseModel):
     type: Literal["open_note"]
     note_id: str
