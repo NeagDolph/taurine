@@ -10,6 +10,8 @@ class PcmWorkletProcessor extends AudioWorkletProcessor {
     this.frameOffset = 0
   }
 
+  /** @returns {boolean} */
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- AudioWorklet global is plain JavaScript.
   process(inputs) {
     const input = inputs[0]?.[0]
     if (!input || input.length === 0) {
@@ -35,6 +37,8 @@ class PcmWorkletProcessor extends AudioWorkletProcessor {
     return true
   }
 
+  /** @returns {number} */
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- AudioWorklet global is plain JavaScript.
   interpolate(input, cursor) {
     const lowerIndex = Math.floor(cursor)
     const upperIndex = Math.min(input.length - 1, lowerIndex + 1)
@@ -42,6 +46,8 @@ class PcmWorkletProcessor extends AudioWorkletProcessor {
     return input[lowerIndex] * (1 - blend) + input[upperIndex] * blend
   }
 
+  /** @returns {number} */
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- AudioWorklet global is plain JavaScript.
   toInt16(sample) {
     const clamped = Math.max(-1, Math.min(1, sample))
     return clamped < 0 ? clamped * 32768 : clamped * 32767

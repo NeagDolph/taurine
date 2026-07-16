@@ -1,5 +1,6 @@
 import { SIDECAR_WS_URL, parseConnectorInfo, parseProfileState, parseSyncStatus } from './sidecar'
 import type { ConnectorInfo, ProfileState, SyncStatus } from './sidecar'
+import { parseMeetingListRow, type MeetingListRow } from './meetings'
 
 // Long-lived state channel: the sidecar pushes connector/sync/re-enrich/graph/
 // profile changes here so the renderer never polls REST endpoints. REST is
@@ -27,7 +28,13 @@ export interface ProfileUpdate extends ProfileState {
   type: 'profile'
 }
 
-export type UpdateEvent = ConnectorsUpdate | SyncUpdate | GraphUpdate | ProfileUpdate
+export interface MeetingsUpdate {
+  type: 'meetings'
+  meetings: MeetingListRow[]
+}
+
+export type UpdateEvent =
+  ConnectorsUpdate | SyncUpdate | GraphUpdate | ProfileUpdate | MeetingsUpdate
 
 type Callback = (event: UpdateEvent) => void
 type Unsubscribe = () => void
@@ -163,6 +170,14 @@ export function parseUpdateEvent(raw: string): UpdateEvent | null {
     case 'profile': {
       const profile = parseProfileState(record)
       return profile ? { type: 'profile', ...profile } : null
+    }
+    case 'meetings': {
+      if (!Array.isArray(record.meetings)) return null
+      try {
+        return { type: 'meetings', meetings: record.meetings.map(parseMeetingListRow) }
+      } catch {
+        return null
+      }
     }
     default:
       return null

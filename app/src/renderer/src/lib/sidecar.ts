@@ -336,8 +336,13 @@ interface SidecarRequestOptions {
 
 type Callback<T> = (event: T) => void
 type Unsubscribe = () => void
+export interface StartMsg {
+  type: 'start'
+  channels: Array<{ id: number; label: string }>
+  meeting_id: string | null
+}
 type JsonControlMessage =
-  | { type: 'start'; channels: Array<{ id: number; label: string }> }
+  | StartMsg
   | { type: 'stop' }
   | { type: 'actionable_status'; id: string; status: 'confirmed' | 'dismissed' }
   | { type: 'open_note'; note_id: string }
@@ -351,6 +356,7 @@ export class SidecarClient {
   private reconnectAttempt = 0
   private closedByClient = false
   private sessionActive = false
+  private lastStartMessage: StartMsg | null = null
   private readonly restBaseUrl: string
 
   private readonly transcriptCallbacks = new Set<Callback<TranscriptEvent>>()
@@ -382,19 +388,25 @@ export class SidecarClient {
   disconnect(): void {
     this.closedByClient = true
     this.sessionActive = false
+    this.lastStartMessage = null
     this.clearReconnectTimer()
     this.socket?.close()
     this.socket = null
     this.emitConnection({ state: 'disconnected' })
   }
 
-  start(channels: Array<{ id: number; label: string }> = [{ id: 0, label: 'mic' }]): void {
+  start(
+    channels: Array<{ id: number; label: string }> = [{ id: 0, label: 'mic' }],
+    meetingId: string | null = null
+  ): void {
     this.sessionActive = true
-    this.sendJson({ type: 'start', channels })
+    this.lastStartMessage = { type: 'start', channels, meeting_id: meetingId }
+    this.sendJson(this.lastStartMessage)
   }
 
   stop(): void {
     this.sessionActive = false
+    this.lastStartMessage = null
     this.sendJson({ type: 'stop' })
   }
 
@@ -486,8 +498,8 @@ export class SidecarClient {
       this.reconnectAttempt = 0
       this.emitConnection({ state: 'connected' })
 
-      if (this.sessionActive) {
-        this.sendJson({ type: 'start', channels: [{ id: 0, label: 'mic' }] })
+      if (this.sessionActive && this.lastStartMessage) {
+        this.sendJson(this.lastStartMessage)
       }
     }
 

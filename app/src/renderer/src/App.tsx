@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { ActionableRail } from './components/ActionableRail'
-import { AmbientList } from './components/AmbientList'
 import { SessionControls, type ListeningState } from './components/SessionControls'
 import { StatusBar } from './components/StatusBar'
-import { SummaryPanel } from './components/SummaryPanel'
-import { TriggerInspector } from './components/TriggerInspector'
 import { PcmAudioCapture } from './lib/audio'
+import {
+  createMeeting as createMeetingRecord,
+  deleteMeeting as deleteMeetingRecord,
+  listMeetings,
+  patchMeeting,
+  type MeetingListRow
+} from './lib/meetings'
 import {
   SidecarClient,
   fetchStartupStatus,
@@ -19,20 +22,20 @@ import {
   type SidecarConnectionState,
   type StartupStatus,
   type SummaryEvent,
-  type TriggerEvent,
   type TranscriptEvent
 } from './lib/sidecar'
 import { UpdatesClient } from './lib/updates'
 import { ChatView, type ChatSeedRequest } from './views/ChatView'
 import { ConnectorsView } from './views/ConnectorsView'
 import { DataView } from './views/DataView'
-import { FeedView, type FeedTranscript } from './views/FeedView'
+import type { FeedTranscript } from './views/FeedView'
+import { MeetingsView, type MeetingsCoordinator } from './views/meetings/MeetingsView'
 import { MapView, type MapFocusRequest } from './views/map/MapView'
 
-type MainTab = 'live' | 'chat' | 'map' | 'data' | 'connectors'
+type MainTab = 'meetings' | 'chat' | 'map' | 'data' | 'connectors'
 
 const MAIN_TABS: Array<{ id: MainTab; label: string }> = [
-  { id: 'live', label: 'Live' },
+  { id: 'meetings', label: 'Meetings' },
   { id: 'chat', label: 'Chat' },
   { id: 'map', label: 'Map' },
   { id: 'data', label: 'Data' },
@@ -43,8 +46,14 @@ function App(): React.JSX.Element {
   const clientRef = useRef<SidecarClient | null>(null)
   const audioRef = useRef<PcmAudioCapture | null>(null)
   const transcriptIdRef = useRef(0)
+  const liveMeetingIdRef = useRef<string | null>(null)
+  const notesFlushRef = useRef<(() => Promise<void>) | null>(null)
+  const notesSavesRef = useRef<Map<string, Promise<void>>>(new Map())
 
-  const [activeTab, setActiveTab] = useState<MainTab>('live')
+  const [activeTab, setActiveTab] = useState<MainTab>('meetings')
+  const [meetingsIndex, setMeetingsIndex] = useState<MeetingListRow[]>([])
+  const [selectedMeetingId, setSelectedMeetingId] = useState<string | null>(null)
+  const [liveMeetingId, setLiveMeetingId] = useState<string | null>(null)
   const [connectors, setConnectors] = useState<ConnectorInfo[] | null>(null)
   const [graphVersion, setGraphVersion] = useState(0)
   const [profile, setProfile] = useState<ProfileState | undefined>(undefined)
@@ -60,8 +69,6 @@ function App(): React.JSX.Element {
   const [syncError, setSyncError] = useState('')
   const [chunks, setChunks] = useState<FeedTranscript[]>([])
   const [interimsByChannel, setInterimsByChannel] = useState<Record<number, TranscriptEvent>>({})
-  const [triggersBySeq, setTriggersBySeq] = useState<Map<number, TriggerEvent[]>>(new Map())
-  const [inspectGrounding, setInspectGrounding] = useState(false)
   const [liveGrounding, setLiveGrounding] = useState<LiveGroundingEvent | null>(null)
   const [summary, setSummary] = useState<SummaryEvent | null>(null)
   const [actionables, setActionables] = useState<Actionable[]>([])
@@ -71,15 +78,30 @@ function App(): React.JSX.Element {
   const [chatSeed, setChatSeed] = useState<ChatSeedRequest | null>(null)
 
   useEffect(() => {
+    let disposed = false
     const client = new SidecarClient()
     clientRef.current = client
+
+    const refreshMeetings = async (): Promise<void> => {
+      try {
+        const meetings = await listMeetings()
+        if (!disposed) {
+          setMeetingsIndex(meetings)
+          setSelectedMeetingId((current) => selectedMeetingForIndex(current, meetings))
+        }
+      } catch {
+        // The updates websocket will supply the list once core startup completes.
+      }
+    }
 
     const unsubscribe = [
       client.onConnection((event) => {
         setConnection(event.state)
         setRetryInMs(event.retryInMs)
+        if (event.state === 'connected') void refreshMeetings()
       }),
       client.onTranscript((event) => {
+        if (!liveMeetingIdRef.current) return
         if (event.final) {
           transcriptIdRef.current += 1
           setChunks((current) => appendFinalChunk(current, event, transcriptIdRef.current))
@@ -97,6 +119,7 @@ function App(): React.JSX.Element {
         }))
       }),
       client.onGrounding((event) => {
+        if (!liveMeetingIdRef.current) return
         setLiveGrounding(event)
         setGroundedNoteIds((current) => {
           const next = new Set(current)
@@ -105,6 +128,7 @@ function App(): React.JSX.Element {
         })
       }),
       client.onSummary((event) => {
+        if (!liveMeetingIdRef.current) return
         setSummary(event)
         setActionables(event.actionables)
         setGroundedNoteIds((current) => {
@@ -114,6 +138,7 @@ function App(): React.JSX.Element {
         })
       }),
       client.onActionable((event) => {
+        if (!liveMeetingIdRef.current) return
         setActionables((current) => {
           const withoutItem = current.filter((item) => item.id !== event.item.id)
           if (event.op === 'dismiss') {
@@ -123,10 +148,8 @@ function App(): React.JSX.Element {
         })
       }),
       client.onRetrieval((event) => {
+        if (!liveMeetingIdRef.current) return
         setLastRetrieval(event)
-      }),
-      client.onTrigger((event) => {
-        setTriggersBySeq((current) => registerTrigger(current, event))
       }),
       client.onStatus((event) => {
         setAsr(event.asr)
@@ -154,17 +177,24 @@ function App(): React.JSX.Element {
         case 'profile':
           setProfile({ card: event.card, generation: event.generation })
           break
+        case 'meetings':
+          setMeetingsIndex(event.meetings)
+          setSelectedMeetingId((current) => selectedMeetingForIndex(current, event.meetings))
+          break
       }
     })
     updates.connect()
+    void refreshMeetings()
 
     return () => {
+      disposed = true
       audioRef.current?.stop()
       audioRef.current = null
       client.stop()
       unsubscribe.forEach((remove) => remove())
       client.disconnect()
       clientRef.current = null
+      liveMeetingIdRef.current = null
       unsubscribeUpdates()
       updates.disconnect()
     }
@@ -201,48 +231,139 @@ function App(): React.JSX.Element {
     }
   }, [connection])
 
-  useEffect(() => {
-    setTriggersBySeq((current) => pruneTriggersByChunks(current, chunks))
-  }, [chunks])
-
-  const interims = useMemo(() => Object.values(interimsByChannel), [interimsByChannel])
   const latestFinalText = chunks.length > 0 ? chunks[chunks.length - 1].text : ''
   const isSyncing = syncing || Boolean(index.sync?.running)
 
-  const startListening = useCallback(async () => {
-    const client = clientRef.current
-    if (!client || listeningState === 'starting' || listeningState === 'listening') {
+  const selectMeeting = useCallback((id: string | null) => {
+    setSelectedMeetingId(id)
+  }, [])
+
+  const createMeeting = useCallback(async (): Promise<string> => {
+    const meeting = await createMeetingRecord()
+    setMeetingsIndex((current) => upsertMeetingRow(current, meeting))
+    setSelectedMeetingId(meeting.meetingId)
+    return meeting.meetingId
+  }, [])
+
+  const deleteMeeting = useCallback(
+    async (id: string): Promise<void> => {
+      if (id === liveMeetingId) throw new Error('Stop the live meeting before deleting it')
+      await deleteMeetingRecord(id)
+      const remaining = meetingsIndex.filter((meeting) => meeting.meetingId !== id)
+      setMeetingsIndex(remaining)
+      if (selectedMeetingId === id) setSelectedMeetingId(remaining[0]?.meetingId ?? null)
+    },
+    [liveMeetingId, meetingsIndex, selectedMeetingId]
+  )
+
+  const renameMeeting = useCallback(async (id: string, title: string): Promise<void> => {
+    const meeting = await patchMeeting(id, { title })
+    setMeetingsIndex((current) => upsertMeetingRow(current, meeting))
+  }, [])
+
+  const saveNotes = useCallback((id: string, notesMd: string): Promise<void> => {
+    const prior = notesSavesRef.current.get(id) ?? Promise.resolve()
+    const task = prior
+      .catch(() => undefined)
+      .then(async () => {
+        const meeting = await patchMeeting(id, { notesMd })
+        setMeetingsIndex((current) => upsertMeetingRow(current, meeting))
+      })
+    notesSavesRef.current.set(id, task)
+    task.then(
+      () => {
+        if (notesSavesRef.current.get(id) === task) notesSavesRef.current.delete(id)
+      },
+      () => {
+        if (notesSavesRef.current.get(id) === task) notesSavesRef.current.delete(id)
+      }
+    )
+    return task
+  }, [])
+
+  const registerNotesFlush = useCallback((flush: () => Promise<void>): (() => void) => {
+    notesFlushRef.current = flush
+    return () => {
+      if (notesFlushRef.current === flush) notesFlushRef.current = null
+    }
+  }, [])
+
+  const startMeeting = useCallback(
+    async (id?: string): Promise<void> => {
+      const client = clientRef.current
+      if (!client || listeningState === 'starting' || listeningState === 'listening') {
+        return
+      }
+
+      let meetingId = id
+      if (!meetingId) {
+        try {
+          meetingId = await createMeeting()
+        } catch (error) {
+          setMicError(error instanceof Error ? error.message : 'Meeting could not be created')
+          setListeningState('error')
+          return
+        }
+      }
+      setSelectedMeetingId(meetingId)
+      setActiveTab('meetings')
+      setMicError('')
+      setListeningState('starting')
+      liveMeetingIdRef.current = meetingId
+      setLiveMeetingId(meetingId)
+      transcriptIdRef.current = 0
+      setChunks([])
+      setInterimsByChannel({})
+      setLiveGrounding(null)
+      setSummary(null)
+      setActionables([])
+      setGroundedNoteIds([])
+      setLastRetrieval(null)
+      client.start([{ id: 0, label: 'mic' }], meetingId)
+
+      const capture = new PcmAudioCapture((frame) => {
+        clientRef.current?.sendAudioFrame(frame)
+      })
+      audioRef.current = capture
+
+      try {
+        await capture.start()
+        setListeningState('listening')
+      } catch (error) {
+        capture.stop()
+        audioRef.current = null
+        client.stop()
+        liveMeetingIdRef.current = null
+        setLiveMeetingId(null)
+        setMicError(error instanceof Error ? error.message : 'Microphone capture failed')
+        setListeningState('error')
+      }
+    },
+    [createMeeting, listeningState]
+  )
+
+  const stopMeeting = useCallback(async (): Promise<void> => {
+    if (listeningState !== 'listening' && listeningState !== 'starting') return
+    setListeningState('stopping')
+    try {
+      await notesFlushRef.current?.()
+      await Promise.all([...notesSavesRef.current.values()])
+    } catch (error) {
+      setMicError(
+        error instanceof Error
+          ? `Could not save notes before stopping: ${error.message}`
+          : 'Could not save notes before stopping'
+      )
+      setListeningState('listening')
       return
     }
-
-    setMicError('')
-    setListeningState('starting')
-    client.start([{ id: 0, label: 'mic' }])
-
-    const capture = new PcmAudioCapture((frame) => {
-      clientRef.current?.sendAudioFrame(frame)
-    })
-    audioRef.current = capture
-
-    try {
-      await capture.start()
-      setListeningState('listening')
-    } catch (error) {
-      capture.stop()
-      audioRef.current = null
-      client.stop()
-      setMicError(error instanceof Error ? error.message : 'Microphone capture failed')
-      setListeningState('error')
-    }
-  }, [listeningState])
-
-  const stopListening = useCallback(() => {
-    setListeningState('stopping')
     audioRef.current?.stop()
     audioRef.current = null
     clientRef.current?.stop()
+    liveMeetingIdRef.current = null
+    setLiveMeetingId(null)
     setListeningState('idle')
-  }, [])
+  }, [listeningState])
 
   const actionableStatus = useCallback((id: string, status: 'confirmed' | 'dismissed') => {
     clientRef.current?.actionableStatus(id, status)
@@ -304,6 +425,53 @@ function App(): React.JSX.Element {
     }
   }, [index.sync?.running])
 
+  const meetingsCoordinator = useMemo<MeetingsCoordinator>(
+    () => ({
+      meetings: meetingsIndex,
+      selectedMeetingId,
+      liveMeetingId,
+      listeningState,
+      micError: micError || null,
+      live: {
+        chunks,
+        interims: interimsByChannel,
+        summary,
+        actionables,
+        liveGrounding
+      },
+      selectMeeting,
+      createMeeting,
+      deleteMeeting,
+      renameMeeting,
+      startMeeting,
+      stopMeeting,
+      saveNotes,
+      registerNotesFlush,
+      setActionableStatus: actionableStatus
+    }),
+    [
+      actionables,
+      actionableStatus,
+      chunks,
+      createMeeting,
+      deleteMeeting,
+      interimsByChannel,
+      listeningState,
+      liveGrounding,
+      liveMeetingId,
+      meetingsIndex,
+      micError,
+      registerNotesFlush,
+      renameMeeting,
+      saveNotes,
+      selectMeeting,
+      selectedMeetingId,
+      startMeeting,
+      stopMeeting,
+      summary
+    ]
+  )
+
   const showDisconnectedBanner = connection !== 'connected'
 
   return (
@@ -344,8 +512,8 @@ function App(): React.JSX.Element {
         <SessionControls
           state={listeningState}
           error={micError}
-          onStart={startListening}
-          onStop={stopListening}
+          onStart={() => void startMeeting()}
+          onStop={() => void stopMeeting()}
         />
       </header>
 
@@ -359,36 +527,14 @@ function App(): React.JSX.Element {
       ) : null}
 
       <div className="min-h-0 flex-1" style={viewStackStyle}>
-        <div aria-hidden={activeTab !== 'live'} style={viewLayerStyle(activeTab === 'live')}>
-          <div className="flex h-full min-h-0 flex-col gap-2.5 overflow-hidden px-px pb-1 pt-px">
-            <div className="grid max-h-[42vh] min-h-0 flex-none grid-cols-[minmax(0,3fr)_minmax(280px,2fr)] gap-2.5">
-              <SummaryPanel summary={summary} onOpenNote={openNote} onShowInMap={showInMap} />
-              <ActionableRail
-                actionables={actionables}
-                evidence={summary?.evidence ?? null}
-                onStatus={actionableStatus}
-                onOpenNote={openNote}
-              />
-            </div>
-            <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_clamp(280px,26vw,340px)] gap-2.5">
-              <main className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)] overflow-hidden rounded-[10px] border border-white/[0.08] bg-surface-1/60">
-                <FeedView
-                  chunks={chunks}
-                  interims={interims}
-                  triggersBySeq={triggersBySeq}
-                  onInspectTrigger={() => undefined}
-                />
-              </main>
-
-              <AmbientList
-                notes={liveGrounding?.display_notes ?? []}
-                passages={liveGrounding?.display_passages ?? []}
-                noNewEvidence={liveGrounding?.no_new_evidence}
-                onInspect={liveGrounding ? () => setInspectGrounding(true) : undefined}
-                onOpenNote={openNote}
-              />
-            </div>
-          </div>
+        <div
+          aria-hidden={activeTab !== 'meetings'}
+          style={viewLayerStyle(activeTab === 'meetings')}
+        >
+          <MeetingsView
+            key={selectedMeetingId ?? 'no-meeting-selected'}
+            coordinator={meetingsCoordinator}
+          />
         </div>
 
         <div aria-hidden={activeTab !== 'chat'} style={viewLayerStyle(activeTab === 'chat')}>
@@ -432,12 +578,6 @@ function App(): React.JSX.Element {
           />
         </div>
       </div>
-
-      <TriggerInspector
-        grounding={inspectGrounding ? liveGrounding : null}
-        onClose={() => setInspectGrounding(false)}
-        onOpenNote={openNote}
-      />
 
       <StatusBar
         asr={asr}
@@ -507,41 +647,27 @@ function compareTranscriptChunks(left: FeedTranscript, right: FeedTranscript): n
   return left.ts - right.ts
 }
 
-function registerTrigger(
-  current: Map<number, TriggerEvent[]>,
-  trigger: TriggerEvent
-): Map<number, TriggerEvent[]> {
-  const next = new Map(current)
-
-  for (const seq of trigger.seqs) {
-    if (seq <= 0) {
-      continue
-    }
-
-    const existing = next.get(seq) ?? []
-    next.set(seq, [...existing.filter((item) => item.trigger_id !== trigger.trigger_id), trigger])
+function upsertMeetingRow(current: MeetingListRow[], meeting: MeetingListRow): MeetingListRow[] {
+  const row: MeetingListRow = {
+    meetingId: meeting.meetingId,
+    title: meeting.title,
+    createdAt: meeting.createdAt,
+    updatedAt: meeting.updatedAt,
+    startedAt: meeting.startedAt,
+    endedAt: meeting.endedAt,
+    status: meeting.status
   }
-
-  return next
+  return [row, ...current.filter((item) => item.meetingId !== meeting.meetingId)].sort(
+    (left, right) => right.createdAt - left.createdAt
+  )
 }
 
-function pruneTriggersByChunks(
-  current: Map<number, TriggerEvent[]>,
-  chunks: FeedTranscript[]
-): Map<number, TriggerEvent[]> {
-  const retainedSeqs = new Set(chunks.map((chunk) => chunk.seq).filter((seq) => seq > 0))
-  let changed = false
-  const next = new Map<number, TriggerEvent[]>()
-
-  for (const [seq, triggers] of current) {
-    if (retainedSeqs.has(seq)) {
-      next.set(seq, triggers)
-    } else {
-      changed = true
-    }
-  }
-
-  return changed ? next : current
+function selectedMeetingForIndex(
+  current: string | null,
+  meetings: MeetingListRow[]
+): string | null {
+  if (current && meetings.some((row) => row.meetingId === current)) return current
+  return meetings[0]?.meetingId ?? null
 }
 
 const viewStackStyle: CSSProperties = {

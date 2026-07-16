@@ -68,7 +68,8 @@ export function FeedView({
   }, [chunks, interims, atBottom])
 
   useEffect(() => {
-    setAtBottom(computeAtBottom())
+    const frame = window.requestAnimationFrame(() => setAtBottom(computeAtBottom()))
+    return () => window.cancelAnimationFrame(frame)
   }, [computeAtBottom, isEmpty])
 
   return (
@@ -167,7 +168,10 @@ function TranscriptRow({
   )
 }
 
-function buildTriggerAnnotations(chunk: TranscriptEvent, triggers: TriggerEvent[]): TriggerAnnotations {
+function buildTriggerAnnotations(
+  chunk: TranscriptEvent,
+  triggers: TriggerEvent[]
+): TriggerAnnotations {
   const ranges: SpanRange[] = []
   const chips: TriggerEvent[] = []
   const hasSearchTrigger = triggers.some((trigger) => trigger.kind === 'search')
@@ -303,7 +307,10 @@ function normalizeForSearch(value: string): { value: string; indexMap: number[] 
   return { value: normalized, indexMap }
 }
 
-function rangesOverlap(left: { start: number; end: number }, right: { start: number; end: number }): boolean {
+function rangesOverlap(
+  left: { start: number; end: number },
+  right: { start: number; end: number }
+): boolean {
   return left.start < right.end && right.start < left.end
 }
 
@@ -320,7 +327,9 @@ function chipLabel(trigger: TriggerEvent): string {
 }
 
 function channelLabel(channel: number): string {
-  return channel === 0 ? 'Mic' : `Ch ${channel}`
+  if (channel === 0) return 'You'
+  if (channel === 1) return 'Them'
+  return `Ch ${channel}`
 }
 
 function formatTime(ts: number): string {
