@@ -15,7 +15,7 @@ from taurine_core.indexer.store import Index
 from taurine_core.live.grounding import GroundingEngine
 from taurine_core.live.ingest import LiveSession
 from taurine_core.retrieval.registry import EvidenceRegistry
-from taurine_core.schemas import Chunk, MeetingSummary, SyncReport
+from taurine_core.schemas import Chunk, FinalSummaryEvent, MeetingSummary, SyncReport
 from taurine_core.server import Runtime, UpdateBus, create_app, _parse_control
 
 
@@ -583,3 +583,404 @@ async def test_stale_disconnect_cannot_replace_newer_epoch_finalizer(
     assert runtime.meeting_finalizers[meeting_id] is newer_handle
     newer_handle._run()
     assert index.meeting_get(meeting_id)["status"] == "done"
+
+
+async def test_stop_orders_snapshot_and_starts_one_runtime_owned_finalization(
+    index: Index, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meeting = index.meeting_create("Ordered")
+    meeting_id = meeting["meeting_id"]
+    index.meeting_update(meeting_id, notes_md="row notes")
+    index.meeting_set_status(meeting_id, "live", started_at=1.0)
+    order: list[str] = []
+    snapshots: list[dict[str, Any]] = []
+    release = asyncio.Event()
+
+    @dataclass
+    class OrderedLive(FakeLiveSession):
+        async def aclose(self) -> None:
+            order.append("live.aclose")
+            await super().aclose()
+
+        def current_summary(self) -> MeetingSummary:
+            return MeetingSummary(
+                summary_md="Fresh rolling summary",
+                actionables=[],
+            )
+
+    @dataclass
+    class OrderedASR(FakeASRClient):
+        async def stop(self) -> None:
+            order.append("asr.stop")
+            await super().stop()
+
+    async def fake_run_final_summary(
+        snapshot: dict[str, Any], llm: Any, execute_tool: Any,
+        profile_block: str, emit: Any, store: Any,
+    ) -> None:
+        del llm, execute_tool, profile_block, emit, store
+        order.append("final_summary")
+        snapshots.append(snapshot)
+        await release.wait()
+
+    monkeypatch.setattr(server_module, "run_final_summary", fake_run_final_summary)
+    runtime = Runtime(
+        index=index,
+        sync_once=lambda: SyncReport(0, 0, 0, 0),
+        open_note=lambda note_id: None,
+        make_live_session=None,
+        make_asr_client=lambda on_chunk, on_status, index_status: OrderedASR(on_chunk),
+        final_summary_llm=object(),
+        make_final_summary_tool_executor=lambda requested_id: _unused_executor,
+    )
+    live = OrderedLive()
+    context = server_module.SessionContext(
+        generation=1,
+        meeting_id=meeting_id,
+        live=live,
+        asr=OrderedASR(live.on_chunk),
+        notepad_md="fresh websocket notes",
+        notepad_base_rev=1,
+    )
+    runtime.active_sessions[meeting_id] = context
+    runtime.meeting_epochs[meeting_id] = 1
+    runtime.context_epochs[id(context)] = 1
+    buffer = server_module._MeetingTranscriptBuffer(index, meeting_id)
+    original_flush = buffer.flush
+
+    async def ordered_flush() -> None:
+        order.append("transcript.flush")
+        await original_flush()
+
+    buffer.flush = ordered_flush  # type: ignore[method-assign]
+    holder = [context]
+
+    await server_module._handle_control(
+        json.dumps({"type": "stop"}),
+        ctx_holder=holder,
+        transcript_buffer=[buffer],
+        on_final_chunk=lambda chunk: None,
+        runtime=runtime,
+        emit=_unused_emit,
+        logger=server_module.NullSessionLogger(),
+        session_started=True,
+    )
+    await asyncio.sleep(0)
+
+    assert order[:4] == [
+        "asr.stop",
+        "live.aclose",
+        "transcript.flush",
+        "final_summary",
+    ]
+    stored = index.meeting_get(meeting_id)
+    assert stored["status"] == "summarizing"
+    assert stored["notes_md"] == "fresh websocket notes"
+    assert snapshots[0]["notes_md"] == "fresh websocket notes"
+    assert snapshots[0]["notes_rev"] == stored["notes_rev"]
+    assert snapshots[0]["last_live_summary"]["summary_md"] == "Fresh rolling summary"
+    assert list(runtime.finalization_tasks) == [meeting_id]
+
+    await server_module._handle_control(
+        json.dumps({"type": "stop"}),
+        ctx_holder=holder,
+        transcript_buffer=[buffer],
+        on_final_chunk=lambda chunk: None,
+        runtime=runtime,
+        emit=_unused_emit,
+        logger=server_module.NullSessionLogger(),
+        session_started=True,
+    )
+    assert len(runtime.finalization_tasks) == 1
+
+    release.set()
+    await asyncio.gather(*tuple(runtime.finalization_tasks.values()))
+    await asyncio.sleep(0)
+    assert meeting_id not in runtime.finalization_tasks
+
+
+async def test_snapshot_keeps_rest_notes_saved_after_last_ws_notepad(index: Index) -> None:
+    meeting = index.meeting_create("Freshness")
+    meeting_id = meeting["meeting_id"]
+    first = index.meeting_update(meeting_id, notes_md="row at ws arrival")
+    context = server_module.SessionContext(
+        generation=1,
+        meeting_id=meeting_id,
+        live=FakeLiveSession(),
+        notepad_md="stale websocket draft",
+        notepad_base_rev=first["notes_rev"],
+    )
+    newest = index.meeting_update(meeting_id, notes_md="newer REST autosave")
+    index.meeting_set_status(meeting_id, "live", started_at=1.0)
+    runtime = _runtime(index)
+    runtime.meeting_epochs[meeting_id] = 1
+    runtime.context_epochs[id(context)] = 1
+
+    snapshot = await server_module._capture_finalization_snapshot(
+        runtime, context, None
+    )
+
+    assert snapshot is not None
+    assert snapshot.notes_md == "newer REST autosave"
+    assert snapshot.notes_rev == newest["notes_rev"]
+    assert index.meeting_get(meeting_id)["notes_md"] == "newer REST autosave"
+
+
+async def test_grace_expiry_uses_final_summary_pipeline_and_epoch_guard(
+    index: Index, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "MEETING_FINALIZE_GRACE_S", 3600)
+    meeting = index.meeting_create("Grace pipeline")
+    meeting_id = meeting["meeting_id"]
+    index.meeting_set_status(meeting_id, "live", started_at=1.0)
+    calls: list[str] = []
+
+    async def fake_run_final_summary(
+        snapshot: dict[str, Any], llm: Any, execute_tool: Any,
+        profile_block: str, emit: Any, store: Any,
+    ) -> None:
+        del llm, execute_tool, profile_block, store
+        calls.append(snapshot["meeting_id"])
+        await emit(object())
+        index.meeting_set_status(meeting_id, "done")
+
+    monkeypatch.setattr(server_module, "run_final_summary", fake_run_final_summary)
+    runtime = _runtime(index)
+    runtime.final_summary_llm = object()
+    runtime.make_final_summary_tool_executor = lambda requested_id: _unused_executor
+    runtime.meeting_epochs[meeting_id] = 2
+    snapshot = server_module._MeetingFinalizationSnapshot(
+        meeting_id=meeting_id,
+        epoch=2,
+        title="Grace pipeline",
+        notes_md="",
+        notes_rev=0,
+        transcript=[],
+        last_live_summary={},
+    )
+
+    server_module._schedule_meeting_finalization(runtime, snapshot)
+    runtime.meeting_finalizers[meeting_id]._run()
+    await asyncio.sleep(0)
+    await asyncio.gather(*tuple(runtime.finalization_tasks.values()))
+
+    assert calls == [meeting_id]
+    assert index.meeting_get(meeting_id)["status"] == "done"
+
+    index.meeting_set_status(meeting_id, "live")
+    runtime.meeting_epochs[meeting_id] = 3
+    server_module._schedule_meeting_finalization(runtime, snapshot)
+    assert meeting_id not in runtime.meeting_finalizers
+
+
+async def test_restart_cancels_running_finalizer_before_starting_new_epoch(
+    index: Index, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meeting = index.meeting_create("Restart")
+    meeting_id = meeting["meeting_id"]
+    index.meeting_set_status(meeting_id, "live", started_at=1.0)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocking_final_summary(
+        snapshot: dict[str, Any], llm: Any, execute_tool: Any,
+        profile_block: str, emit: Any, store: Any,
+    ) -> None:
+        del snapshot, llm, execute_tool, profile_block, emit, store
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(server_module, "run_final_summary", blocking_final_summary)
+    runtime = _runtime(index)
+    runtime.final_summary_llm = object()
+    runtime.make_final_summary_tool_executor = lambda requested_id: _unused_executor
+    runtime.meeting_epochs[meeting_id] = 1
+    snapshot = server_module._MeetingFinalizationSnapshot(
+        meeting_id=meeting_id,
+        epoch=1,
+        notes_md="",
+        transcript=[],
+        title="Restart",
+        notes_rev=0,
+        last_live_summary={},
+    )
+    assert server_module._start_meeting_finalization(
+        runtime, snapshot, _unused_emit
+    )
+    await entered.wait()
+
+    holder = [server_module.SessionContext(generation=0, meeting_id=None)]
+    await server_module._handle_control(
+        json.dumps(
+            {
+                "type": "start",
+                "channels": [{"id": 0, "label": "mic"}],
+                "meeting_id": meeting_id,
+            }
+        ),
+        ctx_holder=holder,
+        transcript_buffer=[None],
+        on_final_chunk=lambda chunk: None,
+        runtime=runtime,
+        emit=_unused_emit,
+        logger=server_module.NullSessionLogger(),
+        session_started=False,
+    )
+
+    assert cancelled.is_set()
+    assert meeting_id not in runtime.finalization_tasks
+    assert runtime.meeting_epochs[meeting_id] == 2
+    assert index.meeting_get(meeting_id)["status"] == "live"
+
+
+async def test_finalization_publishes_meetings_before_terminal_event(
+    index: Index, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meeting = index.meeting_create("Ordering")
+    meeting_id = meeting["meeting_id"]
+    index.meeting_set_status(meeting_id, "summarizing", ended_at=1.0)
+    order: list[str] = []
+
+    class RecordingUpdates:
+        def publish(self, kind: str) -> None:
+            order.append(f"publish:{kind}")
+
+    async def fake_run_final_summary(
+        snapshot: dict[str, Any], llm: Any, execute_tool: Any,
+        profile_block: str, emit: Any, store: Any,
+    ) -> None:
+        del llm, execute_tool, profile_block
+        order.append("persist")
+        store.meeting_set_final(
+            meeting_id,
+            final_summary_md="Summary",
+            suggestions=[],
+            base_rev=0,
+            title="Ordering",
+        )
+        store.meeting_set_status(meeting_id, "done")
+        await emit(
+            FinalSummaryEvent(
+                meeting_id=meeting_id,
+                title="Ordering",
+                final_summary_md="Summary",
+                base_rev=0,
+            )
+        )
+
+    async def emit(event: Any) -> None:
+        order.append(f"event:{event.type}")
+
+    monkeypatch.setattr(server_module, "run_final_summary", fake_run_final_summary)
+    runtime = _runtime(index)
+    runtime.updates = RecordingUpdates()  # type: ignore[assignment]
+    runtime.final_summary_llm = object()
+    runtime.make_final_summary_tool_executor = lambda requested_id: _unused_executor
+    snapshot = server_module._MeetingFinalizationSnapshot(
+        meeting_id=meeting_id,
+        epoch=1,
+        title="Ordering",
+        notes_md="",
+        notes_rev=0,
+        transcript=[],
+        last_live_summary={},
+    )
+
+    await server_module._run_meeting_finalization(runtime, snapshot, emit)
+
+    assert order == ["persist", "publish:meetings", "event:final_summary"]
+
+
+async def test_delete_meeting_cancels_running_finalization(index: Index) -> None:
+    meeting = index.meeting_create("Delete running")
+    meeting_id = meeting["meeting_id"]
+    index.meeting_set_status(meeting_id, "summarizing", ended_at=1.0)
+    cancelled = asyncio.Event()
+
+    async def blocking() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    runtime = _runtime(index)
+    runtime.finalization_tasks[meeting_id] = asyncio.create_task(blocking())
+    await asyncio.sleep(0)
+
+    await server_module._delete_meeting(runtime, meeting_id)
+
+    assert cancelled.is_set()
+    assert meeting_id not in runtime.finalization_tasks
+    assert index.meeting_get(meeting_id) is None
+
+
+async def test_shutdown_cancels_finalizations_and_marks_rows_done(index: Index) -> None:
+    meetings = [index.meeting_create("One"), index.meeting_create("Two")]
+    runtime = _runtime(index)
+    cancelled: list[str] = []
+
+    async def blocking(meeting_id: str) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(meeting_id)
+
+    for meeting in meetings:
+        meeting_id = meeting["meeting_id"]
+        index.meeting_set_status(meeting_id, "summarizing", ended_at=1.0)
+        runtime.finalization_tasks[meeting_id] = asyncio.create_task(
+            blocking(meeting_id)
+        )
+    await asyncio.sleep(0)
+
+    await server_module._shutdown_finalization_tasks(runtime)
+
+    assert set(cancelled) == {meeting["meeting_id"] for meeting in meetings}
+    assert runtime.finalization_tasks == {}
+    assert all(
+        index.meeting_get(meeting["meeting_id"])["status"] == "done"
+        for meeting in meetings
+    )
+
+
+async def test_shutdown_cancels_grace_before_draining_finalization_tasks(
+    index: Index,
+) -> None:
+    meeting = index.meeting_create("Shutdown order")
+    meeting_id = meeting["meeting_id"]
+    index.meeting_set_status(meeting_id, "summarizing", ended_at=1.0)
+    order: list[str] = []
+
+    class GraceHandle:
+        def cancel(self) -> None:
+            order.append("grace.cancel")
+
+    async def blocking() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("task.cancel")
+
+    runtime = _runtime(index)
+    runtime.meeting_finalizers[meeting_id] = GraceHandle()  # type: ignore[assignment]
+    runtime.finalization_tasks[meeting_id] = asyncio.create_task(blocking())
+    await asyncio.sleep(0)
+
+    await server_module._shutdown_meeting_finalizations(runtime)
+
+    assert order == ["grace.cancel", "task.cancel"]
+    assert runtime.meeting_finalizers == {}
+    assert runtime.finalization_tasks == {}
+    assert index.meeting_get(meeting_id)["status"] == "done"
+
+
+async def _unused_executor(name: str, arguments: dict[str, Any]) -> str:
+    del name, arguments
+    return "{}"
+
+
+async def _unused_emit(event: Any) -> None:
+    del event

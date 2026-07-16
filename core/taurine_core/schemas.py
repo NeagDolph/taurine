@@ -522,6 +522,31 @@ class ActionableEvent(BaseModel):
     item: Actionable
 
 
+class SuggestedEdit(BaseModel):
+    id: str
+    anchor: str
+    occurrence: int
+    insert_md: str
+    rationale: str
+    status: Literal["pending"] = "pending"
+
+
+class FinalSummaryStatusEvent(BaseModel):
+    type: Literal["final_summary_status"] = "final_summary_status"
+    meeting_id: str
+    state: Literal["running", "done", "error"]
+    detail: str = ""
+
+
+class FinalSummaryEvent(BaseModel):
+    type: Literal["final_summary"] = "final_summary"
+    meeting_id: str
+    title: str
+    final_summary_md: str
+    base_rev: int
+    suggested_edits: list[SuggestedEdit] = []
+
+
 class RetrievalEvent(BaseModel):
     type: Literal["retrieval"] = "retrieval"
     heard: str

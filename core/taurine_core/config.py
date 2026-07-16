@@ -247,6 +247,11 @@ FUZZY_SNAP_LABELS = ("person", "organization", "project")  # spans eligible for 
 # ── summarizer (spec 2026-07-08: one pass, change-triggered) ───────────
 SUMMARY_MODEL = "deepseek/deepseek-v4-flash"
 LIVE_SUMMARY_MODEL = "google/gemini-3.5-flash"
+FINAL_SUMMARY_MODEL = "google/gemini-3.5-flash"
+FINAL_SUMMARY_MAX_TOOL_CALLS = 6
+FINAL_SUMMARY_TIMEOUT_S = 120
+FINAL_SUMMARY_MAX_TOKENS = 8192          # final strict-JSON turn generation ceiling
+FINAL_SUMMARY_MAX_CHARS = 64_000         # reject oversized decoded JSON before persistence
 SUMMARY_FALLBACK_MODEL = "deepseek/deepseek-chat"
 IDEA_SEARCH_MODEL = SUMMARY_MODEL        # idea-lens per-note alignment adjudication
 CONTEXT_ENRICH_MODEL = SUMMARY_MODEL     # situating prefixes for episodic passages (empty on failure)

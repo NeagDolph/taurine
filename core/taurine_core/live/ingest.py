@@ -18,6 +18,8 @@ from taurine_core.schemas import (
     Actionable,
     ActionableEvent,
     Chunk,
+    FinalSummaryEvent,
+    FinalSummaryStatusEvent,
     LiveGroundingEvent,
     MeetingSummary,
     SummaryEvent,
@@ -25,7 +27,14 @@ from taurine_core.schemas import (
 )
 
 
-Event = TranscriptEvent | LiveGroundingEvent | SummaryEvent | ActionableEvent
+Event = (
+    TranscriptEvent
+    | LiveGroundingEvent
+    | SummaryEvent
+    | ActionableEvent
+    | FinalSummaryStatusEvent
+    | FinalSummaryEvent
+)
 EventSink = Callable[[Event], Awaitable[None] | None]
 FinalChunkSink = Callable[[dict[str, Any]], Awaitable[None] | None]
 

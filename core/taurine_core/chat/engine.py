@@ -37,7 +37,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Coroutine, Mapping, Sequence
 from uuid import uuid4
 
 from .. import config
@@ -69,6 +69,7 @@ from .tools import TOOL_DEFINITIONS, execute_tool, render_search_result
 
 # async callback the server provides: emits one ws event dict/model to the client
 EmitFn = Callable[[Any], Coroutine[Any, Any, None]]
+ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[str]]
 
 # GLM-5.2 leaks its native tool-call markup as plain text when it wants a
 # tool on the forced no-tools round (live smoke 2026-07-08) — never render it
@@ -91,6 +92,38 @@ def _preserves_named_entities(original: str, rewritten: str) -> bool:
     }
     lowered = rewritten.casefold()
     return all(re.search(rf"\b{re.escape(token)}\b", lowered) for token in named)
+
+
+def make_tool_executor(
+    retriever: ChatRetriever,
+    *,
+    now: Callable[[], float] = time.time,
+) -> ToolExecutor:
+    """Expose chat's bounded evidence-tool executor for other runtime agents."""
+
+    async def run(name: str, arguments: dict[str, Any]) -> str:
+        result_json, _step = await _execute_tool_async(
+            name, arguments, retriever, now=now()
+        )
+        return result_json
+
+    return run
+
+
+async def _execute_tool_async(
+    name: str,
+    arguments: dict[str, Any],
+    retriever: ChatRetriever,
+    *,
+    now: float,
+) -> tuple[str, ChatActivityStep]:
+    return await asyncio.to_thread(
+        execute_tool,
+        name,
+        arguments,
+        retriever,
+        now=now,
+    )
 
 
 @dataclass
@@ -700,8 +733,7 @@ class ChatEngine:
                         )
                     else:
                         # Tool execution is retrieval work — keep it off the loop.
-                        result_json, done_step = await asyncio.to_thread(
-                            execute_tool,
+                        result_json, done_step = await _execute_tool_async(
                             str(call.get("name") or ""),
                             arguments,
                             retriever,

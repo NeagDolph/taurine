@@ -149,6 +149,85 @@ async def test_complete_tools_posts_openrouter_tools_request_and_returns_message
 
 
 @pytest.mark.asyncio
+async def test_complete_tools_accepts_per_call_timeout_override() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "done"}}]})
+
+    client = OpenRouterClient("secret-key", transport=httpx.MockTransport(handler))
+
+    await client.complete_tools(
+        "model-a", "system", [{"role": "user", "content": "user"}], [], timeout_s=37.5
+    )
+
+    assert requests[0].extensions["timeout"]["read"] == 37.5
+
+
+@pytest.mark.asyncio
+async def test_complete_json_messages_preserves_full_history_and_strict_schema() -> None:
+    requests: list[httpx.Request] = []
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "research"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_note", "arguments": '{"note":"N1"}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "read_note",
+            "content": '{"passages":[]}',
+        },
+    ]
+    schema = {
+        "title": "final_summary",
+        "type": "object",
+        "properties": {"final_summary_md": {"type": "string"}},
+        "required": ["final_summary_md"],
+        "additionalProperties": False,
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"final_summary_md":"Done"}'}}]},
+        )
+
+    client = OpenRouterClient("secret-key", transport=httpx.MockTransport(handler))
+
+    result = await client.complete_json_messages(
+        "model-a",
+        messages,
+        timeout_s=42.0,
+        temperature=0.1,
+        max_tokens=321,
+        schema=schema,
+    )
+
+    assert result == {"final_summary_md": "Done"}
+    body = json.loads(requests[0].content)
+    assert body["messages"] == messages
+    assert body["temperature"] == 0.1
+    assert body["max_tokens"] == 321
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "final_summary", "strict": True, "schema": schema},
+    }
+    assert requests[0].extensions["timeout"]["read"] == 42.0
+
+
+@pytest.mark.asyncio
 async def test_reasoning_parameter_is_per_model() -> None:
     bodies: list[dict] = []
 

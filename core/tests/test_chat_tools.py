@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+import pytest
+
+from taurine_core.chat.engine import make_tool_executor
 from taurine_core.chat.tools import TOOL_DEFINITIONS, execute_tool
 from taurine_core.retrieval.types import (
     EvidenceFact,
@@ -66,6 +69,19 @@ def test_tool_registration_is_evidence_native() -> None:
     assert definitions["search_evidence"]["function"]["parameters"]["properties"]["temporal"]["enum"] == ["current", "historical", "any"]
     assert set(definitions["read_note"]["function"]["parameters"]["required"]) == {"note", "query"}
     assert definitions["expand_evidence"]["function"]["parameters"]["properties"]["direction"]["enum"] == ["outgoing", "incoming", "both"]
+
+
+@pytest.mark.asyncio
+async def test_public_tool_executor_seam_reuses_chat_tool_implementation() -> None:
+    retriever = ToolRetriever()
+    executor = make_tool_executor(retriever, now=lambda: 10.0)
+
+    result_json = await executor(
+        "search_evidence", {"query": "roadmap", "k": 4, "temporal": "current"}
+    )
+
+    assert json.loads(result_json)["passages"][0]["evidence_id"] == "E1"
+    assert retriever.calls == [("search", "roadmap", 4, "current", 10.0)]
 
 
 def test_search_evidence_returns_exact_registered_evidence() -> None:

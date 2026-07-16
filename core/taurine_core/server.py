@@ -25,7 +25,7 @@ from pydantic import ValidationError
 from taurine_core import config
 from taurine_core import session_log
 from taurine_core.asr import ASRClient, ChunkCallback, IndexStatusProvider, StatusCallback
-from taurine_core.chat.engine import ChatEngine
+from taurine_core.chat.engine import ChatEngine, make_tool_executor
 from taurine_core.chat.retrieval import ChatRetriever
 from taurine_core.connectors.registry import ConnectorRegistry, SourceExtraction
 from taurine_core.indexer.notes import open_note
@@ -57,10 +57,12 @@ from taurine_core.live import ambient as live_ambient
 from taurine_core.live.ambient import AmbientRetriever
 from taurine_core.live.grounding import GroundingEngine
 from taurine_core.live.ingest import Event, EventSink, LiveSession
+from taurine_core.live.final_summary import run_final_summary
 from taurine_core.live.spans import Gliner2SpanExtractor
 from taurine_core.live.summarizer import Summarizer
 from taurine_core.live.trigger import SummaryTrigger
 from taurine_core.llm import OpenRouterClient
+from taurine_core.profile_context import user_profile_block
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.retrieval.runtime import RetrievalRuntime
 from taurine_core.session_log import NullSessionLogger, SessionLogger
@@ -74,6 +76,8 @@ from taurine_core.schemas import (
     ConnectorInfo,
     FactPayload,
     FactsResponse,
+    FinalSummaryEvent,
+    FinalSummaryStatusEvent,
     GraphEdge,
     GraphNode,
     GraphResponse,
@@ -179,6 +183,8 @@ class SessionContext:
     meeting_id: str | None
     live: LiveSession | None = None
     asr: ASRClient | None = None
+    notepad_md: str | None = None
+    notepad_base_rev: int | None = None
 
 
 @dataclass
@@ -213,6 +219,9 @@ class Runtime:
     meeting_finalizers: dict[
         str, asyncio.TimerHandle | asyncio.Task[Any]
     ] = field(default_factory=dict)
+    finalization_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
+    final_summary_llm: Any = None
+    make_final_summary_tool_executor: Callable[[str], Any] | None = None
     active_unbound_sessions: dict[int, SessionContext] = field(default_factory=dict)
     context_epochs: dict[int, int] = field(default_factory=dict)
     context_transcript_buffers: dict[int, Any] = field(default_factory=dict)
@@ -358,16 +367,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             # waiting for it. A partial build only leaves a temporary
             # *.build-*.db file that the next build reuses or replaces.
             if active_runtime is not None:
-                finalizer_tasks = [
-                    finalizer
-                    for finalizer in active_runtime.meeting_finalizers.values()
-                    if isinstance(finalizer, asyncio.Task)
-                ]
-                for finalizer in active_runtime.meeting_finalizers.values():
-                    finalizer.cancel()
-                active_runtime.meeting_finalizers.clear()
-                if finalizer_tasks:
-                    await asyncio.gather(*finalizer_tasks, return_exceptions=True)
+                await _shutdown_meeting_finalizations(active_runtime)
                 if active_runtime.sync_task is not None:
                     active_runtime.sync_task.cancel()
                     await asyncio.gather(active_runtime.sync_task, return_exceptions=True)
@@ -814,11 +814,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         active_runtime = _ready_runtime(app)
         if active_runtime.index.meeting_get(meeting_id) is None:
             raise HTTPException(status_code=404, detail="meeting not found")
-        finalizer = active_runtime.meeting_finalizers.pop(meeting_id, None)
-        if finalizer is not None:
-            finalizer.cancel()
-        active_runtime.index.meeting_delete(meeting_id)
-        active_runtime.updates.publish("meetings")
+        await _delete_meeting(active_runtime, meeting_id)
         return {"ok": True}
 
     @app.put("/profile")
@@ -970,18 +966,15 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             if not session_started:
                 logger.log("session_start", channels=[])
             context = ctx_holder[0]
+            await _teardown_session_context(context)
+            snapshot = None
             if context.meeting_id is not None:
                 snapshot = await _capture_finalization_snapshot(
                     active_runtime, context, transcript_buffer[0]
                 )
-                if snapshot is not None:
-                    _schedule_meeting_finalization(active_runtime, snapshot)
-            await _teardown_session_context(context)
-            if context.meeting_id is not None and snapshot is not None:
-                await _refresh_snapshot_transcript(
-                    active_runtime, snapshot, transcript_buffer[0]
-                )
             _remove_active_context(active_runtime, context)
+            if snapshot is not None:
+                _schedule_meeting_finalization(active_runtime, snapshot)
             sender.cancel()
             await asyncio.gather(sender, return_exceptions=True)
             logger.close()
@@ -1250,6 +1243,20 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
             ),
             validator_factory=knowledge_runtime.make_validator,
         ),
+        final_summary_llm=llm,
+        make_final_summary_tool_executor=lambda meeting_id: make_tool_executor(
+            ChatRetriever(
+                index,
+                f"__final_summary__-{meeting_id}-{uuid4().hex}",
+                engine_factory=lambda registry: knowledge_runtime.make_engine(
+                    "tool", registry
+                ),
+                tool_engine_factory=lambda registry: knowledge_runtime.make_engine(
+                    "tool", registry
+                ),
+                span_extractor=span_extractor,
+            )
+        ),
         make_profile_generator=lambda: ProfileGenerator(
             index,
             llm,
@@ -1473,6 +1480,9 @@ class _MeetingFinalizationSnapshot:
     epoch: int
     notes_md: str
     transcript: list[dict[str, Any]]
+    title: str = ""
+    notes_rev: int = 0
+    last_live_summary: dict[str, Any] = field(default_factory=dict)
 
 
 class _MeetingTranscriptBuffer:
@@ -1545,11 +1555,11 @@ def _make_live_session(
 
 
 async def _teardown_session_context(context: SessionContext) -> None:
+    if context.asr is not None:
+        await context.asr.stop()
     live_close = getattr(context.live, "aclose", None)
     if live_close is not None:
         await live_close()
-    if context.asr is not None:
-        await context.asr.stop()
 
 
 def _remove_active_context(runtime: Runtime, context: SessionContext) -> None:
@@ -1575,11 +1585,25 @@ async def _capture_finalization_snapshot(
     meeting = runtime.index.meeting_get(meeting_id)
     if meeting is None or meeting["status"] != "live":
         return None
+    if (
+        context.notepad_md is not None
+        and context.notepad_md != meeting["notes_md"]
+        and context.notepad_base_rev is not None
+        and int(meeting["notes_rev"]) <= context.notepad_base_rev
+    ):
+        runtime.index.meeting_update(meeting_id, notes_md=context.notepad_md)
+        meeting = runtime.index.meeting_get(meeting_id)
+        if meeting is None:  # pragma: no cover - row held by update
+            return None
+    summary = context.live.current_summary() if context.live is not None else MeetingSummary()
     return _MeetingFinalizationSnapshot(
         meeting_id=meeting_id,
         epoch=runtime.context_epochs.get(id(context), -1),
         notes_md=meeting["notes_md"],
         transcript=list(meeting["transcript"]),
+        title=meeting["title"],
+        notes_rev=int(meeting["notes_rev"]),
+        last_live_summary=summary.model_dump(mode="json"),
     )
 
 
@@ -1612,10 +1636,177 @@ def _finalize_meeting_snapshot(
     return True
 
 
+def _start_meeting_finalization(
+    runtime: Runtime,
+    snapshot: _MeetingFinalizationSnapshot,
+    emit: EventSink,
+) -> bool:
+    """Mark summarizing and launch one meeting-keyed runtime-owned task."""
+
+    if runtime.meeting_epochs.get(snapshot.meeting_id) != snapshot.epoch:
+        return False
+    if snapshot.meeting_id in runtime.active_sessions:
+        return False
+    existing = runtime.finalization_tasks.get(snapshot.meeting_id)
+    if existing is not None and not existing.done():
+        return False
+    meeting = runtime.index.meeting_get(snapshot.meeting_id)
+    if meeting is None or meeting["status"] in {"summarizing", "done"}:
+        return False
+    _cancel_meeting_finalizer(runtime, snapshot.meeting_id)
+    runtime.index.meeting_set_status(
+        snapshot.meeting_id, "summarizing", ended_at=time.time()
+    )
+    runtime.updates.publish("meetings")
+
+    if (
+        runtime.final_summary_llm is None
+        or runtime.make_final_summary_tool_executor is None
+    ):
+        runtime.index.meeting_set_status(snapshot.meeting_id, "done")
+        runtime.updates.publish("meetings")
+        return True
+
+    task = asyncio.create_task(_run_meeting_finalization(runtime, snapshot, emit))
+    runtime.finalization_tasks[snapshot.meeting_id] = task
+
+    def finished(done: asyncio.Task[Any]) -> None:
+        if runtime.finalization_tasks.get(snapshot.meeting_id) is done:
+            runtime.finalization_tasks.pop(snapshot.meeting_id, None)
+
+    task.add_done_callback(finished)
+    return True
+
+
+async def _run_meeting_finalization(
+    runtime: Runtime,
+    snapshot: _MeetingFinalizationSnapshot,
+    emit: EventSink,
+) -> None:
+    terminal_published = False
+
+    async def emit_after_update(event: Any) -> None:
+        nonlocal terminal_published
+        is_terminal = isinstance(event, FinalSummaryEvent) or (
+            isinstance(event, FinalSummaryStatusEvent)
+            and event.state in {"done", "error"}
+        )
+        if is_terminal and not terminal_published:
+            runtime.updates.publish("meetings")
+            terminal_published = True
+        pending = emit(event)  # type: ignore[arg-type]
+        if inspect.isawaitable(pending):
+            await pending
+
+    try:
+        make_executor = runtime.make_final_summary_tool_executor
+        if make_executor is None:  # pragma: no cover - guarded by launcher
+            raise RuntimeError("final summary tools unavailable")
+        execute_tool = make_executor(snapshot.meeting_id)
+        meeting = {
+            "meeting_id": snapshot.meeting_id,
+            "title": snapshot.title,
+            "notes_md": snapshot.notes_md,
+            "notes_rev": snapshot.notes_rev,
+            "transcript": list(snapshot.transcript),
+            "last_live_summary": dict(snapshot.last_live_summary),
+        }
+        await run_final_summary(
+            meeting,
+            runtime.final_summary_llm,
+            execute_tool,
+            user_profile_block(runtime.index),
+            emit_after_update,
+            runtime.index,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logging.getLogger("taurine.final_summary").exception(
+            "meeting finalization crashed: %s", snapshot.meeting_id
+        )
+        meeting = runtime.index.meeting_get(snapshot.meeting_id)
+        if meeting is not None and meeting["status"] != "done":
+            runtime.index.meeting_set_status(snapshot.meeting_id, "done")
+        await emit_after_update(
+            FinalSummaryStatusEvent(
+                meeting_id=snapshot.meeting_id,
+                state="error",
+                detail=(str(exc).strip() or type(exc).__name__)[:300],
+            )
+        )
+    finally:
+        if not terminal_published:
+            runtime.updates.publish("meetings")
+
+
 def _cancel_meeting_finalizer(runtime: Runtime, meeting_id: str) -> None:
     finalizer = runtime.meeting_finalizers.pop(meeting_id, None)
     if finalizer is not None:
         finalizer.cancel()
+
+
+async def _cancel_finalization_task(runtime: Runtime, meeting_id: str) -> None:
+    task = runtime.finalization_tasks.pop(meeting_id, None)
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _shutdown_finalization_tasks(runtime: Runtime) -> None:
+    meeting_ids = tuple(runtime.finalization_tasks)
+    tasks = tuple(runtime.finalization_tasks.values())
+    runtime.finalization_tasks.clear()
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    changed = False
+    for meeting_id in meeting_ids:
+        meeting = runtime.index.meeting_get(meeting_id)
+        if meeting is not None and meeting["status"] == "summarizing":
+            runtime.index.meeting_set_status(meeting_id, "done")
+            changed = True
+    if changed:
+        runtime.updates.publish("meetings")
+
+
+async def _shutdown_meeting_finalizations(runtime: Runtime) -> None:
+    grace_meeting_ids = tuple(runtime.meeting_finalizers)
+    grace_tasks = tuple(
+        finalizer
+        for finalizer in runtime.meeting_finalizers.values()
+        if isinstance(finalizer, asyncio.Task)
+    )
+    for finalizer in runtime.meeting_finalizers.values():
+        finalizer.cancel()
+    runtime.meeting_finalizers.clear()
+    if grace_tasks:
+        await asyncio.gather(*grace_tasks, return_exceptions=True)
+
+    await _shutdown_finalization_tasks(runtime)
+    changed = False
+    for meeting_id in grace_meeting_ids:
+        meeting = runtime.index.meeting_get(meeting_id)
+        if meeting is not None and meeting["status"] in {"live", "summarizing"}:
+            runtime.index.meeting_set_status(meeting_id, "done")
+            changed = True
+    if changed:
+        runtime.updates.publish("meetings")
+
+
+async def _delete_meeting(runtime: Runtime, meeting_id: str) -> None:
+    _cancel_meeting_finalizer(runtime, meeting_id)
+    await _cancel_finalization_task(runtime, meeting_id)
+    runtime.index.meeting_delete(meeting_id)
+    runtime.updates.publish("meetings")
+
+
+async def _noop_emit(event: Any) -> None:
+    del event
 
 
 def _schedule_meeting_finalization(
@@ -1631,7 +1822,7 @@ def _schedule_meeting_finalization(
         if current is not handle:
             return
         runtime.meeting_finalizers.pop(snapshot.meeting_id, None)
-        _finalize_meeting_snapshot(runtime, snapshot)
+        _start_meeting_finalization(runtime, snapshot, _noop_emit)
 
     handle = asyncio.get_running_loop().call_later(
         config.MEETING_FINALIZE_GRACE_S, expire
@@ -1671,22 +1862,19 @@ async def _handle_control(
             if meeting is None:
                 await emit(_status_error(runtime, "meeting not found"))
                 return session_started
+            await _cancel_finalization_task(runtime, message.meeting_id)
 
         previous = ctx_holder[0]
         if previous.generation > 0:
+            await _teardown_session_context(previous)
             snapshot = None
             if previous.meeting_id is not None:
                 snapshot = await _capture_finalization_snapshot(
                     runtime, previous, transcript_buffer[0]
                 )
-                if snapshot is not None:
-                    _schedule_meeting_finalization(runtime, snapshot)
-            await _teardown_session_context(previous)
-            if snapshot is not None:
-                await _refresh_snapshot_transcript(
-                    runtime, snapshot, transcript_buffer[0]
-                )
             _remove_active_context(runtime, previous)
+            if snapshot is not None:
+                _schedule_meeting_finalization(runtime, snapshot)
         elif previous.live is not None or previous.asr is not None:
             await _teardown_session_context(previous)
 
@@ -1742,13 +1930,9 @@ async def _handle_control(
         await context.asr.start(channel_ids)
     elif isinstance(message, StopMsg):
         context = ctx_holder[0]
-        if context.asr is not None:
-            await context.asr.stop()
         if context.meeting_id is not None:
             context_epoch = runtime.context_epochs.get(id(context), -1)
-            live_close = getattr(context.live, "aclose", None)
-            if live_close is not None:
-                await live_close()
+            await _teardown_session_context(context)
             snapshot = await _capture_finalization_snapshot(
                 runtime, context, transcript_buffer[0]
             )
@@ -1756,7 +1940,14 @@ async def _handle_control(
             if runtime.meeting_epochs.get(context.meeting_id) == context_epoch:
                 _cancel_meeting_finalizer(runtime, context.meeting_id)
                 if snapshot is not None:
-                    _finalize_meeting_snapshot(runtime, snapshot)
+                    _start_meeting_finalization(runtime, snapshot, emit)
+            ctx_holder[0] = SessionContext(
+                generation=context.generation,
+                meeting_id=None,
+            )
+            transcript_buffer[0] = None
+        elif context.asr is not None or context.live is not None:
+            await _teardown_session_context(context)
     elif isinstance(message, ActionableStatusMsg):
         live = ctx_holder[0].live
         if live is not None:
@@ -1772,6 +1963,11 @@ async def _handle_control(
             )
         elif context.live is not None:
             context.live.set_notepad(message.text_md)
+            context.notepad_md = message.text_md
+            meeting = runtime.index.meeting_get(message.meeting_id)
+            context.notepad_base_rev = (
+                int(meeting["notes_rev"]) if meeting is not None else None
+            )
     elif isinstance(message, OpenNoteMsg):
         try:
             await asyncio.to_thread(runtime.open_note, message.note_id)

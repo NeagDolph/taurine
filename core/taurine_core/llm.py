@@ -45,27 +45,13 @@ class OpenRouterClient:
         max_tokens: int | None = None,
         schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if schema is None:
-            response_format: dict[str, Any] = {"type": "json_object"}
-        else:
-            schema_name = schema.get("title")
-            if not isinstance(schema_name, str) or not schema_name:
-                schema_name = "response"
-            response_format = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": schema,
-                },
-            }
         payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "response_format": response_format,
+            "response_format": _response_format(schema),
             # only route to providers that honor response_format
             "provider": {"require_parameters": True},
             **_reasoning_for(model),
@@ -82,6 +68,51 @@ class OpenRouterClient:
         try:
             async with httpx.AsyncClient(
                 timeout=timeout_s if timeout_s is not None else config.LLM_TIMEOUT_S,
+                transport=self._transport,
+            ) as client:
+                response = await client.post(
+                    f"{config.OPENROUTER_BASE_URL}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+            response.raise_for_status()
+            body = response.json()
+            content = body["choices"][0]["message"]["content"]
+            parsed = _parse_json_content(content) if isinstance(content, str) else content
+            if not isinstance(parsed, dict):
+                raise TypeError("OpenRouter content was not a JSON object")
+            return parsed
+        except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMError(str(exc)) from exc
+
+    async def complete_json_messages(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        timeout_s: float,
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+        schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Complete strict JSON while preserving an existing tool-call history."""
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "response_format": _response_format(schema),
+            "provider": {"require_parameters": True},
+            **_reasoning_for(model),
+        }
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+        if max_tokens is not None:
+            payload["max_tokens"] = int(max_tokens)
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout_s,
                 transport=self._transport,
             ) as client:
                 response = await client.post(
@@ -247,6 +278,8 @@ class OpenRouterClient:
         system: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        *,
+        timeout_s: float | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": model,
@@ -263,7 +296,7 @@ class OpenRouterClient:
 
         try:
             async with httpx.AsyncClient(
-                timeout=config.LLM_TIMEOUT_S,
+                timeout=timeout_s if timeout_s is not None else config.LLM_TIMEOUT_S,
                 transport=self._transport,
             ) as client:
                 response = await client.post(
@@ -279,6 +312,22 @@ class OpenRouterClient:
             return message
         except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMError(str(exc)) from exc
+
+
+def _response_format(schema: dict[str, Any] | None) -> dict[str, Any]:
+    if schema is None:
+        return {"type": "json_object"}
+    schema_name = schema.get("title")
+    if not isinstance(schema_name, str) or not schema_name:
+        schema_name = "response"
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "strict": True,
+            "schema": schema,
+        },
+    }
 
 
 def _reasoning_for(model: str) -> dict[str, Any]:
