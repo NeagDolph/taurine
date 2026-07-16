@@ -443,6 +443,10 @@ export function MeetingsView({
                 onResolveSuggestion={handleResolveSuggestion}
                 onOpenNoteInMap={openNoteInMap}
                 aiLines={aiLines}
+                meetingId={meeting.meetingId}
+                chatId={meeting.chatId}
+                onChatNotesEdit={handleChatNotesEdit}
+                onAiInserted={(md) => setAiLines(addAiLines(aiLinesRef.current, md))}
                 readOnly={isLiveSelection && coordinator.listeningState === 'stopping'}
               />
             </div>
@@ -568,7 +572,7 @@ function HomeList({
             {meetings.map((row) => (
               <li key={row.meetingId} className="group relative">
                 <button
-                  className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-xl border border-transparent px-3.5 py-3 text-left transition-colors hover:border-white/[0.08] hover:bg-white/[0.03]"
+                  className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-xl border border-transparent px-3.5 py-3 pr-11 text-left transition-colors hover:border-white/[0.08] hover:bg-white/[0.03]"
                   type="button"
                   onClick={() => onOpen(row.meetingId)}
                 >
@@ -587,12 +591,13 @@ function HomeList({
                   </span>
                 </button>
                 <button
-                  className="absolute -right-9 top-1/2 hidden h-7 w-7 -translate-y-1/2 items-center justify-center rounded text-fg/35 hover:text-bad group-hover:flex"
+                  className="absolute right-2.5 top-1/2 hidden h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-fg/35 hover:bg-bad/15 hover:text-bad group-hover:flex"
                   type="button"
+                  title="Delete meeting"
                   aria-label={`Delete ${row.title || 'meeting'}`}
                   onClick={() => onDelete(row.meetingId)}
                 >
-                  ✕
+                  <TrashIcon />
                 </button>
               </li>
             ))}
@@ -600,6 +605,20 @@ function HomeList({
         )}
       </div>
     </div>
+  )
+}
+
+function TrashIcon(): React.JSX.Element {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   )
 }
 

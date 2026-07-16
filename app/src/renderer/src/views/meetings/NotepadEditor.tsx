@@ -1,12 +1,19 @@
 import '@blocknote/core/fonts/inter.css'
 import '@blocknote/mantine/style.css'
-import { BlockNoteSchema, defaultBlockSpecs, type Block } from '@blocknote/core'
+import { BlockNoteSchema, defaultBlockSpecs, filterSuggestionItems, type Block } from '@blocknote/core'
 import { BlockNoteView } from '@blocknote/mantine'
-import { createReactBlockSpec, useCreateBlockNote } from '@blocknote/react'
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import {
+  createReactBlockSpec,
+  getDefaultReactSlashMenuItems,
+  SuggestionMenuController,
+  useCreateBlockNote
+} from '@blocknote/react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type { SuggestedEdit } from '../../lib/meetings'
 import { normalizeLine } from '../../lib/provenance'
+import { AiInline, type AiAnchor } from './AiInline'
+import type { ChatNotesEdit } from './MeetingChat'
 import {
   blockPlainText,
   findAnchorBlockId,
@@ -22,6 +29,11 @@ export interface NotepadEditorProps {
   onOpenNoteInMap?(noteId: string): void
   aiLines?: string[]
   readOnly?: boolean
+  /** Meeting binding for the in-editor Ask AI (slash menu). */
+  meetingId?: string
+  chatId?: string | null
+  onChatNotesEdit?(edit: ChatNotesEdit): void
+  onAiInserted?(md: string): void
 }
 
 // Block specs are module-level and cannot close over component props, so
@@ -117,7 +129,11 @@ export function NotepadEditor({
   onResolveSuggestion,
   onOpenNoteInMap,
   aiLines = [],
-  readOnly = false
+  readOnly = false,
+  meetingId,
+  chatId = null,
+  onChatNotesEdit,
+  onAiInserted
 }: NotepadEditorProps): React.JSX.Element {
   const editor = useCreateBlockNote({ schema })
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -180,6 +196,64 @@ export function NotepadEditor({
     }
   }, [editor, paintProvenance, pending, pendingKey, valueMd])
 
+  // In-editor Ask AI: opened from the slash menu, anchored under the block
+  // that held the cursor; answers can be inserted there as AI-authored lines.
+  const [aiOpen, setAiOpen] = useState(false)
+  const [aiAnchor, setAiAnchor] = useState<AiAnchor | null>(null)
+  const [aiSelection, setAiSelection] = useState('')
+  const aiBlockIdRef = useRef<string | null>(null)
+
+  const openAskAi = useCallback((): void => {
+    const container = containerRef.current
+    let anchor: AiAnchor = { top: 48, left: 0, width: container?.clientWidth ?? 540 }
+    try {
+      const block = editor.getTextCursorPosition().block
+      aiBlockIdRef.current = block.id
+      const element = container?.querySelector(`[data-id="${block.id}"]`)
+      if (container && element) {
+        const containerRect = container.getBoundingClientRect()
+        const rect = element.getBoundingClientRect()
+        anchor = {
+          top: rect.bottom - containerRect.top + 6,
+          left: rect.left - containerRect.left,
+          width: container.clientWidth
+        }
+      }
+    } catch {
+      aiBlockIdRef.current = null
+    }
+    let selected = ''
+    try {
+      selected = editor.getSelectedText()
+    } catch {
+      selected = ''
+    }
+    setAiSelection(selected.trim())
+    setAiAnchor(anchor)
+    setAiOpen(true)
+  }, [editor])
+
+  const insertAiAnswer = useCallback(
+    (md: string): void => {
+      // Citation tokens are dead text outside the chat surface.
+      const cleaned = md.replace(/\s*\[(?:N|E|F|P|T|M)\d+(?:,\s*(?:N|E|F|P|T|M)\d+)*\]/g, '')
+      onAiInserted?.(cleaned)
+      void (async () => {
+        const blocks = (await editor.tryParseMarkdownToBlocks(cleaned)) as NotepadBlock[]
+        const anchorId = aiBlockIdRef.current
+        const anchorBlock = anchorId ? editor.getBlock(anchorId) : undefined
+        if (anchorBlock) {
+          editor.insertBlocks(blocks, anchorBlock, 'after')
+        } else {
+          const last = editor.document[editor.document.length - 1]
+          if (last) editor.insertBlocks(blocks, last, 'after')
+          else editor.replaceBlocks(editor.document, blocks)
+        }
+      })()
+    },
+    [editor, onAiInserted]
+  )
+
   // One capture handler covers links in both note content and suggestion
   // blocks: note://<id> opens the note on the map, everything else goes to
   // the external browser (never in-app navigation).
@@ -196,28 +270,68 @@ export function NotepadEditor({
     }
   }
 
+  const askAiEnabled = Boolean(meetingId && onChatNotesEdit)
+
   return (
-    <div ref={containerRef} onClickCapture={handleLinkClicks}>
+    <div ref={containerRef} className="relative" onClickCapture={handleLinkClicks}>
       <BlockNoteView
-      editor={editor}
-      editable={!readOnly}
-      theme="dark"
-      className="notepad-editor"
-      data-color-scheme="dark"
-      sideMenu={false}
-      onChange={() => {
-        requestAnimationFrame(paintProvenance)
-        void (async () => {
-          const canonical = stripSuggestionBlocks(
-            editor.document as unknown as BlockLike[]
-          ) as unknown as NotepadBlock[]
-          const markdown = (await editor.blocksToMarkdownLossy(canonical)).trimEnd()
-          if (markdown === lastExternalMd.current) return
-          lastExternalMd.current = markdown
-          onChangeMd(markdown)
-        })()
-      }}
-      />
+        editor={editor}
+        editable={!readOnly}
+        theme="dark"
+        className="notepad-editor"
+        data-color-scheme="dark"
+        sideMenu={false}
+        slashMenu={false}
+        onChange={() => {
+          requestAnimationFrame(paintProvenance)
+          void (async () => {
+            const canonical = stripSuggestionBlocks(
+              editor.document as unknown as BlockLike[]
+            ) as unknown as NotepadBlock[]
+            const markdown = (await editor.blocksToMarkdownLossy(canonical)).trimEnd()
+            if (markdown === lastExternalMd.current) return
+            lastExternalMd.current = markdown
+            onChangeMd(markdown)
+          })()
+        }}
+      >
+        <SuggestionMenuController
+          triggerCharacter="/"
+          getItems={async (query) =>
+            filterSuggestionItems(
+              [
+                ...(askAiEnabled
+                  ? [
+                      {
+                        title: 'Ask AI',
+                        subtext: 'Answer from your knowledge base and this meeting',
+                        aliases: ['ai', 'ask', 'agent'],
+                        group: 'AI',
+                        icon: <span>✨</span>,
+                        onItemClick: () => openAskAi()
+                      }
+                    ]
+                  : []),
+                ...getDefaultReactSlashMenuItems(editor)
+              ],
+              query
+            )
+          }
+        />
+      </BlockNoteView>
+      {askAiEnabled && meetingId ? (
+        <AiInline
+          meetingId={meetingId}
+          chatId={chatId}
+          open={aiOpen}
+          anchor={aiAnchor}
+          selection={aiSelection}
+          onClose={() => setAiOpen(false)}
+          onNotesEdit={onChatNotesEdit ?? (() => undefined)}
+          onOpenNote={onOpenNoteInMap ?? (() => undefined)}
+          onInsert={insertAiAnswer}
+        />
+      ) : null}
     </div>
   )
 }
