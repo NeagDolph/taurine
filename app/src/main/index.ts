@@ -5,8 +5,35 @@ import icon from '../../resources/icon.png?asset'
 import { startMicWatch } from './micwatch'
 import { CallNotifier } from './notifier'
 import { registerSystemAudioIpc } from './sysaudio'
+import { createTray, destroyTray } from './tray'
 
 let mainWindow: BrowserWindow | null = null
+// Closing the window keeps the app alive in the tray/dock; only an explicit
+// quit (Cmd+Q, tray Quit, updater) actually tears the window down.
+let quitting = false
+
+function showMainWindow(): void {
+  if (mainWindow === null || mainWindow.isDestroyed()) {
+    createWindow()
+    return
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function startMeetingFromTray(): void {
+  showMainWindow()
+  const contents = mainWindow?.webContents
+  if (!contents) return
+  // Reuses the call-notification channel: the renderer starts a meeting and
+  // opens the Meetings tab.
+  if (contents.isLoading()) {
+    contents.once('did-finish-load', () => contents.send('callnotif:start'))
+  } else {
+    contents.send('callnotif:start')
+  }
+}
 
 if (is.dev) {
   // dev-only: lets tooling attach to the real renderer for debugging
@@ -32,6 +59,11 @@ function createWindow(): void {
   const window = mainWindow
   window.on('ready-to-show', () => {
     window.show()
+  })
+  window.on('close', (event) => {
+    if (quitting) return
+    event.preventDefault()
+    window.hide()
   })
   window.on('closed', () => {
     if (mainWindow === window) mainWindow = null
@@ -90,14 +122,27 @@ app.whenReady().then(() => {
   app.once('will-quit', () => {
     stopMicWatch()
     notifier.dispose()
+    destroyTray()
+  })
+  if (process.platform === 'darwin' && is.dev) {
+    // Packaged builds get the icns; dev runs show the stock Electron icon
+    // unless the dock icon is set explicitly.
+    app.dock?.setIcon(icon)
+  }
+  createTray({
+    showWindow: showMainWindow,
+    startMeeting: startMeetingFromTray
   })
   createWindow()
 
   app.on('activate', function () {
-    // On macOS it's common to re-create a window in the app when the
-    // dock icon is clicked and there are no other windows open.
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    // Dock click: surface the hidden window (or recreate it if gone).
+    showMainWindow()
   })
+})
+
+app.on('before-quit', () => {
+  quitting = true
 })
 
 // Quit when all windows are closed, except on macOS. There, it's common
