@@ -7,6 +7,11 @@ import { CallNotifier } from './notifier'
 import { registerSystemAudioIpc } from './sysaudio'
 import { createTray, destroyTray } from './tray'
 
+// Menus, notifications, and app.getPath('userData') naming. The dev dock
+// label itself comes from the Electron bundle's Info.plist, which
+// scripts/rename-dev-electron.mjs rewrites to Taurine after install.
+app.setName('Taurine')
+
 let mainWindow: BrowserWindow | null = null
 // Closing the window keeps the app alive in the tray/dock; only an explicit
 // quit (Cmd+Q, tray Quit, updater) actually tears the window down.
@@ -92,7 +97,7 @@ function loadRenderer(window: BrowserWindow): void {
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
   // Set app user model id for windows
-  electronApp.setAppUserModelId('com.electron')
+  electronApp.setAppUserModelId('com.taurine.app')
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.

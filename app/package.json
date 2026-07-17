@@ -1,5 +1,5 @@
 {
-  "name": "app",
+  "name": "taurine",
   "version": "1.0.0",
   "description": "An Electron application with React and TypeScript",
   "main": "./out/main/index.js",
@@ -15,7 +15,7 @@
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
     "build:native": "node scripts/build-native.mjs",
-    "postinstall": "electron-builder install-app-deps && node scripts/build-native.mjs --if-needed",
+    "postinstall": "electron-builder install-app-deps && node scripts/rename-dev-electron.mjs",
     "build:unpack": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
     "build:mac": "electron-vite build && electron-builder --mac",

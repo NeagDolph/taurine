@@ -1,5 +1,5 @@
-appId: com.electron.app
-productName: app
+appId: com.taurine.app
+productName: Taurine
 directories:
   buildResources: build
 files:
