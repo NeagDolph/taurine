@@ -46,7 +46,6 @@ const MAIN_TABS: Array<{ id: MainTab; label: string }> = [
   { id: 'connectors', label: 'Connectors' }
 ]
 
-
 function App(): React.JSX.Element {
   const clientRef = useRef<SidecarClient | null>(null)
   const audioRef = useRef<PcmAudioCapture | null>(null)
@@ -92,7 +91,8 @@ function App(): React.JSX.Element {
   // panel, visible even when this window is hidden). The renderer only
   // reports listening state and reacts to the panel's "Start notes".
   useEffect(() => {
-    window.api.session.reportListening(listeningState !== 'idle')
+    // optional-chained: absent outside Electron (browser preview)
+    window.api?.session.reportListening(listeningState !== 'idle')
   }, [listeningState])
 
   useEffect(() => {
@@ -482,7 +482,8 @@ function App(): React.JSX.Element {
   // OS-level notification panel (or its countdown) chose "Start notes".
   useEffect(
     () =>
-      window.api.callNotif.onStart(() => {
+      // optional-chained: absent outside Electron (browser preview)
+      window.api?.callNotif.onStart(() => {
         setActiveTab('meetings')
         void startMeeting()
       }),
@@ -724,7 +725,6 @@ function App(): React.JSX.Element {
         syncError={syncError}
         onSync={syncIndex}
       />
-
     </div>
   )
 }

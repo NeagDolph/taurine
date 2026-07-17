@@ -875,21 +875,54 @@
 
 /* ── selection side panel ──────────────────────────────────────────────── */
 
-.map-side-panel {
-  animation: map-panel-in 160ms ease;
-  backdrop-filter: blur(18px);
-  background: rgba(17, 17, 20, 0.92);
-  border-left: 1px solid var(--map-line-strong);
+/* animated shell: owns position + size and slides on transform only, so the
+   panel content lays out at its final width and never reflows mid-animation */
+.map-side-wrap {
+  animation: map-panel-slide-in 220ms cubic-bezier(0.22, 1, 0.3, 1);
   bottom: 0;
-  box-shadow: var(--map-shadow);
-  display: flex;
-  flex-direction: column;
   max-width: 62%;
   position: absolute;
   right: 0;
   top: 0;
   width: var(--map-panel-width, 332px);
+  will-change: transform;
   z-index: 5;
+}
+
+.map-side-wrap.closing {
+  animation: map-panel-slide-out 170ms cubic-bezier(0.55, 0, 0.8, 0.4) forwards;
+  pointer-events: none;
+}
+
+/* +28px clears the panel's box-shadow so nothing peeks while off-screen */
+@keyframes map-panel-slide-in {
+  from {
+    transform: translateX(calc(100% + 28px));
+  }
+  to {
+    transform: none;
+  }
+}
+
+@keyframes map-panel-slide-out {
+  from {
+    transform: none;
+  }
+  to {
+    transform: translateX(calc(100% + 28px));
+  }
+}
+
+.map-side-panel {
+  animation: map-panel-in 160ms ease;
+  backdrop-filter: blur(18px);
+  background: rgba(17, 17, 20, 0.92);
+  border-left: 1px solid var(--map-line-strong);
+  box-shadow: var(--map-shadow);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
 }
 
 /* invisible grab strip straddling the panel's left edge */
@@ -920,14 +953,14 @@
   background: rgba(245, 197, 24, 0.55);
 }
 
+/* content-swap fade when switching notes inside the already-open shell —
+   opacity only, so it never fights the wrapper's slide */
 @keyframes map-panel-in {
   from {
     opacity: 0;
-    transform: translateX(14px);
   }
   to {
     opacity: 1;
-    transform: none;
   }
 }
 

@@ -87,6 +87,14 @@ interface MapViewProps {
 type GraphLinkObject = LinkObject<MapNode, MapLink>
 type GraphNodeObject = NodeObject<MapNode>
 
+/** Last panel content, kept mounted during the slide-out animation. */
+interface PanelSnapshot {
+  noteId: string | null
+  node: MapNode | null
+  cluster: GraphCluster | null
+  idea: IdeaLensResult | null
+}
+
 interface GlowEntry {
   until: number
   intensity: number
@@ -127,6 +135,9 @@ const MAX_SEARCH_RESULTS = 8
 // zoomToFit on one or two nodes otherwise zooms in until a node fills the
 // screen — clamp the post-fit scale to keep the neighborhood readable
 const MAX_FIT_ZOOM = 3
+// static edges are hidden at/below the first zoom level and reach full
+// strength at the second, so the fully zoomed-out map is nodes, not link mess
+const EDGE_ZOOM_FADE: readonly [number, number] = [0.35, 1.0]
 // double-click detection window for the neighborhood zoom gesture
 const DOUBLE_CLICK_MS = 300
 // background clicks that travelled further than this since pointerdown are
@@ -426,7 +437,7 @@ export function MapView({
     return new Set([...ideaStrengthById.keys()].filter((id) => matchedNodeIds.has(id)))
   }, [ideaResult, ideaStrengthById, matchedNodeIds])
   const displayMatchedKey = useMemo(
-    () => [...displayMatchedIds].sort().join(' '),
+    () => [...displayMatchedIds].sort().join('\u0000'),
     [displayMatchedIds]
   )
 
@@ -1485,6 +1496,13 @@ export function MapView({
           inTimeRange
         )
       }
+      // fully zoomed out the edge mesh vanishes; static edges fade back in
+      // with zoom. Focus (selection/hover) edges, live retrieval edges, and
+      // ego mode — where the small subgraph's edges ARE the content — exempt
+      if (isStatic && !bright && !isEgoMode) {
+        const [fadeStart, fadeEnd] = EDGE_ZOOM_FADE
+        opacity *= Math.max(0, Math.min(1, (globalScale - fadeStart) / (fadeEnd - fadeStart)))
+      }
       if (opacity <= 0) {
         return
       }
@@ -1511,6 +1529,7 @@ export function MapView({
       hoverLinkId,
       hoverNodeId,
       inTimeRange,
+      isEgoMode,
       selectedNeighborhood,
       selectedNodeId,
       activeTimeRange
@@ -1590,6 +1609,46 @@ export function MapView({
       : null
   const ideaStatus: IdeaLensStatus = ideaState.status
   const panelOpen = selectedNodeId !== null || ideaResult !== null
+
+  // keep the last-shown panel content mounted while the wrapper slides out
+  // (cleared by onAnimationEnd). State is adjusted during render — React's
+  // documented "storing information from previous renders" pattern; the
+  // guards converge because the snapshotted references are render-stable
+  const [lastShownPanel, setLastShownPanel] = useState<PanelSnapshot | null>(null)
+  const [closingPanel, setClosingPanel] = useState<PanelSnapshot | null>(null)
+  if (panelOpen) {
+    if (
+      lastShownPanel === null ||
+      lastShownPanel.noteId !== selectedNodeId ||
+      lastShownPanel.node !== selectedNode ||
+      lastShownPanel.cluster !== selectedCluster ||
+      lastShownPanel.idea !== ideaResult
+    ) {
+      setLastShownPanel({
+        noteId: selectedNodeId,
+        node: selectedNode,
+        cluster: selectedCluster,
+        idea: ideaResult
+      })
+    }
+    if (closingPanel !== null) {
+      setClosingPanel(null)
+    }
+  } else if (lastShownPanel !== null) {
+    setClosingPanel(lastShownPanel)
+    setLastShownPanel(null)
+  }
+
+  // safety net: onAnimationEnd normally unmounts the closing panel at 170ms,
+  // but a throttled/occluded window can suspend CSS animation clocks and
+  // swallow animationend — sweep the ghost panel after a grace period
+  useEffect(() => {
+    if (closingPanel === null) {
+      return undefined
+    }
+    const timer = window.setTimeout(() => setClosingPanel(null), 600)
+    return () => window.clearTimeout(timer)
+  }, [closingPanel])
 
   return (
     <section aria-hidden={!visible} aria-label="Map view" className="map-view">
@@ -1790,6 +1849,13 @@ export function MapView({
                 setHoverLink(null)
                 return
               }
+            } else if (link && link.kind === 'static' && !isEgoMode) {
+              // zoom-faded-out edges are invisible — don't tooltip them
+              const zoom = graphRef.current?.zoom()
+              if (typeof zoom === 'number' && zoom <= EDGE_ZOOM_FADE[0]) {
+                setHoverLink(null)
+                return
+              }
             }
             setHoverLink(link ?? null)
             if (link) {
@@ -1873,24 +1939,53 @@ export function MapView({
           />
         ) : null}
 
-        {selectedNodeId ? (
-          <SidePanel
-            key={selectedNodeId}
-            noteId={selectedNodeId}
-            node={selectedNode}
-            cluster={selectedCluster}
-            onClose={() => setSelectedNodeId(null)}
-            onFocus={focusNode}
-            onAskAbout={onAskAbout}
-            onOpenNote={onOpenNote}
-            onSelectNeighbor={(noteId) => selectNode(noteId, { center: true })}
-          />
-        ) : ideaResult ? (
-          <IdeaPanel
-            result={ideaResult}
-            onSelect={(noteId) => selectNode(noteId, { center: true })}
-            onClose={clearIdea}
-          />
+        {panelOpen || closingPanel ? (
+          <div
+            className={`map-side-wrap${panelOpen ? '' : ' closing'}`}
+            onAnimationEnd={(event) => {
+              if (event.animationName === 'map-panel-slide-out') {
+                setClosingPanel(null)
+              }
+            }}
+          >
+            {selectedNodeId ? (
+              <SidePanel
+                key={selectedNodeId}
+                noteId={selectedNodeId}
+                node={selectedNode}
+                cluster={selectedCluster}
+                onClose={() => setSelectedNodeId(null)}
+                onFocus={focusNode}
+                onAskAbout={onAskAbout}
+                onOpenNote={onOpenNote}
+                onSelectNeighbor={(noteId) => selectNode(noteId, { center: true })}
+              />
+            ) : ideaResult ? (
+              <IdeaPanel
+                result={ideaResult}
+                onSelect={(noteId) => selectNode(noteId, { center: true })}
+                onClose={clearIdea}
+              />
+            ) : closingPanel?.noteId ? (
+              <SidePanel
+                key={closingPanel.noteId}
+                noteId={closingPanel.noteId}
+                node={closingPanel.node}
+                cluster={closingPanel.cluster}
+                onClose={() => undefined}
+                onFocus={focusNode}
+                onAskAbout={onAskAbout}
+                onOpenNote={onOpenNote}
+                onSelectNeighbor={() => undefined}
+              />
+            ) : closingPanel?.idea ? (
+              <IdeaPanel
+                result={closingPanel.idea}
+                onSelect={() => undefined}
+                onClose={() => undefined}
+              />
+            ) : null}
+          </div>
         ) : null}
       </div>
 
