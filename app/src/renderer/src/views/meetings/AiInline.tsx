@@ -194,7 +194,9 @@ export function AiInline({
           className="h-8 min-w-0 flex-1 border-0 bg-transparent text-[13px] text-fg outline-none placeholder:text-fg/35"
           value={prompt}
           placeholder={
-            selection ? 'Ask about the selected text…' : 'Ask — the answer is written into your notes…'
+            selection
+              ? 'Ask about the selected text…'
+              : 'Ask — the answer is written into your notes…'
           }
           aria-label="Ask AI"
           disabled={phase === 'running'}

@@ -117,15 +117,18 @@ export function MeetingsView({
 
   useEffect(() => registerNotesFlush(flushNotes), [flushNotes, registerNotesFlush])
 
-  const applyLoadedMeeting = useCallback((next: Meeting): void => {
-    setMeeting(next)
-    setNotesMd(next.notesMd)
-    setTitle(next.title)
-    currentNotesRef.current = next.notesMd
-    savedNotesRef.current = next.notesMd
-    setAiLines(next.aiLines)
-    loadedMeetingIdRef.current = next.meetingId
-  }, [setAiLines])
+  const applyLoadedMeeting = useCallback(
+    (next: Meeting): void => {
+      setMeeting(next)
+      setNotesMd(next.notesMd)
+      setTitle(next.title)
+      currentNotesRef.current = next.notesMd
+      savedNotesRef.current = next.notesMd
+      setAiLines(next.aiLines)
+      loadedMeetingIdRef.current = next.meetingId
+    },
+    [setAiLines]
+  )
 
   // Reset per-meeting overlay state during render when the selection moves.
   const [overlaysFor, setOverlaysFor] = useState(selectedMeetingId)
@@ -229,8 +232,12 @@ export function MeetingsView({
           status: 'pending'
         })
       )
+      // Agent edits persist immediately — never parked in the debounce window.
+      void savePendingNotes().catch((saveError: unknown) => {
+        setError(saveError instanceof Error ? saveError.message : 'Notes could not be saved')
+      })
     },
-    [handleNotesChange, setAiLines]
+    [handleNotesChange, savePendingNotes, setAiLines]
   )
 
   const handleResolveSuggestion = useCallback(
@@ -446,7 +453,16 @@ export function MeetingsView({
                 meetingId={meeting.meetingId}
                 chatId={meeting.chatId}
                 onChatNotesEdit={handleChatNotesEdit}
-                onAiInserted={(md) => setAiLines(addAiLines(aiLinesRef.current, md))}
+                onAiInserted={(md, done) => {
+                  setAiLines(addAiLines(aiLinesRef.current, md))
+                  if (done) {
+                    void savePendingNotes().catch((saveError: unknown) => {
+                      setError(
+                        saveError instanceof Error ? saveError.message : 'Notes could not be saved'
+                      )
+                    })
+                  }
+                }}
                 readOnly={isLiveSelection && coordinator.listeningState === 'stopping'}
               />
             </div>

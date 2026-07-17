@@ -10,11 +10,7 @@ describe('provenance', () => {
   })
 
   it('extracts non-empty normalized lines from an agent insertion', () => {
-    expect(aiLinesFromMarkdown('\n## Summary\n\n- One\n- Two\n')).toEqual([
-      'Summary',
-      'One',
-      'Two'
-    ])
+    expect(aiLinesFromMarkdown('\n## Summary\n\n- One\n- Two\n')).toEqual(['Summary', 'One', 'Two'])
   })
 
   it('accumulates without duplicates', () => {

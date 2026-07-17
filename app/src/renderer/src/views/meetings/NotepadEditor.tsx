@@ -1,6 +1,11 @@
 import '@blocknote/core/fonts/inter.css'
 import '@blocknote/mantine/style.css'
-import { BlockNoteSchema, defaultBlockSpecs, filterSuggestionItems, type Block } from '@blocknote/core'
+import {
+  BlockNoteSchema,
+  defaultBlockSpecs,
+  filterSuggestionItems,
+  type Block
+} from '@blocknote/core'
 import { BlockNoteView } from '@blocknote/mantine'
 import {
   createReactBlockSpec,
@@ -12,6 +17,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type { SuggestedEdit } from '../../lib/meetings'
 import { normalizeLine } from '../../lib/provenance'
+import { AiStreamWriter } from '../../lib/ai-stream'
 import { AiInline, type AiAnchor } from './AiInline'
 import type { ChatNotesEdit } from './MeetingChat'
 import {
@@ -33,7 +39,7 @@ export interface NotepadEditorProps {
   meetingId?: string
   chatId?: string | null
   onChatNotesEdit?(edit: ChatNotesEdit): void
-  onAiInserted?(md: string): void
+  onAiInserted?(md: string, done: boolean): void
 }
 
 // Block specs are module-level and cannot close over component props, so
@@ -64,48 +70,44 @@ const SuggestionBlock = createReactBlockSpec(
       }
       return (
         <div
-          className={`suggestion-block group relative my-1 rounded-md border-l-2 border-ok/60 bg-ok/[0.055] py-1.5 pl-3 pr-20 ${
+          className={`suggestion-block my-1.5 overflow-hidden rounded-md border border-ok/25 bg-ok/[0.05] ${
             big ? 'mt-4' : ''
           }`}
           contentEditable={false}
           data-suggestion-id={suggestionId}
         >
-          {big ? (
-            <div className="mb-1 text-[10px] font-bold uppercase tracking-wider text-ok/80">
-              Suggested summary
-            </div>
-          ) : null}
-          <div className="markdown-body suggestion-md text-[13.5px] leading-6 text-fg/85">
-            <ReactMarkdown>{md}</ReactMarkdown>
-          </div>
-          <div className="absolute right-1.5 top-1.5 flex items-center gap-0.5 opacity-0 transition-opacity duration-100 focus-within:opacity-100 group-hover:opacity-100">
+          <div className="flex min-h-7 items-center gap-2 border-b border-ok/[0.15] bg-ok/[0.06] py-1 pl-2.5 pr-1.5">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-ok/90">
+              {big ? '+ Suggested summary' : '+ Suggested'}
+            </span>
             {rationale ? (
-              <span
-                className="flex h-6 w-6 cursor-help items-center justify-center rounded text-[11px] text-fg/40 hover:text-fg/70"
-                title={rationale}
-                aria-label={`Why: ${rationale}`}
-              >
-                ⓘ
+              <span className="min-w-0 flex-1 truncate text-[11px] text-fg/45" title={rationale}>
+                {rationale}
               </span>
-            ) : null}
+            ) : (
+              <span className="flex-1" />
+            )}
             <button
-              className="flex h-6 w-6 items-center justify-center rounded text-[13px] text-ok hover:bg-ok/15"
+              className="flex h-6 flex-none items-center gap-1 rounded px-2 text-[11px] font-semibold text-ok hover:bg-ok/15"
               type="button"
-              title="Accept suggestion"
               aria-label="Accept suggestion"
               onClick={() => resolve(true)}
             >
-              ✓
+              ✓ Accept
             </button>
             <button
-              className="flex h-6 w-6 items-center justify-center rounded text-[13px] text-fg/45 hover:bg-white/10 hover:text-fg"
+              className="flex h-6 flex-none items-center gap-1 rounded px-2 text-[11px] text-fg/55 hover:bg-white/10 hover:text-fg"
               type="button"
-              title="Dismiss suggestion"
               aria-label="Dismiss suggestion"
               onClick={() => resolve(false)}
             >
-              ✕
+              ✕ Dismiss
             </button>
+          </div>
+          <div className="border-l-2 border-ok/60 py-1.5 pl-3 pr-3">
+            <div className="markdown-body suggestion-md text-[13.5px] leading-6 text-fg/85">
+              <ReactMarkdown>{md}</ReactMarkdown>
+            </div>
           </div>
         </div>
       )
@@ -138,6 +140,10 @@ export function NotepadEditor({
   const editor = useCreateBlockNote({ schema })
   const containerRef = useRef<HTMLDivElement | null>(null)
   const lastExternalMd = useRef<string | null>(null)
+  const onChangeMdRef = useRef(onChangeMd)
+  useEffect(() => {
+    onChangeMdRef.current = onChangeMd
+  }, [onChangeMd])
   const pending = useMemo(
     () => suggestions.filter((edit) => edit.status === 'pending'),
     [suggestions]
@@ -203,88 +209,49 @@ export function NotepadEditor({
   const [aiSelection, setAiSelection] = useState('')
   const aiBlockIdRef = useRef<string | null>(null)
 
-
-  // Streamed Ask-AI answers write straight into the note (Granola style):
-  // the growing markdown replaces its own previously inserted blocks on a
-  // throttle, and every flush registers provenance so the content renders
-  // gray from the first paint.
-  const aiStreamRef = useRef<{
-    blockIds: string[]
-    latestMd: string
-    writtenMd: string
-    timer: number | null
-    writing: boolean
-  }>({ blockIds: [], latestMd: '', writtenMd: '', timer: null, writing: false })
-
-  const resetAiStream = useCallback((): void => {
-    const stream = aiStreamRef.current
-    if (stream.timer !== null) window.clearTimeout(stream.timer)
-    // Follow-up asks continue after the previous answer, not over it.
-    const lastStreamed = stream.blockIds[stream.blockIds.length - 1]
-    if (lastStreamed && editor.getBlock(lastStreamed)) aiBlockIdRef.current = lastStreamed
-    aiStreamRef.current = { blockIds: [], latestMd: '', writtenMd: '', timer: null, writing: false }
+  // Streamed Ask-AI answers write straight into the note (Granola style).
+  // Every flush explicitly serializes and propagates the document upward —
+  // persistence never depends on editor-internal change events.
+  const emitEditorMarkdown = useCallback(async (): Promise<void> => {
+    const canonical = stripSuggestionBlocks(
+      editor.document as unknown as BlockLike[]
+    ) as unknown as NotepadBlock[]
+    const markdown = (await editor.blocksToMarkdownLossy(canonical)).trimEnd()
+    if (markdown === lastExternalMd.current) return
+    lastExternalMd.current = markdown
+    onChangeMdRef.current(markdown)
   }, [editor])
 
-  const flushAiStream = useCallback((): void => {
-    const stream = aiStreamRef.current
-    if (stream.writing || stream.latestMd === stream.writtenMd) return
-    stream.writing = true
-    const md = stream.latestMd
-    void (async () => {
-      try {
-        // Citation tokens are dead text outside the chat surface.
-        const cleaned = md
-          .replace(/\s*\[(?:N|E|F|P|T|M)\d+(?:,\s*(?:N|E|F|P|T|M)\d+)*\]/g, '')
-          .trim()
-        if (!cleaned) return
-        onAiInserted?.(cleaned)
-        const blocks = (await editor.tryParseMarkdownToBlocks(cleaned)) as NotepadBlock[]
-        if (blocks.length === 0) return
-        const existing = stream.blockIds.filter((id) => editor.getBlock(id))
-        if (existing.length > 0) {
-          const replaced = editor.replaceBlocks(existing, blocks)
-          stream.blockIds = replaced.insertedBlocks.map((block) => block.id)
-        } else {
-          const anchorId = aiBlockIdRef.current
-          const anchorBlock = anchorId ? editor.getBlock(anchorId) : undefined
-          const reference = anchorBlock ?? editor.document[editor.document.length - 1]
-          const inserted = reference
-            ? editor.insertBlocks(blocks, reference, 'after')
-            : editor.replaceBlocks(editor.document, blocks).insertedBlocks
-          stream.blockIds = inserted.map((block) => block.id)
-        }
-        stream.writtenMd = md
-      } finally {
-        stream.writing = false
-        // A newer delta (or the authoritative final content) arrived while
-        // this write was in flight — flush again so nothing is dropped.
-        if (stream.latestMd !== stream.writtenMd && stream.timer === null) {
-          flushAiStream()
-        }
-      }
-    })()
-  }, [editor, onAiInserted])
+  const onAiInsertedRef = useRef(onAiInserted)
+  const emitEditorMarkdownRef = useRef(emitEditorMarkdown)
+  useEffect(() => {
+    onAiInsertedRef.current = onAiInserted
+    emitEditorMarkdownRef.current = emitEditorMarkdown
+  }, [emitEditorMarkdown, onAiInserted])
 
-  const handleAiAnswer = useCallback(
-    (md: string, done: boolean): void => {
-      const stream = aiStreamRef.current
-      stream.latestMd = md
-      if (done) {
-        if (stream.timer !== null) {
-          window.clearTimeout(stream.timer)
-          stream.timer = null
-        }
-        flushAiStream()
-        return
+  const aiWriterRef = useRef<AiStreamWriter | null>(null)
+  useEffect(() => {
+    aiWriterRef.current = new AiStreamWriter(
+      editor as unknown as ConstructorParameters<typeof AiStreamWriter>[0],
+      {
+        emit: () => emitEditorMarkdownRef.current(),
+        onProvenance: (md, done) => onAiInsertedRef.current?.(md, done),
+        anchorBlockId: () => aiBlockIdRef.current
       }
-      if (stream.timer !== null) return
-      stream.timer = window.setTimeout(() => {
-        stream.timer = null
-        flushAiStream()
-      }, 300)
-    },
-    [flushAiStream]
-  )
+    )
+    return () => {
+      aiWriterRef.current = null
+    }
+  }, [editor])
+
+  const resetAiStream = useCallback((): void => {
+    const continueAfter = aiWriterRef.current?.reset() ?? null
+    if (continueAfter) aiBlockIdRef.current = continueAfter
+  }, [])
+
+  const handleAiAnswer = useCallback((md: string, done: boolean): void => {
+    aiWriterRef.current?.handleAnswer(md, done)
+  }, [])
 
   const openAskAi = useCallback((): void => {
     resetAiStream()
