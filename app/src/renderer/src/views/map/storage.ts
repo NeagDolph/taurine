@@ -102,22 +102,27 @@ export function saveColorMode(mode: ColorMode, storage: Storage = window.localSt
   }
 }
 
+export const MIN_DEGREE_DEFAULT = 2
+
 export function loadMinDegree(storage: Storage = window.localStorage): number {
   try {
-    const value = Number(storage.getItem(MIN_DEGREE_KEY))
-    return Number.isFinite(value) && value >= 0 && value <= 8 ? Math.round(value) : 0
+    const raw = storage.getItem(MIN_DEGREE_KEY)
+    if (raw === null) {
+      return MIN_DEGREE_DEFAULT
+    }
+    const value = Number(raw)
+    return Number.isFinite(value) && value >= 0 && value <= 8
+      ? Math.round(value)
+      : MIN_DEGREE_DEFAULT
   } catch {
-    return 0
+    return MIN_DEGREE_DEFAULT
   }
 }
 
 export function saveMinDegree(minDegree: number, storage: Storage = window.localStorage): void {
   try {
-    if (minDegree <= 0) {
-      storage.removeItem(MIN_DEGREE_KEY)
-    } else {
-      storage.setItem(MIN_DEGREE_KEY, String(minDegree))
-    }
+    // always store explicitly — with a non-zero default, "all" (0) must persist
+    storage.setItem(MIN_DEGREE_KEY, String(Math.round(minDegree)))
   } catch {
     // non-fatal
   }

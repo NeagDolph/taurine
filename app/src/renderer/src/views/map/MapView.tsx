@@ -1554,6 +1554,37 @@ export function MapView({
     [selectedNeighborhood]
   )
 
+  // while a node is selected, edges not touching it are removed from the
+  // pointer hit canvas entirely — otherwise they capture hits and make the
+  // selection's own edges nearly impossible to hover in dense regions
+  const paintLinkPointerArea = useCallback(
+    (link: GraphLinkObject, paintColor: string, ctx: CanvasRenderingContext2D) => {
+      if (selectedNodeId) {
+        const srcId = endpointId(link.source)
+        const dstId = endpointId(link.target)
+        if (srcId !== selectedNodeId && dstId !== selectedNodeId) {
+          return
+        }
+      }
+      const source = endpoint(link.source)
+      const target = endpoint(link.target)
+      if (!source || !target) {
+        return
+      }
+      const zoom = graphRef.current?.zoom() ?? 1
+      ctx.save()
+      ctx.beginPath()
+      ctx.moveTo(source.x, source.y)
+      ctx.lineTo(target.x, target.y)
+      ctx.strokeStyle = paintColor
+      // ≈6 screen px, matching the linkHoverPrecision the default hit paint used
+      ctx.lineWidth = Math.max(6 / zoom, 1)
+      ctx.stroke()
+      ctx.restore()
+    },
+    [selectedNodeId]
+  )
+
   // ── layout forces ──────────────────────────────────────────────────────
 
   // tame disconnected islands: weaker repulsion for degree<2 notes plus a
@@ -1808,6 +1839,7 @@ export function MapView({
           nodeCanvasObjectMode={() => 'replace'}
           nodeId="id"
           nodeLabel={() => ''}
+          linkPointerAreaPaint={paintLinkPointerArea}
           nodePointerAreaPaint={paintNodePointerArea}
           nodeRelSize={1}
           nodeVal={(node) => node.val}
