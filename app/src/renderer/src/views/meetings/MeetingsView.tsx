@@ -31,6 +31,7 @@ export interface MeetingsCoordinator {
     summary: SummaryEvent | null
     actionables: Actionable[]
     liveGrounding: LiveGroundingEvent | null
+    noteSnippets: Record<string, string>
   }
   selectMeeting(id: string | null): void
   createMeeting(): Promise<string>

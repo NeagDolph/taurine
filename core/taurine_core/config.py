@@ -274,6 +274,14 @@ CONTEXT_LLM_MIN_PASSAGES = 3             # hybrid: multi-passage threads receive
 CONTEXT_ENRICH_BATCH = 10                # passages per enrichment call, grouped by note
 CONTEXT_ENRICH_CONCURRENCY = 6           # bounded parallel enrichment calls
 SUMMARY_TIMEOUT_S = 20.0
+# Neil 2026-07-20: when live retrieval surfaces a note, a small LLM pass picks
+# the single "most important snippet" of that note for this moment of the
+# conversation — shown in the Insights list and the OS-level suggestion popup.
+NOTE_SNIPPET_MODEL = LIVE_SUMMARY_MODEL
+NOTE_SNIPPET_TIMEOUT_S = 12.0
+NOTE_SNIPPET_MAX_CHARS = 220             # hard display cap; model asked for less
+NOTE_SNIPPET_TRANSCRIPT_TAIL_CHARS = 1200
+NOTE_SNIPPET_MAX_PER_MEETING = 24        # stop burning tokens on marathon calls
 MEETING_NOTES_PROMPT_MAX_CHARS = 8000
 MEETING_CONTEXT_MAX_CHARS = 12000
 SUMMARY_MIN_INTERVAL_S = 25.0            # hard floor between summarizer passes

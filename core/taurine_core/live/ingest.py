@@ -13,6 +13,7 @@ from taurine_core import config
 from taurine_core.live.ambient import AmbientRetriever
 from taurine_core.live.grounding import GroundingEngine, GroundingUpdate
 from taurine_core.live.ledger import SummaryLedgerSnapshot, TranscriptLedger
+from taurine_core.live.snippets import SnippetAgent
 from taurine_core.retrieval.registry import EvidenceRegistry
 from taurine_core.schemas import (
     Actionable,
@@ -22,6 +23,7 @@ from taurine_core.schemas import (
     FinalSummaryStatusEvent,
     LiveGroundingEvent,
     MeetingSummary,
+    NoteSuggestionEvent,
     SummaryEvent,
     TranscriptEvent,
 )
@@ -34,6 +36,7 @@ Event = (
     | ActionableEvent
     | FinalSummaryStatusEvent
     | FinalSummaryEvent
+    | NoteSuggestionEvent
 )
 EventSink = Callable[[Event], Awaitable[None] | None]
 FinalChunkSink = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -84,6 +87,7 @@ class LiveSession:
         emit: EventSink,
         logger: LoggerLike | None = None,
         on_final_chunk: FinalChunkSink | None = None,
+        snippets: SnippetAgent | None = None,
     ) -> None:
         if grounding.registry is not registry:
             raise ValueError("live retrieval, grounding, and transcript must share a registry")
@@ -96,6 +100,7 @@ class LiveSession:
         self._emit = emit
         self._logger = logger or _NullLogger()
         self._on_final_chunk = on_final_chunk
+        self._snippets = snippets
         self._partials: dict[int, str] = {}
         self.last_grounding: GroundingUpdate | None = None
         self._summary: MeetingSummary | None = None
@@ -121,6 +126,8 @@ class LiveSession:
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        if self._snippets is not None:
+            await self._snippets.aclose()
 
     async def on_chunk(self, chunk: Chunk) -> None:
         if chunk.final:
@@ -222,6 +229,8 @@ class LiveSession:
         update = self._grounding.on_pack(pack, topic_shift=topic_shift)
         self.last_grounding = update
         await self._emit_event(LiveGroundingEvent.from_domain(update))
+        if self._snippets is not None:
+            self._snippets.offer(update, window.query_text, self._emit_event)
         self._logger.log(
             "retrieval",
             accepted=pack.decision.accepted,

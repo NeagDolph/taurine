@@ -1,0 +1,147 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Suggested note</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        background: transparent;
+        overflow: hidden;
+        font-family:
+          -apple-system,
+          BlinkMacSystemFont,
+          'Segoe UI',
+          sans-serif;
+        user-select: none;
+      }
+      .card {
+        position: relative;
+        margin: 6px;
+        height: 156px;
+        border-radius: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(28, 28, 31, 0.94);
+        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+        overflow: hidden;
+        color: #ecebe6;
+        -webkit-app-region: no-drag;
+      }
+      .countdown {
+        position: absolute;
+        top: 0;
+        left: 0;
+        height: 3px;
+        width: 100%;
+        background: #f5c518;
+        transform-origin: left;
+      }
+      .countdown.running {
+        transition-property: transform;
+        transition-timing-function: linear;
+        transform: scaleX(0);
+      }
+      .body {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        height: 100%;
+        padding: 14px 14px 12px;
+      }
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 10.5px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: rgba(236, 235, 230, 0.5);
+      }
+      .kicker .spark {
+        color: #f5c518;
+        font-size: 12px;
+      }
+      .close {
+        position: absolute;
+        top: 9px;
+        right: 9px;
+        width: 22px;
+        height: 22px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: rgba(236, 235, 230, 0.55);
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .close:hover {
+        background: rgba(255, 255, 255, 0.08);
+        color: #ecebe6;
+      }
+      .title {
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.3;
+        padding-right: 22px;
+        display: -webkit-box;
+        -webkit-line-clamp: 1;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .snippet {
+        flex: 1;
+        min-height: 0;
+        font-size: 12px;
+        line-height: 1.45;
+        color: rgba(236, 235, 230, 0.78);
+        border-left: 2px solid rgba(245, 197, 24, 0.6);
+        padding-left: 8px;
+        display: -webkit-box;
+        -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .snippet.empty {
+        border-left-color: transparent;
+        color: rgba(236, 235, 230, 0.45);
+        font-style: italic;
+      }
+      .open {
+        height: 30px;
+        flex: none;
+        border-radius: 8px;
+        border: 1px solid transparent;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        background: #f5c518;
+        color: #17140a;
+      }
+      .open:hover {
+        background: #ffd75e;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="countdown" id="countdown"></div>
+      <div class="body">
+        <div class="kicker"><span class="spark">✦</span> From your notes</div>
+        <button class="close" id="dismiss" type="button" aria-label="Dismiss">✕</button>
+        <div class="title" id="title"></div>
+        <div class="snippet" id="snippet"></div>
+        <button class="open" id="open" type="button">Open note</button>
+      </div>
+    </div>
+    <script type="module" src="./src/suggest-main.ts"></script>
+  </body>
+</html>

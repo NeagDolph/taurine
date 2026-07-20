@@ -1,5 +1,9 @@
 /** Countdown panel logic for the OS-level call notification window. */
 
+// No imports here — the empty export keeps this a module so its top-level
+// names don't collide with the other panel script in the same TS program.
+export {}
+
 interface PanelApi {
   callNotifPanel: {
     action(action: 'start' | 'dismiss'): void

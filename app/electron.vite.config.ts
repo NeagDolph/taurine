@@ -16,7 +16,8 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve('src/renderer/index.html'),
-          notif: resolve('src/renderer/notif.html')
+          notif: resolve('src/renderer/notif.html'),
+          suggest: resolve('src/renderer/suggest.html')
         }
       }
     },

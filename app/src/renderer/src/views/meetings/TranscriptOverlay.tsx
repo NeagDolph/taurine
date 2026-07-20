@@ -13,6 +13,7 @@ interface TranscriptOverlayProps {
     chunks: TranscriptEvent[]
     interims: Record<number, TranscriptEvent>
     liveGrounding: LiveGroundingEvent | null
+    noteSnippets: Record<string, string>
   }
   onClose(): void
   onOpenNote(noteId: string): void
@@ -135,6 +136,7 @@ export function TranscriptOverlay({
         <AmbientList
           notes={isLive ? (live.liveGrounding?.display_notes ?? []) : []}
           passages={isLive ? (live.liveGrounding?.display_passages ?? []) : []}
+          snippets={isLive ? live.noteSnippets : undefined}
           noNewEvidence={isLive ? live.liveGrounding?.no_new_evidence : undefined}
           onInspect={isLive && live.liveGrounding ? () => setInspectorOpen(true) : undefined}
           onOpenNote={onOpenNote}

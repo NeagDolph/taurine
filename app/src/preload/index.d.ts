@@ -9,6 +9,21 @@ export interface TaurineApi {
     action: (action: 'start' | 'dismiss') => void
     onShow: (callback: (seconds: number) => void) => () => void
   }
+  suggestNotif: {
+    notify: (payload: { noteId: string; title: string; snippet: string; source: string }) => void
+    onOpen: (callback: (noteId: string) => void) => () => void
+  }
+  suggestNotifPanel: {
+    action: (action: 'open' | 'dismiss') => void
+    onShow: (
+      callback: (payload: {
+        title: string
+        snippet: string
+        source: string
+        seconds: number
+      }) => void
+    ) => () => void
+  }
   session: {
     reportListening: (listening: boolean) => void
   }

@@ -332,9 +332,23 @@ export interface StatusEvent {
   detail: string
 }
 
+// One note newly surfaced by live retrieval, with its LLM-picked
+// "most important snippet" — feeds the Insights list and the OS-level popup.
+export interface NoteSuggestionEvent {
+  type: 'note_suggestion'
+  note_id: string
+  note_ref: string
+  title: string
+  source: string
+  score: number
+  snippet: string
+  ts: number
+}
+
 export type SidecarEvent =
   | TranscriptEvent
   | LiveGroundingEvent
+  | NoteSuggestionEvent
   | SummaryEvent
   | FinalSummaryStatusEvent
   | FinalSummaryEvent
@@ -382,6 +396,7 @@ export class SidecarClient {
 
   private readonly transcriptCallbacks = new Set<Callback<TranscriptEvent>>()
   private readonly groundingCallbacks = new Set<Callback<LiveGroundingEvent>>()
+  private readonly noteSuggestionCallbacks = new Set<Callback<NoteSuggestionEvent>>()
   private readonly summaryCallbacks = new Set<Callback<SummaryEvent>>()
   private readonly finalSummaryStatusCallbacks = new Set<Callback<FinalSummaryStatusEvent>>()
   private readonly finalSummaryCallbacks = new Set<Callback<FinalSummaryEvent>>()
@@ -488,6 +503,10 @@ export class SidecarClient {
 
   onGrounding(callback: Callback<LiveGroundingEvent>): Unsubscribe {
     return this.addCallback(this.groundingCallbacks, callback)
+  }
+
+  onNoteSuggestion(callback: Callback<NoteSuggestionEvent>): Unsubscribe {
+    return this.addCallback(this.noteSuggestionCallbacks, callback)
   }
 
   onSummary(callback: Callback<SummaryEvent>): Unsubscribe {
@@ -607,6 +626,9 @@ export class SidecarClient {
         break
       case 'grounding':
         this.emit(this.groundingCallbacks, event)
+        break
+      case 'note_suggestion':
+        this.emit(this.noteSuggestionCallbacks, event)
         break
       case 'summary':
         this.emit(this.summaryCallbacks, event)
@@ -802,6 +824,8 @@ function parseSidecarEvent(raw: string): SidecarEvent | null {
       return parseTranscript(record)
     case 'grounding':
       return parseLiveGrounding(record)
+    case 'note_suggestion':
+      return parseNoteSuggestion(record)
     case 'summary':
       return parseSummary(record)
     case 'final_summary_status':
@@ -902,6 +926,26 @@ function parseTranscript(record: Record<string, unknown>): TranscriptEvent | nul
     final: record.final,
     ts: record.ts,
     seq: record.seq
+  }
+}
+
+function parseNoteSuggestion(record: Record<string, unknown>): NoteSuggestionEvent | null {
+  if (
+    typeof record.note_id !== 'string' ||
+    typeof record.note_ref !== 'string' ||
+    typeof record.title !== 'string'
+  ) {
+    return null
+  }
+  return {
+    type: 'note_suggestion',
+    note_id: record.note_id,
+    note_ref: record.note_ref,
+    title: record.title,
+    source: typeof record.source === 'string' ? record.source : '',
+    score: typeof record.score === 'number' ? record.score : 0,
+    snippet: typeof record.snippet === 'string' ? record.snippet : '',
+    ts: typeof record.ts === 'number' ? record.ts : 0
   }
 }
 

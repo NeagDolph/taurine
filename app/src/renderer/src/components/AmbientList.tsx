@@ -5,6 +5,8 @@ import type { EvidenceNote, EvidencePassage } from '../lib/sidecar'
 interface AmbientListProps {
   notes: EvidenceNote[]
   passages: EvidencePassage[]
+  // note_ref → LLM-picked "most important snippet"; falls back to passage text
+  snippets?: Record<string, string>
   noNewEvidence?: boolean
   onInspect?: () => void
   onOpenNote?: (noteId: string) => void
@@ -13,6 +15,7 @@ interface AmbientListProps {
 export function AmbientList({
   notes,
   passages,
+  snippets,
   noNewEvidence = false,
   onInspect,
   onOpenNote
@@ -75,9 +78,15 @@ export function AmbientList({
                     <span className="citation-chip citation-passage">{passage.evidence_id}</span>
                   ) : null}
                 </div>
-                <p className="mt-1 text-xs leading-snug text-fg/65">
-                  {passage?.text ?? 'Source metadata only'}
-                </p>
+                {snippets?.[note.note_ref] ? (
+                  <p className="mt-1 border-l-2 border-accent/60 pl-2 text-xs font-medium leading-snug text-fg/85">
+                    {snippets[note.note_ref]}
+                  </p>
+                ) : (
+                  <p className="mt-1 text-xs leading-snug text-fg/65">
+                    {passage?.text ?? 'Source metadata only'}
+                  </p>
+                )}
                 <div className="score-track" style={style} aria-hidden="true">
                   <div className="score-fill" />
                 </div>

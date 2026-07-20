@@ -421,6 +421,23 @@ class AmbientEvent(BaseModel):
     items: list[AmbientItem]
 
 
+class NoteSuggestionEvent(BaseModel):
+    """One note newly surfaced by live retrieval, with its LLM-picked snippet.
+
+    Emitted once per note per session; the renderer shows it in the Insights
+    list and forwards it to the OS-level suggestion popup.
+    """
+
+    type: Literal["note_suggestion"] = "note_suggestion"
+    note_id: str
+    note_ref: str
+    title: str
+    source: str
+    score: float = 0.0
+    snippet: str = ""              # empty when the note surfaced metadata-only
+    ts: float = 0.0
+
+
 class LiveGroundingEvent(BaseModel):
     """Evidence-first live retrieval state exposed to the renderer."""
 

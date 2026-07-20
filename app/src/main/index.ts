@@ -4,6 +4,7 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { startMicWatch } from './micwatch'
 import { CallNotifier } from './notifier'
+import { SuggestionNotifier } from './suggest-notifier'
 import { registerSystemAudioIpc } from './sysaudio'
 import { createTray, destroyTray } from './tray'
 
@@ -107,6 +108,9 @@ app.whenReady().then(() => {
   // see https://github.com/alex8088/electron-toolkit/tree/master/packages/utils
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
+    // Taurine is invisible to screenshare: every window — main, call
+    // notification, suggestion popup — is excluded from screen capture.
+    window.setContentProtection(true)
   })
 
   // IPC test
@@ -126,10 +130,24 @@ app.whenReady().then(() => {
   })
   registerSystemAudioIpc()
   const notifier = new CallNotifier(() => mainWindow)
+  const suggestions = new SuggestionNotifier({
+    openNote: (noteId) => {
+      // User explicitly asked to see the note — surfacing the window is right.
+      showMainWindow()
+      const contents = mainWindow?.webContents
+      if (!contents) return
+      if (contents.isLoading()) {
+        contents.once('did-finish-load', () => contents.send('suggestnotif:open', noteId))
+      } else {
+        contents.send('suggestnotif:open', noteId)
+      }
+    }
+  })
   const stopMicWatch = startMicWatch((active) => notifier.onMicActive(active))
   app.once('will-quit', () => {
     stopMicWatch()
     notifier.dispose()
+    suggestions.dispose()
     destroyTray()
   })
   if (process.platform === 'darwin' && is.dev) {

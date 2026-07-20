@@ -76,6 +76,8 @@ function App(): React.JSX.Element {
   const [chunks, setChunks] = useState<FeedTranscript[]>([])
   const [interimsByChannel, setInterimsByChannel] = useState<Record<number, TranscriptEvent>>({})
   const [liveGrounding, setLiveGrounding] = useState<LiveGroundingEvent | null>(null)
+  // note_ref → LLM-picked "most important snippet" for the live Insights list
+  const [noteSnippets, setNoteSnippets] = useState<Record<string, string>>({})
   const [summary, setSummary] = useState<SummaryEvent | null>(null)
   const [finalSummaryStatuses, setFinalSummaryStatuses] = useState<
     Record<string, FinalSummaryStatusEvent>
@@ -147,6 +149,19 @@ function App(): React.JSX.Element {
           const next = new Set(current)
           event.notes.forEach((item) => next.add(item.note_id))
           return next.size === current.length ? current : [...next]
+        })
+      }),
+      client.onNoteSuggestion((event) => {
+        if (!liveMeetingIdRef.current) return
+        if (event.snippet) {
+          setNoteSnippets((current) => ({ ...current, [event.note_ref]: event.snippet }))
+        }
+        // OS-level popup — visible even when this window is hidden.
+        window.api?.suggestNotif?.notify({
+          noteId: event.note_id,
+          title: event.title,
+          snippet: event.snippet,
+          source: event.source
         })
       }),
       client.onSummary((event) => {
@@ -367,6 +382,7 @@ function App(): React.JSX.Element {
       setChunks([])
       setInterimsByChannel({})
       setLiveGrounding(null)
+      setNoteSnippets({})
       setSummary(null)
       setActionables([])
       setGroundedNoteIds([])
@@ -509,6 +525,9 @@ function App(): React.JSX.Element {
     setActiveTab('map')
   }, [])
 
+  // OS-level suggestion popup chose "Open note" — jump to it in the map.
+  useEffect(() => window.api?.suggestNotif?.onOpen(showInMap), [showInMap])
+
   // map "Ask about this" → new chat seeded with the note, composer prefilled
   const askAboutNote = useCallback((noteId: string, title: string) => {
     setChatSeed((current) => ({ noteId, title, nonce: (current?.nonce ?? 0) + 1 }))
@@ -566,7 +585,8 @@ function App(): React.JSX.Element {
         interims: interimsByChannel,
         summary,
         actionables,
-        liveGrounding
+        liveGrounding,
+        noteSnippets
       },
       selectMeeting,
       createMeeting,
@@ -591,6 +611,7 @@ function App(): React.JSX.Element {
       interimsByChannel,
       listeningState,
       liveGrounding,
+      noteSnippets,
       liveMeetingId,
       finalSummaryStatuses,
       latestFinalSummary,

@@ -57,6 +57,7 @@ from taurine_core.indexer.store import Index
 from taurine_core.live import ambient as live_ambient
 from taurine_core.live.ambient import AmbientRetriever
 from taurine_core.live.grounding import GroundingEngine
+from taurine_core.live.snippets import SnippetAgent
 from taurine_core.live.ingest import Event, EventSink, LiveSession
 from taurine_core.live.final_summary import run_final_summary
 from taurine_core.live.spans import Gliner2SpanExtractor
@@ -1264,6 +1265,7 @@ def build_runtime(progress: Callable[[str, str], None] | None = None) -> Runtime
             emit=emit,
             logger=logger,
             on_final_chunk=on_final_chunk,
+            snippets=SnippetAgent(llm),
         )
 
     def make_asr_client(

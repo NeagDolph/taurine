@@ -25,6 +25,47 @@ const api = {
       return () => ipcRenderer.removeListener('callnotif:show', listener)
     }
   },
+  suggestNotif: {
+    // Main window: forward a live note suggestion to the OS-level popup.
+    notify: (payload: {
+      noteId: string
+      title: string
+      snippet: string
+      source: string
+    }): void => {
+      ipcRenderer.send('suggestnotif:notify', payload)
+    },
+    // Main window: the popup chose "Open note".
+    onOpen: (callback: (noteId: string) => void): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, noteId: unknown): void => {
+        if (typeof noteId === 'string' && noteId) callback(noteId)
+      }
+      ipcRenderer.on('suggestnotif:open', listener)
+      return () => ipcRenderer.removeListener('suggestnotif:open', listener)
+    }
+  },
+  suggestNotifPanel: {
+    // Suggestion panel window only.
+    action: (action: 'open' | 'dismiss'): void => {
+      ipcRenderer.send('suggestnotif:panel-action', action)
+    },
+    onShow: (
+      callback: (payload: { title: string; snippet: string; source: string; seconds: number }) => void
+    ): (() => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: unknown): void => {
+        const record = payload as Record<string, unknown> | null
+        if (!record || typeof record.title !== 'string') return
+        callback({
+          title: record.title,
+          snippet: typeof record.snippet === 'string' ? record.snippet : '',
+          source: typeof record.source === 'string' ? record.source : '',
+          seconds: typeof record.seconds === 'number' && record.seconds > 0 ? record.seconds : 12
+        })
+      }
+      ipcRenderer.on('suggestnotif:show', listener)
+      return () => ipcRenderer.removeListener('suggestnotif:show', listener)
+    }
+  },
   session: {
     reportListening: (listening: boolean): void => {
       ipcRenderer.send('session:listening', listening)
