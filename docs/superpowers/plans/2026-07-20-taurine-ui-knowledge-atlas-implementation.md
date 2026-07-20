@@ -369,7 +369,7 @@ Wire messages remain snake_case and are exhaustively parsed into camel-case doma
 - Create: `app/src/renderer/src/test/baseline.test.ts`
 - Create: `app/scripts/check-bundle-budget.mjs`
 
-**Interfaces:** Produces the `npm test`, `npm run test:e2e`, `npm run test:visual`, and `npm run check:bundle` commands consumed by every renderer task. Enable Vite's manifest and make the bundle checker read `app/out/renderer/.vite/manifest.json`; it fails on initial JS >1,250,000 bytes, aggregate CSS >140,000 bytes, or any lazy feature chunk >900,000 bytes unless `app/bundle-analysis/<chunk>.md` exists.
+**Interfaces:** Produces the `npm test`, `npm run test:e2e`, `npm run test:visual`, `npm run check:bundle:report`, and `npm run check:bundle` commands consumed by later renderer tasks. Enable Vite's manifest and make both bundle modes read `app/out/renderer/.vite/manifest.json`. The enforcing command fails on initial JS >1,250,000 bytes, aggregate CSS >140,000 bytes, or any lazy feature chunk >900,000 bytes unless `app/bundle-analysis/<chunk>.md` exists. The report-only command measures and prints the identical assets and violations but exits zero so Task 1 can characterize the intentionally still-active legacy renderer. It is not a waiver: the unchanged enforcing command must pass after the sole-entry cutover in Tasks 26–28.
 
 - [ ] **Step 1: Write the failing harness contract test.**
 
@@ -410,13 +410,14 @@ Add package scripts exactly as follows and configure Vitest `test.projects` with
   "test:watch": "vitest",
   "test:e2e": "playwright test",
   "test:visual": "playwright test e2e/visual.spec.ts",
+  "check:bundle:report": "node scripts/check-bundle-budget.mjs --report-only",
   "check:bundle": "node scripts/check-bundle-budget.mjs",
   "check:old-ui": "node scripts/check-old-ui-removed.mjs",
   "check:sensitive-logs": "node scripts/check-sensitive-logs.mjs"
 }
 ```
 
-Export the exact `BUNDLE_BUDGETS` object used by the test. Classify entry-reachable chunks as initial, files with `isDynamicEntry` as lazy, and CSS assets separately. Print every measured file and byte count before exiting nonzero on a violation. Add deterministic named manual chunks for `editor`, `atlas`, and `markdown`; do not force them into the initial graph.
+Export the exact `BUNDLE_BUDGETS` object used by the test. Classify entry-reachable chunks as initial, files with `isDynamicEntry` as lazy, and CSS assets separately. Print every measured file, byte count, and violation in both modes. Exit nonzero on a violation unless `--report-only` is present; report-only changes only the exit status, never the measured graph, limits, or output. Add deterministic named manual chunks for `editor`, `atlas`, and `markdown`; do not force them into the initial graph.
 
 - [ ] **Step 4: Run the new contract and all existing frontend gates.**
 
@@ -427,10 +428,10 @@ cd app
 npm test -- src/renderer/src/test/baseline.test.ts
 npm run typecheck
 npm run build
-npm run check:bundle
+npm run check:bundle:report
 ```
 
-Expected: the contract passes, typecheck/build exit 0, and the checker reports each current asset below its assigned threshold.
+Expected: the contract passes, typecheck/build exit 0, and report-only exits 0 while showing the current legacy entry and approximately 381 KB stylesheet above the final target. Then run `npm run check:bundle` separately and observe the expected nonzero exit on those same violations. Record both outputs as the RED bundle characterization. Do not add a waiver or weaken a limit. Task 26 switches the sole entry; Tasks 27–28 require this unchanged enforcing command to pass.
 
 - [ ] **Step 5: Commit the harness.**
 
