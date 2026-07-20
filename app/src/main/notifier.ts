@@ -57,12 +57,10 @@ export class CallNotifier {
 
   private startMeeting(): void {
     this.resolvePanel()
-    const main = this.getMainWindow()
-    if (!main) return
-    if (main.isMinimized()) main.restore()
-    main.show()
-    main.focus()
-    main.webContents.send('callnotif:start')
+    // Never surface or focus the app — the user is in a call in another
+    // window. Recording starts silently in the (possibly hidden) renderer;
+    // Taurine is already on the meeting when they next open it.
+    this.getMainWindow()?.webContents.send('callnotif:start')
   }
 
   private resolvePanel(): void {
@@ -106,7 +104,10 @@ export class CallNotifier {
       minimizable: false,
       maximizable: false,
       closable: false,
-      focusable: true,
+      // Non-activating: clicking the panel's buttons must not activate the
+      // app (macOS would raise every Taurine window, stealing focus from the
+      // user's call). Mouse events still arrive; keyboard focus never does.
+      focusable: false,
       show: false,
       skipTaskbar: true,
       hasShadow: false,

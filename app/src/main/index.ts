@@ -57,7 +57,10 @@ function createWindow(): void {
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      sandbox: false,
+      // Transcription can start from the call notification while this window
+      // is hidden — never throttle the renderer that pumps PCM frames.
+      backgroundThrottling: false
     }
   })
 
