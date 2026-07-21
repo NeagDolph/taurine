@@ -2,276 +2,222 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace Taurine's five-tab Electron renderer with the production Knowledge Atlas workstation while preserving every current capability and adding durable note proposals, resumable live sessions, and desktop OAuth.
+**Goal:** Replace Taurine's five-tab Electron renderer with the complete Knowledge Atlas workstation while preserving durable meeting data, making every generated note edit reviewable, and using one serialized actor for resumable live sessions.
 
-**Architecture:** Keep FastAPI/SQLite as the durable product spine, add transactional meeting-mutation and OAuth services, and retain the three existing WebSocket protocols behind one typed renderer gateway. Replace `App.tsx` coordination with Redux Toolkit domain slices, listener-owned side effects, a sole meeting document writer, three shared-context coordinates, and lazy Atlas/editor/Markdown feature chunks; Electron main owns windows, permissions, privacy, recovery, and bounded IPC.
+**Architecture:** Approved Tasks 1–4 remain the durable prerequisite. Six end-to-end slices now carry the branch from a serialized `SessionActor` and bounded desktop boundary through a working shell, meetings, inquiry/evidence, knowledge operations, and one exhaustive cutover. FastAPI/SQLite remain the durable spine; Redux Toolkit, one typed sidecar gateway, and one `MeetingDocumentController` own renderer coordination; the actor alone owns ephemeral live-session state.
 
-**Tech Stack:** Python 3.12, FastAPI, Pydantic 2, SQLite, pytest/pytest-asyncio, keyring; Electron 39, React 19, TypeScript 5.9, Redux Toolkit/RTK Query, BlockNote, Canvas + d3-force, React Virtual, Vitest, Testing Library, axe-core, and Playwright Electron.
+**Tech Stack:** Python 3.12, FastAPI, Pydantic 2, SQLite, pytest/pytest-asyncio; Electron 39, React 19, TypeScript 5.9, Redux Toolkit/RTK Query, BlockNote, Canvas with d3-force, React Virtual, Vitest, Testing Library, axe-core, and Playwright Electron.
 
-## Global Constraints
+**Authoritative design:** Read both documents before executing a slice:
 
-- Release one completed Knowledge Atlas interface: no runtime feature flag, no dual renderer, no legacy route, no compatibility UI, and no user-facing migration program.
-- Preserve readable `taurine.db`, `taurine-knowledge.db`, meeting/chat/source rows, and current REST/WebSocket data; database work is additive DDL initialized in place.
-- Preserve the verified floors of 981 passing core tests with 2 skipped and 61 passing Vitest tests; all new tests add to those floors.
-- Python remains `>=3.12`; Electron remains `^39.2.6`, React `^19.2.1`, and TypeScript `^5.9.3` unless an explicit dependency update is reviewed separately.
-- Use Redux Toolkit as the only renderer global-state library; sockets, fetches, capture sequencing, and editor writes do not live in React views.
-- `MeetingDocumentController` is the only frontend caller allowed to mutate canonical meeting Markdown; every AI-authored note path first persists a `MeetingNoteProposal`.
-- Audio is never queued or replayed. Disconnect resume preserves bounded live reasoning state for 60 seconds; explicit Stop ceases capture immediately and offers a 10-second server-owned resume window.
-- Do not add graph pagination, a unified WebSocket, event replay IDs, final-summary retry, profile cancellation, or hard retrieval scoping.
-- `/graph/edge-reason` is not called from projected note edges because `GraphEdge` lacks exact passage endpoints.
-- Default/minimum main-window bounds are 1280×820 and 960×640 CSS px; ordinary Live is two lanes, and optional three-lane Live begins at 1440 px.
-- Initial renderer shell is at most 1.25 MB uncompressed JavaScript and 140 KB uncompressed CSS; each lazy feature chunk is at most 900 KB without a checked-in bundle analysis.
+- `docs/superpowers/specs/2026-07-20-ui-first-session-architecture-reset-design.md`
+- `docs/superpowers/specs/2026-07-20-taurine-ui-knowledge-atlas-design.md`
+
+This plan supersedes the former 28-task sequence in this file. It does not narrow any visual, interaction, evidence, accessibility, privacy, or release requirement from the Knowledge Atlas design. The reset specification controls lifecycle ownership and task sequencing wherever the two specifications differ.
+
+## Global constraints
+
+- Execute in the current `codex/ui-knowledge-atlas` worktree. Do not reset, rebase, rewrite, or replay completed branch history.
+- Approved prerequisite state is Task 1 commit `0d4827d` plus Tasks 2–4 and their approved repairs through `bb4da82`. Those commits already provide the harness, bundle budgets, revision-aware meeting notes, durable proposals/commands/undo, producer persistence, and referential chat cleanup.
+- Commits after `bb4da82` and the current uncommitted `core/taurine_core/live/session_registry.py` repair are superseded implementation material. Do not continue its lock, detached-entry, callback-handoff, retry-driver, or cleanup-successor design. Slice 1 replaces the file and its tests wholesale; useful snapshot limits and user-visible contract assertions may be rewritten against the actor.
+- The paused repair archive `/private/tmp/taurine-atlas-paused-task5-20260720.tar.gz` is reference-only. Do not extract it over the worktree.
+- Do not add a data migration task or an ephemeral-session migration. Existing additive meeting proposal/operation DDL from Tasks 2–4 remains initialized in place; existing `taurine.db` and `taurine-knowledge.db` open in place. The actor table, deadlines, snapshot, audio state, and task ownership are memory-only.
+- Release one completed Knowledge Atlas interface: no feature flag, dual renderer, legacy route, fallback CSS, compatibility UI, or alternate successful test path.
+- Preserve at least the verified baselines of 981 passing Core tests with 2 skipped and 61 passing Vitest tests; new tests add to those floors.
+- Python remains `>=3.12`; Electron remains `^39.2.6`, React `^19.2.1`, and TypeScript `^5.9.3` unless a separately reviewed dependency change is unavoidable.
+- Redux Toolkit is the only renderer global-state library. Sockets, fetches, capture sequencing, and editor writes do not live in React views.
+- `MeetingDocumentController` is the only frontend caller allowed to mutate canonical meeting Markdown. Every AI-authored path first persists a `MeetingNoteProposal`.
+- `SessionActor` is the only component allowed to read or mutate the live-session table. Public commands cross one bounded admission semaphore and one private FIFO `asyncio.Queue`; only the actor loop changes records.
+- Audio is never queued or replayed. Disconnect suspends bounded reasoning state for 60 seconds; Stop rejects new audio immediately and uses a 10-second resumable deadline or a zero-second finalization request.
+- Keep the existing wire error `meeting_session_conflict`. It is the transport rendering of the reset specification's Knowledge Atlas `session_conflict` outcome. `state_reset` is reserved for a missing in-memory record after process restart.
+- Do not add graph pagination, a unified WebSocket, replay IDs, final-summary retry, profile cancellation, hard retrieval scoping, or a projected-edge call to `/graph/edge-reason`.
+- Main-window default/minimum bounds are 1280×820 and 960×640 CSS px. Ordinary Live is two lanes; opt-in three-lane Live begins at 1440 px. Compact Live is the same BrowserWindow at 440×680 default, 420×560 minimum, and 560×900 maximum.
+- Initial renderer shell is at most 1.25 MB uncompressed JavaScript and 140 KB uncompressed CSS. Each lazy feature chunk is at most 900 KB without a checked-in analysis.
 - Atlas sustains at least 30 fps at 5,000 projected nodes on the reference Mac; virtualized lists sustain 60 fps; selection/command response p95 is below 100 ms excluding model/network work.
-- Every rendered surface meets WCAG 2.2 AA, supports keyboard-only operation, 200% zoom, reduced motion, forced colors, 35% string expansion, and RTL; primary/destructive/meeting controls target 40–44 px and all targets meet 24×24 px.
-- Copy never claims content protection makes Taurine invisible or uncapturable. Privacy state is exactly Requested, Limited on this Mac, Unavailable, or Privacy curtain on.
-- Evidence copy preserves Cited, Consulted, Retrieved, fallback, abstained, interrupted, historical, conflicted, and unavailable distinctions. Never render “verified,” “fact checked,” or numeric confidence as a primary truth claim.
-- Never fabricate progress. Determinate progress requires real `done/total`; model/runtime operations without totals remain indeterminate.
-- Production Redux DevTools are disabled; logs and error breadcrumbs exclude note, transcript, profile, passage, prompt, answer, token, and credential content.
-- Keep `app/src/renderer/src/app/App.tsx` below approximately 120 substantive lines after the final cutover.
-- Execute only inside the assigned `ui-knowledge-atlas` linked worktree. At the start of the implementation session, discover and validate its root exactly once:
+- Every surface meets WCAG 2.2 AA, keyboard-only use, 200% zoom, reduced motion, forced colors, 35% string expansion, and RTL. Every target meets 24×24 px; primary, destructive, and meeting controls target 40–44 px.
+- Privacy copy is exactly Protection requested, Limited on this Mac, Unavailable, or Privacy curtain on. Never claim Taurine is invisible or uncapturable.
+- Evidence copy keeps Cited, Consulted, Retrieved, fallback, abstained, interrupted, historical, conflicted, and unavailable distinct. Never render “verified,” “fact checked,” or numeric confidence as a primary truth claim.
+- Determinate progress requires real `done/total`. Runtime, model, finalization, and profile operations without totals remain indeterminate.
+- Production Redux DevTools are off. Logs and breadcrumbs exclude note, transcript, profile, passage, prompt, answer, token, credential, and raw retrieval content.
+- `app/src/renderer/src/app/App.tsx` stays below approximately 120 substantive lines and owns providers plus `AppShell` only.
+- Each slice has one combined RED checkpoint, one combined GREEN checkpoint, one runnable inspectable journey, one frozen commit, and one independent review in this order: GREEN → commit/freeze → stop → independent review. Begin no next-slice edit until that review is clean; repair findings in the frozen slice and submit a new frozen commit for re-review.
+- Every checkbox below is one 2–5 minute action. If local code shape makes an action larger, split it into adjacent checkboxes before editing; do not merge behavioral steps into an unreviewable batch.
+
+## Execution preflight
+
+- [ ] **Locate and validate the current Atlas worktree.**
+
+  Run:
 
   ```bash
   export WORKTREE_ROOT="$(git rev-parse --show-toplevel)"
-  case "$(git rev-parse --git-dir)" in
-    *"/worktrees/ui-knowledge-atlas") ;;
-    *) echo "Refusing to run outside the assigned ui-knowledge-atlas linked worktree" >&2; exit 1 ;;
-  esac
   cd "$WORKTREE_ROOT"
+  test "$(git branch --show-current)" = "codex/ui-knowledge-atlas"
+  git merge-base --is-ancestor bb4da82 HEAD
+  git status --short
   ```
 
-- Before every command block in this plan, run `cd "$WORKTREE_ROOT"`; then execute the displayed relative `cd app`, `cd core`, Git, and path commands verbatim. Never substitute the primary checkout or another worktree for `WORKTREE_ROOT`.
+  Expected: the branch test and ancestry check exit 0. Status may show only the known superseded Task 5 actor-predecessor files; preserve any unrelated user changes.
 
----
+- [ ] **Record the prerequisite commits without replaying them.**
 
-## Repository baseline and delivery boundaries
+  Run:
 
-The current renderer is coordinated by `app/src/renderer/src/App.tsx` (852 lines), with old views under `views/`, old chrome under `components/`, and three separate clients in `lib/sidecar.ts`, `lib/updates.ts`, and `lib/chat.ts`. The current main window is built in `app/src/main/index.ts`; utility windows live in `notifier.ts` and `suggest-notifier.ts`; preload exposes one broad `window.api` object. Core meeting storage is in `core/taurine_core/indexer/store.py`, WebSocket/finalization ownership is in `core/taurine_core/server.py`, and schemas are in `core/taurine_core/schemas.py`. OAuth token reads are embedded in `gmail.py`, `outlook.py`, and `google_common.py`.
+  ```bash
+  cd "$WORKTREE_ROOT"
+  git log --oneline --reverse b84877d..bb4da82
+  ```
 
-Implementation is internally staged but externally atomic. Tasks 1–25 build reviewed modules and contract tests without exposing a second UI. Task 26 switches the sole renderer entry to Knowledge Atlas. Tasks 27–28 prove the full flow, remove every old UI file, and record the release gate.
+  Expected: the range begins with `0d4827d test: establish knowledge atlas quality gates`, includes durable note/proposal work, and ends with `bb4da82 fix(core): harden durable meeting proposal producers`.
 
-## Target file map
+- [ ] **Record the superseded Task 5 delta.**
 
-### Core files
+  Run:
 
-| Path | Action | Responsibility |
-|---|---|---|
-| `core/taurine_core/schemas.py` | Modify | Pydantic proposal, command, session-resume, OAuth, and enriched connector contracts |
-| `core/taurine_core/indexer/store.py` | Modify | additive proposal/operation tables, revision-checked writes, chat referential cleanup |
-| `core/taurine_core/meetings/__init__.py` | Create | meeting-mutation package boundary |
-| `core/taurine_core/meetings/note_mutations.py` | Create | proposal validation, atomic command application, inverse/undo, retention |
-| `core/taurine_core/live/session_registry.py` | Create | active/suspended ownership, deadlines, snapshot, one-winner resume/finalize claims |
-| `core/taurine_core/live/final_summary.py` | Modify | materialize final recap/additions as durable proposals in the final transaction |
-| `core/taurine_core/chat/engine.py` | Modify | persist meeting-chat proposals before `chat_notes_edit` emit |
-| `core/taurine_core/server.py` | Modify | REST routes, session controls, registry lifecycle, OAuth routes, cleanup |
-| `core/taurine_core/connectors/credentials.py` | Create | `CredentialStore`, keyring implementation, in-memory test store, env fallback |
-| `core/taurine_core/connectors/oauth.py` | Create | provider registry, PKCE/state, exact loopback callback, flow expiry/exchange |
-| `core/taurine_core/connectors/gmail.py` | Modify | credential-provider token refresh |
-| `core/taurine_core/connectors/outlook.py` | Modify | credential-provider token refresh and rotated-token persistence |
-| `core/taurine_core/connectors/google_common.py` | Modify | shared Google credential-provider token refresh |
-| `core/taurine_core/connectors/google_calendar.py` | Modify | injected shared Google token provider |
-| `core/taurine_core/connectors/google_docs.py` | Modify | injected shared Google token provider |
-| `core/taurine_core/connectors/registry.py` | Modify | OAuth provider identity/status and credential injection |
-| `core/taurine_core/connectors/catalog.py` | Modify | materialize OAuth connectors from runtime credential services |
-| `core/pyproject.toml` / `core/uv.lock` | Modify | keyring dependency lock |
-| `core/tests/test_meeting_note_mutations.py` | Create | proposal/revision/command/undo/storage coverage |
-| `core/tests/test_session_registry.py` | Create | registry unit and race coverage |
-| `core/tests/test_meeting_session_resume.py` | Create | `/session` continuation integration |
-| `core/tests/test_connector_oauth.py` | Create | OAuth routes/provider/vault redaction |
-| `core/tests/test_meetings.py` | Modify | new REST detail/revision/final/chat-delete behavior |
-| `core/tests/test_chat_meeting_context.py` | Modify | chat proposal persistence-before-emit |
-| `core/tests/test_final_summary.py` | Modify | final proposals share final-record transaction |
+  ```bash
+  cd "$WORKTREE_ROOT"
+  git diff --name-status bb4da82..HEAD
+  git diff --stat
+  ```
 
-### Electron main and preload files
+  Expected: committed Task 5 changes are limited to `core/taurine_core/live/session_registry.py`, `core/tests/test_session_registry.py`, and progress metadata; current uncommitted repair is visible. Do not stage or commit it.
 
-| Path | Action | Responsibility |
-|---|---|---|
-| `app/src/main/index.ts` | Rewrite | lifecycle composition only |
-| `app/src/main/windows/main-window.ts` | Create | main bounds/restore/hide/fullscreen/compact |
-| `app/src/main/windows/window-state.ts` | Create | geometry-only persistence and visible-work-area clamp |
-| `app/src/main/windows/call-prompt-window.ts` | Create | 372×136 non-activating call prompt |
-| `app/src/main/windows/context-suggestion-window.ts` | Create | 372×188 bounded/redactable suggestion queue |
-| `app/src/main/windows/window-privacy.ts` | Create | content-protection request/report and curtain broadcast |
-| `app/src/main/capture/system-audio.ts` | Create | moved `sysaudio.ts` implementation |
-| `app/src/main/capture/micwatch.ts` | Create | moved micwatch process/debouncer |
-| `app/src/main/permissions/capabilities.ts` | Create | microphone/system/call/content capability report |
-| `app/src/main/permissions/system-settings.ts` | Create | allowlisted OS settings launch |
-| `app/src/main/recovery/drafts.ts` | Create | safeStorage recovery draft and live-session metadata |
-| `app/src/main/ipc.ts` | Create | narrow validated IPC registration |
-| `app/src/main/tray.ts` | Rewrite | exact dynamic Knowledge Atlas tray state/actions |
-| `app/src/preload/contracts.ts` | Create | complete `DesktopBridge` types |
-| `app/src/preload/index.ts` | Rewrite | validated bridge implementation |
-| `app/src/preload/index.d.ts` | Modify | `window.desktop` global declaration |
-| `app/src/main/notifier.ts`, `suggest-notifier.ts`, `sysaudio.ts`, `micwatch.ts` | Delete in Task 28 | superseded old ownership |
+## Canonical cross-slice interfaces
 
-### Renderer application and services
+These names and shapes are fixed. If implementation discovers an incompatible checked-in contract, update every producer, consumer, parser, fixture, and test in the same slice before freezing it.
 
-| Path | Action | Responsibility |
-|---|---|---|
-| `app/src/renderer/src/app/App.tsx` | Create | providers and `AppShell` only |
-| `app/src/renderer/src/app/AppShell.tsx` | Create | coordinate rail/index/workbench/inspector/shelf/operations composition |
-| `app/src/renderer/src/app/store.ts` | Create | Redux store, listener middleware, redaction, typed hooks |
-| `app/src/renderer/src/app/listeners.ts` | Create | cross-domain start/stop/hydrate/reconcile orchestration |
-| `app/src/renderer/src/app/commands.ts` | Create | command registry and shortcut precedence |
-| `app/src/renderer/src/app/hydration.ts` | Create | startup backoff, domain hydration, restore validation |
-| `app/src/renderer/src/services/sidecar/contracts.ts` | Create | exhaustive wire/domain types and parsers |
-| `app/src/renderer/src/services/sidecar/rest-api.ts` | Create | RTK Query endpoints/cache tags/conflict errors |
-| `app/src/renderer/src/services/sidecar/gateway.ts` | Create | one sidecar supervisor and connection epochs |
-| `app/src/renderer/src/services/sidecar/updates-connection.ts` | Create | `/updates` lifecycle |
-| `app/src/renderer/src/services/sidecar/session-connection.ts` | Create | `/session`, binary audio, resume controls |
-| `app/src/renderer/src/services/sidecar/chat-connection.ts` | Create | lazy `/chat`, no resend |
-| `app/src/renderer/src/services/sidecar/reconciliation.ts` | Create | snapshot and reconnect merge rules |
-| `app/src/renderer/src/services/desktop/bridge.ts` | Create | `window.desktop` adapter |
-| `app/src/renderer/src/services/desktop/capabilities.ts` | Create | capability-to-copy selectors |
-| `app/src/renderer/src/main.tsx` | Modify | load fonts/tokens, Redux provider, target `App` |
+```python
+SessionState = Literal["active", "suspended", "finalizing"]
+SessionDisposition = Literal["new", "resumed", "state_reset", "stopped_resumable"]
+AsrState = Literal["disconnected", "connecting", "connected", "error"]
 
-### Renderer features and shared UI
+@dataclass(frozen=True, slots=True)
+class SessionChannel:
+    id: int
+    label: str
 
-Create the feature tree specified below. Each directory owns `state.ts`, `selectors.ts`, and tests next to the behavior it implements.
+@dataclass(frozen=True, slots=True)
+class SessionSnapshot:
+    meeting_id: str
+    client_session_id: str
+    disposition: SessionDisposition
+    resume_deadline: float | None
+    asr: AsrState
+    channels: tuple[SessionChannel, ...]
+    transcript_seq: int
+    summary: SummaryEvent | None
+    grounding: LiveGroundingEvent | None
+    actionables: tuple[Actionable, ...]
+    note_suggestions: tuple[NoteSuggestionEvent, ...]
 
-```text
-app/src/renderer/src/
-  features/
-    runtime/        RuntimeGate.tsx FirstRunChecklist.tsx OperationLedger.tsx state.ts selectors.ts
-    workspace/      CoordinateRail.tsx CommandDeck.tsx CommandCenter.tsx QuickOpen.tsx
-                    ContextShelf.tsx ComparisonBoard.tsx ControlWorkbench.tsx state.ts selectors.ts
-    atlas/          AtlasWorkbench.tsx AtlasCanvas.tsx AtlasOutline.tsx AtlasIndex.tsx
-                    AtlasControls.tsx TimeBand.tsx atlas-worker.ts layout.ts render.ts
-                    contracts.ts state.ts selectors.ts storage.ts
-    meetings/       MeetingsIndex.tsx MeetingDossier.tsx LiveDesk.tsx CompactLive.tsx
-                    CaptureHeader.tsx TranscriptLane.tsx NotesDocument.tsx
-                    MeetingDocumentController.ts ProposalQueue.ts LiveIntelligence.tsx
-                    FinalRecord.tsx ProposalDiff.tsx state.ts listeners.ts selectors.ts contracts.ts
-      editor/       blocknote-adapter.ts provenance.ts markdown-source.tsx
-    inquiry/        InquiryIndex.tsx InquiryWorkbench.tsx InquiryComposer.tsx
-                    AssistantTurn.tsx ProcessTrace.tsx MessageMarkdown.tsx
-                    state.ts listeners.ts selectors.ts contracts.ts
-    evidence/       EvidenceInspector.tsx EvidenceLedger.tsx PassageView.tsx
-                    FactView.tsx PathView.tsx normalize.ts selectors.ts
-    sources/        SourcesIndex.tsx SourcesLedger.tsx SourceDetail.tsx SourceConfig.tsx
-                    Authorization.tsx descriptors.ts state.ts listeners.ts selectors.ts
-    profile/        ProfileWorkbench.tsx ProfileEditor.tsx GenerationRail.tsx state.ts listeners.ts
-    privacy/        PrivacyCurtain.tsx PrivacyStatus.tsx state.ts
-    notifications/  ContextQueue.tsx state.ts
-    diagnostics/    DiagnosticsWorkbench.tsx SessionLog.tsx
-  components/
-    primitives/     Button.tsx Field.tsx Menu.tsx Dialog.tsx Sheet.tsx Notice.tsx
-                    Tooltip.tsx Progress.tsx Skeleton.tsx Divider.tsx
-    layout/         SplitPane.tsx VirtualList.tsx IndexPane.tsx FocusZone.tsx
-    knowledge/      ObjectRow.tsx SourceMark.tsx EvidenceRef.tsx DecisionLabel.tsx
-                    FactRow.tsx PathView.tsx DiffProposal.tsx
-  i18n/             en.ts format.ts pseudo.ts useMessage.ts
-  styles/           tokens.css reset.css typography.css shell.css primitives.css print.css
-  assets/sources/   apple-notes.svg obsidian.svg imessage.svg gmail.svg outlook.svg
-                    google-calendar.svg google-docs.svg folders.svg claude.svg codex.svg taurine.svg
+@dataclass(slots=True)
+class LiveSessionRecord:
+    meeting_id: str
+    client_session_id: str
+    state: SessionState
+    context: SessionContext
+    generation: int
+    resume_deadline: float | None
+    expiry_task: asyncio.Task[None] | None
+    finalization_task: asyncio.Task[None] | None
+
+class SessionSnapshotUpdate(TypedDict, total=False):
+    transcript_seq: int
+    summary: SummaryEvent | None
+    grounding: LiveGroundingEvent | None
+    actionables: tuple[Actionable, ...]
+    note_suggestions: tuple[NoteSuggestionEvent, ...]
+    asr: AsrState
+
+@dataclass(frozen=True, slots=True)
+class FinalizationInput:
+    meeting_id: str
+    client_session_id: str
+    generation: int
+    notes_md: str
+    notes_rev: int
+    transcript: tuple[Mapping[str, Any], ...]
+    last_live_summary: Mapping[str, Any]
+
+@dataclass(frozen=True, slots=True)
+class FinalizationOutcome:
+    status: Literal["success", "failure", "cancelled"]
+    error_kind: str | None
+
 ```
 
-### Test and build infrastructure
+`SessionActor` has exactly these public calls:
 
-| Path | Action | Responsibility |
-|---|---|---|
-| `app/package.json` / `app/package-lock.json` | Modify | state/UI/test/performance dependencies and scripts |
-| `app/vitest.config.ts` | Modify | setup, coverage groups, deterministic browser globals |
-| `app/src/renderer/src/test/setup.ts` | Create | Testing Library cleanup and DOM shims |
-| `app/electron.vite.config.ts` | Modify | manifest, named lazy chunks, three renderer entries |
-| `app/playwright.config.ts` | Create | Electron projects, viewport/theme/zoom matrix, artifacts |
-| `app/e2e/fixtures/fake-sidecar.ts` | Create | deterministic REST and three-WebSocket fixture |
-| `app/e2e/fixtures/scenarios.ts` | Create | meetings/evidence/graph/source/profile datasets and faults |
-| `app/e2e/knowledge-atlas.spec.ts` | Create | acceptance stories A–N |
-| `app/e2e/accessibility.spec.ts` | Create | axe, keyboard, focus, zoom, pseudo-locale, RTL |
-| `app/e2e/visual.spec.ts` | Create | stabilized screenshot matrix |
-| `app/e2e/performance.spec.ts` | Create | 5k/10k/3k/200 datasets and p95/frame/heap assertions |
-| `app/scripts/check-bundle-budget.mjs` | Create | uncompressed initial/feature/CSS budget enforcement |
-| `app/scripts/check-old-ui-removed.mjs` | Create | reject deleted imports/routes/selectors/theme motifs |
-| `app/scripts/check-sensitive-logs.mjs` | Create | static rejection of content in logger/breadcrumb calls |
-| `app/src/renderer/src/App.tsx`, `assets/main.css`, old `views/`, old `components/`, superseded `lib/` UI coordinators | Delete in Task 28 | remove old interface completely |
+- `start(meeting_id: str, client_session_id: str, channels: Sequence[SessionChannel], sink: EventSink) -> Awaitable[SessionSnapshot]`
+- `disconnect(meeting_id: str, client_session_id: str) -> Awaitable[SessionSnapshot]`
+- `stop(meeting_id: str, client_session_id: str, resume_window_s: Literal[0, 10]) -> Awaitable[SessionSnapshot | None]`; 10 returns `stopped_resumable`, while 0 returns `None` after the actor has atomically entered finalizing and started its single wrapper.
+- `delete(meeting_id: str) -> Awaitable[None]`
+- `snapshot(meeting_id: str, client_session_id: str) -> Awaitable[SessionSnapshot]`
+- `update_snapshot(meeting_id: str, client_session_id: str, update: SessionSnapshotUpdate) -> Awaitable[SessionSnapshot]`
+- `shutdown(finalize: bool) -> Awaitable[None]`
 
-## Canonical cross-task interfaces
+Actor constructor dependencies are exact: `create_context`, `finalize_context`, `delete_meeting`, `initial_disposition`, `monotonic`, `sleep`, `diagnostics`, and `on_loop_failure`. Constructor creation occurs inside the FastAPI lifespan and starts one actor-loop task before `/session` accepts work.
 
-These names are fixed. A task that changes one must update every consumer and contract test in the same commit.
+`SessionContext` is the actor-owned adapter over the existing `LiveSession`, ASR client, transcript buffer, rebindable sink, latest notepad, and bounded projection. It has exactly these calls:
+
+- `disable_audio_and_flush() -> Awaitable[SessionSnapshotUpdate]`: reject new frames first, stop ASR, flush final transcript, and return the actual bounded state even when the flush reports a safe diagnostic.
+- `rebind_transport(channels: Sequence[SessionChannel], sink: EventSink) -> Awaitable[None]`: bind the new sink and create only the ASR/channel transport; it does not recreate the retained `LiveSession`.
+- `apply_snapshot(update: SessionSnapshotUpdate) -> None`: validate/merge bounded projection data and never accept audio or credentials.
+- `materialize_snapshot(disposition: SessionDisposition, resume_deadline: float | None) -> SessionSnapshot`: return an immutable copy for the wire mapper.
+- `freeze_finalization(generation: int) -> FinalizationInput`: capture durable notes/transcript/summary input once before starting finalization.
+- `close_without_output() -> Awaitable[None]`: cooperatively stop ASR/live helpers without generating a meeting record.
 
 ```ts
-type KnowledgeCoordinate = "atlas" | "chronicle" | "inquiry"
-type ControlSection = "sources" | "profile" | "privacy" | "appearance" | "shortcuts" | "diagnostics"
-type CapturePhase =
+export type KnowledgeCoordinate = "atlas" | "chronicle" | "inquiry"
+export type ControlSection = "sources" | "profile" | "privacy" | "appearance" | "shortcuts" | "diagnostics"
+export type CapturePhase =
   | "idle" | "preparing" | "live_full" | "live_mic_only" | "reconnecting"
-  | "stopped_resumable" | "ending" | "finalizing" | "done" | "finalization_error" | "failed"
+  | "stopped_resumable" | "ending" | "finalizing" | "done"
+  | "finalization_error" | "failed"
 
-type SessionIdentity = {
+export type SessionIdentity = {
   meetingId: string
   clientSessionId: string
-  channels: Array<{id: number; label: string}>
+  channels: Array<{ id: number; label: string }>
 }
 
-type ProposalSource = {
-  chatId?: string
-  messageId?: number
-  summaryRevision?: number
-  actionableId?: string
-  evidenceIds?: string[]
-}
-
-type MeetingNoteProposal = {
-  proposalId: string
-  meetingId: string
-  origin: "final_summary" | "meeting_chat" | "inline_ask" | "rolling_summary" | "actionable"
-  baseNotesRev: number
-  anchor: string | null
-  occurrence: number | null
-  deleteMd: string
-  insertMd: string
-  rationale: string
-  supersedesProposalId: string | null
-  source: ProposalSource
-  status: "pending" | "accepted" | "rejected" | "superseded"
-  createdAt: number
-  decidedAt: number | null
-  decisionCommandId: string | null
-}
-
-type ProposalPlacement = {anchor: string | null; occurrence: number | null}
-type UserNoteCommand = {
-  commandId: string
-  kind: "insert" | "replace"
-  baseNotesRev: number
-  anchor: string | null
-  occurrence: number | null
-  deleteMd: string
-  insertMd: string
-}
-
-type SessionStartWire = {
+export type SessionStartWire = {
   type: "start"
   meeting_id: string
   client_session_id: string
-  channels: Array<{id: number; label: string}>
+  channels: Array<{ id: number; label: string }>
 }
-type SessionStopWire = {
+
+export type SessionStopWire = {
   type: "stop"
   meeting_id: string
   client_session_id: string
   resume_window_s: 10 | 0
 }
-type SessionNotepadWire = {
+
+export type SessionNotepadWire = {
   type: "notepad"
   meeting_id: string
   client_session_id: string
   text_md: string
 }
-type SessionSnapshotWire = {
+
+export type SessionSnapshotWire = {
   type: "session_snapshot"
   meeting_id: string
   client_session_id: string
   disposition: "new" | "resumed" | "state_reset" | "stopped_resumable"
   resume_deadline: number | null
   asr: "disconnected" | "connecting" | "connected" | "error"
-  channels: Array<{id: number; label: string}>
+  channels: Array<{ id: number; label: string }>
   transcript_seq: number
   summary: SummaryEventWire | null
   grounding: LiveGroundingEventWire | null
   actionables: ActionableWire[]
   note_suggestions: NoteSuggestionEventWire[]
 }
-type SessionErrorWire = {
+
+export type SessionErrorWire = {
   type: "session_error"
   meeting_id: string | null
   client_session_id: string | null
@@ -279,7 +225,7 @@ type SessionErrorWire = {
   detail: string
 }
 
-interface MeetingDocumentController {
+export interface MeetingDocumentController {
   replaceFromEditor(notesMd: string): void
   insertUserText(command: UserNoteCommand): Promise<Meeting>
   decideProposal(proposalId: string, decision: "accept" | "reject"): Promise<Meeting>
@@ -289,623 +235,50 @@ interface MeetingDocumentController {
   resolveConflict(choice: "mine" | "server" | "copy_both"): Promise<void>
 }
 
-interface SidecarGateway {
+export interface SidecarGateway {
   start(): void
   stop(): void
-  session: SessionConnection
-  updates: UpdatesConnection
-  chat: ChatConnection
+  readonly session: SessionConnection
+  readonly updates: UpdatesConnection
+  readonly chat: ChatConnection
   subscribe(listener: (event: GatewayEvent) => void): () => void
   getEpoch(protocol: "session" | "updates" | "chat"): number
 }
-```
 
-```py
-class ProposalSource(BaseModel):
-    chat_id: str | None = None
-    message_id: int | None = None
-    summary_revision: int | None = None
-    actionable_id: str | None = None
-    evidence_ids: list[str] | None = None
-
-class NotesConflict(Exception):
-    meeting_id: str
-    expected_rev: int
-    actual_rev: int
-
-class MeetingNoteProposal(BaseModel):
-    proposal_id: str
-    meeting_id: str
-    origin: Literal["final_summary", "meeting_chat", "inline_ask", "rolling_summary", "actionable"]
-    base_notes_rev: int
-    anchor: str | None
-    occurrence: int | None
-    delete_md: str
-    insert_md: str
-    rationale: str
-    supersedes_proposal_id: str | None
-    source: ProposalSource
-    status: Literal["pending", "accepted", "rejected", "superseded"]
-    created_at: float
-    decided_at: float | None
-    decision_command_id: str | None
-
-class NoteCommandRequest(BaseModel):
-    command_id: str
-    kind: Literal["insert", "replace", "proposal_decision", "undo"]
-    base_notes_rev: int
-    anchor: str | None = None
-    occurrence: int | None = None
-    delete_md: str = ""
-    insert_md: str = ""
-    proposal_id: str | None = None
-    decision: Literal["accept", "reject"] | None = None
-    target_command_id: str | None = None
-
-class CredentialStore(Protocol):
-    def get(self, provider: str, account_id: str) -> OAuthCredential | None: ...
-    def put(self, provider: str, account_id: str, credential: OAuthCredential) -> None: ...
-    def delete(self, provider: str, account_id: str) -> None: ...
-
-class SessionRegistry(Protocol):
-    async def start(self, meeting_id: str, client_session_id: str, channels: list[SessionChannel]) -> SessionLease: ...
-    async def suspend(self, meeting_id: str, client_session_id: str, reason: str, resume_window_s: int) -> SessionLease: ...
-    async def stop(self, meeting_id: str, client_session_id: str, resume_window_s: Literal[0, 10]) -> SessionLease: ...
-    async def finalize_due(self, meeting_id: str, client_session_id: str, generation: int) -> bool: ...
-```
-
-Wire messages remain snake_case and are exhaustively parsed into camel-case domain objects. Unknown message discriminants are logged by name and epoch only, then trigger a bounded snapshot reconciliation; message payloads never enter logs.
-
----
-
-### Task 1: Lock the test harness, dependencies, and budgets
-
-**Files:**
-- Modify: `app/package.json`
-- Modify: `app/package-lock.json`
-- Modify: `app/vitest.config.ts`
-- Modify: `app/electron.vite.config.ts`
-- Create: `app/src/renderer/src/test/setup.ts`
-- Create: `app/src/renderer/src/test/baseline.test.ts`
-- Create: `app/scripts/check-bundle-budget.mjs`
-
-**Interfaces:** Produces the `npm test`, `npm run test:e2e`, `npm run test:visual`, `npm run check:bundle:report`, and `npm run check:bundle` commands consumed by later renderer tasks. Enable Vite's manifest and make both bundle modes read `app/out/renderer/.vite/manifest.json`. The enforcing command fails on initial JS >1,250,000 bytes, aggregate CSS >140,000 bytes, or any lazy feature chunk >900,000 bytes unless `app/bundle-analysis/<chunk>.md` exists. The report-only command measures and prints the identical assets and violations but exits zero so Task 1 can characterize the intentionally still-active legacy renderer. It is not a waiver: the unchanged enforcing command must pass after the sole-entry cutover in Tasks 26–28.
-
-- [ ] **Step 1: Write the failing harness contract test.**
-
-```ts
-// app/src/renderer/src/test/baseline.test.ts
-import { describe, expect, it } from "vitest"
-// @ts-expect-error The executable JavaScript checker intentionally has no TypeScript surface.
-import { BUNDLE_BUDGETS } from "../../../../scripts/check-bundle-budget.mjs"
-
-describe("Knowledge Atlas build contracts", () => {
-  it("pins the approved uncompressed budgets", () => {
-    expect(BUNDLE_BUDGETS).toEqual({ initialJs: 1_250_000, css: 140_000, lazyFeature: 900_000 })
-  })
-})
-```
-
-- [ ] **Step 2: Run the contract test and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/test/baseline.test.ts`
-
-Expected: FAIL with `Failed to resolve import "../../../../scripts/check-bundle-budget.mjs"`.
-
-- [ ] **Step 3: Install and configure the exact toolchain, then implement the checker.**
-
-Run:
-
-```bash
-cd app
-npm install @reduxjs/toolkit react-redux lucide-react @tanstack/react-virtual d3-force d3-polygon @fontsource/ibm-plex-sans @fontsource/ibm-plex-mono
-npm install --save-dev @testing-library/react @testing-library/user-event @testing-library/jest-dom axe-core @axe-core/playwright @playwright/test ws @types/ws @types/d3-force @types/d3-polygon
-```
-
-Add package scripts exactly as follows and configure Vitest `test.projects` with a `node` project for `src/main/**/*.test.ts` and a `renderer` project using `jsdom`, `setupFiles: ["src/renderer/src/test/setup.ts"]`, CSS support, and `src/renderer/src/**/*.test.{ts,tsx}`. This preserves the existing main-process suite instead of applying DOM globals to it:
-
-```json
-{
-  "test": "vitest run",
-  "test:watch": "vitest",
-  "test:e2e": "playwright test",
-  "test:visual": "playwright test e2e/visual.spec.ts",
-  "check:bundle:report": "node scripts/check-bundle-budget.mjs --report-only",
-  "check:bundle": "node scripts/check-bundle-budget.mjs",
-  "check:old-ui": "node scripts/check-old-ui-removed.mjs",
-  "check:sensitive-logs": "node scripts/check-sensitive-logs.mjs"
+export type CapabilityReport = {
+  platform: NodeJS.Platform
+  microphone: "unknown" | "granted" | "denied" | "restricted"
+  systemAudio: "unsupported" | "unknown" | "granted" | "denied" | "error"
+  callDetection: "supported" | "unsupported" | "error"
+  contentProtection: "requested_limited" | "requested" | "unavailable"
+  appVersion: string
 }
-```
 
-Export the exact `BUNDLE_BUDGETS` object used by the test. Classify entry-reachable chunks as initial, files with `isDynamicEntry` as lazy, and CSS assets separately. Print every measured file, byte count, and violation in both modes. Exit nonzero on a violation unless `--report-only` is present; report-only changes only the exit status, never the measured graph, limits, or output. Add deterministic named manual chunks for `editor`, `atlas`, and `markdown`; do not force them into the initial graph.
+export type RecoveryDraft = {
+  meetingId: string
+  baseNotesRev: number
+  contentHash: string
+  notesMd: string
+  updatedAt: number
+}
+
+export type CaptureRequest = {
+  microphoneDeviceId: string | null
+  includeSystemAudio: boolean
+}
+
+export type CaptureResult = {
+  microphone: "started" | "denied" | "restricted" | "no_device" | "error"
+  systemAudio: "started" | "not_requested" | "unsupported" | "denied" | "error"
+}
+
+export type DesktopEvent =
+  | { type: "callState"; state: "detected" | "ask" | "countdown" | "paused" | "starting" | "error" | "dismissed"; secondsRemaining: number | null }
+  | { type: "contextSuggestion"; state: "queued" | "visible" | "opened" | "dismissed" | "timed_out"; suggestionId: string; title: string | null; snippet: string | null }
+  | { type: "systemAudioChunk"; pcm: ArrayBuffer }
+  | { type: "privacyChanged"; curtain: boolean; protection: CapabilityReport["contentProtection"] }
+  | { type: "windowIntent"; intent: "show" | "start_meeting" | "open_live_meeting" | "stop_meeting" | "new_inquiry" }
 
-- [ ] **Step 4: Run the new contract and all existing frontend gates.**
-
-Run:
-
-```bash
-cd app
-npm test -- src/renderer/src/test/baseline.test.ts
-npm run typecheck
-npm run build
-npm run check:bundle:report
-```
-
-Expected: the contract passes, typecheck/build exit 0, and report-only exits 0 while showing the current legacy entry and approximately 381 KB stylesheet above the final target. Then run `npm run check:bundle` separately and observe the expected nonzero exit on those same violations. Record both outputs as the RED bundle characterization. Do not add a waiver or weaken a limit. Task 26 switches the sole entry; Tasks 27–28 require this unchanged enforcing command to pass.
-
-- [ ] **Step 5: Commit the harness.**
-
-```bash
-git add app/package.json app/package-lock.json app/vitest.config.ts app/electron.vite.config.ts app/src/renderer/src/test/setup.ts app/src/renderer/src/test/baseline.test.ts app/scripts/check-bundle-budget.mjs
-git commit -m "test: establish knowledge atlas quality gates"
-```
-
-### Task 2: Add revisioned meeting proposals and operation storage
-
-**Files:**
-- Modify: `core/taurine_core/schemas.py`
-- Modify: `core/taurine_core/indexer/store.py`
-- Create: `core/tests/test_meeting_note_mutations.py`
-- Modify: `core/tests/test_meetings.py`
-
-**Interfaces:** Preserves the existing `notes_rev` column and produces `Meeting.note_proposals`, `Meeting.note_operations`, `MeetingNoteProposal`, `MeetingNoteOperation`, `create_note_proposal`, `list_note_proposals`, `apply_note_operation`, and `NotesConflict`. Proposal and operation IDs are client/server idempotency keys; no migration screen or copied database is introduced.
-
-- [ ] **Step 1: Write failing additive-schema and optimistic-concurrency tests.**
-
-```py
-def test_proposal_survives_store_reopen(store_path):
-    store = Index(store_path)
-    meeting = store.meeting_create(title="Review")
-    proposal = store.create_note_proposal(
-        meeting["meeting_id"], origin="meeting_chat", proposal_id="proposal-1",
-        base_notes_rev=meeting["notes_rev"],
-        anchor=None, occurrence=None, delete_md="", insert_md="- Ship it", rationale="Requested in chat",
-        supersedes_proposal_id=None, source={"chat_id": "chat-1", "message_id": 1},
-    )
-    store.close()
-    reopened = Index(store_path)
-    assert reopened.list_note_proposals(meeting["meeting_id"])[0] == proposal
-
-def test_stale_note_operation_is_rejected_without_writing(store):
-    meeting = store.meeting_create(title="Review")
-    meeting_id = meeting["meeting_id"]
-    store.apply_note_operation(
-        meeting_id, "command-1", 0, "insert",
-        {"anchor": None, "occurrence": None, "delete_md": "", "insert_md": "one"},
-    )
-    with pytest.raises(NotesConflict) as conflict:
-        store.apply_note_operation(
-            meeting_id, "command-2", 0, "insert",
-            {"anchor": None, "occurrence": None, "delete_md": "", "insert_md": "stale"},
-        )
-    assert conflict.value.actual_rev == 1
-    assert store.meeting_get(meeting_id)["notes_md"] == "one"
-```
-
-- [ ] **Step 2: Run the focused tests and confirm the expected failure.**
-
-Run: `cd core && uv run pytest tests/test_meeting_note_mutations.py tests/test_meetings.py -q`
-
-Expected: FAIL because proposal schemas/tables/store methods and revision compare-and-swap do not exist.
-
-- [ ] **Step 3: Implement the additive DDL and typed store API.**
-
-Retain the existing `meetings.notes_rev` DDL/read behavior. Add `meeting_note_proposals` and `meeting_note_operations` through the current idempotent initializer, with meeting foreign keys, status/origin checks, unique IDs, timestamps, serialized source/payload/inverse, and indexes on `(meeting_id, status, created_at)`. Proposal-decision operation rows reference the proposal and never duplicate its private Markdown. All note-changing mutation methods use one `BEGIN IMMEDIATE` transaction and this compare-and-swap:
-
-```sql
-UPDATE meetings
-SET notes_md = ?, notes_rev = notes_rev + 1, updated_at = ?
-WHERE meeting_id = ? AND notes_rev = ?
-```
-
-If `rowcount != 1`, roll back and raise `NotesConflict(expected_rev, actual_rev)`. Reusing a command ID returns its stored result without incrementing the revision. Proposal reads are ordered by `created_at, id`; parsers validate every stored enum/source shape.
-
-- [ ] **Step 4: Run focused and schema-regression tests.**
-
-Run:
-
-```bash
-cd core
-uv run pytest tests/test_meeting_note_mutations.py tests/test_meetings.py tests/test_index_store.py -q
-```
-
-Expected: PASS, including reopening a pre-change fixture with revision 0 and cascade-deleting its proposals/operations.
-
-- [ ] **Step 5: Commit the storage spine.**
-
-```bash
-git add core/taurine_core/schemas.py core/taurine_core/indexer/store.py core/tests/test_meeting_note_mutations.py core/tests/test_meetings.py
-git commit -m "feat(core): persist revisioned meeting note proposals"
-```
-
-### Task 3: Expose atomic note commands, decisions, and undo
-
-**Files:**
-- Create: `core/taurine_core/meetings/__init__.py`
-- Create: `core/taurine_core/meetings/note_mutations.py`
-- Modify: `core/taurine_core/server.py`
-- Modify: `core/taurine_core/schemas.py`
-- Modify: `core/tests/test_meeting_note_mutations.py`
-- Modify: `core/tests/test_meetings.py`
-
-**Interfaces:** Consumes Task 2 storage. Produces `POST /meetings/{meeting_id}/note-commands`, `POST /meetings/{meeting_id}/note-proposals`, proposal/operation metadata in meeting detail, HTTP 409 `{detail:"notes_conflict", meeting}`, HTTP 409 `proposal_stale`, and HTTP 409 `undo_conflict`. Accepted proposals are inserted exactly once; reject changes status without changing `notes_rev`; supersede occurs in proposal creation; undo applies the stored inverse as a new operation.
-
-- [ ] **Step 1: Write failing API tests for accept, idempotency, conflict, and undo.**
-
-```py
-async def test_accept_proposal_is_atomic_and_idempotent(client, meeting):
-    meeting_id = meeting["meeting_id"]
-    proposal = await create_append_proposal(client, meeting_id, "proposal-1", "## Decision\nShip", 0)
-    body = {"command_id": "accept-1", "kind": "proposal_decision", "proposal_id": proposal["proposal_id"],
-            "decision": "accept", "base_notes_rev": 0}
-    first = await client.post(f"/meetings/{meeting_id}/note-commands", json=body)
-    second = await client.post(f"/meetings/{meeting_id}/note-commands", json=body)
-    assert first.status_code == second.status_code == 200
-    assert first.json()["meeting"]["notes_rev"] == second.json()["meeting"]["notes_rev"] == 1
-    assert first.json()["meeting"]["notes_md"].count("Ship") == 1
-```
-
-- [ ] **Step 2: Run the API tests and confirm the expected failure.**
-
-Run: `cd core && uv run pytest tests/test_meeting_note_mutations.py tests/test_meetings.py -q`
-
-Expected: FAIL with 404 for `/note-commands` and `/note-proposals`.
-
-- [ ] **Step 3: Implement command validation and routes.**
-
-Implement a `NoteMutationService` with pure functions for insert-at-heading, replace-range, proposal placement, and inverse generation. Validate heading/range anchors against the base revision, constrain payload Markdown to the configured meeting note limit, reject unknown payload keys, and never concatenate on conflict. Return `MeetingMutationResult(meeting, proposal, operation)` from one transaction. Map `NotesConflict` to 409 and invalid placement to 422. Retain the newest 100 operations per meeting after a successful transaction; never remove proposal audit rows.
-
-```py
-@router.post("/meetings/{meeting_id}/note-commands", response_model=MeetingMutationResult)
-def apply_note_command(meeting_id: str, request: NoteCommandRequest) -> MeetingMutationResult:
-    return note_mutations.apply(meeting_id, request)
-```
-
-- [ ] **Step 4: Run mutation, meeting, and OpenAPI tests.**
-
-Run: `cd core && uv run pytest tests/test_meeting_note_mutations.py tests/test_meetings.py tests/test_server_startup.py -q`
-
-Expected: PASS; generated OpenAPI contains both new routes, explicit request/response models, 409, and 422 responses. Tests also prove exact idempotent replay, conflicting command/proposal ID reuse, required `base_notes_rev` on `notes_md` PATCH, no revision increment for reject/undo-of-reject, one increment for accept/undo-of-accept, latest-operation-only undo, immutable proposal content on Accept, and deterministic on-read adaptation of stored `suggestions`.
-
-- [ ] **Step 5: Commit the mutation API.**
-
-```bash
-git add core/taurine_core/meetings core/taurine_core/server.py core/taurine_core/schemas.py core/tests/test_meeting_note_mutations.py core/tests/test_meetings.py
-git commit -m "feat(core): add transactional meeting note commands"
-```
-
-### Task 4: Route every AI note edit through durable proposals
-
-**Files:**
-- Modify: `core/taurine_core/chat/engine.py`
-- Modify: `core/taurine_core/live/final_summary.py`
-- Modify: `core/taurine_core/indexer/store.py`
-- Modify: `core/tests/test_chat_meeting_context.py`
-- Modify: `core/tests/test_final_summary.py`
-- Modify: `core/tests/test_meetings.py`
-
-**Interfaces:** Consumes `create_note_proposal`. Produces proposal-bearing `chat_notes_edit` updates and final meeting records. `source` carries only durable reference IDs; proposal audit rows survive deletion of a referenced chat and render an unresolved reference as unavailable. Deleting a chat clears `meetings.chat_id` transactionally. Final proposal creation and final meeting status commit together.
-
-- [ ] **Step 1: Write failing persistence-before-emit and final-transaction tests.**
-
-```py
-async def test_chat_edit_is_persisted_before_event(chat_engine, store, events):
-    await chat_engine.run_edit_notes(meeting_id="m1", chat_id="c1", instruction="add decision")
-    event = next(event for event in events if event.type == "chat_notes_edit")
-    persisted = store.get_note_proposal(event.proposal.proposal_id)
-    assert persisted.status == "pending"
-    assert event.proposal == persisted
-
-def test_final_record_never_exposes_unpersisted_note_additions(finalizer, store):
-    finalizer.complete("m1", recap="Recap", additions=["Action"])
-    meeting = store.meeting_get("m1")
-    assert meeting["status"] == "done"
-    assert [p.origin for p in store.list_note_proposals("m1")] == ["final_summary"]
-```
-
-- [ ] **Step 2: Run focused producer tests and confirm the expected failure.**
-
-Run: `cd core && uv run pytest tests/test_chat_meeting_context.py tests/test_final_summary.py tests/test_meetings.py -q`
-
-Expected: FAIL because chat emits transient Markdown and finalization writes additions outside the proposal ledger.
-
-- [ ] **Step 3: Replace direct/transient edits with proposal writes.**
-
-Create the proposal before publishing an update, emit only the stored proposal DTO, and use the same database transaction as the final meeting record. Deleting a chat clears every matching `meetings.chat_id` in the same transaction and publishes both chats and meetings updates; deleting a meeting still preserves its linked inquiry. Proposal audit rows and their source IDs remain immutable; a later unresolved chat ID renders as unavailable. Add origin mappings: meeting chat → `meeting_chat`, dossier inline Ask → `inline_ask`, live rolling summary → `rolling_summary`, live actionable item → `actionable`, final recap/additions → `final_summary`. No producer mutates `notes_md`.
-
-- [ ] **Step 4: Run all chat/final/meeting tests.**
-
-Run: `cd core && uv run pytest tests/test_chat_meeting_context.py tests/test_server_chat_ws.py tests/test_final_summary.py tests/test_meetings.py -q`
-
-Expected: PASS; a forced publish exception still leaves a queryable pending proposal, while a forced final transaction exception leaves neither final state nor final proposals.
-
-- [ ] **Step 5: Commit durable AI proposals.**
-
-```bash
-git add core/taurine_core/chat/engine.py core/taurine_core/live/final_summary.py core/taurine_core/indexer/store.py core/tests/test_chat_meeting_context.py core/tests/test_final_summary.py core/tests/test_meetings.py
-git commit -m "feat(core): persist all ai-authored meeting proposals"
-```
-
-### Task 5: Build the resumable session registry
-
-**Files:**
-- Create: `core/taurine_core/live/session_registry.py`
-- Create: `core/tests/test_session_registry.py`
-
-**Interfaces:** Produces a lock-protected registry keyed by `(meeting_id, client_session_id)`, with active/suspended/finalizing states, a monotonic deadline, generation token, retained `LiveSession`, and one-winner matching-Start/`finalize_due`. A different token cannot take over an active or suspended meeting. The snapshot projection holds transcript sequence, current summary, grounding, actionables, note suggestions, channels, ASR state, and deadline; it never stores or replays audio bytes.
-
-- [ ] **Step 1: Write failing deterministic time and race tests.**
-
-```py
-async def test_disconnect_resumes_before_sixty_seconds(fake_clock, registry):
-    await registry.start("m1", "s1", channels())
-    await registry.suspend("m1", "s1", reason="disconnect", resume_window_s=60)
-    fake_clock.advance(59.9)
-    lease = await registry.start("m1", "s1", channels())
-    assert lease.state == "active"
-
-async def test_only_resume_or_expiry_finalization_wins(registry):
-    await registry.start("m1", "s1", channels())
-    lease = await registry.suspend("m1", "s1", reason="disconnect", resume_window_s=60)
-    results = await asyncio.gather(
-        registry.start("m1", "s1", channels()),
-        registry.finalize_due("m1", "s1", lease.generation),
-        return_exceptions=True,
-    )
-    assert sum(not isinstance(result, Exception) and result for result in results) == 1
-```
-
-- [ ] **Step 2: Run the registry test and confirm the expected failure.**
-
-Run: `cd core && uv run pytest tests/test_session_registry.py -q`
-
-Expected: FAIL because `taurine_core.live.session_registry` is absent.
-
-- [ ] **Step 3: Implement explicit-stop and disconnect leases.**
-
-Inject `monotonic`, `create_task`, and finalizer callbacks. Use 60 seconds for disconnect and the requested 10 or 0 seconds for explicit Stop. Stop returns the suspended/finalizing lease immediately so the client ceases capture; matching Start validates meeting/token/generation/deadline, cancels the one timer, rebinds the retained event sink, and resumes; `finalize_due` atomically claims the generation before invoking finalization. Duplicate Stop is idempotent and never extends a deadline; Stop on a disconnect-suspended entry shortens it to at most 10 seconds. Delete and explicit app quit claim/remove entries. Bound current state with existing limits and clear it after successful finalization or terminal failure.
-
-- [ ] **Step 4: Run registry tests under repeat and race stress.**
-
-Add `@pytest.mark.parametrize("iteration", range(20))` to the race case, then run: `cd core && uv run pytest tests/test_session_registry.py -q`
-
-Expected: PASS across all 20 race instances with exactly one owner and no pending-task warnings.
-
-- [ ] **Step 5: Commit the registry.**
-
-```bash
-git add core/taurine_core/live/session_registry.py core/tests/test_session_registry.py
-git commit -m "feat(core): add resumable live session registry"
-```
-
-### Task 6: Integrate session start, stop, reconnect, and snapshot reconciliation
-
-**Files:**
-- Modify: `core/taurine_core/server.py`
-- Modify: `core/taurine_core/schemas.py`
-- Create: `core/tests/test_meeting_session_resume.py`
-- Modify: `core/tests/test_server_ws.py`
-
-**Interfaces:** Consumes Task 5. `/session` extends existing `start`, `stop`, and `notepad` controls with `client_session_id`; Stop also carries `meeting_id` and `resume_window_s: 10|0`. It emits exact `session_snapshot` and `session_error` contracts while retaining current status/transcript/summary/grounding/actionable/suggestion events. A matching Start is the only resume control. Binary frames are accepted only after the resumed snapshot and ASR-connected acknowledgement.
-
-- [ ] **Step 1: Write failing socket lifecycle tests.**
-
-```py
-async def test_explicit_stop_is_immediate_and_resumable(live_socket, fake_clock):
-    start = {"type": "start", "client_session_id": "s1", "meeting_id": "m1", "channels": []}
-    await live_socket.send_json(start)
-    await live_socket.send_json({"type": "stop", "client_session_id": "s1", "meeting_id": "m1",
-                                 "resume_window_s": 10})
-    stopped = await live_socket.receive_json()
-    assert stopped["type"] == "session_snapshot"
-    assert stopped["disposition"] == "stopped_resumable"
-    assert stopped["resume_deadline"] is not None
-    await live_socket.send_json(start)
-    assert (await live_socket.receive_json())["disposition"] == "resumed"
-
-async def test_audio_after_stop_is_rejected_without_buffering(live_socket):
-    await start_then_stop(live_socket, "s1", "m1")
-    await live_socket.send_bytes(b"audio-must-not-be-retained")
-    assert (await live_socket.receive_json())["code"] == "invalid_session_control"
-```
-
-- [ ] **Step 2: Run socket tests and confirm the expected failure.**
-
-Run: `cd core && uv run pytest tests/test_meeting_session_resume.py tests/test_server_ws.py -q`
-
-Expected: FAIL because stop finalizes directly and a reconnect creates a new context.
-
-- [ ] **Step 3: Make the registry the sole lifecycle owner.**
-
-Replace `Runtime.active_sessions`/`meeting_finalizers` ownership with `SessionRegistry` and a `RebindableEventSink`. On disconnect, flush ASR and suspend the retained `LiveSession` for 60 seconds. On explicit Stop, stop accepting frames and flush ASR before responding; use the requested 10-second lease or immediate finalization. A matching Start restores the same live summary/grounding/actionable/notepad objects and sends `session_snapshot{disposition:"resumed"}` before ASR connected; never replay audio or already-consumed controls. Process restart returns `state_reset` after durable meeting/transcript refetch. Preserve current event shapes except for required session identity additions. Delete meeting cancels its registry entry before durable deletion; explicit app quit requests immediate finalization.
-
-- [ ] **Step 4: Run integration and existing audio/finalization suites.**
-
-Run: `cd core && uv run pytest tests/test_meeting_session_resume.py tests/test_server_ws.py tests/test_live_ingest.py tests/test_final_summary.py -q`
-
-Expected: PASS; tests prove 59.9-second resume, 60-second expiry, 9.9-second stopped resume, 10-second finalization, stale-generation rejection, and exactly-once finalization.
-
-- [ ] **Step 5: Commit live continuation.**
-
-```bash
-git add core/taurine_core/server.py core/taurine_core/schemas.py core/tests/test_meeting_session_resume.py core/tests/test_server_ws.py
-git commit -m "feat(core): resume live sessions across disconnects"
-```
-
-### Task 7: Create OS-backed credential storage and OAuth flow state
-
-**Files:**
-- Create: `core/taurine_core/connectors/credentials.py`
-- Create: `core/taurine_core/connectors/oauth.py`
-- Modify: `core/pyproject.toml`
-- Modify: `core/uv.lock`
-- Create: `core/tests/test_connector_oauth.py`
-
-**Interfaces:** Produces `CredentialStore`, `KeyringCredentialStore(service_name="Taurine")`, `MemoryCredentialStore`, environment fallback, `OAuthProvider`, `OAuthFlow`, and `OAuthFlowRegistry`. Provider app registration remains configuration; access/refresh tokens and expiry are stored by provider/account in the OS vault. Flow state uses PKCE S256, cryptographic state, exact loopback redirect, five-minute expiry, and single consumption.
-
-- [ ] **Step 1: Write failing vault and flow-security tests.**
-
-```py
-def test_flow_uses_pkce_exact_redirect_and_single_use(oauth, clock):
-    flow = oauth.begin("gmail", callback_origin="http://127.0.0.1:43119")
-    assert flow.authorization_url.startswith("https://accounts.google.com/")
-    assert flow.code_challenge_method == "S256"
-    assert flow.redirect_uri == f"http://127.0.0.1:43119/oauth/callback/{flow.flow_id}"
-    credential = oauth.complete(flow.flow_id, state=flow.state, code="code")
-    assert credential.refresh_token == "refresh"
-    with pytest.raises(InvalidOAuthState):
-        oauth.complete(flow.flow_id, state=flow.state, code="again")
-
-def test_credentials_are_never_represented_with_tokens(memory_credentials):
-    memory_credentials.put("google", "me@example.com", oauth_credential("secret-token"))
-    assert "secret-token" not in repr(memory_credentials)
-```
-
-- [ ] **Step 2: Run the OAuth unit tests and confirm the expected failure.**
-
-Run: `cd core && uv run pytest tests/test_connector_oauth.py -q`
-
-Expected: FAIL because credentials and OAuth flow modules do not exist.
-
-- [ ] **Step 3: Add keyring and implement the provider-neutral core.**
-
-Run: `cd core && uv add keyring`
-
-Serialize credentials as versioned JSON in keyring, never in SQLite or logs. Support read-only environment fallback for existing token variables, with the vault taking precedence. Inject HTTP exchange functions and clocks in tests. Validate provider, redirect origin/path/port, state, expiry, and response content before persisting. Redact exception bodies and map errors to stable codes. Do not ship OAuth client secrets in renderer code.
-
-- [ ] **Step 4: Run security-focused and connector baseline tests.**
-
-Run: `cd core && uv run pytest tests/test_connector_oauth.py tests/test_connectors.py -q`
-
-Expected: PASS; keyring is mocked, environment fallback still works, expired/mismatched/replayed flows fail, and captured logs contain no token/code/verifier values.
-
-- [ ] **Step 5: Commit credential and flow services.**
-
-```bash
-git add core/taurine_core/connectors/credentials.py core/taurine_core/connectors/oauth.py core/pyproject.toml core/uv.lock core/tests/test_connector_oauth.py
-git commit -m "feat(core): add secure connector oauth services"
-```
-
-### Task 8: Expose OAuth and inject credentials into every connector
-
-**Files:**
-- Modify: `core/taurine_core/server.py`
-- Modify: `core/taurine_core/schemas.py`
-- Modify: `core/taurine_core/connectors/gmail.py`
-- Modify: `core/taurine_core/connectors/outlook.py`
-- Modify: `core/taurine_core/connectors/google_common.py`
-- Modify: `core/taurine_core/connectors/google_calendar.py`
-- Modify: `core/taurine_core/connectors/google_docs.py`
-- Modify: `core/taurine_core/connectors/registry.py`
-- Modify: `core/taurine_core/connectors/catalog.py`
-- Modify: `core/tests/test_connector_oauth.py`
-- Modify: `core/tests/test_connectors.py`
-
-**Interfaces:** Consumes Task 7. Produces `POST /connectors/{id}/authorize -> 202 {flow_id, authorization_url, expires_at}`, `GET /connectors/{id}/authorize/{flow_id} -> {state, detail}`, `DELETE /connectors/{id}/authorization -> ConnectorInfo`, and `GET /oauth/callback/{flow_id}` minimal browser HTML. Enriches connector descriptors with authorization state and redacted detail. Each connector-registry member owns an authorization flow; shared Google credential plumbing prevents duplicate token code without inventing an undocumented provider-wide UI action.
-
-- [ ] **Step 1: Write failing route and shared-provider tests.**
-
-```py
-async def test_google_connector_authorization_completes_via_polled_flow(client, oauth_exchange):
-    started = await client.post("/connectors/gmail/authorize")
-    flow_id = started.json()["flow_id"]
-    callback = await client.get(
-        f"/oauth/callback/{flow_id}",
-        params={"state": oauth_exchange.state_for(flow_id), "code": "valid"},
-    )
-    assert callback.status_code == 200
-    status = await client.get(f"/connectors/gmail/authorize/{flow_id}")
-    assert status.json()["state"] == "authorized"
-
-async def test_disconnect_revokes_local_credential_without_returning_token(client):
-    response = await client.delete("/connectors/gmail/authorization")
-    assert response.status_code == 200
-    assert response.json()["id"] == "gmail"
-    assert "token" not in response.text.lower()
-```
-
-- [ ] **Step 2: Run route/connector tests and confirm the expected failure.**
-
-Run: `cd core && uv run pytest tests/test_connector_oauth.py tests/test_connectors.py -q`
-
-Expected: FAIL with 404 for the OAuth routes and constructors that do not accept a credential provider.
-
-- [ ] **Step 3: Implement routes, refresh, and descriptor projection.**
-
-Use fixed loopback callbacks derived from the bound sidecar port and refuse a renderer-provided redirect. Accept authorization only for registry members with `kind="oauth"`. Callback exchanges the code, stores credentials, publishes the existing connector update event, and returns a small success/failure page. Connector fetches request a current token from injected credential services, persist rotated refresh tokens, retry once after an authorization failure, and surface stable errors. Successful auth does not auto-enable or auto-sync. Disconnect removes the vault entry, clears provider-derived caches, and publishes a connector update; Disable and Delete indexed data remain separate actions.
-
-- [ ] **Step 4: Run all connector, API, and logging tests.**
-
-Run:
-
-```bash
-cd core
-uv run pytest tests/test_connector_oauth.py tests/test_connectors.py tests/test_server_startup.py tests/test_session_log.py -q
-```
-
-Expected: PASS; registry validation, flow polling, shared Google credential code, Microsoft isolation, refresh rotation, expired authorization, no automatic enable/sync, disconnect without purge, and response/log redaction are asserted.
-
-- [ ] **Step 5: Commit desktop authorization support.**
-
-```bash
-git add core/taurine_core/server.py core/taurine_core/schemas.py core/taurine_core/connectors core/tests/test_connector_oauth.py core/tests/test_connectors.py
-git commit -m "feat(core): expose connector oauth authorization"
-```
-
-### Task 9: Replace the Electron boundary with bounded capabilities
-
-**Files:**
-- Create: `app/src/main/windows/window-state.ts`
-- Create: `app/src/main/windows/main-window.ts`
-- Create: `app/src/main/windows/window-privacy.ts`
-- Create: `app/src/main/permissions/capabilities.ts`
-- Create: `app/src/main/permissions/system-settings.ts`
-- Create: `app/src/main/recovery/drafts.ts`
-- Create: `app/src/main/ipc.ts`
-- Create: `app/src/preload/contracts.ts`
-- Rewrite: `app/src/preload/index.ts`
-- Modify: `app/src/preload/index.d.ts`
-- Create: `app/src/main/ipc.test.ts`
-- Create: `app/src/main/windows/window-state.test.ts`
-- Create: `app/src/main/recovery/drafts.test.ts`
-
-**Interfaces:** Produces one frozen `window.desktop` bridge matching §13.5: `capabilities`, `requestPermission`, `openSystemSettings`, `setPrivacyCurtain`, `setCompactLive`, allowlisted `openExternal`, `chooseDirectory`, `recoveryDraft`, `liveSession`, retained capture/call/context methods, and bounded event subscription. Each method maps to one validated IPC channel. It does not expose raw `ipcRenderer`, shell, arbitrary paths/URLs, subprocesses, or a generic invoke method.
-
-- [ ] **Step 1: Write failing bridge, geometry, privacy, and recovery tests.**
-
-```ts
-// app/src/main/ipc.test.ts
-// @vitest-environment node
-it("registers only the allowlisted bridge channels", () => {
-  registerIpc(deps)
-  expect([...registeredChannels]).toEqual([
-    "desktop:capabilities", "desktop:request-permission", "desktop:open-system-settings",
-    "desktop:set-privacy-curtain", "desktop:set-compact-live", "desktop:open-external",
-    "desktop:choose-directory", "desktop:recovery-read", "desktop:recovery-write",
-    "desktop:recovery-delete", "desktop:live-session-read", "desktop:live-session-write",
-    "desktop:live-session-delete", "desktop:capture-start", "desktop:capture-stop",
-    "desktop:call-prompt-action", "desktop:context-suggestion-action",
-    "desktop:session-listening", "desktop:show-main",
-  ])
-})
-
-it("clamps restored geometry into the visible work area", () => {
-  expect(clampWindowState({ x: -5000, y: 12, width: 700, height: 400 }, workArea))
-    .toMatchObject({ width: 960, height: 640, x: workArea.x })
-})
-```
-
-- [ ] **Step 2: Run the Electron boundary tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/main/ipc.test.ts src/main/windows/window-state.test.ts src/main/recovery/drafts.test.ts`
-
-Expected: FAIL because the bounded modules and `window.desktop` contract are absent.
-
-- [ ] **Step 3: Implement the bridge and main-window services.**
-
-Create the main window at 1280×820 with 960×640 minimum; persist geometry/fullscreen/compact state only and clamp against `screen.getDisplayMatching(...).workArea`. Preserve close-to-hide and explicit Quit semantics. Compute privacy status from the actual `setContentProtection` request/result and publish exactly `requested`, `limited`, `unavailable`, or `curtain_on`. Encrypt recovery data with `safeStorage`; store only unsaved Markdown, meeting/session identity, base revision, and timestamps, never transcript/audio/token content. Permit external navigation only for validated `https:` OAuth origins returned by the sidecar and exact OS settings routes. Use schema validators on every IPC argument and return serializable result unions rather than throwing content-bearing errors.
-
-```ts
 export interface DesktopBridge {
   capabilities(): Promise<CapabilityReport>
   requestPermission(kind: "microphone" | "systemAudio"): Promise<CapabilityReport>
@@ -924,96 +297,57 @@ export interface DesktopBridge {
     write(identity: SessionIdentity): Promise<void>
     delete(): Promise<void>
   }
-  capture: { start(input: CaptureRequest): Promise<CaptureResult>; stop(): Promise<void> }
-  events: { subscribe(listener: (event: DesktopEvent) => void): () => void }
+  capture: {
+    start(input: CaptureRequest): Promise<CaptureResult>
+    stop(): Promise<void>
+  }
+  events: {
+    subscribe(listener: (event: DesktopEvent) => void): () => void
+  }
 }
 ```
 
-- [ ] **Step 4: Run Electron tests and static type checks.**
+Wire values remain snake_case; normalized renderer state is camelCase. `MeetingNoteProposal`, `ProposalSource`, `UserNoteCommand`, and note-command REST shapes are the approved definitions already implemented by Tasks 2–4 and must not be renamed.
 
-Run:
+---
 
-```bash
-cd app
-npm test -- src/main/ipc.test.ts src/main/windows/window-state.test.ts src/main/recovery/drafts.test.ts
-npm run typecheck
-```
+### Task 1: Live-session and desktop foundation
 
-Expected: PASS; tests reject unapproved schemes/channels, malformed drafts, off-screen geometry, token-shaped recovery fields, and content-protection overclaims.
-
-- [ ] **Step 5: Commit the bounded desktop boundary.**
-
-```bash
-git add app/src/main/windows app/src/main/permissions app/src/main/recovery app/src/main/ipc.ts app/src/main/ipc.test.ts app/src/preload
-git commit -m "refactor(electron): bound desktop capabilities"
-```
-
-### Task 10: Build native prompt windows, capture services, and tray state
+**Runnable journey:** Start a durable meeting from the tray or nonactivating call prompt, capture mic/system audio without raising a hidden main window, lose and resume the session honestly, Stop immediately with a 10-second Resume option, and finalize at most once.
 
 **Files:**
+
+- Delete: `core/taurine_core/live/session_registry.py`
+- Delete: `core/tests/test_session_registry.py`
+- Create: `core/taurine_core/live/session_actor.py`
+- Create: `core/tests/test_session_actor.py`
+- Create: `core/tests/test_meeting_session_resume.py`
+- Modify: `core/taurine_core/schemas.py`
+- Modify: `core/taurine_core/server.py`
+- Modify: `core/tests/test_server_ws.py`
+- Modify: `core/tests/test_live_ingest.py`
+- Modify: `core/tests/test_final_summary.py`
+- Create: `app/src/main/windows/window-state.ts`
+- Create: `app/src/main/windows/main-window.ts`
+- Create: `app/src/main/windows/window-privacy.ts`
 - Create: `app/src/main/windows/call-prompt-window.ts`
 - Create: `app/src/main/windows/context-suggestion-window.ts`
 - Create: `app/src/main/capture/system-audio.ts`
 - Create: `app/src/main/capture/micwatch.ts`
-- Rewrite: `app/src/main/tray.ts`
+- Create: `app/src/main/permissions/capabilities.ts`
+- Create: `app/src/main/permissions/system-settings.ts`
+- Create: `app/src/main/recovery/drafts.ts`
+- Create: `app/src/main/ipc.ts`
 - Rewrite: `app/src/main/index.ts`
+- Rewrite: `app/src/main/tray.ts`
+- Create: `app/src/preload/contracts.ts`
+- Rewrite: `app/src/preload/index.ts`
+- Modify: `app/src/preload/index.d.ts`
+- Create: `app/src/main/ipc.test.ts`
+- Create: `app/src/main/windows/window-state.test.ts`
 - Create: `app/src/main/windows/utility-windows.test.ts`
 - Create: `app/src/main/tray.test.ts`
-- Modify: `app/electron.vite.config.ts`
-
-**Interfaces:** Consumes Task 9. Produces nonactivating 372×136 call prompt and 372×188 context suggestion windows, exact tray actions, moved capture/microphone watchers, and thin lifecycle composition. Prompt actions dispatch typed desktop events; the renderer owns no `BrowserWindow` references.
-
-- [ ] **Step 1: Write failing utility-window and tray tests.**
-
-```ts
-it("constructs bounded nonactivating utility windows", () => {
-  const call = createCallPromptWindow(deps)
-  const context = createContextSuggestionWindow(deps)
-  expect(call.options).toMatchObject({ width: 372, height: 136, show: false, focusable: false, resizable: false })
-  expect(context.options).toMatchObject({ width: 372, height: 188, show: false, focusable: false, resizable: false })
-})
-
-it("changes tray actions with capture state", () => {
-  expect(labels(buildTrayMenu({ capturePhase: "live_full" }))).toEqual([
-    "Show Knowledge Atlas", "Stop meeting", "New inquiry", "Privacy curtain Off",
-    "Privacy protection: Requested", "Quit Taurine",
-  ])
-})
-```
-
-- [ ] **Step 2: Run utility tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/main/windows/utility-windows.test.ts src/main/tray.test.ts`
-
-Expected: FAIL because the new window factories and state-derived tray menu do not exist.
-
-- [ ] **Step 3: Move native services and compose the lifecycle.**
-
-Move current system-audio and microphone-watch behavior without changing subprocess/protocol semantics, then delete imports of their old paths. Configure utility windows with sandbox, context isolation, no Node integration, no activation, no arbitrary navigation, and explicit screen-edge clamping. Render only event-derived sanitized strings. The call prompt offers Start full, Mic only, Dismiss; the suggestion prompt offers Open, Dismiss, and a bounded queue count. `index.ts` composes windows, sidecar, tray, capture, permissions, recovery, single-instance activation, and quit cleanup; it contains no feature business logic.
-
-- [ ] **Step 4: Run main-process, packaging, and type gates.**
-
-Run:
-
-```bash
-cd app
-npm test -- src/main/windows/utility-windows.test.ts src/main/tray.test.ts src/main/ipc.test.ts
-npm run typecheck
-npm run build
-```
-
-Expected: PASS; the production build contains three renderer entries and no old capture-module import.
-
-- [ ] **Step 5: Commit native composition.**
-
-```bash
-git add app/src/main/index.ts app/src/main/tray.ts app/src/main/windows app/src/main/capture app/electron.vite.config.ts
-git commit -m "feat(electron): compose knowledge atlas native windows"
-```
-
-### Task 11: Create exhaustive sidecar contracts and one connection gateway
-
-**Files:**
+- Create: `app/src/main/recovery/drafts.test.ts`
 - Create: `app/src/renderer/src/services/sidecar/contracts.ts`
 - Create: `app/src/renderer/src/services/sidecar/contracts.test.ts`
 - Create: `app/src/renderer/src/services/sidecar/updates-connection.ts`
@@ -1025,221 +359,268 @@ git commit -m "feat(electron): compose knowledge atlas native windows"
 - Create: `app/src/renderer/src/services/sidecar/rest-api.ts`
 - Create: `app/src/renderer/src/services/desktop/bridge.ts`
 - Create: `app/src/renderer/src/services/desktop/capabilities.ts`
+- Create: `app/src/renderer/src/utility/call-prompt-main.tsx`
+- Create: `app/src/renderer/src/utility/context-suggestion-main.tsx`
+- Create: `app/src/renderer/src/utility/utility.css`
+- Create: `app/src/renderer/src/utility/utility.test.tsx`
+- Modify: `app/src/renderer/notif.html`
+- Modify: `app/src/renderer/suggest.html`
+- Modify: `app/electron.vite.config.ts`
 
-**Interfaces:** Consumes the existing REST, `/updates`, `/session`, `/chat`, Tasks 3/6/8 additions, and `window.desktop`. Produces one `SidecarGateway`, exhaustive parsers, RTK Query `sidecarApi`, connection epochs, and `GatewayEvent`. Exactly one updates socket and one session socket exist for app lifetime; chat connects lazily. Reconnect never resends a chat message or audio frame.
+**Interfaces:** Consumes approved meeting/proposal/finalization services and the existing three protocols. Produces `SessionActor`, the exact session wire types above, one `SidecarGateway`, frozen `window.desktop`, three native renderer entries, and no socket-owned lifecycle task.
 
-- [ ] **Step 1: Write failing parser, ownership, and stale-epoch tests.**
+#### RED checkpoint
 
-```ts
-it("normalizes a meeting update and rejects unknown discriminants", () => {
-  expect(parseUpdatesMessage({ type: "meeting_updated", meeting_id: "m1", notes_rev: 3 }))
-    .toMatchObject({ type: "meetingUpdated", meetingId: "m1", notesRev: 3 })
-  expect(() => parseUpdatesMessage({ type: "new_server_event", body: "secret" }))
-    .toThrowError(UnknownWireMessageError)
-})
+- [ ] **Replace the registry import in the unit-test file name only.** Create `core/tests/test_session_actor.py` importing `SessionActor`, `SessionChannel`, `SessionConflict`, and `SessionNotResumable` from `taurine_core.live.session_actor`.
 
-it("drops late events from a replaced socket epoch", () => {
-  const gateway = makeGateway(fakeSockets)
-  gateway.start()
-  fakeSockets.updates.reconnect()
-  fakeSockets.updates.emitFromEpoch(1, { type: "sources_changed" })
-  expect(receivedEvents).toEqual([])
-})
-```
+- [ ] **Add the actor creation test.**
 
-- [ ] **Step 2: Run gateway tests and confirm the expected failure.**
+  ```python
+  @pytest.mark.asyncio
+  async def test_new_start_creates_one_active_record(actor, sink):
+      snapshot = await actor.start("m1", "s1", [SessionChannel(0, "Microphone")], sink)
+      assert snapshot.disposition == "new"
+      assert snapshot.meeting_id == "m1"
+      assert await actor.snapshot("m1", "s1") == snapshot
+  ```
 
-Run: `cd app && npx vitest run src/renderer/src/services/sidecar/contracts.test.ts src/renderer/src/services/sidecar/gateway.test.ts`
+- [ ] **Add the 59.9/60-second disconnect cases using the fake monotonic scheduler.** Assert the same context identity resumes at 59.9 and exactly one immutable finalization input is observed at 60.
 
-Expected: FAIL because the sidecar service modules do not exist.
+- [ ] **Add the 9.9/10-second Stop cases.** Assert `stopped_resumable` at Stop, `resumed` at 9.9, and one finalization at 10.
 
-- [ ] **Step 3: Implement explicit wire/domain parsing and socket supervision.**
+- [ ] **Add Stop-zero and repeated-Stop cases.** Assert Stop-zero returns `None` after exactly one finalizer begins; repeated resumable Stop never extends the deadline or creates another expiry/finalizer.
 
-Define discriminated unions for every currently emitted message plus Tasks 3/6/8, including updates `connectors`, `sync`, `graph`, `profile`, `chats`, and `meetings`, and legacy session ambient/pin/unpin/retrieval/trigger seams. Parse required/optional keys without `as` casting at the network boundary. Gateway backoff is jittered/bounded, visibility-aware, and reset after a healthy interval. Updates reconnect requests REST snapshots for affected domains; session reconnect sends matching `SessionStartWire` with the retained meeting/token/channels and accepts the server snapshot; chat reconnect marks an interrupted turn and waits for user retry. `rest-api.ts` maps 409 to typed notes/proposal/undo conflicts and declares tags for Meeting, Proposal, Source, Profile, Graph, Chat, and Diagnostics.
+- [ ] **Add stale `_Expire` and `_Finalized` cases.** Queue captured generations directly through the actor test seam and assert a newer record remains.
 
-- [ ] **Step 4: Run gateway, legacy protocol, and type tests.**
+- [ ] **Add the Knowledge Atlas conflicting-token case.** Assert `SessionConflict` for a different token against active and suspended records.
 
-Run:
+- [ ] **Add delete and shutdown cases.** Assert delete closes without finalization output and shutdown with both `finalize=False` and `finalize=True` leaves zero actor-owned expiry/finalization tasks.
 
-```bash
-cd app
-npm test -- src/renderer/src/services/sidecar
-npm run typecheck
-```
+- [ ] **Add public-caller cancellation cases.** Cancel once before semaphore admission and once after command enqueue; assert the first command never appears and the second transition completes without corrupting the table.
 
-Expected: PASS; one-owner counts, epoch dropping, backoff, snapshot reconciliation, error redaction, and no-resend behavior are deterministic.
+- [ ] **Add finalizer-failure and process-restart cases.** Assert the ephemeral record is removed, durable notes/transcript fixtures remain, and a new actor returns `state_reset` through `initial_disposition` for a durable row left live.
 
-- [ ] **Step 5: Commit the typed gateway.**
+- [ ] **Add socket ordering tests in `core/tests/test_meeting_session_resume.py`.**
 
-```bash
-git add app/src/renderer/src/services
-git commit -m "feat(renderer): add typed sidecar gateway"
-```
+  ```python
+  @pytest.mark.asyncio
+  async def test_resumed_snapshot_precedes_audio_acceptance(live_socket):
+      await live_socket.start("m1", "s1")
+      await live_socket.disconnect()
+      resumed = await live_socket.reconnect("m1", "s1")
+      assert resumed[0]["type"] == "session_snapshot"
+      assert resumed[0]["disposition"] == "resumed"
+      assert resumed[1] == {"type": "status", "asr": "connected"}
+  ```
 
-### Task 12: Establish the Redux domain model and safe hydration
+- [ ] **Add the post-Stop binary rejection test.** Assert `invalid_session_control` and a zero-length audio replay/buffer fixture.
+
+- [ ] **Add pre-suspension flush-failure coverage.** Assert the dead sink is unbound, state is suspended, safe diagnostics contain only meeting ID/error kind, and persisted transcript/notes remain.
+
+- [ ] **Add actor-loop failure coverage.** Force the command handler to raise; assert queued and future public requests receive the same safe unavailable error and application shutdown closes remaining contexts.
+
+- [ ] **Create Electron boundary tests.** Assert exact bridge channels, URL/settings allowlists, geometry clamp, safeStorage-only recovery, and no raw `ipcRenderer`, shell, path, URL, or generic invoke capability.
+
+- [ ] **Create native-window and tray tests.** Assert 372×136/372×188 nonactivating utilities, queue cap three, 12-second suggestion expiry, one-prompt-per-call/five-second rearm, Ask default, opt-in 10-second auto-start, live tray labels, and no `show()` call when capture begins from a hidden window.
+
+- [ ] **Create minimal utility-renderer tests.** Assert the call renderer exposes Start now/Mic only/Dismiss without activating the main window, the context renderer exposes Open/Dismiss, curtain payloads contain no title/snippet, and neither entry imports Redux, gateway, meeting, transcript, editor, or connector modules.
+
+- [ ] **Create gateway tests.** Assert one socket per protocol, epoch rejection, no audio/chat replay, matching-token session reconciliation, coalesced notepad, full six-domain refetch after updates reconnect, and content-free logs.
+
+- [ ] **Run the combined Slice 1 RED checkpoint.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/core"
+  uv run pytest tests/test_session_actor.py tests/test_meeting_session_resume.py tests/test_server_ws.py -q
+  cd "$WORKTREE_ROOT/app"
+  npx vitest run src/main/ipc.test.ts src/main/windows/window-state.test.ts src/main/windows/utility-windows.test.ts src/main/tray.test.ts src/main/recovery/drafts.test.ts src/renderer/src/services/sidecar src/renderer/src/utility
+  ```
+
+  Expected: FAIL because `session_actor.py`, bounded desktop modules, and renderer gateway modules do not exist. Save the output as the slice's one RED review artifact.
+
+#### Minimal implementation
+
+- [ ] **Delete the superseded Task 5 implementation and tests.** Remove `session_registry.py` and `test_session_registry.py`; do not preserve aliases, detached-entry helpers, callback handoffs, task registries, retry loops, or cancellation shielding.
+
+- [ ] **Define actor record, snapshots, typed public commands, `_Expire`, and `_Finalized`.** Use one record key per `meeting_id`, a monotonically increasing generation, and no client-token index or retired-token table.
+
+- [ ] **Implement bounded submission.**
+
+  ```python
+  async def _submit(self, command: PublicCommand[T]) -> T:
+      if self._failure is not None or not self._accepting:
+          raise SessionServiceUnavailable()
+      await self._admission.acquire()
+      try:
+          self._queue.put_nowait(command)
+          return await asyncio.shield(command.response)
+      finally:
+          self._admission.release()
+  ```
+
+  The semaphore size is exactly 256. Caller cancellation before admission submits nothing; cancellation after `put_nowait` leaves the command to complete.
+
+- [ ] **Implement the one actor loop.** Dispatch one command at a time; set a response only when its future is pending; on unexpected loop failure store one sanitized error, stop admission, fail queued public futures, invoke `on_loop_failure`, and let lifespan shutdown close contexts.
+
+- [ ] **Implement missing→active Start.** Ask `initial_disposition(meeting_id)` for `new` versus `state_reset`, create one context/sink, store the record, and return a bounded snapshot before audio can be accepted.
+
+- [ ] **Implement matching suspended Start.** Cancel and await the concrete expiry task, clear it, rebind the sink, recreate only ASR/channel transport, set active with a new generation, and return `resumed` before status connected.
+
+- [ ] **Implement conflicting Start.** Reject any different token while a record exists with `SessionConflict`; reject same-token active duplicate as a conflict rather than creating a second context.
+
+- [ ] **Implement disconnect suspension.** Disable audio acceptance, attempt ASR/transcript flush, always unbind the dead sink, record only a safe flush diagnostic on failure, set a 60-second deadline, and create one expiry task.
+
+- [ ] **Implement Stop suspension.** Reuse the disconnect transition with 10 seconds; on repeated Stop choose `min(existing_deadline, now + 10)` and do not create a second timer.
+
+- [ ] **Implement Stop-zero finalization claim.** Set `finalizing` and capture an immutable context snapshot before spawning exactly one finalization wrapper.
+
+- [ ] **Implement expiry completion without callback ownership.**
+
+  ```python
+  async def expire_after(meeting_id: str, generation: int, delay: float) -> None:
+      await self._sleep(delay)
+      self._queue.put_nowait(_Expire(meeting_id, generation))
+  ```
+
+  `_Expire` first awaits the now-returning recorded expiry task, clears its field, checks generation/state/deadline, then claims finalization.
+
+- [ ] **Implement finalization completion without successor tasks.**
+
+  ```python
+  async def finalize(record: FinalizationInput) -> None:
+      outcome: FinalizationOutcome
+      try:
+          await self._finalize_context(record)
+          outcome = FinalizationOutcome("success", None)
+      except asyncio.CancelledError:
+          outcome = FinalizationOutcome("cancelled", None)
+          raise
+      except Exception as exc:
+          outcome = FinalizationOutcome("failure", type(exc).__name__)
+      finally:
+          self._queue.put_nowait(_Finalized(record.meeting_id, record.generation, outcome))
+  ```
+
+  `_Finalized` awaits the recorded wrapper, validates generation, reports failure safely, closes the context, and removes the record. A stale completion changes nothing.
+
+- [ ] **Implement typed snapshot updates.** Merge only transcript sequence, latest summary/grounding revisions, bounded actionables/suggestions, channels, and ASR state. Enforce existing count/byte/depth bounds and reject audio, credentials, traces, and unbounded payloads.
+
+- [ ] **Implement actor delete.** Remove the record first, cancel/await its expiry and finalization tasks, close without meeting output, then call the durable meeting deletion callback. Let the application deletion deadline report cooperative cancellation failure.
+
+- [ ] **Implement actor shutdown.** Stop public admission; for `finalize=False`, cancel expiry, close, clear; for `finalize=True`, claim each nonfinalizing record once, allow `_Finalized` messages to drain, and resolve shutdown only when the table is empty.
+
+- [ ] **Replace Runtime lifecycle fields.** Remove `active_sessions`, `meeting_finalizers`, `finalization_tasks`, `active_unbound_sessions`, lifecycle epoch maps, and socket-owned timer handles. Add `session_actor: SessionActor | None` plus one composition-owned actor-loop failure state.
+
+- [ ] **Start and stop the actor in FastAPI lifespan.** Construct it after Runtime is ready and before `/session` accepts work; call `shutdown(finalize=True)` under the existing outer quit deadline.
+
+- [ ] **Extend/retain Pydantic session controls.** Require `meeting_id` and `client_session_id`; Stop accepts only 10 or 0; Notepad carries the token; keep the approved `session_snapshot` and `session_error` schema.
+
+- [ ] **Integrate Start with the actor.** Validate durable meeting status, ask the actor to start/resume, emit its snapshot first, then start ASR and emit connected. Map `SessionConflict` to `meeting_session_conflict` and missing/terminal ownership to `meeting_not_resumable`.
+
+- [ ] **Integrate disconnect and Stop with the actor.** Flip the socket's binary-acceptance flag before awaiting either command; never let the handler own a grace timer or finalization task.
+
+- [ ] **Route Notepad and live deltas through `update_snapshot`.** Retain stable IDs/revisions and persisted transcript authority; do not log payload text.
+
+- [ ] **Route meeting deletion through `SessionActor.delete`.** Invoke durable `meeting_delete` only after actor-owned cooperative work stops; keep linked inquiry preservation from Task 4.
+
+- [ ] **Implement `DesktopBridge` validators and `safeStorage` recovery.** Store only meeting ID, token, channels, base revision, content hash, Markdown, and timestamps. If encryption is unavailable, return the memory-only recovery status and write no plaintext file.
+
+- [ ] **Implement exact main-window geometry and privacy status.** Preserve hide-on-close, dock reveal, full screen, clamped restoration, content-protection Requested/Limited/Unavailable reporting, compact bounds restoration, and opt-in always-on-top.
+
+- [ ] **Move system-audio and micwatch behavior behind capture services.** Preserve helper protocols, macOS 14.2 support check, 1.5-second debounce, one prompt per call, and five-second idle rearm; remove imports from old module paths only after tests pass.
+
+- [ ] **Implement nonactivating utility windows.** Use sandbox/context isolation/no Node integration, sanitize strings, prevent navigation, clamp to active work area, redact suggestion title/snippet under curtain, and never connect them to sidecar.
+
+- [ ] **Implement dynamic tray behavior.** Produce Show Knowledge Atlas, Start/Open/Stop meeting by phase, New inquiry, curtain state, informational protection state, and Quit. Start from tray does not reveal the main window.
+
+- [ ] **Implement minimal stateless utility renderers and safe CSS.** Bind only the typed sanitized preload event/action surface, render call Start now/Mic only/Dismiss and context Open/Dismiss, replace title/snippet with `Relevant context available` under curtain, use no private store, and switch `notif.html`/`suggest.html` to these new entry modules immediately.
+
+- [ ] **Implement exhaustive frontend wire parsing.** Parse every existing `/updates`, `/session`, and `/chat` discriminant plus snapshots/errors. Unknown names log only protocol/discriminant/epoch and request bounded reconciliation.
+
+- [ ] **Implement connection classes and `SidecarGateway`.** Open updates/session after readiness, chat lazily, use capped jittered backoff/visibility wakeups, reject stale epochs, and never replay binary audio or uncertain chat sends.
+
+- [ ] **Implement reconciliation.** Updates reconnect refetches meetings, chats, connectors, profile, graph metadata/status, and runtime summary. Session reconnect presents the stored token, consumes snapshot before audio, and chat reconnect refetches active histories without resending.
+
+- [ ] **Configure exactly three renderer entries.** Keep one stateful main entry plus stateless call-prompt and context-suggestion entries; named lazy chunks remain editor, atlas, and markdown.
+
+#### GREEN checkpoint
+
+- [ ] **Run the complete actor matrix repeatedly.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/core"
+  uv run pytest tests/test_session_actor.py tests/test_meeting_session_resume.py tests/test_server_ws.py tests/test_live_ingest.py tests/test_final_summary.py -q
+  ```
+
+  Expected: PASS. The 14 reset cases pass, race-sensitive cases repeat at least 20 times, finalization occurs at most once, and pytest emits no pending-task warning.
+
+- [ ] **Run desktop/gateway and build gates.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npm test -- src/main src/renderer/src/services src/renderer/src/utility
+  npm run typecheck
+  npm run build
+  ```
+
+  Expected: PASS with one gateway owner per protocol, exact native geometry/actions, bounded IPC, no utility socket, and a production build with three renderer entries.
+
+- [ ] **Prove the superseded ownership design is absent.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT"
+  test ! -e core/taurine_core/live/session_registry.py
+  test ! -e core/tests/test_session_registry.py
+  rg -n 'SessionRegistry|_detached_entries|finalizer_handoff|finalizer_driver|_schedule_finalization_cleanup|meeting_finalizers|active_sessions' core/taurine_core core/tests
+  ```
+
+  Expected: both file checks exit 0 and `rg` exits 1 with no matches. Actor expiry/finalization completion is queue-message-only.
+
+- [ ] **Run the Slice 1 inspectable journey.** Start from tray while the main window is hidden, confirm it stays hidden, disconnect/reconnect with the same token, observe snapshot before resumed audio, Stop and Resume inside 10 seconds, Stop again and Finalize now, then open the durable dossier. Expected: one meeting, one finalization, persisted notes/transcript intact, and no audio from either gap.
+
+- [ ] **Freeze Slice 1 after GREEN.**
+
+  ```bash
+  cd "$WORKTREE_ROOT"
+  git diff --check
+  git status --short
+  git add -A core/taurine_core/live/session_registry.py core/tests/test_session_registry.py
+  git add core/taurine_core/live/session_actor.py core/taurine_core/schemas.py core/taurine_core/server.py core/tests/test_session_actor.py core/tests/test_meeting_session_resume.py core/tests/test_server_ws.py core/tests/test_live_ingest.py core/tests/test_final_summary.py app/src/main app/src/preload app/src/renderer/src/services app/src/renderer/src/utility app/src/renderer/notif.html app/src/renderer/suggest.html app/electron.vite.config.ts
+  git commit -m "feat: establish atlas live-session and desktop foundation"
+  ```
+
+  Expected: commit succeeds and becomes the immutable Slice 1 review target.
+
+- [ ] **Stop and request independent Slice 1 review.** Provide the commit SHA, RED/GREEN output, inspectable-journey evidence, and actor absence scan. Expected: no Slice 2 path changes until review returns clean; any blocking finding is fixed in Slice 1 and re-frozen first.
+
+---
+
+### Task 2: Atlas shell
+
+**Runnable journey:** Launch immediately into the paper-and-ink shell, observe real readiness, use keyboard commands to move among Atlas/Chronicle/Inquiry while preserving context, search/select/open/pin objects, and inspect a deterministic territory/list baseline without a pointer.
 
 **Files:**
-- Create: `app/src/renderer/src/app/store.ts`
-- Create: `app/src/renderer/src/app/listeners.ts`
-- Create: `app/src/renderer/src/app/hydration.ts`
-- Create: `app/src/renderer/src/app/store.test.ts`
-- Create: `app/src/renderer/src/features/runtime/state.ts`
-- Create: `app/src/renderer/src/features/workspace/state.ts`
-- Create: `app/src/renderer/src/features/meetings/state.ts`
-- Create: `app/src/renderer/src/features/inquiry/state.ts`
-- Create: `app/src/renderer/src/features/atlas/state.ts`
-- Create: `app/src/renderer/src/features/sources/state.ts`
-- Create: `app/src/renderer/src/features/profile/state.ts`
-- Create: `app/src/renderer/src/features/privacy/state.ts`
-- Create: `app/src/renderer/src/features/notifications/state.ts`
 
-**Interfaces:** Consumes Task 11 gateway/API and Task 9 recovery. Produces `RootState`, typed hooks, normalized domain slices, listener middleware, hydration phases, and restore validation. Durable truth remains server-owned; Redux stores projections, selection, bounded UI history, and operation metadata only.
-
-- [ ] **Step 1: Write failing reducer/listener/hydration tests.**
-
-```ts
-it("keeps the three coordinates separate from Control", () => {
-  const state = workspaceReducer(undefined, workspaceActions.openControl("sources"))
-  expect(state.coordinate).toBe("atlas")
-  expect(state.control).toBe("sources")
-})
-
-it("restores only a matching meeting revision", async () => {
-  desktop.recovery.load.mockResolvedValue(recovery({ meetingId: "m1", baseNotesRev: 2 }))
-  api.getMeeting.mockResolvedValue(meeting({ id: "m1", notesRev: 3 }))
-  await hydrate(store, deps)
-  expect(selectRecoveryConflict(store.getState())).toEqual({ meetingId: "m1", draftRev: 2, serverRev: 3 })
-})
-```
-
-- [ ] **Step 2: Run state tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/app/store.test.ts`
-
-Expected: FAIL because store, slices, and hydration do not exist.
-
-- [ ] **Step 3: Implement normalized slices and listener-owned effects.**
-
-Configure RTK serializability checks and production `devTools: false`; do not store sockets, DOM nodes, errors with content, editor instances, or promises. Register gateway subscription once in listener middleware. Hydration sequence is capabilities → recovery metadata → meetings/sources/profile → graph summary; a domain failure marks only that domain unavailable and creates an exception-ledger entry. Validate restored coordinate/control/selection IDs against hydrated entities. Persist only geometry through main and safe recovery through `window.desktop`; do not add browser localStorage for knowledge content.
-
-- [ ] **Step 4: Run state, gateway, and type tests.**
-
-Run: `cd app && npm test -- src/renderer/src/app src/renderer/src/services/sidecar && npm run typecheck`
-
-Expected: PASS; strict mode double-mount leaves one subscription, recovery mismatch is explicit, and production store construction disables DevTools.
-
-- [ ] **Step 5: Commit the application state spine.**
-
-```bash
-git add app/src/renderer/src/app app/src/renderer/src/features/*/state.ts
-git commit -m "feat(renderer): establish knowledge atlas state model"
-```
-
-### Task 13: Implement tokens, typography, localization, and accessible primitives
-
-**Files:**
-- Create: `app/src/renderer/src/styles/tokens.css`
-- Create: `app/src/renderer/src/styles/reset.css`
-- Create: `app/src/renderer/src/styles/typography.css`
-- Create: `app/src/renderer/src/styles/primitives.css`
-- Create: `app/src/renderer/src/styles/print.css`
-- Create: `app/src/renderer/src/i18n/en.ts`
-- Create: `app/src/renderer/src/i18n/format.ts`
-- Create: `app/src/renderer/src/i18n/pseudo.ts`
-- Create: `app/src/renderer/src/i18n/useMessage.ts`
-- Create: `app/src/renderer/src/components/primitives/Button.tsx`
-- Create: `app/src/renderer/src/components/primitives/Field.tsx`
-- Create: `app/src/renderer/src/components/primitives/Menu.tsx`
-- Create: `app/src/renderer/src/components/primitives/Dialog.tsx`
-- Create: `app/src/renderer/src/components/primitives/Sheet.tsx`
-- Create: `app/src/renderer/src/components/primitives/Notice.tsx`
-- Create: `app/src/renderer/src/components/primitives/Tooltip.tsx`
-- Create: `app/src/renderer/src/components/primitives/Progress.tsx`
-- Create: `app/src/renderer/src/components/primitives/Skeleton.tsx`
-- Create: `app/src/renderer/src/components/primitives/Divider.tsx`
-- Create: `app/src/renderer/src/components/primitives/primitives.test.tsx`
-- Create: source SVG files enumerated in the target tree
-
-**Interfaces:** Produces CSS variables and accessible primitives consumed by every surface. IBM Plex Sans is UI type; IBM Plex Mono is timestamps, IDs, and technical metadata. Theme supports light, dark, system, forced colors, reduced motion, and print. `Progress` requires real `done/total` for determinate mode.
-
-- [ ] **Step 1: Write failing keyboard, progress, and pseudo-locale tests.**
-
-```tsx
-it("does not permit invented determinate progress", () => {
-  expect(() => render(<Progress label="Indexing" mode="determinate" />)).toThrow()
-})
-
-it("expands strings by at least thirty-five percent", () => {
-  expect(pseudo("Open meeting").length).toBeGreaterThanOrEqual(Math.ceil("Open meeting".length * 1.35))
-})
-
-it("returns focus after a modal closes", async () => {
-  render(<DialogHarness />)
-  await user.click(screen.getByRole("button", { name: "Open" }))
-  await user.keyboard("{Escape}")
-  expect(screen.getByRole("button", { name: "Open" })).toHaveFocus()
-})
-```
-
-- [ ] **Step 2: Run primitive tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/components/primitives/primitives.test.tsx`
-
-Expected: FAIL because primitives, message catalog, and pseudo-localizer are absent.
-
-- [ ] **Step 3: Implement the visual foundation.**
-
-Define neutral paper/ink/sage/cobalt/amber/red tokens, 4/8 px spacing rhythm, 1 px rules, restrained radii, semantic focus/selection/status colors, and z-index layers. Use Lucide icons with text/accessible names; use checked-in source marks only for sources, never hand-authored UI glyphs. Implement roving focus menus, trapped modal dialogs, nonmodal sheets, labelled fields, polite notices, reduced-motion skeletons, and 24×24 minimum hit areas with 40–44 px primary/destructive/meeting controls. Catalog every user-facing string in `en.ts`; formatting uses `Intl` and logical CSS properties.
-
-Use these canonical token values rather than approximations:
-
-```css
-:root {
-  --paper: #f3f1eb; --surface: #fbfaf7; --raised: #ffffff;
-  --ink: #1e2732; --muted: #566170; --subtle: #788391;
-  --rule: #c8cdd3; --rule-strong: #8c96a2;
-  --accent: #315bcb; --accent-hover: #2548a5; --accent-soft: #e1e8fc;
-  --focus: #1463e6; --positive: #19734b; --warning: #956018;
-  --negative: #b43b3b; --live: #a8325a; --generated: #6555a5;
-}
-[data-theme="dark"] {
-  --paper: #151a20; --surface: #1d232b; --raised: #252d37;
-  --ink: #f1f3f5; --muted: #aab2bd; --rule: #414b57;
-  --accent: #8eaaff; --accent-soft: #283657;
-}
-```
-
-Source marks use Apple Notes `#B46B00`, Obsidian `#7352B8`, iMessage `#187854`, Gmail `#B43B3B`, Outlook `#23699C`, Google Calendar `#2F7D67`, Google Docs `#315BCB`, Folders `#66717E`, Claude `#8B5A2B`, Codex `#34404C`, and Taurine `#9B4763`, always paired with glyph and label. Bundle Sans weights 400/500/600 and Mono 400/500. Use the exact spacing scale `2,4,6,8,12,16,20,24,32,40,48,64`, radii 4/6/3/0, motion 80/140/220 ms with `cubic-bezier(.2,.8,.2,1)`, and the spec's reduced-motion override. No gradients are permitted.
-
-- [ ] **Step 4: Run primitive, accessibility-unit, and style build tests.**
-
-Run:
-
-```bash
-cd app
-npm test -- src/renderer/src/components/primitives
-npm run typecheck
-npm run build
-```
-
-Expected: PASS; no missing accessible names, modal focus leaks, invalid progress, physical left/right layout declarations, or missing font assets.
-
-- [ ] **Step 5: Commit the design system.**
-
-```bash
-git add app/src/renderer/src/styles app/src/renderer/src/i18n app/src/renderer/src/components/primitives app/src/renderer/src/assets/sources
-git commit -m "feat(renderer): add knowledge atlas visual system"
-```
-
-### Task 14: Compose the workspace shell and command model
-
-**Files:**
+- Modify: `app/package.json`
+- Modify: `app/package-lock.json`
 - Create: `app/src/renderer/src/app/App.tsx`
 - Create: `app/src/renderer/src/app/AppShell.tsx`
+- Create: `app/src/renderer/src/app/store.ts`
+- Create: `app/src/renderer/src/app/listeners.ts`
 - Create: `app/src/renderer/src/app/commands.ts`
-- Create: `app/src/renderer/src/app/AppShell.test.tsx`
+- Create: `app/src/renderer/src/app/hydration.ts`
 - Create: `app/src/renderer/src/features/runtime/RuntimeGate.tsx`
+- Create: `app/src/renderer/src/features/runtime/FirstRunChecklist.tsx`
 - Create: `app/src/renderer/src/features/runtime/OperationLedger.tsx`
+- Create: `app/src/renderer/src/features/runtime/state.ts`
 - Create: `app/src/renderer/src/features/runtime/selectors.ts`
 - Create: `app/src/renderer/src/features/workspace/CoordinateRail.tsx`
 - Create: `app/src/renderer/src/features/workspace/CommandDeck.tsx`
@@ -1247,125 +628,414 @@ git commit -m "feat(renderer): add knowledge atlas visual system"
 - Create: `app/src/renderer/src/features/workspace/QuickOpen.tsx`
 - Create: `app/src/renderer/src/features/workspace/ContextShelf.tsx`
 - Create: `app/src/renderer/src/features/workspace/ControlWorkbench.tsx`
+- Create: `app/src/renderer/src/features/workspace/state.ts`
 - Create: `app/src/renderer/src/features/workspace/selectors.ts`
-- Create: `app/src/renderer/src/components/layout/SplitPane.tsx`
-- Create: `app/src/renderer/src/components/layout/VirtualList.tsx`
-- Create: `app/src/renderer/src/components/layout/IndexPane.tsx`
-- Create: `app/src/renderer/src/components/layout/FocusZone.tsx`
+- Create: `app/src/renderer/src/features/atlas/AtlasWorkbench.tsx`
+- Create: `app/src/renderer/src/features/atlas/AtlasCanvas.tsx`
+- Create: `app/src/renderer/src/features/atlas/AtlasOutline.tsx`
+- Create: `app/src/renderer/src/features/atlas/AtlasIndex.tsx`
+- Create: `app/src/renderer/src/features/atlas/atlas-worker.ts`
+- Create: `app/src/renderer/src/features/atlas/layout.ts`
+- Create: `app/src/renderer/src/features/atlas/render.ts`
+- Create: `app/src/renderer/src/features/atlas/storage.ts`
+- Create: `app/src/renderer/src/features/atlas/contracts.ts`
+- Create: `app/src/renderer/src/features/atlas/state.ts`
+- Create: `app/src/renderer/src/features/atlas/selectors.ts`
+- Create: `app/src/renderer/src/components/primitives/`
+- Create: `app/src/renderer/src/components/layout/`
+- Create: `app/src/renderer/src/components/knowledge/ObjectRow.tsx`
+- Create: `app/src/renderer/src/components/knowledge/SourceMark.tsx`
+- Create: `app/src/renderer/src/i18n/en.ts`
+- Create: `app/src/renderer/src/i18n/format.ts`
+- Create: `app/src/renderer/src/i18n/pseudo.ts`
+- Create: `app/src/renderer/src/i18n/useMessage.ts`
+- Create: `app/src/renderer/src/styles/tokens.css`
+- Create: `app/src/renderer/src/styles/reset.css`
+- Create: `app/src/renderer/src/styles/typography.css`
 - Create: `app/src/renderer/src/styles/shell.css`
+- Create: `app/src/renderer/src/styles/primitives.css`
+- Create: `app/src/renderer/src/styles/print.css`
+- Create: `app/src/renderer/src/assets/sources/`
+- Create: colocated `*.test.ts` and `*.test.tsx` files for the modules above
 
-**Interfaces:** Consumes Tasks 12–13. Produces the sole shell hierarchy: coordinate rail (Atlas, Chronicle, Inquiry), coordinate-specific index, primary workbench, evidence inspector, persistent context shelf, exception-only operation ledger, command deck, quick open, and separate Control workbench. Commands have stable IDs, availability selectors, shortcut labels, and one execution path shared by menus/keys/buttons.
+**Interfaces:** Consumes Slice 1 gateway/desktop services and Task 1 harness. Produces normalized `RootState`, one gateway subscription, exact command IDs, the responsive shell, exception-only operation ledger, max-three context shelf, deterministic Atlas snapshot/Outline baseline, and catalogued visible copy.
 
-- [ ] **Step 1: Write failing semantic, breakpoint, and command-precedence tests.**
+#### RED checkpoint
 
-```tsx
-it("renders exactly three coordinates and separate Control", () => {
-  renderShell({ width: 1280 })
-  expect(screen.getByRole("navigation", { name: "Knowledge coordinates" }))
-    .toHaveTextContent("AtlasChronicleInquiry")
-  expect(screen.getByRole("button", { name: "Control" })).toBeVisible()
-  expect(screen.queryByRole("tab", { name: "Sources" })).not.toBeInTheDocument()
-})
+- [ ] **Add store ownership tests.** Assert Control does not overwrite the active coordinate, pins cap at three, removed restored pins become notices, production DevTools are off, and StrictMode mounts one gateway subscription.
 
-it("gives modal escape precedence over global shortcuts", async () => {
-  renderShellWithOpenCommandCenter()
-  await user.keyboard("{Escape}")
-  expect(screen.queryByRole("dialog", { name: "Command center" })).not.toBeInTheDocument()
-  expect(selectCoordinate(store.getState())).toBe("atlas")
-})
-```
+- [ ] **Add hydration tests.** Assert `/startup` backoff at 250 ms, 500 ms, 1 s, then 2 s; 503/1013 returns to Starting; hidden polling pauses only after 30 seconds; ready opens sockets then hydrates six domain summaries.
 
-- [ ] **Step 2: Run shell tests and confirm the expected failure.**
+- [ ] **Add command tests.** Assert `⌘1/2/3`, `⌘,`, `⌘K`, `⌘P`, `⌘[`, `⌘]`, `⌘B`, `⌘\`, `F6`, and `Shift+F6`; editor/modal/menu scopes win over global commands.
 
-Run: `cd app && npx vitest run src/renderer/src/app/AppShell.test.tsx`
+- [ ] **Add shell semantic/breakpoint tests.** Assert exactly three coordinate controls plus separate Control, region landmarks, ≥1440 docked inspector, 1180–1439 inspector sheet, 960–1179 mutually exclusive index/inspector sheets, and the 200%-zoom compact-pane policy.
 
-Expected: FAIL because the shell and command registry are absent.
+- [ ] **Add primitive tests.** Assert labelled fields, menu roving focus, dialog/sheet focus trap and restoration, dismissible tooltip, truthful determinate progress, reduced-motion skeleton, 12 px divider hit region, and 24/40 px target rules.
 
-- [ ] **Step 3: Implement shell composition and exact responsive modes.**
+- [ ] **Add token/catalog tests.** Assert exact light/dark/source tokens, bundled IBM Plex weights, no gradients/emoji control glyphs, 35% pseudo expansion, `Intl` formatting, RTL logical properties, and no visible JSX string outside the catalog.
 
-At ≥1440 px show rail + index + workbench + inspector and allow Live three-lane. At 1180–1439 show rail + index + workbench with inspector as a sheet; Live remains two-lane. At 960–1179 collapse index and inspector to sheets while preserving coordinate identity. Below 960 is compact-window content only, never a squeezed full shell. Persist split ratios within bounded ranges. Operation ledger stays hidden when operations succeed and shows only failures, blocked/paused work, required decisions, and explicit retry state. App-level shortcuts defer to editor, modal, and menu scopes.
+- [ ] **Add deterministic Atlas tests.** Assert stable hash positions, prior-position reuse, new-node community-centroid placement, sanitized coordinate persistence, worker epoch rejection, reduced-motion snap, and four exact LOD thresholds.
 
-- [ ] **Step 4: Run shell/state/type tests.**
+- [ ] **Add accessible baseline tests.** Assert Canvas is `aria-hidden`, Outline is the screen-reader default, global tree selection is not activation, Enter opens, Space previews, Shift+Enter pins, and hidden tail nodes remain searchable.
 
-Run: `cd app && npm test -- src/renderer/src/app src/renderer/src/features/workspace src/renderer/src/features/runtime && npm run typecheck`
+- [ ] **Run the combined Slice 2 RED checkpoint.**
 
-Expected: PASS for 1440/1280/960 widths, keyboard navigation, inspector sheets, hidden healthy ledger, and strict-mode listener ownership.
+  Run:
 
-- [ ] **Step 5: Commit the shell.**
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npx vitest run src/renderer/src/app src/renderer/src/features/runtime src/renderer/src/features/workspace src/renderer/src/features/atlas src/renderer/src/components src/renderer/src/i18n
+  ```
 
-```bash
-git add app/src/renderer/src/app app/src/renderer/src/features/runtime app/src/renderer/src/features/workspace app/src/renderer/src/components/layout app/src/renderer/src/styles/shell.css
-git commit -m "feat(renderer): compose knowledge atlas workspace shell"
-```
+  Expected: FAIL because store, shell, design system, and Atlas baseline modules do not exist. Save this output as the slice's one RED artifact.
 
-### Task 15: Normalize evidence semantics and build the shared inspector
+#### Minimal implementation
+
+- [ ] **Install/verify the exact Slice 2 renderer dependencies and lock them.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npm install @reduxjs/toolkit react-redux lucide-react @tanstack/react-virtual d3-force d3-polygon @fontsource/ibm-plex-sans @fontsource/ibm-plex-mono
+  npm install --save-dev @types/d3-force @types/d3-polygon
+  ```
+
+  Expected: `package.json` contains those direct runtime/dev dependencies at the resolved versions and `package-lock.json` matches. On the current branch this may be a verified no-op because approved Task 1 commit `0d4827d` already introduced the same packages; do not remove or replace them.
+
+- [ ] **Create normalized slices.** Keep server entities, operational state, and workspace state separate; store no socket, DOM node, editor instance, promise, or content-bearing Error.
+
+- [ ] **Configure the store and one listener registration.**
+
+  ```ts
+  export const createAppStore = (services: AppServices) => configureStore({
+    reducer: rootReducer,
+    middleware: (defaults) => defaults({ serializableCheck: true })
+      .prepend(listenerMiddleware.middleware)
+      .concat(sidecarApi.middleware),
+    devTools: import.meta.env.DEV,
+  })
+  ```
+
+- [ ] **Implement readiness polling and hydration ordering.** Keep shell/preferences/curtain available during startup and fatal error; lazy-load graph only when Atlas or a restored graph pin needs it.
+
+- [ ] **Implement restored-context validation.** Restore coordinate, Control section, history, pins, widths, density, and theme only when identifiers still exist; represent invalid pins as removed-item notices.
+
+- [ ] **Implement the UI tokens exactly.** Use the full §9 hex/OKLCH values, source colors plus glyph/label, spacing `2,4,6,8,12,16,20,24,32,40,48,64`, radii `4/6/3/0`, motion `80/140/220`, and no gradients.
+
+  ```css
+  :root {
+    --paper: #f3f1eb; --surface: #fbfaf7; --raised: #ffffff;
+    --ink: #1e2732; --muted: #566170; --subtle: #788391;
+    --rule: #c8cdd3; --rule-strong: #8c96a2;
+    --accent: #315bcb; --accent-hover: #2548a5; --accent-soft: #e1e8fc;
+    --focus: #1463e6; --positive: #19734b; --warning: #956018;
+    --negative: #b43b3b; --live: #a8325a; --generated: #6555a5;
+  }
+  [data-theme="dark"] {
+    --paper: #151a20; --surface: #1d232b; --raised: #252d37;
+    --ink: #f1f3f5; --muted: #aab2bd; --rule: #414b57;
+    --accent: #8eaaff; --accent-soft: #283657;
+  }
+  ```
+
+  Source marks are Apple Notes `#B46B00`, Obsidian `#7352B8`, iMessage `#187854`, Gmail `#B43B3B`, Outlook `#23699C`, Google Calendar `#2F7D67`, Google Docs `#315BCB`, Folders `#66717E`, Claude `#8B5A2B`, Codex `#34404C`, and Taurine meetings `#9B4763`; every mark also has its specified glyph/shape and text label.
+
+- [ ] **Implement typography and local assets.** Bundle IBM Plex Sans 400/500/600 and Mono 400/500; forbid remote fonts; normalize the eleven connector SVGs to 20 px.
+
+  Use display 28/34 weight 500, title 20/26 weight 600, section 15/20 weight 600, UI body 14/21, editor 16/25, control 13/18 weight 500, metadata 12/16, and micro 11/14. The micro style is evidence IDs/annotations only, never long prose.
+
+- [ ] **Implement one catalog/formatter path.** Use namespaced complete messages, `Intl.DateTimeFormat`, `Intl.RelativeTimeFormat`, `Intl.NumberFormat`, plural rules, platform key labels, and LTR isolation for evidence IDs/hashes.
+
+- [ ] **Implement primitive controls.** Match §10.1 measurements and semantics; `Progress` throws for determinate mode without finite nonnegative `done` and positive `total`.
+
+  Exact geometry: Button 34/40 px with 0×12 padding; IconButton 32 px visual inside 40×40 hit; fields/selects 34/40; SearchField 36; checkbox 16 inside 32/40 row; switch 32×18 inside 40; menu rows 32/40 with 320 px max height; tooltip delay 400 ms for pointer and immediate for keyboard; focus ring 2 px plus 2 px offset. Toasts are transient success only, while errors remain at the point of action.
+
+- [ ] **Implement SplitPane and focus zones.** Clamp index 230–360 and inspector 320–480, resize by 16 px or 48 px with Shift, Enter/double-click reset, and retain last focus in each F6 zone.
+
+- [ ] **Implement command registry as the sole activation path.**
+
+  ```ts
+  export type Command = {
+    id: string
+    labelKey: MessageKey
+    shortcut?: Shortcut
+    isAvailable(state: RootState): boolean
+    execute(context: CommandContext): void
+  }
+  ```
+
+  Buttons, menus, tray intents, and shortcuts resolve the same command ID.
+
+- [ ] **Implement the 48 px command deck and 52 px rail.** Show Atlas/Chronicle/Inquiry, separate bottom Control, back/forward, rectangular locator, capture/privacy state, inspector toggle, and one scope-specific primary action.
+
+- [ ] **Implement Index, Workbench, Inspector, Shelf, and Operations regions.** Virtualize after 100 rows, cap pins at three, provide compare/Ask these entry points, and remove the 28 px ledger from layout when healthy/idle unless pinned.
+
+- [ ] **Implement command center and Quick Open.** Group objects/commands/recent contexts for `⌘K`; make `⌘P` object-only; use arrow selection, Enter open, Shift+Enter pin, and `⌘Enter` open-and-close.
+
+- [ ] **Implement first-run checklist.** Store only UI schema version/preferences; report runtime credential status, request mic/system permissions just in time, expose recommended sources, Off/Ask/Auto-start, and privacy limitation/shortcut.
+
+- [ ] **Implement Atlas contracts and immutable snapshot selectors.** Use existing `GET /graph`, `GET /graph/local`, search, facts, notes, graph status/version; never call edge reason from projected edges.
+
+- [ ] **Implement deterministic layout.** Seed from community ID, stable note-ID hash, degree, and date band; run d3-force/hulls in the worker; publish settled snapshots no faster than animation frame.
+
+- [ ] **Implement sanitized layout storage.** Persist build ID, note ID, x/y, and user-pinned flag only; store no title, snippet, passage, source text, or private content.
+
+- [ ] **Implement territory-first Canvas rendering.** Use flat 6–10% tints, horizontal labels, shape/text/pattern plus color, exact LOD bands, no perpetual force motion, and 140 ms removal fade unless reduced motion.
+
+- [ ] **Implement baseline Atlas Index and Outline.** Global Outline is territory→notes tree with source/date/degree/match. Search selection pans/previews; Enter opens local depth one; all essential actions remain outside Canvas.
+
+- [ ] **Keep `App.tsx` composition-only.** It creates providers and renders `AppShell`; no socket constructor, fetch, capture listener, graph reducer, chat reducer, or editor state appears there.
+
+#### GREEN checkpoint
+
+- [ ] **Run the Slice 2 unit/type/build gate.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npm test -- src/renderer/src/app src/renderer/src/features/runtime src/renderer/src/features/workspace src/renderer/src/features/atlas src/renderer/src/components src/renderer/src/i18n
+  npm run lint
+  npm run typecheck
+  npm run build
+  npm run check:bundle:report
+  ```
+
+  Expected: PASS for tests/lint/type/build. The report-only bundle command prints the unchanged approved limits and may still report the legacy production entry until Slice 6; it must not change the thresholds or create a waiver.
+
+- [ ] **Run the Slice 2 inspectable journey.** Launch with a delayed fake startup, use shell/curtain while starting, reach Ready, traverse all focus zones, select/open/pin in Outline, pivot Atlas→Chronicle→Inquiry and back, and confirm selection/pins/history persist. Expected: no pointer required and the operation ledger collapses after success without moving focus.
+
+- [ ] **Freeze Slice 2 after GREEN.**
+
+  ```bash
+  cd "$WORKTREE_ROOT"
+  git diff --check
+  git add app/package.json app/package-lock.json app/src/renderer/src/app app/src/renderer/src/features/runtime app/src/renderer/src/features/workspace app/src/renderer/src/features/atlas app/src/renderer/src/components app/src/renderer/src/i18n app/src/renderer/src/styles app/src/renderer/src/assets
+  git commit -m "feat: deliver the knowledge atlas shell"
+  ```
+
+  Expected: commit succeeds and becomes the immutable Slice 2 review target.
+
+- [ ] **Stop and request independent Slice 2 review.** Provide the commit SHA, RED/GREEN output, bundle report, and shell/Outline journey evidence. Expected: no Slice 3 path changes until review returns clean; blocking findings are repaired and re-frozen in Slice 2.
+
+---
+
+### Task 3: Meeting journey
+
+**Runnable journey:** Create a draft, pass mic/system preflight, capture in the two-lane Chronicle Live desk, freely edit durable notes, survive reconnect or revision conflict, Stop immediately, review final recap/proposals, and open meeting-scoped Ask without any generated text mutating notes before Accept.
 
 **Files:**
+
+- Create: `app/src/renderer/src/features/meetings/contracts.ts`
+- Create: `app/src/renderer/src/features/meetings/state.ts`
+- Create: `app/src/renderer/src/features/meetings/selectors.ts`
+- Create: `app/src/renderer/src/features/meetings/listeners.ts`
+- Create: `app/src/renderer/src/features/meetings/capture-machine.ts`
+- Create: `app/src/renderer/src/features/meetings/MeetingsIndex.tsx`
+- Create: `app/src/renderer/src/features/meetings/MeetingDossier.tsx`
+- Create: `app/src/renderer/src/features/meetings/LiveDesk.tsx`
+- Create: `app/src/renderer/src/features/meetings/CompactLive.tsx`
+- Create: `app/src/renderer/src/features/meetings/CaptureHeader.tsx`
+- Create: `app/src/renderer/src/features/meetings/TranscriptLane.tsx`
+- Create: `app/src/renderer/src/features/meetings/NotesDocument.tsx`
+- Create: `app/src/renderer/src/features/meetings/MeetingDocumentController.ts`
+- Create: `app/src/renderer/src/features/meetings/ProposalQueue.ts`
+- Create: `app/src/renderer/src/features/meetings/LiveIntelligence.tsx`
+- Create: `app/src/renderer/src/features/meetings/FinalRecord.tsx`
+- Create: `app/src/renderer/src/features/meetings/ProposalDiff.tsx`
+- Create: `app/src/renderer/src/features/meetings/editor/blocknote-adapter.ts`
+- Create: `app/src/renderer/src/features/meetings/editor/provenance.ts`
+- Create: `app/src/renderer/src/features/meetings/editor/markdown-source.tsx`
+- Create: `app/src/renderer/src/features/meetings/MeetingDocumentController.test.ts`
+- Create: `app/src/renderer/src/features/meetings/capture-machine.test.ts`
+- Create: `app/src/renderer/src/features/meetings/MeetingDossier.test.tsx`
+- Create: `app/src/renderer/src/features/meetings/LiveDesk.test.tsx`
+- Create: `app/src/renderer/src/features/privacy/PrivacyCurtain.tsx`
+- Create: `app/src/renderer/src/features/privacy/PrivacyStatus.tsx`
+- Create: `app/src/renderer/src/features/privacy/state.ts`
+- Create: `app/src/renderer/src/features/notifications/ContextQueue.tsx`
+- Create: `app/src/renderer/src/features/notifications/state.ts`
+- Modify: `app/src/renderer/src/app/listeners.ts`
+- Modify: `app/src/renderer/src/app/AppShell.tsx`
+
+**Interfaces:** Consumes Tasks 2–4 durable proposal/note-command APIs, Slice 1 actor/session/desktop services, and Slice 2 shell. Produces the exact capture finite-state machine, one document controller per mounted dossier, Chronicle, Live desk/compact mode, transcript/intelligence, proposal history, final record, meeting deletion flow, and meeting-scoped inquiry seed.
+
+#### RED checkpoint
+
+- [ ] **Add the capture transition table test.** Assert every legal transition in §12.3 and reject stale `meetingId`, `clientSessionId`, `attemptId`, or `connectionEpoch` events.
+
+- [ ] **Add preflight tests.** Cover runtime/socket unavailable, mic denied/restricted/no device, system unsupported/denied/helper error, durable row create failure, same/different active meeting, saved device, and exact Start mic + system audio/Start mic only labels.
+
+- [ ] **Add immediate Stop ordering.**
+
+  ```ts
+  it("stops capture before network stop and document flush", async () => {
+    await stopMeeting({ resumeWindowS: 10 })
+    expect(desktop.capture.stop.mock.invocationCallOrder[0])
+      .toBeLessThan(session.sendStop.mock.invocationCallOrder[0])
+    expect(session.sendStop.mock.invocationCallOrder[0])
+      .toBeLessThan(controller.flush.mock.invocationCallOrder[0])
+  })
+  ```
+
+- [ ] **Add reconnect tests.** Assert no binary buffering, Reconnecting copy, resumed snapshot merge before ASR connected, audio-gap divider, `state_reset` ephemeral clear/refetch/restart divider, token conflict, after-grace durable reconciliation, and no artificial summary epoch.
+
+- [ ] **Add document-controller debounce/order tests.** Assert recovery write precedes 800 ms REST autosave, 2-second token-bearing notepad while active/suspended, stale save success cannot clear a later edit, and Stop never waits for storage.
+
+- [ ] **Add revision conflict tests.** Assert both local/server Markdown survive 409, automatic writes pause, and Keep mine/Keep server/Copy both have exact outcomes.
+
+- [ ] **Add sole-writer tests.** Spy on REST note PATCH and note-command calls; assert only `MeetingDocumentController` can issue them and `ProposalQueue`, socket handlers, transcript, Live intelligence, and views cannot.
+
+- [ ] **Add proposal tests for all five origins.** Assert rolling summary, actionable, meeting chat, inline Ask, and final summary remain absent from canonical Markdown until a durable proposal exists and Accept succeeds.
+
+- [ ] **Add proposal decision tests.** Cover accept/reject, immutable payload, stale base revision, ambiguous/missing anchor, explicit append, superseding placement, latest-operation undo, undo conflict, failed creation, retry/copy, and collapsed decision history.
+
+- [ ] **Add transcript tests.** Cover final/interim replacement, localized You/Them/Speaker N, channel grouping, 32 px auto-follow, Jump count, Copy, Insert transcript excerpt, Ask excerpt, 300-block virtualization, and no interim persistence/citation/live spam.
+
+- [ ] **Add Live desk breakpoint tests.** Assert Notes ≥620 plus one 300–360 lane at 1280, optional remembered three-lane only ≥1440, focus-trapped mutually exclusive sheets below 1180, and preserved lane scroll/selection/disclosure.
+
+- [ ] **Add capture/privacy/compact tests.** Assert 44 px header, textual channels, no decorative waveform, curtain keeps elapsed/channels/Stop and removes private DOM, compact uses the same window and restores exact bounds.
+
+- [ ] **Add final dossier tests.** Assert strata order Notes→Generated recap→Proposed additions→Actions→Transcript→Inquiry, generated title fills only empty title, indexing states, missed final event refetch, and finalization error offers no nonexistent retry.
+
+- [ ] **Add meeting deletion tests.** Assert exact permanent consequences, actor cleanup first, linked inquiry retained, Taurine-derived note stale until clean sync, and no trash/undo claim.
+
+- [ ] **Add meeting-scoped Ask tests.** Assert composer reads `This meeting + pinned context`, carries `meeting_id` and seeds indexed `taurine:{meetingId}` only when available, and `edit_notes` output persists a proposal rather than editing.
+
+- [ ] **Run the combined Slice 3 RED checkpoint.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npx vitest run src/renderer/src/features/meetings src/renderer/src/features/privacy src/renderer/src/features/notifications
+  ```
+
+  Expected: FAIL because the meeting controller, capture state machine, and Chronicle surfaces do not exist. Save this as the slice's one RED artifact.
+
+#### Minimal implementation
+
+- [ ] **Define normalized meeting operational state.** Store active meeting ID, capture identity/phase, transcript buffers, summary/actionables/context queue, note save metadata, and proposal metadata; keep editor nodes outside Redux.
+
+- [ ] **Implement capture reducer with identity guards.**
+
+  ```ts
+  const isCurrent = (state: CaptureState, event: CaptureEvent) =>
+    event.meetingId === state.meetingId &&
+    event.clientSessionId === state.clientSessionId &&
+    event.attemptId === state.attemptId &&
+    event.connectionEpoch === state.connectionEpoch
+  ```
+
+  `resumeDeadline` exists only in `stopped_resumable`; local expiry requests reconciliation and never overrules the server snapshot.
+
+- [ ] **Implement draft creation idempotency.** New meeting creates one durable draft and opens its dossier; a duplicate pending intent reveals preparation instead of creating a row.
+
+- [ ] **Implement inline preflight.** Inspect permissions without prompting, request from labelled action, require mic/device and durable row, let system audio degrade, and redirect a conflicting active meeting to the existing record.
+
+- [ ] **Persist live-session metadata before Start.** Generate one client token per capture attempt, write meeting/token/channels through `desktop.liveSession`, then send Start; clear only after finalization/deletion.
+
+- [ ] **Start mic before optional system audio.** Abort on mic failure; if system start fails after mic, enter `live_mic_only`, keep mic, and render remediation.
+
+- [ ] **Implement snapshot-first reconnect.** Merge summary by revision, actionables by ID with user status precedence, grounding/evidence by stable ID/revision, suggestions by note ID, and transcript sequence monotonically; restart only preflight-approved channels after ASR connected.
+
+- [ ] **Implement immediate Stop and grace.** Stop desktop capture, write recovery, send one Stop(10), enter stopped-resumable without moving focus, show 44 px Resume plus secondary Finalize now, and flush REST/notepad during grace.
+
+- [ ] **Implement Resume and Finalize now.** Resume reuses meeting/token and creates no new meeting/epoch; Finalize now sends Stop(0). Navigation does not own or cancel runtime finalization.
+
+- [ ] **Implement the controller state machine.**
+
+  ```ts
+  async function persistSnapshot(snapshot: LocalNotesSnapshot) {
+    await desktop.recoveryDraft.write(snapshot.recovery)
+    const meeting = await api.updateMeeting(snapshot.meetingId, {
+      notes_md: snapshot.notesMd,
+      base_notes_rev: snapshot.baseNotesRev,
+    })
+    applySaveSuccessOnlyWhenHashMatches(snapshot.contentHash, meeting)
+  }
+  ```
+
+- [ ] **Implement conflict resolution without last-write-wins.** Keep both strings, suspend autosave, let Keep mine retry from server revision, Keep server replace local/controller state, and Copy both copy without mutating.
+
+- [ ] **Implement editor adapters and source-mode parity.** Serialize Markdown deterministically, keep pending proposal content outside serialization, represent operation provenance in a 2 px generated gutter, and transfer edited spans to user-owned styling.
+
+- [ ] **Implement user-authored atomic commands.** Typing/paste uses revision-aware save; Insert transcript excerpt uses `insert`; no generated origin may call these paths.
+
+- [ ] **Implement `ProposalQueue`.** Hydrate durable proposals, create renderer-originated rolling/actionable/inline proposals idempotently, expose Accept only after persistence, and refetch on chat/final proposal events.
+
+- [ ] **Implement controller decisions and undo.** Send proposal ID/decision/base revision only; use server-returned immutable text and operation; on stale/ambiguous placement create a new superseding proposal.
+
+- [ ] **Implement Chronicle rows and dossier states.** Render draft, preparing, live full/mic-only, reconnecting, stopped, ending, summarizing, done, finalization error, deleted elsewhere, and indexing consequences with exact actions from §8.3.
+
+- [ ] **Implement Live desk and compact layouts.** Notes remain primary; Transcript/Intelligence state persists when switched or sheeted; compact contains header, 120 px transcript, notes, and 44 px collapsed context/action queue.
+
+- [ ] **Implement transcript behavior.** Keep interims replaceable and noncitable; group finals, virtualize after 300 blocks with overscan 10, disclose reconnect gaps, and route Insert/Ask through typed commands.
+
+- [ ] **Implement Live intelligence.** One-open disclosure among rolling summary, actionables, context queue; `Review for notes` persists a proposal; actionable user status wins; retrieval disclosure dispatches the typed `workspace/evidenceSelected` intent consumed by Slice 4 without duplicating truth logic.
+
+- [ ] **Implement final record and proposal history.** Generated recap is visible but not canonical notes; exact insertion diff/rationale/time/base revision and Accept/Reject/Undo are keyboard reachable; decisions remain collapsed history.
+
+- [ ] **Implement meeting-scoped Ask entry.** Pass meeting/pins/selection into the shared inquiry scope contract used in Slice 4; until that workbench exists, render a typed shell destination rather than a second chat client.
+
+- [ ] **Implement deletion sequencing.** Ask actor/server to stop cooperative live work, then delete durable row; preserve linked inquiry and show stale-index consequence.
+
+#### GREEN checkpoint
+
+- [ ] **Run the Slice 3 unit/type/build gate.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npm test -- src/renderer/src/features/meetings src/renderer/src/features/privacy src/renderer/src/features/notifications src/renderer/src/services
+  npm run lint
+  npm run typecheck
+  npm run build
+  ```
+
+  Expected: PASS for every capture phase, immediate Stop ordering, honest resume/reset, controller conflict/durability, all proposal origins, responsive Live, transcript, final record, and deletion.
+
+- [ ] **Run the Slice 3 inspectable journey.** Create a draft, degrade to mic-only once, start full capture, type notes, insert a transcript excerpt, force reconnect, Stop/Resume, Stop/Finalize, accept and undo a proposal, trigger a revision conflict, resolve it, then enter scoped Ask. Expected: capture truth is exact and no authored text is lost or generated text silently inserted.
+
+- [ ] **Freeze Slice 3 after GREEN.**
+
+  ```bash
+  cd "$WORKTREE_ROOT"
+  git diff --check
+  git add app/src/renderer/src/features/meetings app/src/renderer/src/features/privacy app/src/renderer/src/features/notifications app/src/renderer/src/app
+  git commit -m "feat: deliver the knowledge atlas meeting journey"
+  ```
+
+  Expected: commit succeeds and becomes the immutable Slice 3 review target.
+
+- [ ] **Stop and request independent Slice 3 review.** Provide the commit SHA, RED/GREEN output, meeting journey evidence, and sole-writer scan. Expected: no Slice 4 path changes until review returns clean; blocking findings are repaired and re-frozen in Slice 3.
+
+---
+
+### Task 4: Inquiry and evidence
+
+**Runnable journey:** Ask from all knowledge, the current meeting, pinned objects, or the current Atlas neighborhood; watch one streaming thread; inspect every citation/consulted/retrieved object at claim level; cancel/reconnect honestly; and navigate the same evidence back into Atlas/Chronicle.
+
+**Files:**
+
 - Create: `app/src/renderer/src/features/evidence/normalize.ts`
-- Create: `app/src/renderer/src/features/evidence/normalize.test.ts`
 - Create: `app/src/renderer/src/features/evidence/selectors.ts`
 - Create: `app/src/renderer/src/features/evidence/EvidenceInspector.tsx`
 - Create: `app/src/renderer/src/features/evidence/EvidenceLedger.tsx`
 - Create: `app/src/renderer/src/features/evidence/PassageView.tsx`
 - Create: `app/src/renderer/src/features/evidence/FactView.tsx`
 - Create: `app/src/renderer/src/features/evidence/PathView.tsx`
-- Create: `app/src/renderer/src/components/knowledge/ObjectRow.tsx`
-- Create: `app/src/renderer/src/components/knowledge/SourceMark.tsx`
+- Create: `app/src/renderer/src/features/evidence/normalize.test.ts`
+- Create: `app/src/renderer/src/features/evidence/EvidenceInspector.test.tsx`
 - Create: `app/src/renderer/src/components/knowledge/EvidenceRef.tsx`
 - Create: `app/src/renderer/src/components/knowledge/DecisionLabel.tsx`
 - Create: `app/src/renderer/src/components/knowledge/FactRow.tsx`
 - Create: `app/src/renderer/src/components/knowledge/PathView.tsx`
 - Create: `app/src/renderer/src/components/knowledge/DiffProposal.tsx`
-- Create: `app/src/renderer/src/features/evidence/EvidenceInspector.test.tsx`
-
-**Interfaces:** Consumes passage/fact/path/grounding/chat contracts. Produces one normalized `EvidenceRecord` union and the shared inspector used by Atlas, meetings, and Inquiry. Evidence relationship is `cited|consulted|retrieved`; policy outcome is `accepted|fallback|abstained|cancelled|interrupted|error`; temporal fact state is separate. Numeric confidence appears only in Advanced with calibration wording.
-
-- [ ] **Step 1: Write failing truth-language and normalization tests.**
-
-```ts
-it.each([
-  ["cited", "Cited in this answer"],
-  ["consulted", "Consulted but not cited"],
-  ["retrieved", "Retrieved only"],
-] as const)("renders %s without strengthening the claim", (relationship, label) => {
-  render(<EvidenceInspector record={passage({ relationship, score: 0.87 })} />)
-  expect(screen.getByRole("heading", { name: label })).toBeVisible()
-  expect(screen.queryByText(/verified|fact checked/i)).not.toBeInTheDocument()
-  expect(screen.queryByText("87%")).not.toBeInTheDocument()
-})
-
-it("withholds support lists for an interrupted partial", () => {
-  expect(normalizeTurn(interruptedTurnWithCitationTokens()).support).toEqual([])
-})
-```
-
-- [ ] **Step 2: Run evidence tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/features/evidence`
-
-Expected: FAIL because the evidence normalization and inspector modules are absent.
-
-- [ ] **Step 3: Implement shared evidence records and views.**
-
-Render passage ID/title/exact text/date/range, fact direction/status/interval/source support, resolved path nodes/edge kinds/fact IDs, meeting transcript sequence, and note passage sets. Preserve prior-context/low-confidence and fallback warnings. Label graph edge weight `Projection weight`; do not expose an edge-explanation command or call `/graph/edge-reason`. Show Open in source app only when the adapter supports it, route Apple Notes through existing `/session open_note`, offer payload-backed Copy text/path/link otherwise, and keep failures inline. Use a linear list alternative for paths under 420 px. Announce inspector selection once, not on streaming token changes. Advanced numeric values carry `Bootstrap calibration; no held-out metrics` when the active build reports degraded calibration.
-
-- [ ] **Step 4: Run evidence, semantics, and type tests.**
-
-Run: `cd app && npm test -- src/renderer/src/features/evidence src/renderer/src/components/knowledge && npm run typecheck`
-
-Expected: PASS across cited/consulted/retrieved, fallback/abstained/interrupted, active/historical/superseded/conflicted/candidate facts, and missing/unavailable records.
-
-- [ ] **Step 5: Commit shared evidence semantics.**
-
-```bash
-git add app/src/renderer/src/features/evidence app/src/renderer/src/components/knowledge
-git commit -m "feat(renderer): unify evidence inspection semantics"
-```
-
-### Task 16: Implement Inquiry threads, streaming turns, and scoped Ask
-
-**Files:**
 - Create: `app/src/renderer/src/features/inquiry/contracts.ts`
+- Create: `app/src/renderer/src/features/inquiry/state.ts`
 - Create: `app/src/renderer/src/features/inquiry/selectors.ts`
 - Create: `app/src/renderer/src/features/inquiry/listeners.ts`
 - Create: `app/src/renderer/src/features/inquiry/InquiryIndex.tsx`
@@ -1375,338 +1045,155 @@ git commit -m "feat(renderer): unify evidence inspection semantics"
 - Create: `app/src/renderer/src/features/inquiry/ProcessTrace.tsx`
 - Create: `app/src/renderer/src/features/inquiry/MessageMarkdown.tsx`
 - Create: `app/src/renderer/src/features/inquiry/inquiry.test.tsx`
+- Modify: `app/src/renderer/src/app/AppShell.tsx`
+- Modify: `app/src/renderer/src/app/listeners.ts`
+- Modify: `app/src/renderer/src/features/meetings/MeetingDossier.tsx`
+- Modify: `app/src/renderer/src/features/atlas/AtlasWorkbench.tsx`
 
-**Interfaces:** Consumes chat REST/socket, Task 15 evidence, and workspace scope. Produces Inquiry index/workbench with scopes All indexed knowledge, Current meeting, Pinned context, and Current Atlas selection/neighborhood. Scope maps to `meeting_id` and `seed_note_ids` and is described as “Start from these objects,” never as hard retrieval isolation.
+**Interfaces:** Consumes the full existing `/chat` protocol, meeting scope from Slice 3, workspace pins/selection, and graph/note/fact contracts. Produces one normalized `EvidenceRecord` union, one renderer-wide inspector, complete inquiry state/event reduction, and navigation intents shared by all coordinates.
 
-- [ ] **Step 1: Write failing scope, streaming, cancel, and reconnect tests.**
+#### RED checkpoint
 
-```tsx
-it("sends pinned objects as retrieval seeds without claiming hard scope", async () => {
-  renderInquiry({ pins: [note("n1"), meeting("m1")] })
-  await user.type(screen.getByRole("textbox", { name: "Ask Taurine" }), "What changed?{Enter}")
-  expect(chat.send).toHaveBeenCalledWith(expect.objectContaining({ seed_note_ids: ["n1", "taurine:m1"] }))
-  expect(screen.getByText("Start from these objects · 2")).toBeVisible()
-})
+- [ ] **Add evidence precedence tests.** Assert an ID appears once at its highest relationship `cited > consulted > retrieved`, with lower relationships retained only in metadata.
 
-it("never resends an interrupted user turn on reconnect", () => {
-  reconnectActiveChat()
-  expect(chat.send).not.toHaveBeenCalled()
-  expect(screen.getByText("Unvalidated partial")).toBeVisible()
-})
-```
+- [ ] **Add exact trust-language tests.** Assert Cited in this answer, Consulted but not cited, Retrieved only, Evidence policy passed, Low-confidence fallback, No supported evidence, and Interrupted/unvalidated; reject Verified/fact checked copy and primary numeric confidence.
 
-- [ ] **Step 2: Run Inquiry tests and confirm the expected failure.**
+- [ ] **Add evidence-type tests.** Cover passage exact text/date/range/scores Advanced, fact direction/status/interval/confidence/source, path route/edges/fact IDs/weight, meeting/transcript speaker/time/sequence, note navigation/passages, missing and unavailable records.
 
-Run: `cd app && npx vitest run src/renderer/src/features/inquiry/inquiry.test.tsx`
+- [ ] **Add temporal/fallback/interruption tests.** Assert inactive current-tense warning, prior-context label, fallback with facts/paths withheld, abstained empty support, and interrupted/cancelled partial with no support even when raw text contains citation-looking tokens.
 
-Expected: FAIL because Inquiry components/listeners are absent.
+- [ ] **Add inquiry scope tests.** Assert All, Current meeting, Pinned context, and Current Atlas selection/neighborhood map to `meeting_id`/`seed_note_ids` and render Start from these objects rather than Search only these.
 
-- [ ] **Step 3: Implement the chat finite-state UI.**
+- [ ] **Add first-send and acknowledgement tests.** Assert an empty local thread is not created server-side until send, optimistic user text says Sending, `chat_ack` replaces temporary IDs, and authoritative history prevents uncertain retry duplication.
 
-Keep a new inquiry client-empty until first send. Composer is at least 44 px, grows to eight lines, Enter sends, Shift+Enter inserts newline, and `⌘.` stops the focused active turn. Batch Markdown deltas at 30–50 ms. Render phase, ordered process disclosure, answer, evidence ledger, and actions as a flat document section; raw reasoning stays under Advanced process and is not evidence. Preserve input on busy, distinguish fallback/abstained/cancelled/interrupted/error, support server-authoritative regenerate replacement, rename rollback, delete consequences, background-stream count, and meeting-linked chat cleanup. Chat reconnection refetches authoritative history and marks persisted partials interrupted/cancelled without sending again.
+- [ ] **Add interleaved streaming tests.** Assert retrieval, thinking, activity, and answer deltas may interleave; process events replace by stable index; answer deltas batch 30–50 ms; `chat_done.message` replaces buffers.
 
-- [ ] **Step 4: Run Inquiry, gateway, and evidence tests.**
+- [ ] **Add turn outcome tests.** Cover accepted, fallback, abstained, cancelled, interrupted, busy, timeout, LLM error, stripped claims, usage/build metadata, original/rewritten query, and calibration identity.
 
-Run: `cd app && npm test -- src/renderer/src/features/inquiry src/renderer/src/features/evidence src/renderer/src/services/sidecar && npm run typecheck`
+- [ ] **Add cancel/reconnect/regenerate tests.** Assert one `chat_cancel`, Stopping until terminal event, no auto-resend, refetch active history, temporary Replacing snapshot for regenerate, and rollback on failure.
 
-Expected: PASS; tests cover process replacement by stable index, stop, fallback/abstain, stripped claims, Retry/Regenerate, rename/delete rollback, background turns, citation focus, and interrupted no-resend.
+- [ ] **Add management/background tests.** Assert rename rollback, destructive delete consequences, meeting link cleanup, background streaming coordinate count, composer preservation, and coordinate changes do not cancel turns.
 
-- [ ] **Step 5: Commit Inquiry.**
+- [ ] **Add navigation tests.** Assert citation selection updates inspector without workbench navigation; note/meeting opens Atlas/Chronicle; View evidence in Atlas sets evidence lens; Open in source appears only for supported adapter.
 
-```bash
-git add app/src/renderer/src/features/inquiry
-git commit -m "feat(renderer): build inquiry and evidence workflow"
-```
+- [ ] **Run the combined Slice 4 RED checkpoint.**
 
-### Task 17: Build deterministic Atlas layout and Canvas rendering
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npx vitest run src/renderer/src/features/evidence src/renderer/src/features/inquiry src/renderer/src/components/knowledge
+  ```
+
+  Expected: FAIL because shared evidence normalization and Inquiry workbench modules do not exist. Save this output as the slice's one RED artifact.
+
+#### Minimal implementation
+
+- [ ] **Define normalized evidence unions.** Separate record kind, relationship, policy outcome, temporal state, availability, and prior-context/low-confidence flags; never infer one from another.
+
+- [ ] **Implement relationship normalization.**
+
+  ```ts
+  const rank = { retrieved: 0, consulted: 1, cited: 2 } as const
+  export function mergeEvidence(rows: EvidenceRecord[]): EvidenceRecord[] {
+    const byId = new Map<string, EvidenceRecord>()
+    for (const row of rows) {
+      const current = byId.get(row.id)
+      if (!current || rank[row.relationship] > rank[current.relationship]) byId.set(row.id, row)
+    }
+    return [...byId.values()]
+  }
+  ```
+
+- [ ] **Implement `EvidenceRef` and `EvidenceLedger`.** Use inline focusable tokens E/F/P/T/M with accessible type names; order Cited, Consulted, Retrieved; compute counts from unique IDs.
+
+- [ ] **Implement inspector record views.** Render exact provided fields, Advanced scores/build/calibration, linear path alternative under 420 px, textual temporal/availability states, and no semantic claims stronger than the payload.
+
+- [ ] **Implement native-source actions.** Route Apple Notes through session `open_note`; allow Copy text/path/link only when present; keep failure inline; never guess a source-app capability.
+
+- [ ] **Define inquiry state.** Store normalized threads/messages, active thread, local composer drafts/scopes, ordered process events, content buffers, active operation ID, and background stream counts; keep socket out of Redux.
+
+- [ ] **Implement first-send semantics.** Create server chat on first send/ack, retain input on busy/failure until authoritative reconciliation, and never replay a write after socket uncertainty.
+
+- [ ] **Implement exact scope serialization.** Resolve meeting ID and seed note IDs from current meeting, pinned notes/meetings, or Atlas selection/neighborhood; label all seed scopes as retrieval starting points, not security filters.
+
+- [ ] **Implement the stream reducer.** Preserve full retrieval pack, reasoning/activity in Advanced, 30–50 ms answer batching, stable activity replacement, cancellation/interruption, stripped claims, usage, build/calibration IDs, and authoritative done swap.
+
+- [ ] **Implement flat turn anatomy.** Render phase line, process disclosure, progressive Markdown, evidence ledger, and actions under one document section with 2 px rule; user turns are full-width labelled blocks, never bubbles/cards.
+
+- [ ] **Implement composer behavior.** Minimum 44 px, grow to eight lines, Enter send, Shift+Enter newline, `⌘.` stop focused turn, editable next-turn text while streaming with Send disabled.
+
+- [ ] **Implement regenerate/rename/delete.** Preserve old rendered answer during server replacement, refetch on failure, roll back optimistic title, and state permanent message/evidence deletion.
+
+- [ ] **Implement shared navigation intents.** Inspector selection is workspace state; note/meeting/evidence links update coordinate/selection/history; `View evidence in Atlas` applies an evidence-set lens without duplicating graph state.
+
+- [ ] **Wire meeting Ask and inline Ask.** Reuse the Inquiry workbench with meeting scope; `chat_notes_edit` upserts the durable proposal and never calls the editor.
+
+#### GREEN checkpoint
+
+- [ ] **Run the Slice 4 unit/type/build gate.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npm test -- src/renderer/src/features/evidence src/renderer/src/features/inquiry src/renderer/src/components/knowledge src/renderer/src/features/meetings src/renderer/src/features/atlas
+  npm run lint
+  npm run typecheck
+  npm run build
+  ```
+
+  Expected: PASS for every chat event/outcome, exact evidence semantics, no-resend reconnect, claim-level inspection, and cross-coordinate navigation.
+
+- [ ] **Run the Slice 4 inspectable journey.** Ask with three cited, two consulted, and four retrieved-only records; inspect a passage/fact/path; run fallback and interrupted scenarios; stop and regenerate a turn; navigate one citation to Atlas and one meeting citation to Chronicle. Expected: groups/counts are exact and no unsupported support claim appears.
+
+- [ ] **Freeze Slice 4 after GREEN.**
+
+  ```bash
+  cd "$WORKTREE_ROOT"
+  git diff --check
+  git add app/src/renderer/src/features/evidence app/src/renderer/src/features/inquiry app/src/renderer/src/components/knowledge app/src/renderer/src/app app/src/renderer/src/features/meetings app/src/renderer/src/features/atlas
+  git commit -m "feat: deliver atlas inquiry and evidence"
+  ```
+
+  Expected: commit succeeds and becomes the immutable Slice 4 review target.
+
+- [ ] **Stop and request independent Slice 4 review.** Provide the commit SHA, RED/GREEN output, evidence grouping fixtures, and inquiry journey evidence. Expected: no Slice 5 path changes until review returns clean; blocking findings are repaired and re-frozen in Slice 4.
+
+---
+
+### Task 5: Knowledge operations
+
+**Runnable journey:** Investigate with Atlas time/lenses/neighborhood/Outline/comparison, authorize and sync a source without losing the old Atlas, purge with exact consequences, edit/generate the Interpretation profile, inspect redacted diagnostics, use native note opening and utilities, and activate a deterministic privacy curtain during capture.
 
 **Files:**
-- Create: `app/src/renderer/src/features/atlas/contracts.ts`
-- Create: `app/src/renderer/src/features/atlas/layout.ts`
-- Create: `app/src/renderer/src/features/atlas/layout.test.ts`
-- Create: `app/src/renderer/src/features/atlas/atlas-worker.ts`
-- Create: `app/src/renderer/src/features/atlas/render.ts`
-- Create: `app/src/renderer/src/features/atlas/storage.ts`
-- Create: `app/src/renderer/src/features/atlas/storage.test.ts`
-- Create: `app/src/renderer/src/features/atlas/AtlasCanvas.tsx`
-- Create: `app/src/renderer/src/features/atlas/AtlasCanvas.test.tsx`
 
-**Interfaces:** Consumes global/local graph snapshots and live grounding. Produces immutable `AtlasSnapshot`, worker messages `{type:"layout", buildId, graphVersion, nodes, edges, priorPositions, reducedMotion}` and `{type:"settled", buildId, graphVersion, positions, hulls}`, four cartographic levels of detail, hit-test index, and a Canvas that is `aria-hidden`. Persisted layout contains only build ID, note ID, x/y, and user-pinned flag—never titles, snippets, passages, or source content.
-
-- [ ] **Step 1: Write failing determinism, graph-version, and storage tests.**
-
-```ts
-it("derives identical initial geography for identical stable inputs", () => {
-  expect(initialPosition(node, "build-7")).toEqual(initialPosition(node, "build-7"))
-})
-
-it("keeps unchanged nodes and places additions at their territory centroid", () => {
-  const next = seedGraph(nextGraph, previousPositions)
-  expect(next.n1).toEqual(previousPositions.n1)
-  expect(distance(next.newNode, territoryCentroid("community-a"))).toBeLessThan(24)
-})
-
-it("persists no knowledge text", () => {
-  saveLayout(storage, layoutWithPrivateNodeText())
-  expect(storage.lastValue).not.toMatch(/private title|private snippet/)
-})
-```
-
-- [ ] **Step 2: Run Atlas engine tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/features/atlas/layout.test.ts src/renderer/src/features/atlas/storage.test.ts src/renderer/src/features/atlas/AtlasCanvas.test.tsx`
-
-Expected: FAIL because layout, storage, worker, and Canvas modules are absent.
-
-- [ ] **Step 3: Implement stable worker geography and Canvas LOD.**
-
-Seed positions from community ID, stable note-ID hash, degree, and date band. Run d3-force and hull computation in the worker, settle, and publish no faster than animation frame. Reuse prior coordinates by build/note ID, place new nodes near their territory centroid, fade removed nodes for exactly 140 ms unless reduced motion, and persist user pins locally. Render flat 6–10% territory tints, horizontal labels, shape-plus-label selection/pin/live states, and exact scale bands `<0.55`, `0.55–1.05`, `1.05–1.80`, `>1.80`. Static edges appear only on hover/selection until the highest band. Encode semantic/topic/entity/mixed/fact and live states by the specified line/shape patterns. Never mutate graph data or keep a perpetual animation.
-
-- [ ] **Step 4: Run engine, worker, Canvas, and type tests.**
-
-Run: `cd app && npm test -- src/renderer/src/features/atlas && npm run typecheck`
-
-Expected: PASS; deterministic snapshots, stale worker result rejection, reduced-motion snap, pin/release/reset, four LODs, line patterns, and sanitized persistence are asserted.
-
-- [ ] **Step 5: Commit the Atlas engine.**
-
-```bash
-git add app/src/renderer/src/features/atlas/contracts.ts app/src/renderer/src/features/atlas/layout.ts app/src/renderer/src/features/atlas/layout.test.ts app/src/renderer/src/features/atlas/atlas-worker.ts app/src/renderer/src/features/atlas/render.ts app/src/renderer/src/features/atlas/storage.ts app/src/renderer/src/features/atlas/storage.test.ts app/src/renderer/src/features/atlas/AtlasCanvas.tsx app/src/renderer/src/features/atlas/AtlasCanvas.test.tsx
-git commit -m "feat(renderer): add deterministic atlas canvas engine"
-```
-
-### Task 18: Complete Atlas navigation, Outline, time, lenses, and comparison
-
-**Files:**
-- Create: `app/src/renderer/src/features/atlas/AtlasWorkbench.tsx`
-- Create: `app/src/renderer/src/features/atlas/AtlasOutline.tsx`
-- Create: `app/src/renderer/src/features/atlas/AtlasIndex.tsx`
+- Modify: `app/src/renderer/src/features/atlas/AtlasWorkbench.tsx`
+- Modify: `app/src/renderer/src/features/atlas/AtlasCanvas.tsx`
+- Modify: `app/src/renderer/src/features/atlas/AtlasOutline.tsx`
+- Modify: `app/src/renderer/src/features/atlas/AtlasIndex.tsx`
 - Create: `app/src/renderer/src/features/atlas/AtlasControls.tsx`
 - Create: `app/src/renderer/src/features/atlas/TimeBand.tsx`
-- Create: `app/src/renderer/src/features/atlas/selectors.ts`
 - Create: `app/src/renderer/src/features/atlas/AtlasWorkbench.test.tsx`
 - Create: `app/src/renderer/src/features/workspace/ComparisonBoard.tsx`
 - Create: `app/src/renderer/src/features/workspace/ComparisonBoard.test.tsx`
-
-**Interfaces:** Consumes Task 17 engine, graph/search/idea APIs, Task 15 inspector, and shared workspace selection/pins. Produces synchronized Canvas/Outline, global and neighborhood modes, lenses, 56 px time band, selection history, and two/three-column comparison. Selection is not activation: move/click selects, Enter opens, Space previews, Shift+Enter pins.
-
-- [ ] **Step 1: Write failing keyboard, outline, filter, and comparison tests.**
-
-```tsx
-it("provides every Canvas action through the Outline", async () => {
-  renderAtlas({ screenReader: true })
-  const outline = screen.getByRole("tree", { name: "Atlas outline" })
-  await user.click(within(outline).getByText("Project Cedar"))
-  expect(selectSelection(store.getState())).toBe("n1")
-  await user.keyboard("{Enter}")
-  expect(api.getLocalGraph).toHaveBeenCalledWith({ center: "n1", depth: 1 })
-})
-
-it("filters Canvas, Outline, and Chronicle with one time range", () => {
-  setTimePreset("90_days")
-  expect(selectAtlasNodes(store.getState())).toEqual([recentNode])
-  expect(selectOutlineRows(store.getState())).toEqual([recentNode])
-  expect(selectChronicleRows(store.getState())).toEqual([recentMeeting])
-})
-```
-
-- [ ] **Step 2: Run Atlas workbench tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/features/atlas/AtlasWorkbench.test.tsx src/renderer/src/features/workspace/ComparisonBoard.test.tsx`
-
-Expected: FAIL because Outline, time band, controls, and comparison are absent.
-
-- [ ] **Step 3: Implement complete spatial and comparative interaction.**
-
-Make Outline the screen-reader default and Canvas `aria-hidden`. Global Outline is territory→notes tree; local Outline is selected note→incoming/outgoing treegrid with relationship kind/weight. Add sorting, `/`, `V`, `F`, `+/-`, arrow pan/navigation, `[ ]` neighborhood history, depth 1/2/3, context-menu keyboard access, 40×40 zoom controls, pin/release/reset, and non-drag alternatives. Time presets are All/30 days/90 days/1 year/Custom with localized fields/tooltips. Render lenses as removable text clauses for source/community/recency/connections/minimum links/session/evidence set/AI idea; preserve idea query on abstain/error. Keep prior graph on sync/fetch failure with build identity. Comparison pins at most three objects, aligns shared entities/dates/sources/citations with textual “shared,” and synthesizes only when the user invokes Ask these.
-
-- [ ] **Step 4: Run complete Atlas/workspace tests.**
-
-Run: `cd app && npm test -- src/renderer/src/features/atlas src/renderer/src/features/workspace src/renderer/src/features/evidence && npm run typecheck`
-
-Expected: PASS for keyboard parity, LOD-independent outline reachability, neighborhood directionality, filters, live overlay/restart disclosure, stale graph, idea abstain/error, and two/three-object comparison.
-
-- [ ] **Step 5: Commit the Atlas workbench.**
-
-```bash
-git add app/src/renderer/src/features/atlas app/src/renderer/src/features/workspace/ComparisonBoard.tsx app/src/renderer/src/features/workspace/ComparisonBoard.test.tsx
-git commit -m "feat(renderer): complete atlas navigation and comparison"
-```
-
-### Task 19: Make one meeting document controller the sole notes writer
-
-**Files:**
-- Create: `app/src/renderer/src/features/meetings/contracts.ts`
-- Create: `app/src/renderer/src/features/meetings/MeetingDocumentController.ts`
-- Create: `app/src/renderer/src/features/meetings/MeetingDocumentController.test.ts`
-- Create: `app/src/renderer/src/features/meetings/editor/blocknote-adapter.ts`
-- Create: `app/src/renderer/src/features/meetings/editor/provenance.ts`
-- Create: `app/src/renderer/src/features/meetings/editor/markdown-source.tsx`
-- Create: `app/src/renderer/src/features/meetings/NotesDocument.tsx`
-- Create: `app/src/renderer/src/features/meetings/ProposalQueue.ts`
-- Create: `app/src/renderer/src/features/meetings/ProposalDiff.tsx`
-- Create: `app/src/renderer/src/features/meetings/listeners.ts`
-- Create: `app/src/renderer/src/features/meetings/selectors.ts`
-
-**Interfaces:** Consumes Tasks 3/4 APIs and safe recovery. Produces exactly one `MeetingDocumentController` per mounted dossier. All editor typing/paste, transcript insert, proposal decision, conflict resolution, and undo enter typed controller commands. `ProposalQueue` can create/refetch but cannot call editor mutation or note-command endpoints.
-
-- [ ] **Step 1: Write failing autosave, proposal, conflict, and ownership tests.**
-
-```ts
-it("persists a recovery draft before revision-aware autosave", async () => {
-  controller.replaceFromEditor("changed")
-  await clock.advanceByAsync(800)
-  expect(desktop.recovery.save.mock.invocationCallOrder[0])
-    .toBeLessThan(api.updateMeeting.mock.invocationCallOrder[0])
-  expect(api.updateMeeting).toHaveBeenCalledWith("m1", { notes_md: "changed", base_notes_rev: 4 })
-})
-
-it("does not put a proposal into the document before Accept succeeds", async () => {
-  queue.upsert(proposal({ insertMd: "assistant text" }))
-  expect(editor.getMarkdown()).not.toContain("assistant text")
-  await controller.decideProposal("p1", "accept")
-  expect(editor.getMarkdown()).toContain("assistant text")
-})
-```
-
-- [ ] **Step 2: Run controller tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/features/meetings/MeetingDocumentController.test.ts`
-
-Expected: FAIL because controller/editor/proposal adapters are absent.
-
-- [ ] **Step 3: Implement the finite-state save boundary.**
-
-Controller states are clean/editing/saving/queued_offline/conflict. Autosave begins 800 ms after idle, writes encrypted recovery first, and supplies `base_notes_rev`. While live, send token-bearing `/session notepad` after 2 seconds idle. Stop capture never awaits save; `flush()` runs during grace. On 409 preserve local/server text, stop automatic writes, and open resolution with Keep mine, Keep server, Copy both. Proposal Accept/Reject sends immutable server-owned content through `proposal_decision`; stale proposals offer Choose location, explicit Append, or Reject by creating a superseding proposal. Undo obeys server conflict response. Track AI provenance from operations/blocks; editing an AI span marks the changed span user-authored without erasing operation history. If safeStorage is unavailable, keep recovery memory-only and show the exact restart-unavailable state.
-
-- [ ] **Step 4: Run controller, API-contract, and editor tests.**
-
-Run: `cd app && npm test -- src/renderer/src/features/meetings/MeetingDocumentController.test.ts src/renderer/src/services/sidecar && npm run typecheck`
-
-Expected: PASS for debounce, offline queue, reload recovery, base-revision conflict, accept/reject, stale re-anchor, latest undo, direct transcript insertion, final notepad, and strict one-writer spies.
-
-- [ ] **Step 5: Commit the notes boundary.**
-
-```bash
-git add app/src/renderer/src/features/meetings app/src/renderer/src/services/sidecar
-git commit -m "feat(renderer): enforce sole meeting document writer"
-```
-
-### Task 20: Implement capture preflight and the resumable live state machine
-
-**Files:**
-- Modify: `app/src/renderer/src/features/meetings/state.ts`
-- Modify: `app/src/renderer/src/features/meetings/listeners.ts`
-- Create: `app/src/renderer/src/features/meetings/capture-machine.ts`
-- Create: `app/src/renderer/src/features/meetings/capture-machine.test.ts`
-- Create: `app/src/renderer/src/features/meetings/CaptureHeader.tsx`
-- Create: `app/src/renderer/src/features/meetings/CompactLive.tsx`
-- Create: `app/src/renderer/src/features/privacy/PrivacyCurtain.tsx`
-- Create: `app/src/renderer/src/features/privacy/PrivacyStatus.tsx`
-- Create: `app/src/renderer/src/features/notifications/ContextQueue.tsx`
-
-**Interfaces:** Consumes desktop capabilities/capture, session gateway, document controller, and session snapshots. Produces the exact `CapturePhase` machine, stable renderer-generated `client_session_id`, capability preflight, immediate Stop, 10-second Resume/Finalize now, 60-second disconnect continuation, gap/reset disclosure, compact live, and curtain-safe capture controls.
-
-- [ ] **Step 1: Write failing transition and sequencing tests.**
-
-```ts
-it("stops local capture before network stop and document flush", async () => {
-  await listeners.stopMeeting({ resumeWindowS: 10 })
-  expect(desktop.capture.stop.mock.invocationCallOrder[0])
-    .toBeLessThan(session.sendStop.mock.invocationCallOrder[0])
-  expect(session.sendStop.mock.invocationCallOrder[0])
-    .toBeLessThan(controller.flush.mock.invocationCallOrder[0])
-})
-
-it("resumes only after snapshot then ASR connected", () => {
-  machine.send({ type: "SOCKET_RECONNECTED" })
-  machine.send({ type: "SESSION_SNAPSHOT", disposition: "resumed" })
-  expect(machine.state).toBe("reconnecting")
-  machine.send({ type: "ASR_STATUS", status: "connected" })
-  expect(machine.state).toBe("live_full")
-})
-```
-
-- [ ] **Step 2: Run lifecycle tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/features/meetings/capture-machine.test.ts`
-
-Expected: FAIL because the capture machine and listeners are absent.
-
-- [ ] **Step 3: Implement exact preflight and continuation rules.**
-
-Preflight checks session socket, microphone/device, optional system audio, durable meeting row, and active-meeting conflict. Mic failure aborts; system failure degrades to mic-only. Declare actual channels on Start. On socket loss pause/stop sending audio and never buffer; show `Reconnecting · audio may be missing`. Matching Start uses the same meeting/token, merges snapshot by summary revision/actionable ID/status/evidence ID/suggestion note ID/transcript sequence, then restarts only channels passing preflight after ASR connected. Resumed state inserts an audio-gap divider; `state_reset` also clears ephemeral grounding/context and inserts `Live context restarted`. Stop saves recovery and ceases capture first, sends idempotent Stop with 10 seconds, continues notes/notepad flush, and offers 44 px Resume plus secondary Finalize now (`resume_window_s:0`). Apply originating `final_summary_status`/`final_summary` only when meeting ID and base revision match the open record, then refetch; missed events reconcile through meetings updates and detail REST. Never show model percent/phases.
-
-- [ ] **Step 4: Run lifecycle, desktop, controller, and gateway tests.**
-
-Run: `cd app && npm test -- src/renderer/src/features/meetings src/renderer/src/features/privacy src/renderer/src/services src/main && npm run typecheck`
-
-Expected: PASS for full/mic-only, duplicate Start, permission recovery, immediate Stop, 10-second resume, disconnect resume/reset/conflict, no audio replay, stale event rejection, and finalization navigation.
-
-- [ ] **Step 5: Commit meeting capture lifecycle.**
-
-```bash
-git add app/src/renderer/src/features/meetings app/src/renderer/src/features/privacy app/src/renderer/src/features/notifications
-git commit -m "feat(renderer): add resumable meeting capture lifecycle"
-```
-
-### Task 21: Build Chronicle, live desk, dossier, and proposal review
-
-**Files:**
-- Create: `app/src/renderer/src/features/meetings/MeetingsIndex.tsx`
-- Create: `app/src/renderer/src/features/meetings/MeetingDossier.tsx`
-- Create: `app/src/renderer/src/features/meetings/LiveDesk.tsx`
-- Create: `app/src/renderer/src/features/meetings/TranscriptLane.tsx`
-- Create: `app/src/renderer/src/features/meetings/LiveIntelligence.tsx`
-- Create: `app/src/renderer/src/features/meetings/FinalRecord.tsx`
-- Create: `app/src/renderer/src/features/meetings/MeetingDossier.test.tsx`
-- Create: `app/src/renderer/src/features/meetings/LiveDesk.test.tsx`
-
-**Interfaces:** Consumes Tasks 19–20, meeting/chat/update contracts, and evidence inspector. Produces Chronicle index, draft/preflight/live/final dossier, two-lane default Live, opt-in three-lane ≥1440, sheet layout <1180, transcript, live intelligence, durable proposal review/history, final record, index status, delete consequences, and meeting-scoped Ask.
-
-- [ ] **Step 1: Write failing lane, transcript, proposal, and deletion tests.**
-
-```tsx
-it("uses two lanes at the ordinary 1280 width", () => {
-  renderLiveDesk({ width: 1280, threeLanePreference: true })
-  expect(screen.getByRole("document", { name: "Meeting notes" })).toBeVisible()
-  expect(screen.getByRole("region", { name: /Transcript|Live intelligence/ })).toBeVisible()
-  expect(screen.queryByRole("region", { name: "Third live lane" })).not.toBeInTheDocument()
-})
-
-it("keeps decided proposals in collapsed history", async () => {
-  renderDossier({ proposals: [acceptedProposal, rejectedProposal] })
-  expect(screen.getByRole("button", { name: "Decision history · 2" })).toBeVisible()
-})
-```
-
-- [ ] **Step 2: Run meeting surface tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/features/meetings/MeetingDossier.test.tsx src/renderer/src/features/meetings/LiveDesk.test.tsx`
-
-Expected: FAIL because Chronicle/dossier/live surfaces are absent.
-
-- [ ] **Step 3: Implement every meeting state and action.**
-
-Chronicle rows distinguish Draft · not recorded, preparing, live channel mode, ending, generating final record, failed, done, and indexing state. Live header is 44 px with elapsed/status/channel text/save state/Compact/Privacy curtain/Stop and no decorative waveform. At 1280 render Notes ≥620 px plus a 300–360 px switchable Transcript/Intelligence lane preserving scroll/selection; enable remembered three-lane only at ≥1440; use focus-trapped sheets below 1180. Virtualize final transcript, replace interims, group final rows, use 32 px auto-follow threshold, and expose Copy/Insert excerpt/Ask. Intelligence renders rolling summary, actionables, context queue, evidence, user-wins actionable status, proposal creation failures, and no direct note writes. Final strata are notes, generated recap, proposed additions, actions, transcript, inquiry. Show exact diff/rationale/time/base revision; retain decision history. Preserve generated titles only when user title is empty. Delete cancels live/finalization and states permanent storage, linked-inquiry survival, and derived-index staleness.
-
-- [ ] **Step 4: Run all meeting and shared-evidence tests.**
-
-Run: `cd app && npm test -- src/renderer/src/features/meetings src/renderer/src/features/evidence src/renderer/src/features/inquiry && npm run typecheck`
-
-Expected: PASS across create/detect/preflight/live/compact/stop/final/review/delete, responsive lanes, transcript keyboard actions, proposal failure/retry, note conflict, delayed index state, and meeting-scoped Ask.
-
-- [ ] **Step 5: Commit Chronicle and meetings.**
-
-```bash
-git add app/src/renderer/src/features/meetings
-git commit -m "feat(renderer): complete chronicle meeting dossiers"
-```
-
-### Task 22: Complete Sources, authorization, sync, and purge
-
-**Files:**
+- Create: `core/taurine_core/connectors/credentials.py`
+- Create: `core/taurine_core/connectors/oauth.py`
+- Modify: `core/taurine_core/connectors/gmail.py`
+- Modify: `core/taurine_core/connectors/outlook.py`
+- Modify: `core/taurine_core/connectors/google_common.py`
+- Modify: `core/taurine_core/connectors/google_calendar.py`
+- Modify: `core/taurine_core/connectors/google_docs.py`
+- Modify: `core/taurine_core/connectors/registry.py`
+- Modify: `core/taurine_core/connectors/catalog.py`
+- Modify: `core/taurine_core/schemas.py`
+- Modify: `core/taurine_core/server.py`
+- Modify: `core/pyproject.toml`
+- Modify: `core/uv.lock`
+- Create: `core/tests/test_connector_oauth.py`
+- Modify: `core/tests/test_connectors.py`
 - Create: `app/src/renderer/src/features/sources/descriptors.ts`
+- Create: `app/src/renderer/src/features/sources/state.ts`
 - Create: `app/src/renderer/src/features/sources/selectors.ts`
 - Create: `app/src/renderer/src/features/sources/listeners.ts`
 - Create: `app/src/renderer/src/features/sources/SourcesIndex.tsx`
@@ -1715,54 +1202,7 @@ git commit -m "feat(renderer): complete chronicle meeting dossiers"
 - Create: `app/src/renderer/src/features/sources/SourceConfig.tsx`
 - Create: `app/src/renderer/src/features/sources/Authorization.tsx`
 - Create: `app/src/renderer/src/features/sources/sources.test.tsx`
-
-**Interfaces:** Consumes connector/sync REST and updates, OAuth routes, directory chooser, graph version, and Task 14 Control. Produces a 56 px source ledger grouped Needs attention/Active/Off/System, typed configuration that round-trips unknown keys, explicit Connect/poll/Disconnect, coherent global sync, stale-index state, and two-step purge.
-
-- [ ] **Step 1: Write failing priority, round-trip, OAuth, and sync tests.**
-
-```tsx
-it("prioritizes active work over availability-derived groups", () => {
-  expect(deriveSourceGroup(connector({ syncing: true, enabled: true, available: false }))).toBe("active_work")
-  expect(deriveSourceGroup(connector({ syncing: false, enabled: true, available: false }))).toBe("needs_attention")
-})
-
-it("round-trips config keys unknown to the target renderer", async () => {
-  renderSourceConfig({ config: { sync_window_days: 30, provider_extension: "keep" } })
-  await user.clear(screen.getByLabelText("Sync window in days"))
-  await user.type(screen.getByLabelText("Sync window in days"), "60")
-  await user.click(screen.getByRole("button", { name: "Save" }))
-  expect(api.updateConnector).toHaveBeenCalledWith(expect.objectContaining({
-    config: { sync_window_days: 60, provider_extension: "keep" },
-  }))
-})
-```
-
-- [ ] **Step 2: Run Sources tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/features/sources/sources.test.tsx`
-
-Expected: FAIL because Sources descriptors/listeners/views are absent.
-
-- [ ] **Step 3: Implement the complete source ledger.**
-
-Derive state in this order: syncing/cancelling; enabled unavailable; enabled available; disabled; hidden Taurine System. Enabling offers Enable and sync or Enable without syncing. Disable copy states stored rows retained, immediate exclusion/derived staleness, and clean-sync recommendation. Descriptors cover Apple Notes permission, Obsidian vault, ordered Folders, iMessage Full Disk Access/contact/advanced DB paths, Claude glob, Codex glob list, Gmail/Outlook authorization + sync days + contacts, Calendar authorization + past/future days + system calendars, and Docs authorization + modified-within days + maximum documents; ranges come from server/product constants, unknown keys round-trip, and folder paths come only from `chooseDirectory`. Connect opens only the returned allowlisted HTTPS URL, polls waiting/authorized/expired/error, never receives tokens, and leaves enable/sync user-controlled; environment setup lives under Advanced developer setup. Use server `done/total` only when total >0, distinguish extraction from knowledge build, cancel and await terminal state, keep the old immutable Atlas during build, and atomically swap on graph-version fetch. Purge requires two clicks, names document count/provider boundary/no undo, disables the source, marks index stale, refetches affected objects, and is blocked at noncancellable critical work.
-
-- [ ] **Step 4: Run Sources, OAuth, graph reconciliation, and type tests.**
-
-Run: `cd app && npm test -- src/renderer/src/features/sources src/renderer/src/services/sidecar src/renderer/src/features/atlas && npm run typecheck`
-
-Expected: PASS for all ledger groups, known descriptors, unknown-key preservation, enable/disable, OAuth states, sync/cancel/failure, old-Atlas retention, hidden Taurine source, purge boundaries, and removed-open-object state.
-
-- [ ] **Step 5: Commit Sources.**
-
-```bash
-git add app/src/renderer/src/features/sources
-git commit -m "feat(renderer): complete sources control workflow"
-```
-
-### Task 23: Complete Profile and Diagnostics control workbenches
-
-**Files:**
+- Create: `app/src/renderer/src/features/profile/state.ts`
 - Create: `app/src/renderer/src/features/profile/listeners.ts`
 - Create: `app/src/renderer/src/features/profile/ProfileWorkbench.tsx`
 - Create: `app/src/renderer/src/features/profile/ProfileEditor.tsx`
@@ -1771,234 +1211,175 @@ git commit -m "feat(renderer): complete sources control workflow"
 - Create: `app/src/renderer/src/features/diagnostics/DiagnosticsWorkbench.tsx`
 - Create: `app/src/renderer/src/features/diagnostics/SessionLog.tsx`
 - Create: `app/src/renderer/src/features/diagnostics/diagnostics.test.tsx`
-
-**Interfaces:** Consumes profile REST/updates/generation and session-log REST. Produces Interpretation profile empty/populated/editing/confirm/generating/failed states and operational Diagnostics. Profile is explicitly noncitable. Diagnostics exports safe runtime metadata and filters ASR/chunk/retrieval/grounding/summary/chat/control/error.
-
-- [ ] **Step 1: Write failing generation-retention and redaction tests.**
-
-```tsx
-it("retains the saved profile while replacement generation fails", async () => {
-  renderProfile({ markdown: "Existing profile" })
-  await user.click(screen.getByRole("button", { name: "Generate replacement" }))
-  emitProfileGeneration({ status: "error", detail: "Generation failed" })
-  expect(screen.getByText("Existing profile")).toBeVisible()
-  expect(screen.getByRole("button", { name: "Retry" })).toBeVisible()
-})
-
-it("redacts diagnostics paths and credentials by default", async () => {
-  renderDiagnostics({ records: [unsafeDiagnosticRecord] })
-  await user.click(screen.getByRole("button", { name: "Copy diagnostics" }))
-  expect(await clipboard.readText()).not.toMatch(/\/Users\/private|access_token|refresh_token/)
-})
-```
-
-- [ ] **Step 2: Run Profile/Diagnostics tests and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/features/profile src/renderer/src/features/diagnostics`
-
-Expected: FAIL because the workbenches are absent.
-
-- [ ] **Step 3: Implement exact states without invented progress.**
-
-Label Profile `Interpretation profile` and state that it resolves names/projects/interests and is not citable evidence. Require nonempty manual content. Confirm overwrite; retain current content until generation succeeds. Render only server phases Surveying, Interests, Projects & people, Career & studies, Synthesizing plus activity/nodes/tool calls/elapsed; no percent and no navigation cancellation. Disable manual Save during generation with an accessible reason. Diagnostics lists sessions by timestamp/ID, filters structured events, states logs are operational rather than durable meetings and may be absent, omits duplicated private text, and copies app/runtime/socket/build/calibration/safe errors with path/token redaction.
-
-- [ ] **Step 4: Run Profile, Diagnostics, updates, and type tests.**
-
-Run: `cd app && npm test -- src/renderer/src/features/profile src/renderer/src/features/diagnostics src/renderer/src/services/sidecar && npm run typecheck`
-
-Expected: PASS for empty/edit/save/error, overwrite/generation/background/failure/success, every server phase, absent logs, all filters, and safe diagnostic copy.
-
-- [ ] **Step 5: Commit Profile and Diagnostics.**
-
-```bash
-git add app/src/renderer/src/features/profile app/src/renderer/src/features/diagnostics
-git commit -m "feat(renderer): add profile and diagnostics workbenches"
-```
-
-### Task 24: Finish runtime readiness, first run, privacy, compact mode, and utilities
-
-**Files:**
-- Modify: `app/src/renderer/src/features/runtime/RuntimeGate.tsx`
-- Create: `app/src/renderer/src/features/runtime/FirstRunChecklist.tsx`
-- Create: `app/src/renderer/src/features/runtime/runtime.test.tsx`
 - Modify: `app/src/renderer/src/features/privacy/PrivacyCurtain.tsx`
 - Modify: `app/src/renderer/src/features/privacy/PrivacyStatus.tsx`
 - Create: `app/src/renderer/src/features/privacy/privacy.test.tsx`
-- Create: `app/src/renderer/src/utility/call-prompt-main.tsx`
-- Create: `app/src/renderer/src/utility/context-suggestion-main.tsx`
-- Create: `app/src/renderer/src/utility/utility.css`
-- Create: `app/src/renderer/src/utility/utility.test.tsx`
+- Modify: `app/src/renderer/src/utility/call-prompt-main.tsx`
+- Modify: `app/src/renderer/src/utility/context-suggestion-main.tsx`
+- Modify: `app/src/renderer/src/utility/utility.css`
+- Modify: `app/src/renderer/src/utility/utility.test.tsx`
 - Modify: `app/src/renderer/notif.html`
 - Modify: `app/src/renderer/suggest.html`
+- Modify: `app/src/renderer/src/features/runtime/FirstRunChecklist.tsx`
+- Modify: `app/src/renderer/src/app/AppShell.tsx`
 
-**Interfaces:** Consumes startup, capabilities, privacy/call/context events, and native window factories. Produces exact startup polling, dismissible UI-schema-versioned first run, compact bounds/state, literal privacy statuses, neutral curtain, and sanitized utility renderers. Utility entries have no store, sidecar, notes, transcript, connector, or editor imports.
+**Interfaces:** Consumes the immutable graph/evidence shell, connector/index/profile/session-log contracts, bounded desktop bridge, and existing native adapters. Produces the completed Atlas, `CredentialStore`/PKCE OAuth REST surface, Sources/Profile/Diagnostics workbenches, truthful privacy/utility behavior, and exact Control state inventory.
 
-- [ ] **Step 1: Write failing readiness, curtain, and utility redaction tests.**
+#### RED checkpoint
 
-```tsx
-it("uses capped startup backoff and pauses only after hidden for thirty seconds", async () => {
-  await driveStartupPolls([false, false, false, false])
-  expect(startupCallTimes()).toEqual([0, 250, 750, 1750, 3750])
-  hideFor(30_001)
-  await clock.advanceByAsync(4_000)
-  expect(startupCallTimes()).toHaveLength(5)
-})
+- [ ] **Add complete Atlas interaction tests.** Cover global/local depth 1–3, ego history, incoming/outgoing direction, exact edge patterns/labels, selection/pin/live marks, user pin/release/reset, old graph retention, and graph/list fallback.
 
-it("removes private content from the rendered tree while curtain is on", () => {
-  renderCurtainedLiveMeeting({ notes: "private notes", transcript: "private speech" })
-  expect(document.body).not.toHaveTextContent("private notes")
-  expect(document.body).not.toHaveTextContent("private speech")
-  expect(screen.getByRole("button", { name: "Stop" })).toBeVisible()
-})
+- [ ] **Add time-band tests.** Cover 56 px band, All/30 days/90 days/1 year/Custom, brush/fields equivalence, invalid/custom dates, absolute localized tooltip/name, and synchronized Atlas/Outline/Chronicle filtering.
 
-it("redacts context utility content while curtain is on", () => {
-  renderContextUtility({ curtain: true, title: "Secret", snippet: "Private" })
-  expect(screen.getByText("Relevant context available")).toBeVisible()
-  expect(document.body).not.toHaveTextContent("Secret")
-})
-```
+- [ ] **Add lens tests.** Cover source/community/recency/connections/minimum links default 2/session/evidence set/AI idea, removable text clauses, search override for hidden tail, idea input preservation on result/abstain/error, and no graph mutation.
 
-- [ ] **Step 2: Run runtime/privacy/utility tests and confirm the expected failure.**
+- [ ] **Add live-overlay tests.** Cover Conversation now diamond, ranked direct retrieval, striped traversal, grounded ring, three-second visual recession, event-list retention, and reconnect copy `Live retrieval trail restarted after reconnect`.
 
-Run: `cd app && npx vitest run src/renderer/src/features/runtime src/renderer/src/features/privacy src/renderer/src/utility`
+- [ ] **Add Outline parity tests.** Assert every zoom/pan/fit/search/history/depth/pin/release/reset/time/context action is reachable by keyboard/menu and Canvas contains no exclusive behavior.
 
-Expected: FAIL because first-run and utility entry modules are absent and privacy state is incomplete.
+- [ ] **Add comparison tests.** Cover exactly two/three objects, type-specific dossier content, shared entity/date/source/citation text markers, optional synchronized scroll, and explicit Ask these as the only synthesis action.
 
-- [ ] **Step 3: Implement exact readiness and privacy behavior.**
+- [ ] **Add OAuth core tests.** Cover supported-provider guard, PKCE S256/state/exact loopback, five-minute expiry, replay rejection, credential vault read/write/delete, env compatibility precedence, refresh rotation, provider error redaction, and zero token/code/verifier leakage.
 
-Poll `/startup` at 250 ms, 500 ms, 1 second, then 2 seconds; after 30 seconds hidden pause and resume immediately on show. Render actual phase/detail/elapsed; on error retain shell/preferences/curtain and offer safe diagnostics, retry, setup guide. On ready connect sockets before hydrating all domains and lazy-load graph/editor/Markdown only when opened. First run covers credential readiness status, just-in-time mic, macOS 14.2 system-audio note, recommended sources, Off/Ask/Auto-start call detection, and privacy limitation/shortcut; it is dismissible and stores only checklist/schema preference.
+- [ ] **Add OAuth route tests.** Cover POST authorize 202, GET flow waiting/authorized/expired/error, exact callback page, DELETE authorization, connector update publication, and no automatic enable/sync/purge.
 
-Map capability states to exact copy: Protection requested, Limited on this Mac, Unavailable, Privacy curtain on. Curtain replaces all main private DOM with elapsed/channel/Stop/Turn curtain off, redacts utilities, and disables preview. Compact uses the same BrowserWindow and exact 440×680 default, 420×560 minimum, 560×900 maximum; always-on-top is opt-in and off by default. Call detection defaults to Ask after upgrade/first run; utility states cover detected/ask/10-second auto-start/starting/failure/dismissed with Pause/Start now/Dismiss, one prompt per call, and the retained five-second idle rearm rule. Context utility caps three, lasts 12 seconds, and offers Open/Dismiss. Both mirror actions in tray/command center and never connect to sidecar.
+- [ ] **Add Sources state tests.** Cover priority syncing/cancelling→Needs attention→Active→Off→System, hidden Taurine row, enable-and-sync/batch enable, disable consequences, critical-boundary disabled controls, and old Atlas during build.
 
-- [ ] **Step 4: Run runtime/privacy/utility/native tests.**
+- [ ] **Add descriptor tests.** Cover Apple Notes, Obsidian, Folders, iMessage, Claude, Codex, Gmail, Outlook, Calendar, and Docs controls/ranges plus unknown-key round trip and directory-chooser-only paths.
 
-Run: `cd app && npm test -- src/renderer/src/features/runtime src/renderer/src/features/privacy src/renderer/src/utility src/main && npm run typecheck && npm run build`
+- [ ] **Add sync/purge tests.** Cover real `done/total`, indeterminate absent totals, extraction versus build, cancel terminal wait, stale on cancel/failure, atomic graph swap, two-click purge, document count/provider boundary/no undo, and removed open object state.
 
-Expected: PASS for exact polling, protected 503/socket 1013 restart, checklist persistence, permission timing, all privacy copy, curtain DOM removal/restoration, compact geometry, call rearm/countdown, context cap/expiry/redaction, and zero utility sockets.
+- [ ] **Add Profile tests.** Cover empty/populated/editing/dirty/saving/error, nonempty validation, overwrite confirmation, all five server phases, background navigation, disabled manual save reason, success, and failure retaining prior content.
 
-- [ ] **Step 5: Commit readiness and privacy completion.**
+- [ ] **Add Diagnostics tests.** Cover session list/detail filters ASR/chunk/retrieval/grounding/summary/chat/control/error, absent logs, operational-not-durable copy, and redacted diagnostics export.
 
-```bash
-git add app/src/renderer/src/features/runtime app/src/renderer/src/features/privacy app/src/renderer/src/utility app/src/renderer/notif.html app/src/renderer/suggest.html
-git commit -m "feat(renderer): complete readiness privacy and utility states"
-```
+- [ ] **Add privacy tests.** Cover requested/limited/unavailable/curtain, neutral private-free main DOM, curtain-safe call/context utilities, disabled preview, exact state restoration, and Stop availability while capture continues.
 
-### Task 25: Enforce accessibility, keyboard, zoom, RTL, and localization contracts
+- [ ] **Add native utility tests.** Cover call states, pause/start/dismiss, one prompt/rearm, no focus raise, context cap/timeout/open/dismiss, native Apple Notes open/failure, source settings remediation, and utility absence of store/sidecar imports.
+
+- [ ] **Run the combined Slice 5 RED checkpoint.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/core"
+  uv run pytest tests/test_connector_oauth.py tests/test_connectors.py -q
+  cd "$WORKTREE_ROOT/app"
+  npx vitest run src/renderer/src/features/atlas src/renderer/src/features/workspace/ComparisonBoard.test.tsx src/renderer/src/features/sources src/renderer/src/features/profile src/renderer/src/features/diagnostics src/renderer/src/features/privacy src/renderer/src/utility
+  ```
+
+  Expected: FAIL because OAuth, completed Atlas operations, Control workbenches, and utility renderers do not exist. Save this as the slice's one RED artifact.
+
+#### Minimal implementation
+
+- [ ] **Complete local/global Atlas navigation.** Use existing graph endpoints, keep note-edge weight labelled Projection weight, list fact/provenance/mechanisms exactly as returned, and omit Explain this edge.
+
+- [ ] **Implement the time band and shared date selector.** Use locale/time zone `Intl`; update Atlas, Outline, and Chronicle from one range; provide fields/presets so drag is never required.
+
+- [ ] **Implement removable lens clauses.** Store explicit filter values, render a sentence-like clause summary, keep hidden tail reachable via search/Outline, and retain user input on idea no-result/error.
+
+- [ ] **Implement live conversation overlay.** Keep route history renderer-memory-only, decay marks without deleting current event rows, and reset only the route trail after renderer/session reconnect.
+
+- [ ] **Complete Outline parity.** Use tree/treegrid semantics, correct set position/count, separate incoming/outgoing groups, keyboard context menu, and every Canvas operation via named command.
+
+- [ ] **Implement bounded comparison.** Render two/three rule-separated columns with object-specific fields and textual shared markers; do not call an LLM until Ask these.
+
+- [ ] **Add keyring through the lockfile.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/core"
+  uv add keyring
+  ```
+
+  Expected: `core/pyproject.toml` and `core/uv.lock` change; no application database or migration file is created.
+
+- [ ] **Implement `CredentialStore`.** Provide OS-keyring and memory test backends using versioned JSON; vault credentials override read-only environment compatibility; `repr`, errors, and logs redact all secrets.
+
+- [ ] **Implement provider-neutral OAuth flow state.** Generate cryptographic state/verifier, S256 challenge, fixed loopback redirect from bound sidecar port, five-minute expiry, single consumption, injected exchange/clock in tests, and stable safe error codes.
+
+- [ ] **Inject credential providers into OAuth connectors.** Share Google refresh plumbing, isolate Microsoft, persist rotated refresh tokens, retry once after auth failure, and retain existing environment developer setup.
+
+- [ ] **Implement authorization REST endpoints.** Accept only registry members with `kind="oauth"`; open a minimal callback page; publish connector updates on auth/disconnect; never put tokens in ConnectorInfo, config, Redux, logs, errors, or IPC.
+
+- [ ] **Implement source descriptor state.** Preserve unknown flat config keys; derive field ranges from constants/descriptors; accept folder/vault values only from `chooseDirectory`.
+
+- [ ] **Implement the 56 px Sources ledger.** Group Needs attention/Active/Off/System; show glyph/name/state/detail/count/last sync/enable/disclosure; use the specified priority and one hidden immutable Taurine system source.
+
+- [ ] **Implement enable/disable and authorization.** Enable offers sync now or batch; disable states stored/excluded/stale/rebuild consequences; Connect opens only returned allowlisted HTTPS URL and polls; environment setup stays Advanced.
+
+- [ ] **Implement global/per-source sync.** Show percent only for real totals, distinguish source read from index build, cancel and await terminal state, retain old graph, and swap only after version fetch succeeds.
+
+- [ ] **Implement purge.** Two actions, current count, provider untouched, source disabled, derived/local rows removed where supported, stale until rebuild, no undo, conflict while critical sync, and affected object refetch.
+
+- [ ] **Implement Interpretation profile.** State that it resolves names/projects/interests and is not citable evidence; retain current content through generation; use only Surveying, Interests, Projects & people, Career & studies, Synthesizing plus server detail/counts/time.
+
+- [ ] **Implement Diagnostics.** Treat session logs as optional operational traces, filter structured records, omit absent private passage text, and export runtime/app/socket/build/calibration/safe errors with default redaction.
+
+- [ ] **Complete literal privacy state.** Map desktop report to exact copy; curtain unmounts private main content, substitutes generic utility payloads, disables preview, and restores prior coordinate/layout/live/compact focus state.
+
+- [ ] **Implement stateless utility renderers.** Consume only sanitized preload events; call prompt and context suggestion render exact states/actions; import no Redux, gateway, meeting entity, transcript, editor, or connector service.
+
+- [ ] **Implement native source opening and remediation.** Offer Apple Notes open only when supported; show inline failure; use allowlisted System Settings for mic/system/Full Disk Access; show copy/path/link alternatives only from payload.
+
+#### GREEN checkpoint
+
+- [ ] **Run Core OAuth/connector and full targeted regression.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/core"
+  uv run ruff check taurine_core tests
+  uv run pytest tests/test_connector_oauth.py tests/test_connectors.py tests/test_server_startup.py tests/test_session_log.py -q
+  ```
+
+  Expected: PASS; logs/responses contain no token, code, verifier, or credential; authorization never silently enables, syncs, disables, or purges.
+
+- [ ] **Run the Slice 5 app gate.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npm test -- src/renderer/src/features/atlas src/renderer/src/features/workspace src/renderer/src/features/sources src/renderer/src/features/profile src/renderer/src/features/diagnostics src/renderer/src/features/privacy src/renderer/src/utility src/main
+  npm run lint
+  npm run typecheck
+  npm run build
+  ```
+
+  Expected: PASS for Atlas parity/time/lenses/comparison, every source/profile/diagnostic/privacy state, and utility/native behavior.
+
+- [ ] **Run the Slice 5 inspectable journey.** Pin and compare three notes without pointer; Ask these; enable/authorize/sync a fixture source while using the old Atlas; cancel once and resync; purge after reading consequences; edit/generate profile; export redacted diagnostics; activate curtain during capture and inspect utility redaction. Expected: every consequence/state is exact and private content is absent under curtain.
+
+- [ ] **Freeze Slice 5 after GREEN.**
+
+  ```bash
+  cd "$WORKTREE_ROOT"
+  git diff --check
+  git add core/taurine_core/connectors core/taurine_core/schemas.py core/taurine_core/server.py core/pyproject.toml core/uv.lock core/tests/test_connector_oauth.py core/tests/test_connectors.py app/src/renderer/src/features/atlas app/src/renderer/src/features/workspace app/src/renderer/src/features/sources app/src/renderer/src/features/profile app/src/renderer/src/features/diagnostics app/src/renderer/src/features/privacy app/src/renderer/src/features/runtime app/src/renderer/src/utility app/src/renderer/notif.html app/src/renderer/suggest.html
+  git commit -m "feat: complete atlas knowledge operations"
+  ```
+
+  Expected: commit succeeds and becomes the immutable Slice 5 review target.
+
+- [ ] **Stop and request independent Slice 5 review.** Provide the commit SHA, both GREEN outputs, OAuth redaction evidence, and knowledge/privacy journey evidence. Expected: no Slice 6 path changes until review returns clean; blocking findings are repaired and re-frozen in Slice 5.
+
+---
+
+### Task 6: Cutover and proof
+
+**Runnable journey:** Launch the production/package entry with only Knowledge Atlas, complete acceptance stories A–N across stable visual/accessibility states, prove native/privacy/performance/bundle behavior, remove every old UI/native owner, and pass the complete Core/Electron release gate.
 
 **Files:**
+
 - Create: `app/src/renderer/src/test/accessibility-contracts.test.tsx`
 - Create: `app/src/renderer/src/i18n/i18n.test.ts`
-- Modify: `app/src/renderer/src/app/AppShell.tsx`
-- Modify: `app/src/renderer/src/app/commands.ts`
-- Modify: `app/src/renderer/src/components/primitives/Button.tsx`
-- Modify: `app/src/renderer/src/components/primitives/Dialog.tsx`
-- Modify: `app/src/renderer/src/components/primitives/Menu.tsx`
-- Modify: `app/src/renderer/src/components/primitives/Sheet.tsx`
-- Modify: `app/src/renderer/src/components/layout/SplitPane.tsx`
-- Modify: `app/src/renderer/src/features/atlas/AtlasOutline.tsx`
-- Modify: `app/src/renderer/src/features/atlas/AtlasControls.tsx`
-- Modify: `app/src/renderer/src/features/meetings/NotesDocument.tsx`
-- Modify: `app/src/renderer/src/features/meetings/TranscriptLane.tsx`
-- Modify: `app/src/renderer/src/features/meetings/ProposalDiff.tsx`
-- Modify: `app/src/renderer/src/features/inquiry/InquiryComposer.tsx`
-- Modify: `app/src/renderer/src/features/inquiry/AssistantTurn.tsx`
-- Modify: `app/src/renderer/src/features/evidence/EvidenceInspector.tsx`
-- Modify: `app/src/renderer/src/features/sources/SourcesLedger.tsx`
-- Modify: `app/src/renderer/src/features/profile/ProfileWorkbench.tsx`
-- Modify: `app/src/renderer/src/features/privacy/PrivacyCurtain.tsx`
-- Modify: `app/src/renderer/src/styles/reset.css`
-- Modify: `app/src/renderer/src/styles/primitives.css`
-- Modify: `app/src/renderer/src/styles/shell.css`
-
-**Interfaces:** Consumes the completed stable workbenches. Produces unit-level semantic/keyboard/reflow guarantees before Electron E2E. Global shortcut meanings are stable and platform labels localized; single-character Atlas shortcuts can be disabled.
-
-- [ ] **Step 1: Write the complete failing contract matrix.**
-
-```tsx
-it.each(stableWorkbenchFixtures)("has no automated axe violations: $name", async ({ renderWorkbench }) => {
-  const { container } = renderWorkbench()
-  const results = await axe.run(container)
-  expect(results.violations).toEqual([])
-})
-
-it.each(["atlas", "chronicle", "inquiry", "sources", "profile", "privacy", "diagnostics"])(
-  "retains every action at 200%% zoom in %s", (workbench) => {
-    setViewport({ width: 960, height: 640, zoom: 2 })
-    renderNamedWorkbench(workbench)
-    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(document.documentElement.clientWidth)
-    expect(allRequiredActions(workbench).every((element) => element.tabIndex >= 0)).toBe(true)
-  },
-)
-```
-
-- [ ] **Step 2: Run accessibility/i18n tests and record each real failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/test/accessibility-contracts.test.tsx src/renderer/src/i18n/i18n.test.ts`
-
-Expected: FAIL on the first incomplete accessible name, focus order, reflow, pseudo-locale, RTL, target-size, or catalog assertion; keep the test output with the implementing commit.
-
-- [ ] **Step 3: Fix only demonstrated contract failures.**
-
-Cover landmarks/headings, tree/treegrid/list semantics, modal focus containment/return, live-region throttling, editor labels, proposal diff reading order, status text beyond color, 24×24 targets, 40–44 px primary/destructive/meeting targets, 200% reflow, 35% pseudo expansion, RTL logical layout, forced colors, reduced motion, localized date/number/key names, and complete string-catalog lookup. Shortcut precedence is editor → modal/menu → focused workbench → global; `⌘1/2/3`, `⌘,`, `⌘K`, `⌘⇧M`, `⌘⇧L`, `⌘⇧P`, `⌘.`, and Atlas local keys remain available through named controls.
-
-- [ ] **Step 4: Run accessibility/i18n plus the full frontend unit suite.**
-
-Run: `cd app && npm test && npm run lint && npm run typecheck`
-
-Expected: PASS with at least the 61-test pre-redesign floor plus all added tests; no axe violations in stable fixtures and no uncatalogued visible string failures.
-
-- [ ] **Step 5: Commit accessibility completion.**
-
-```bash
-git add app/src/renderer/src app/src/renderer/src/styles
-git commit -m "fix(renderer): satisfy accessibility and localization contracts"
-```
-
-### Task 26: Cut the sole renderer entry over atomically
-
-**Files:**
+- Modify: all stable renderer components only where tests demonstrate accessibility/localization failures
 - Modify: `app/src/renderer/src/main.tsx`
 - Modify: `app/src/renderer/src/env.d.ts`
 - Create: `app/src/renderer/src/app/cutover.test.tsx`
-
-**Interfaces:** Consumes Tasks 11–25. The production entry imports only `app/App`, local fonts, and target token/style sheets. There is no runtime switch, query parameter, route, environment variable, or alternate entry that mounts the old UI.
-
-- [ ] **Step 1: Write the failing sole-entry contract test.**
-
-```ts
-it("mounts the Knowledge Atlas app with no interface selector", async () => {
-  const source = await readSource("src/renderer/src/main.tsx")
-  expect(source).toContain('from "./app/App"')
-  expect(source).not.toMatch(/legacy|oldUi|interfaceFlag|FeedView|MapView|DataView/)
-})
-```
-
-- [ ] **Step 2: Run the cutover test and confirm the expected failure.**
-
-Run: `cd app && npx vitest run src/renderer/src/app/cutover.test.tsx`
-
-Expected: FAIL because `main.tsx` still imports the old root `App.tsx` and old theme.
-
-- [ ] **Step 3: Switch the one production entry.**
-
-Import `@fontsource/ibm-plex-sans`, `@fontsource/ibm-plex-mono`, target reset/tokens/typography/primitives/shell styles, and `./app/App`. Mount one Redux Provider and one App. Remove old root App/theme imports from the entry. Do not expose a selection mechanism and do not keep an alternate main renderer entry. Old unreachable files remain only until Task 28's deletion gate so this commit is reviewable and bisectable.
-
-- [ ] **Step 4: Run cutover smoke, full unit, type, and build gates.**
-
-Run: `cd app && npm test && npm run lint && npm run typecheck && npm run build`
-
-Expected: PASS; opening the production index entry renders Knowledge coordinates, does not construct old sidecar clients, and the build manifest has one stateful main renderer plus two stateless utilities.
-
-- [ ] **Step 5: Commit the atomic cutover.**
-
-```bash
-git add app/src/renderer/src/main.tsx app/src/renderer/src/env.d.ts app/src/renderer/src/app/cutover.test.tsx
-git commit -m "feat(renderer): switch production to knowledge atlas"
-```
-
-### Task 27: Prove acceptance stories, performance, visuals, native behavior, and privacy
-
-**Files:**
 - Create: `app/playwright.config.ts`
 - Create: `app/e2e/fixtures/fake-sidecar.ts`
 - Create: `app/e2e/fixtures/scenarios.ts`
@@ -2009,65 +1390,6 @@ git commit -m "feat(renderer): switch production to knowledge atlas"
 - Create: `app/scripts/check-old-ui-removed.mjs`
 - Create: `app/scripts/check-sensitive-logs.mjs`
 - Create: `docs/superpowers/verification/2026-07-20-knowledge-atlas-release-checklist.md`
-
-**Interfaces:** Consumes the production Electron build and deterministic fake sidecar. Produces acceptance stories A–N, viewport/theme/zoom/RTL/forced-color/reduced-motion screenshots, renderer budgets, safe-log checks, and a signed manual checklist. Test fixtures implement current REST and all three WebSockets plus proposal/resume/OAuth additions; they do not bypass the gateway.
-
-- [ ] **Step 1: Write the failing end-to-end and performance assertions.**
-
-```ts
-test("C. reconnects honestly without replaying audio", async ({ taurine, sidecar }) => {
-  await taurine.startMeeting("full")
-  await sidecar.dropSessionSocket()
-  await expect(taurine.header).toContainText("Reconnecting · audio may be missing")
-  expect(sidecar.binaryFramesAfterDrop).toHaveLength(0)
-  await sidecar.resumeWithSnapshot()
-  await expect(taurine.transcript).toContainText("Audio may be missing during reconnect")
-})
-
-test("Atlas holds the 5k-node frame budget", async ({ taurine }) => {
-  await taurine.loadScenario("atlas-5000")
-  expect(await taurine.measureAtlasFps(5_000)).toBeGreaterThanOrEqual(30)
-  expect(await taurine.measureCommandP95("atlas.select", 200)).toBeLessThan(100)
-})
-```
-
-- [ ] **Step 2: Run the new suites and confirm the expected failures before fixture/test completion.**
-
-Run: `cd app && npm run test:e2e`
-
-Expected: FAIL because Playwright configuration, fake-sidecar behaviors, scenarios, and snapshots are not yet complete.
-
-- [ ] **Step 3: Implement deterministic full-story verification.**
-
-Encode stories A–N one-for-one: start/finish; mic-only degradation; honest reconnect; note-loss prevention; accept/undo final proposal; transparent evidence; fallback/interrupted; pointer-free Atlas; source sync retaining old Atlas; purge boundaries; safe profile generation; privacy curtain; sole replacement; every AI edit reviewable. Scenario sizes are Atlas 5,000 nodes, source/Chronicle lists 10,000 rows, transcript 3,000 chunks, and inquiry 200 turns. Assert ≥30 Atlas fps, virtualized-list 60 fps, p95 selection/command <100 ms excluding network/model, bounded DOM row counts, and no unbounded heap growth over repeated coordinate switches. Visual matrix covers 1440/1280/960, compact 440×680, light/dark, 200% zoom, pseudo 35%, RTL, reduced motion, privacy, every stable empty/loading/error state, and utility windows.
-
-Implement old-UI scanning for root legacy imports/routes/selectors, old dark/yellow token signatures, Feed/Map/Data labels, duplicate renderer entries, and interface flags. Implement sensitive-log scanning over logger/breadcrumb arguments and built source maps for note/transcript/profile/passage/prompt/answer/token/credential payload fields. The manual checklist records date/build/OS/device/result/evidence for VoiceOver Canvas→Outline parity, keyboard-only A–N, 200% zoom, forced colors, actual ScreenCaptureKit capture in requested/limited/curtain states, mic-only/full capture, call prompt focus behavior, compact restoration, tray/dock/single-instance, sleep/wake, hide/show, and packaged-app signing/launch.
-
-- [ ] **Step 4: Run automated release gates and execute the manual checklist on the reference Mac.**
-
-Run:
-
-```bash
-cd app
-npm run build
-npm run check:bundle
-npm run check:sensitive-logs
-npm run test:e2e
-npm run test:visual
-```
-
-Expected: every automated story/performance/accessibility/visual/privacy gate passes; the checklist contains no unchecked release-blocking row, includes ScreenCaptureKit evidence, and records any environment-only nonblocking observation explicitly. The newly written old-UI scanner is intentionally first required in Task 28, where its red result proves the deletion test before removal.
-
-- [ ] **Step 5: Commit verification assets and evidence.**
-
-```bash
-git add app/playwright.config.ts app/e2e app/scripts/check-old-ui-removed.mjs app/scripts/check-sensitive-logs.mjs docs/superpowers/verification/2026-07-20-knowledge-atlas-release-checklist.md
-git commit -m "test: verify knowledge atlas end to end"
-```
-
-### Task 28: Remove the old UI and run the final release gate
-
-**Files:**
 - Delete: `app/src/renderer/src/App.tsx`
 - Delete: `app/src/renderer/src/assets/main.css`
 - Delete: `app/src/renderer/src/assets/electron.svg`
@@ -2094,129 +1416,236 @@ git commit -m "test: verify knowledge atlas end to end"
 - Modify: `app/package.json`
 - Modify: `app/package-lock.json`
 
-**Interfaces:** Consumes the complete target and Task 27 scanners. Produces one shippable interface with no old renderer, CSS fallback, alternate route/entry, or native ownership duplicate. Existing databases remain opened in place by additive core initialization.
+**Interfaces:** Consumes all five frozen slices. Produces one production entry, three total renderer entries (main plus two stateless utilities), release fixtures/scanners/evidence, no old architecture, and one recorded exhaustive acceptance run.
 
-- [ ] **Step 1: Run the deletion scanner before removal and confirm the expected failure.**
+#### RED checkpoint
 
-Run: `cd app && npm run check:old-ui`
+- [ ] **Add stable-workbench axe tests.** Cover startup, Atlas, Chronicle draft/live/stopped/final/error, Inquiry outcomes, Sources states, Profile states, Diagnostics, privacy, empty/loading/error, comparison, and utility windows.
 
-Expected: FAIL and list each remaining old root, view, component, library coordinator, native module, selector/theme signature, and utility entry.
+- [ ] **Add keyboard/focus tests.** Cover every primary job, all global/local shortcuts, F6 zones, modal/sheet/menu precedence, focus restoration, no hidden focusable descendants, and no essential pointer-only action.
 
-- [ ] **Step 2: Delete the enumerated files and resolve imports into target ownership.**
+- [ ] **Add zoom/i18n tests.** Cover 200% at 960×640, 35% pseudo expansion, RTL, localized dates/numbers/plurals/key names/speakers, evidence/hash LTR isolation, and no destructive-label ellipsis.
 
-Delete every listed path. If a current low-level behavior is still imported, move its tested behavior into the target module named in the file map before deletion; do not retain an alias/re-export. Remove obsolete tests with their implementation only after equivalent target tests are passing. Keep `public/pcm-worklet.js` because capture still loads it. Remove Tailwind's Vite plugin and run `cd app && npm uninstall react-force-graph-2d @tailwindcss/vite tailwindcss`; the target uses Canvas/d3 and checked-in CSS. Leave exactly main, call prompt, and context suggestion renderer entries.
+- [ ] **Add cutover source test.** Assert `main.tsx` imports `./app/App`, providers, local fonts, and target CSS only; reject legacy/old UI/interface selector names and alternate main entry.
 
-- [ ] **Step 3: Prove deletion and privacy invariants.**
+- [ ] **Add fake-sidecar REST and three-socket fixture.** Model approved current contracts plus note proposals/commands, actor session snapshot/error, and OAuth; expose deterministic network/startup/permission/conflict/finalization faults through fixture methods, never by bypassing gateway code.
 
-Run:
+- [ ] **Add acceptance stories A–N one-for-one.** Use exact test names from the design: start/finish, mic-only, reconnect, note loss, proposal undo, evidence, fallback/interruption, pointer-free Atlas, source sync, purge, profile, curtain, sole replacement, and reviewable AI edits.
 
-```bash
-cd app
-npm run check:old-ui
-npm run check:sensitive-logs
-rg -n 'FeedView|MapView|DataView|ConnectorsView|legacy|interfaceFlag|yellow|window\.api' src electron.vite.config.ts package.json
-```
+- [ ] **Add performance scenarios.** Generate 5,000 Atlas nodes, 10,000 list rows, 3,000 transcript blocks, and 200 inquiry messages; assert ≥30 Atlas fps, 60 fps virtual lists, p95 command/selection <100 ms, bounded DOM rows, and no unbounded heap growth over coordinate switches.
 
-Expected: both scripts PASS and `rg` exits 1 with no matches. Any legitimate copy containing one of those bare words must be expressed through the message catalog without recreating an old selector/route marker and explicitly allowlisted in the scanner with its exact file/key.
+- [ ] **Add visual scenarios.** Capture 1440/1280/960, compact 440×680, light/dark/system, compact/comfortable, two/three-lane Live, 100/200% zoom, pseudo, RTL, reduced motion, privacy, stable empty/loading/error, and both utility windows with stabilized time/fonts/animations.
 
-- [ ] **Step 4: Run the complete release gate from a clean build.**
+- [ ] **Add old-UI scanner rules.** Reject old root/views/components/lib owners, old Feed/Map/Data/Connectors routes, old yellow/dark token signatures, duplicate stateful entry, interface flags, and moved native module imports.
 
-Run:
+- [ ] **Add sensitive-log scanner rules.** Inspect source and built source maps for logger/breadcrumb calls containing note/transcript/profile/passage/prompt/answer/token/credential/raw retrieval fields.
 
-```bash
-cd core
-uv run ruff check taurine_core tests
-uv run pytest tests -q
-cd ../app
-npm run lint
-npm run typecheck
-npm test
-npm run build
-npm run check:bundle
-npm run check:old-ui
-npm run check:sensitive-logs
-npm run test:e2e
-npm run test:visual
-```
+- [ ] **Add the manual release checklist.** Require date/build/OS/device/result/evidence for VoiceOver, NVDA where supported, 200% zoom, pseudo/RTL, reduced motion, forced colors, ScreenCaptureKit requested/limited/curtain, permissions/audio, call/context utilities, tray/dock/compact, source adapters, sleep/wake/network/sidecar restart/renderer reload, signing, and packaged launch.
 
-Expected: Ruff/lint/typecheck/build/check scripts exit 0; core reports at least 981 passed and exactly the existing 2 skipped plus all new tests; Vitest reports at least the verified 61-test floor plus all new tests; stories A–N, accessibility, performance, visual, and native checklist gates pass; bundle output remains within 1.25 MB initial JS, 140 KB CSS, and 900 KB per lazy feature.
+- [ ] **Run the combined Slice 6 RED checkpoint before cutover/deletion.**
 
-- [ ] **Step 5: Review the final diff for atomic replacement and commit deletion.**
+  Run:
 
-Run: `git diff --check && git status --short && git diff --stat`
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npx vitest run src/renderer/src/test/accessibility-contracts.test.tsx src/renderer/src/i18n/i18n.test.ts src/renderer/src/app/cutover.test.tsx
+  npm run check:old-ui
+  npm run test:e2e
+  ```
 
-Expected: no whitespace errors, only Knowledge Atlas implementation/verification paths are changed, old paths are deletions, and there are no unrelated working-tree changes staged.
+  Expected: FAIL because production still mounts the old root, old files remain, and release fixtures/snapshots/checklist evidence are incomplete. Save this as the slice's one RED artifact.
 
-```bash
-git add -A app/src app/electron.vite.config.ts app/package.json app/package-lock.json
-git commit -m "refactor: remove superseded taurine interface"
-```
+#### Minimal implementation
+
+- [ ] **Fix only demonstrated unit accessibility failures.** Repair names, roles, heading/order, tree/treegrid metadata, focus trap/return, inert backgrounds, live-region cadence, target sizes, focus visibility, status text, and reader ordering without changing approved product behavior.
+
+- [ ] **Fix only demonstrated zoom/localization failures.** Use logical CSS, pane collapse, scroll padding, wrapping, catalogue completion, `Intl`, RTL mirroring of UI chrome but not fact direction, and reduced/forced-color equivalents.
+
+- [ ] **Audit BlockNote with the required source-mode fallback.** If the WYSIWYG cannot pass heading/list/menu/undo/selection/proposal/provenance/focus tests, make the persistent Markdown source mode equally reachable and complete before cutover.
+
+- [ ] **Switch the sole production entry.**
+
+  ```ts
+  import "@fontsource/ibm-plex-sans/400.css"
+  import "@fontsource/ibm-plex-sans/500.css"
+  import "@fontsource/ibm-plex-sans/600.css"
+  import "@fontsource/ibm-plex-mono/400.css"
+  import "@fontsource/ibm-plex-mono/500.css"
+  import "./styles/reset.css"
+  import "./styles/tokens.css"
+  import "./styles/typography.css"
+  import "./styles/primitives.css"
+  import "./styles/shell.css"
+  import { App } from "./app/App"
+  ```
+
+  Mount one Redux provider and one `App`; expose no environment/query/route selection mechanism.
+
+- [ ] **Implement fake-sidecar scenarios through real contracts.** Serve REST and WebSocket order exactly; fault injection changes transport/server state, not renderer store/actions.
+
+- [ ] **Implement stories A–N.** Assert observable state and durable fixture records, including no audio replay, notes revision behavior, exact evidence groups, old immutable Atlas, and canonical notes unchanged before proposal Accept.
+
+- [ ] **Implement automated keyboard/axe/visual/performance suites.** Stabilize time/font/motion; collect traces/screenshots only on configured failures; report measured frame/input/heap and bundle values.
+
+- [ ] **Implement old-UI and sensitive-log scanners.** Use explicit path/import/token rules and exact allowlists only for catalog copy that is not an old route/selector.
+
+- [ ] **Delete all old renderer ownership.** Remove the root App/theme/assets, `views/`, old UI components, socket/state coordinators, and old utility entries; move no alias/re-export forward.
+
+- [ ] **Delete all superseded native ownership.** Remove notifier/suggest-notifier/sysaudio/micwatch only after target windows/capture imports and tests pass; keep `public/pcm-worklet.js` because capture still uses it.
+
+- [ ] **Remove unused old dependencies.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/app"
+  npm uninstall react-force-graph-2d @tailwindcss/vite tailwindcss
+  ```
+
+  Expected: package/lock update; Canvas/d3 and checked-in CSS remain; no runtime or database migration occurs.
+
+- [ ] **Leave exactly three renderer entries.** Configure main Knowledge Atlas, call prompt, and context suggestion; ensure only main imports Redux/gateway/domain code.
+
+- [ ] **Complete the signed manual checklist on packaged builds.** Record requested/limited ScreenCaptureKit reality without overclaim, curtain neutral pixels, VoiceOver full jobs, Windows NVDA non-native-audio jobs where supported, and native lifecycle tests.
+
+- [ ] **Treat unavailable external proof as a release blocker.** A missing reference Mac/ScreenCaptureKit app, unavailable required assistive-technology run, unsigned/unlaunchable package, or unexecuted native permission/audio check leaves its checklist row `BLOCKED`, prevents the Slice 6 GREEN checkpoint, and must not be replaced by a unit, axe, mocked Electron, screenshot, or source-review result.
+
+#### GREEN checkpoint
+
+- [ ] **Run the clean comprehensive release gate in one recorded run.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT/core"
+  uv run ruff check taurine_core tests
+  uv run pytest tests -q
+  cd "$WORKTREE_ROOT/app"
+  npm run lint
+  npm run typecheck
+  npm test
+  npm run build
+  npm run check:bundle
+  npm run check:old-ui
+  npm run check:sensitive-logs
+  npm run test:e2e
+  npm run test:visual
+  ```
+
+  Expected: every command exits 0; Core reports at least 981 passed and exactly the existing 2 skipped plus additions; Vitest reports at least 61 plus additions; A–N, axe, keyboard, performance, visual, privacy, and native checklist gates pass; bundle output is ≤1.25 MB initial JS, ≤140 KB CSS, and ≤900 KB per lazy feature. No manual/moderated checklist row is unchecked, waived, inferred from automation, or marked unavailable.
+
+- [ ] **Run structural invariants.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT"
+  test "$(sed '/^[[:space:]]*$/d' app/src/renderer/src/app/App.tsx | wc -l | tr -d ' ')" -le 120
+  rg -n 'new WebSocket' app/src/renderer/src
+  rg -n 'setMarkdown|updateMeeting\(|note-commands' app/src/renderer/src
+  rg -n 'edge-reason|SessionRegistry|_detached_entries|finalizer_handoff|interfaceFlag|window\.api' core/taurine_core app/src
+  ```
+
+  Expected: the line-count check exits 0; WebSocket constructors appear only in the three sidecar connection modules; canonical note mutation appears only in `MeetingDocumentController.ts`, its API adapter, and tests; the final `rg` exits 1.
+
+- [ ] **Run source/removal/privacy scans.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT"
+  rg -n 'FeedView|MapView|DataView|ConnectorsView|legacy|oldUi|yellow|screenshare invisible|uncapturable' app/src app/electron.vite.config.ts app/package.json
+  rg -n 'T[O]DO|T[B]D|F[I]XME|place[h]older|coming[ ]soon|implement[ ]later' core/taurine_core app/src app/e2e docs/superpowers/verification
+  ```
+
+  Expected: both commands exit 1 with no matches. Any legitimate source word must live behind a reviewed catalog key and an exact scanner allowlist, never an old route/theme marker.
+
+- [ ] **Inspect the final diff and checklist.**
+
+  Run:
+
+  ```bash
+  cd "$WORKTREE_ROOT"
+  git diff --check
+  git status --short
+  git diff --stat
+  ```
+
+  Expected: no whitespace errors, one target implementation, old paths are deletions, verification evidence is present, and no unrelated user change is staged.
+
+- [ ] **Freeze Slice 6 after comprehensive GREEN.**
+
+  ```bash
+  cd "$WORKTREE_ROOT"
+  git add -A app/src/renderer/src app/src/main/notifier.ts app/src/main/suggest-notifier.ts app/src/main/sysaudio.ts app/src/main/micwatch.ts app/electron.vite.config.ts app/package.json app/package-lock.json app/playwright.config.ts app/e2e app/scripts/check-old-ui-removed.mjs app/scripts/check-sensitive-logs.mjs docs/superpowers/verification
+  git commit -m "feat: cut over and prove the knowledge atlas"
+  ```
+
+  Expected: commit succeeds and becomes the immutable final review target.
+
+- [ ] **Stop and request independent final review.** Provide the commit SHA, complete RED/GREEN record, A–N report, bundle/performance/visual artifacts, scanner outputs, and signed manual checklist. Expected: release remains blocked until review is clean; any blocking finding requires a new Slice 6 commit and a repeated affected gate before re-review.
 
 ---
 
-## Spec-requirement-to-task completion matrix
+## Design coverage audit
 
-| Finalized design requirement | Implemented in | Completion evidence |
+| Approved requirement | Owning slice | Direct proof |
 |---|---:|---|
-| §0–1 product model, power-user density, keyboard parity, trust, success gates, and non-goals | 13–18, 21–28 | shell/feature contracts; A–N; final gates |
-| §2 preserve existing capabilities and Python trust boundary while removing five-tab coordination | 2–12, 15–28 | core regression floor; gateway parsers; story M; deletion scanner |
-| §3 three coordinates, separate Control, persistent context/history/pins, exception-only operations, max-three comparison | 12, 14, 18 | reducer/shell/command/comparison tests |
-| §4 one stateful main window, 1280×820/960×640, exact breakpoints, compact bounds, nonactivating utilities, tray/dock, privacy states | 9, 10, 14, 20, 24, 27 | geometry/native/shell/utility/privacy tests and native checklist |
-| §5 selection ≠ activation, preview/open/pin grammar, command center, focus zones, shortcuts | 14, 18, 25 | keyboard and command-precedence tests; keyboard E2E |
-| §6 territory-first Atlas, deterministic stable geography, four LODs, time band, lenses, local direction, live overlay, equal Outline, no invalid edge-reason call | 15, 17, 18, 27 | Atlas/evidence/performance/a11y tests; story H |
-| §7.1 startup phases/backoff, domain hydration, nonblocking first run, just-in-time permissions | 12, 24 | runtime/hydration/capability tests |
-| §7.2 complete meeting lifecycle, preflight, two-lane ordinary Live, transcript/intelligence, sole notes writer, honest resume, immediate Stop, final review/delete | 2–6, 9, 19–21, 24, 27 | proposal/session/controller/dossier tests; stories A–E/L/N |
-| §7.3 Inquiry scope wording, turn anatomy, evidence outcomes, inspector, reconnect/no resend, thread management | 4, 11, 15, 16, 27 | Inquiry/gateway/evidence tests; stories F–G |
-| §7.4 source ledger, exact config, desktop OAuth, global sync/cancel, old Atlas, purge boundary | 7, 8, 22, 27 | core OAuth/source tests; Sources tests; stories I–J |
-| §7.5 Interpretation profile states and server-only phase rail | 12, 23, 27 | profile tests; story K |
-| §7.6–7.7 Diagnostics/session logs and capability-gated native source open | 9, 11, 15, 23 | diagnostic redaction and open-source failure tests |
-| §8 complete capability/state inventory with specific rendered recovery | 11, 12, 14–24 | exhaustive parser/slice/fixture matrices; stable-state screenshots |
-| §9 visual system, exact light/dark tokens, typography, density, no gradients/sparkles/emoji/cards | 13, 25, 27, 28 | token/visual/pseudo/forced-color tests; old-theme scanner |
-| §10 primitives, layout, knowledge, meeting, and Ask component behavior; Lucide plus local source marks | 13–16, 18, 21–23 | component unit/a11y/visual tests |
-| §11 shortcut map, semantics, announcements, AA/reflow/targets/editor accessibility/i18n | 13–16, 18–25, 27 | axe, keyboard, 200% zoom, pseudo, RTL, VoiceOver checklist |
-| §12 Redux-only global state, finite states, one gateway, hydration/reconciliation, optimistic writes, redaction, code splitting/performance | 1, 11, 12, 16–20, 25, 27 | store/gateway/controller tests; sensitive-log/bundle/performance gates |
-| §13.1–13.5 retained REST and three socket/desktop contracts, all update/event variants, chats newly consumed | 9–12, 15–16, 20–24 | exhaustive parser/OpenAPI/gateway/native tests |
-| §13.6 additive proposals/commands/revisions/idempotency/undo, legacy suggestion and `ai_lines` reads | 2–4, 19, 21, 27 | core transaction/conflict/legacy tests; stories D/E/N |
-| §13.7 in-memory retained live session, 60-second disconnect, 10/0 Stop, matching-token ownership, one-winner finalize | 5, 6, 20, 27 | deterministic registry/socket/state-machine race tests; story C |
-| §13.8 connector authorization endpoints, PKCE/state/loopback, OS vault, no token exposure, environment compatibility | 7, 8, 9, 22, 27 | OAuth/vault/IPC/log/E2E tests |
-| §13.9 meeting-linked inquiry referential cleanup; §13.10 intentionally absent graph/pagination/socket/replay/retry additions | 4, 16, 28 | delete/refetch tests and final API/diff review |
-| §14 exact final module decomposition and complete old-architecture removal | 9–24, 26, 28 | target path checks; one entry; deletion scanner; story M |
-| §15 all automated/accessibility/native/performance gates and acceptance stories A–N | 1, 25, 27, 28 | release commands and signed checklist |
-| §16 risk mitigations: Canvas/Outline equality, immutable graph swaps, durable notes, race ownership, vault/redaction, literal privacy, atomic replacement | 2–8, 11–28 | risk-specific tests and scanners |
-| §17 existing-capability completeness matrix | 11, 15–24, 27 | contract parser coverage and story/scenario matrix |
-| §18 final decisions: Atlas as orientation, three coordinates, generated edit review, immediate recoverable Stop, atomic release | 14, 17–21, 26–28 | shell/Atlas/controller/session/cutover gates |
-| §19 design self-review record | 1–28 | this execution matrix, per-task Interfaces, A–N ownership, and Final execution audit |
+| Reset §§1–4 one serial owner, admission 256, queue completions, simple cancellation, actor failure/unavailability | 1 | actor matrix, absence scan, socket journey |
+| Reset §5 bounded projection, snapshot-before-deltas, immediate frame rejection, no audio replay | 1, 3 | actor/socket tests, meeting reconnect journey |
+| Reset §6 all 14 lifecycle cases | 1 | repeated `test_session_actor.py` and socket integration |
+| Reset §7 retain approved Tasks 1–4, replace Task 5, no detached repair continuation | prerequisite, 1 | ancestry checks, deleted registry/tests, absence scan |
+| Reset §§8–9 six runnable vertical slices, one RED/GREEN and review per slice | 1–6 | exact headings/checkpoints/commits in this plan |
+| Design §§0–2 thesis, capability preservation, trust vocabulary, metrics/non-goals | 1–6 | slice journeys, evidence tests, final A–N/release gate |
+| §3 three coordinates, separate Control, history, selection, pins, compare, exception ledger | 2, 5 | shell/store/comparison tests |
+| §4 one stateful window, exact breakpoints/compact/utilities/tray/privacy | 1–3, 5–6 | desktop/shell/live/privacy/native tests |
+| §5 selection/preview/open/pin grammar, command center, primary actions, focus zones | 2, 5–6 | command, shell, Outline, keyboard E2E |
+| §6 territory LOD, stable geography, time, lenses, local direction, live overlay, accessible Outline, errors | 2, 5 | Atlas unit/performance/keyboard/visual tests |
+| §7.1 startup/readiness/first run/permissions | 2 | hydration/runtime tests and inspectable journey |
+| §7.2 complete meeting lifecycle, notes, transcript, intelligence, resume/Stop/final/review/delete | prerequisite, 1, 3 | actor/controller/dossier tests and stories A–E/N |
+| §7.3 Inquiry threads, scopes, turns, evidence outcomes, management/reconnect | 4 | inquiry/evidence tests and stories F–G |
+| §7.4 Sources config/auth/sync/cancel/purge and immutable old Atlas | 5 | OAuth/Sources tests and stories I–J |
+| §7.5 Profile states and server-only phases | 5 | Profile tests and story K |
+| §§7.6–7.7 Diagnostics and capability-gated native opening | 4–5 | inspector/diagnostic/native tests |
+| §8 complete runtime/permission/meeting/notes/chat/evidence/connector/profile/utility state inventory | 1–6 | colocated state matrices and visual fixtures |
+| §9 exact tokens/type/spacing/density/motion/no decorative AI styling | 2, 6 | token tests, visual matrix, old-theme scanner |
+| §10 primitives/layout/knowledge/meeting/Ask measurements and behavior | 2–5 | component tests and final axe/visual matrix |
+| §11 keyboard, semantics, announcements, contrast, zoom, editor, i18n/RTL | 2–6 | unit accessibility, Playwright, manual checks |
+| §12 Redux ownership, finite states, one gateway, hydration/reconciliation, privacy, splitting/performance | 1–6 | gateway/store/controller tests, scanners, bundle/perf gates |
+| §§13.1–13.5 retained REST, three sockets, desktop contracts, all discriminants | 1–5 | parser/OpenAPI/gateway/native tests |
+| §13.6 proposals/commands/revision/idempotency/undo/legacy reads | approved Tasks 2–4, 3 | retained Core suites, controller tests, stories D/E/N |
+| §13.7 live continuation as superseded by reset actor | 1, 3 | actor 14-case matrix, socket/state-machine tests, story C |
+| §13.8 desktop OAuth/vault/env compatibility | 5 | OAuth/vault/IPC/log tests and Sources journey |
+| §§13.9–13.10 chat cleanup and deliberately absent contracts | approved Task 4, 4–6 | retained delete tests, API/diff/edge scan |
+| §14 target decomposition and total old-architecture removal | 1–6 | exact file lists, cutover/deletion scanner |
+| §15 automated/manual/native/performance/visual acceptance | 6 | one comprehensive recorded GREEN run/checklist |
+| §§16–18 risk mitigations, completeness, final product decisions | 1–6 | requirement matrix, A–N, final invariant scans |
 
-### Acceptance-story ownership
+## Acceptance-story ownership
 
-| Story | Owning test in `app/e2e/knowledge-atlas.spec.ts` | Primary implementation tasks |
-|---|---|---:|
-| A. Start and finish a meeting | `A start and finish a meeting` | 5–6, 19–21 |
-| B. Degrade to mic only | `B degrade to mic only` | 9–10, 20–21 |
-| C. Reconnect honestly | `C reconnect honestly` | 5–6, 11, 20 |
-| D. Prevent note loss | `D prevent note loss` | 2–3, 9, 19–20 |
-| E. Accept and undo a final proposal | `E accept and undo a final proposal` | 2–4, 19, 21 |
-| F. Ask with transparent evidence | `F ask with transparent evidence` | 15–16 |
-| G. Handle low-confidence and interrupted turns | `G low confidence and interrupted turns` | 11, 15–16 |
-| H. Investigate spatially without a pointer | `H investigate spatially without a pointer` | 17–18, 25 |
-| I. Sync sources without losing the old Atlas | `I sync sources without losing the old Atlas` | 11, 18, 22 |
-| J. Purge with exact boundaries | `J purge with exact boundaries` | 22 |
-| K. Generate profile safely | `K generate profile safely` | 23 |
-| L. Use privacy curtain during capture | `L privacy curtain during capture` | 9, 20, 24 |
-| M. Replace, not coexist | `M replace not coexist` | 26, 28 |
-| N. Keep every AI note change reviewable | `N every ai note change is reviewable` | 2–4, 19–21 |
+| Story | Slice | Required test name in `app/e2e/knowledge-atlas.spec.ts` |
+|---|---:|---|
+| A. Start and finish a meeting | 1, 3 | `A start and finish a meeting` |
+| B. Degrade to mic only | 1, 3 | `B degrade to mic only` |
+| C. Reconnect honestly | 1, 3 | `C reconnect honestly` |
+| D. Prevent note loss | prerequisite, 3 | `D prevent note loss` |
+| E. Accept and undo a final proposal | prerequisite, 3 | `E accept and undo a final proposal` |
+| F. Ask with transparent evidence | 4 | `F ask with transparent evidence` |
+| G. Handle low-confidence and interrupted turns | 4 | `G low confidence and interrupted turns` |
+| H. Investigate spatially without a pointer | 2, 5 | `H investigate spatially without a pointer` |
+| I. Sync sources without losing the old Atlas | 5 | `I sync sources without losing the old Atlas` |
+| J. Purge with exact boundaries | 5 | `J purge with exact boundaries` |
+| K. Generate profile safely | 5 | `K generate profile safely` |
+| L. Use privacy curtain during capture | 1, 3, 5 | `L privacy curtain during capture` |
+| M. Replace, not coexist | 6 | `M replace not coexist` |
+| N. Keep every AI note change reviewable | prerequisite, 3, 4 | `N every ai note change is reviewable` |
 
-## Final execution audit
+## Final plan audit for the executing worker
 
-Before declaring implementation complete, the executing agent must run `cd "$WORKTREE_ROOT"`, revalidate that `git rev-parse --git-dir` ends in `/worktrees/ui-knowledge-atlas`, and verify all of the following there:
-
-1. Every task commit exists in order or an explicitly documented squash preserves the same review boundaries.
-2. `git diff --check` is empty and `git status --short` contains no unrelated staged path.
-3. `app/src/renderer/src/app/App.tsx` remains below approximately 120 substantive lines and contains no socket, fetch, capture, graph, chat, or editor ownership.
-4. `rg -n 'setMarkdown|updateMeeting\(|note-commands' app/src/renderer/src` shows canonical note writes only in `MeetingDocumentController.ts`/its API adapter and tests; proposal producers never call them.
-5. `rg -n 'new WebSocket' app/src/renderer/src` shows constructors only in the three connection modules; utility renderers show none.
-6. `rg -n 'edge-reason' app/src/renderer/src` exits 1.
-7. `rg -n 'T[O]DO|T[B]D|F[I]XME|place[h]older|coming[ ]soon|implement[ ]later' core/taurine_core app/src app/e2e docs/superpowers/verification` exits 1.
-8. All Markdown fences in this plan and the release checklist are balanced, headings are unique within their intended hierarchy, and every path named as Create/Modify/Delete is either present or intentionally deleted at the corresponding commit.
-9. The Task 28 command block passes with the stated test floors and bundle/performance limits.
-10. The requirement matrix and A–N ownership table have no uncovered row, and the manual checklist contains dated evidence for every §15.4–15.5 check.
+- [ ] **Confirm slice commits/reviews.** Six slice commits exist in order after the approved prerequisite; each has its saved RED/GREEN output and review disposition.
+- [ ] **Confirm no migration work appeared.** No database copy/reset, user-facing conversion, actor-state persistence, migration screen, or ephemeral-session schema exists; existing additive proposal DDL still opens old stores in place.
+- [ ] **Confirm canonical type consistency.** Python and TypeScript session dispositions, wire codes, snapshot fields, meeting proposal fields, capture phases, coordinate/control values, and gateway/controller method names match the canonical block.
+- [ ] **Confirm no incomplete-marker language.** Run the exact red-flag scan from Slice 6 and resolve every match before release.
+- [ ] **Confirm path accountability.** Every Create/Modify/Delete path in the six slices is present or intentionally removed in the owning frozen commit; no old alias masks a missing target module.
+- [ ] **Confirm design completeness.** Every row in the design coverage and A–N tables points to passing automated evidence plus manual evidence where the operating system or assistive technology requires it.
+- [ ] **Confirm external evidence availability.** Any unavailable reference device, assistive-technology session, ScreenCaptureKit capture, native permission/audio run, signed package, or moderated workflow is a release blocker recorded as `BLOCKED`; completion cannot infer or waive it from automated coverage.

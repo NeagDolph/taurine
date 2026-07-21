@@ -594,9 +594,9 @@ Run the app against a copy of a pre-redesign database/knowledge fixture. Open me
 
 Expected: durable objects open unchanged; fixture secrets appear in none of those outputs.
 
-- [ ] **Step 11: Write the release record**
+- [ ] **Step 11: Write the release and product-acceptance record**
 
-Record command outputs, versions, counts, bundle table, performance percentiles, platform matrix, commit SHA, and every design §17.3 acceptance item mapped to measured automated/manual proof. The record contains no private content.
+Record command outputs, versions, counts, bundle table, performance percentiles, platform matrix, commit SHA, and every design §17.3 acceptance item mapped to measured automated/manual proof. Attach the design §17.4 moderated-pilot evidence for at least eight users or eight repeated target-user sessions, including each stated 7/8 threshold and every qualitative guardrail. Do not infer participant comprehension from unit/E2E tests; missing external pilot evidence is a named release blocker. The record contains no private content.
 
 - [ ] **Step 12: Freeze and commit Slice 6**
 
@@ -618,4 +618,4 @@ Before claiming the branch complete, map every normative section of `2026-07-20-
 | §§9–10 navigation, persistence, encrypted recovery | 1–3 | route restoration and recovery byte/quarantine/conflict tests |
 | §§11–13 accessibility, privacy, platform behavior | 1–6 | axe/keyboard/curtain suites and signed manual matrix |
 | §§14–16 telemetry, file boundaries, phased cutover | 1–6 | allowlist tests, ownership scan, sole-entry verifier |
-| §17 acceptance and release proof | 6 | release record with one evidence link per acceptance item |
+| §17 functional and product acceptance | 6 | release record with one evidence link per §17.3 item and measured eight-session/user §17.4 pilot evidence |
